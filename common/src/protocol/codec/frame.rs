@@ -1,4 +1,3 @@
-use aead::OsRng;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 use crate::{crypto::hmac::generate_auth_tag, protocol::codec::padding::Padding};

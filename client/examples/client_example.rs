@@ -1,13 +1,12 @@
 use std::sync::Arc;
 
 use netrunner_common::proxy::{
-    connection::handler::{socks2netr::Socks2Netr, tcp2netr::Tcp2Netr},
+    connection::handler::{netr2tcp::Netr2Tcp, tcp2netr::Tcp2Netr},
     network::Network,
 };
 fn main() {
-    println!("Подготовка конфигов...");
-    let inbound_handler = Arc::new(Socks2Netr); //change here to Netr2tcp
-    let outbound_handler = Arc::new(Tcp2Netr);
+    let inbound_handler = Arc::new(Tcp2Netr::new(true, String::from("127.0.0.1:4443")));
+    let outbound_handler = Arc::new(Netr2Tcp);
     let net = Network::new(inbound_handler, outbound_handler, 8080);
 
     // Создаем движок (Runtime)

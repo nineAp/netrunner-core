@@ -1,26 +1,22 @@
 use bytes::{Buf, Bytes, BytesMut};
 
 use crate::{
-    protocol::interceptors::{
-        error_interceptor::interceptor_error::{ErrorAction, ErrorType, InterceptorError},
-        interceptor::Interceptor,
+    protocol::{
+        interceptors::error_interceptor::{ErrorAction, ErrorType, InterceptorError},
+        parser::parser::FrameParser,
     },
-    tlseng::extension::Extension,
+    tlseng::extension::{Extension, ExtensionStack},
 };
 
-pub struct ExtensionStack {
-    pub extensions: Vec<Extension>,
-}
-
-impl Interceptor for ExtensionStack {
+impl FrameParser for ExtensionStack {
     type Error = InterceptorError;
 
-    fn can_handle(bytes: &BytesMut) -> bool {
+    fn can_parse(bytes: &BytesMut) -> bool {
         // Минимальное расширение: тип(2) + длина(2) = 4 байта
         bytes.len() >= 4
     }
 
-    fn intercept(bytes: &mut BytesMut) -> Result<Option<Self>, Self::Error> {
+    fn parse(bytes: &mut BytesMut) -> Result<Option<Self>, Self::Error> {
         let mut extensions = Vec::new();
 
         while bytes.remaining() >= 4 {
@@ -39,7 +35,6 @@ impl Interceptor for ExtensionStack {
             let data = bytes.split_to(elen).freeze();
             extensions.push(Extension::new(etype, data));
         }
-
         Ok(Some(Self { extensions }))
     }
 }

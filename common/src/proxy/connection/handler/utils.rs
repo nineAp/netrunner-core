@@ -11,13 +11,16 @@ pub async fn relay_data<W>(
 where
     W: AsyncWriteExt + Unpin,
 {
-    let n = res.map_err(|e| e.to_string())?;
-    if n == 0 {
-        return Ok(true);
+    match res {
+        Ok(0) => {
+            println!("Read 0 bytes - closing half of connection");
+            return Ok(true); // Это закроет туннель
+        }
+        Ok(n) => println!("Relayed {} bytes", n),
+        Err(e) => println!("Relay error: {}", e),
     }
 
-    println!(">>> Client sent {} bytes", n);
-
-    writer.write_all(&buffer).await.map_err(|e| e.to_string())?;
+    println!("What is here {:?}", &buffer);
+    writer.write_buf(buffer).await.map_err(|e| e.to_string())?;
     Ok(false)
 }

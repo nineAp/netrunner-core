@@ -32,7 +32,6 @@ impl BufPair {
     }
 
     pub async fn write_to(&mut self, writer: &mut OwnedWriteHalf) -> Result<(), String> {
-        println!("Writer Before write {:?}", self.write_buf);
         writer
             .write_all_buf(&mut self.write_buf)
             .await

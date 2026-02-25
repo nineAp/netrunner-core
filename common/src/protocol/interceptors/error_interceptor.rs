@@ -6,13 +6,14 @@ pub enum ErrorAction {
     Redirect,
     Drop,
 }
-
+#[derive(Debug)]
 pub enum ErrorType {
     Tls(&'static str),
     Handshake(&'static str),
     ApplicationData(&'static str),
 }
 
+#[derive(Debug)]
 pub struct InterceptorError {
     pub error_type: ErrorType,
     pub action: ErrorAction,

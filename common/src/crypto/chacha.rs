@@ -15,7 +15,6 @@ pub struct NonceState {
 impl NonceState {
     pub fn new() -> Self {
         let nonce = ChaCha20Poly1305::generate_nonce(&mut OsRng);
-        println!("Nonce is {:?}", nonce);
         Self {
             counter: 0,
             nonce,
@@ -36,7 +35,6 @@ impl NonceState {
         self.counter += 1;
         let counter_bytes = self.counter.to_be_bytes();
         self.nonce[4..12].copy_from_slice(&counter_bytes);
-        println!("Current Nonce is {:?}", self.nonce);
     }
 }
 
@@ -74,8 +72,6 @@ impl AeadPacker for ChaChaCipher {
     }
 
     fn decrypt<B: Buffer>(&mut self, data: &mut B) -> Result<(), chacha20poly1305::aead::Error> {
-        println!("Buffer: {:?}", data.as_mut());
-        println!("nonce: {:?}", &self.decrypt_state.nonce);
         self.cipher
             .decrypt_in_place(&self.decrypt_state.nonce, &[], data)?;
         self.decrypt_state.increase_counter();

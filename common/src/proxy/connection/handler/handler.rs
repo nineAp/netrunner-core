@@ -10,31 +10,31 @@ use crate::{
 };
 #[async_trait]
 pub trait ProxyHandler {
-    async fn do_new(
+    async fn init_session(
         &self,
-        reader: &mut OwnedReadHalf,
-        writer: &mut OwnedWriteHalf,
+        client_reader: &mut OwnedReadHalf,
+        client_writer: &mut OwnedWriteHalf,
         buffers: &mut BufPair,
     ) -> Result<ConnectionState, String>;
-    async fn do_handshake(
+    async fn authorize_request(
         &self,
-        reader: &mut OwnedReadHalf,
-        writer: &mut OwnedWriteHalf,
+        client_reader: &mut OwnedReadHalf,
+        client_writer: &mut OwnedWriteHalf,
         buffers: &mut BufPair,
         codec: &mut Codec,
     ) -> Result<ConnectionState, String>;
-    async fn do_tunnel(
+    async fn exchange_data(
         &self,
-        reader: &mut OwnedReadHalf,
-        writer: &mut OwnedWriteHalf,
+        client_reader: &mut OwnedReadHalf,
+        client_writer: &mut OwnedWriteHalf,
         buffers: &mut BufPair,
         codec: &mut Codec,
         target: &mut TcpStream,
     ) -> Result<ConnectionState, String>;
-    async fn do_close(
+    async fn finalize_session(
         &self,
-        reader: &mut OwnedReadHalf,
-        writer: &mut OwnedWriteHalf,
+        client_reader: &mut OwnedReadHalf,
+        client_writer: &mut OwnedWriteHalf,
         buffers: &mut BufPair,
     ) -> Result<ConnectionState, String>;
 }

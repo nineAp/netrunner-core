@@ -1,32 +1,30 @@
 use bytes::{Buf, Bytes};
 
 use crate::{
-    protocol::interceptors::{
-        error_interceptor::interceptor_error::{ErrorAction, ErrorType, InterceptorError},
-        interceptor::Interceptor,
+    protocol::{
+        interceptors::error_interceptor::{ErrorAction, ErrorType, InterceptorError},
+        parser::parser::FrameParser,
     },
-    tlseng::tls::{ClientHello, ProtocolVersion},
+    tlseng::{handshake::client_hello::ClientHello, types::ProtocolVersion},
 };
 
-impl Interceptor for ClientHello {
+impl FrameParser for ClientHello {
     type Error = InterceptorError;
 
-    fn can_handle(bytes: &bytes::BytesMut) -> bool {
+    fn can_parse(bytes: &bytes::BytesMut) -> bool {
         // Мы предполагаем, что HelloHeader уже проверил тип.
         // Здесь можно проверить минимально допустимый размер ClientHello
         // (Version 2 + Random 32 + SessionID_len 1 = 35 байт)
         bytes.len() >= 35
     }
 
-    fn intercept(bytes: &mut bytes::BytesMut) -> Result<Option<Self>, Self::Error>
+    fn parse(bytes: &mut bytes::BytesMut) -> Result<Option<Self>, Self::Error>
     where
         Self: Sized,
     {
-        // 1. Проверяем минимальную длину для базовых полей (до Session ID включительно)
         if bytes.len() < 35 {
             return Ok(None);
         }
-
         // 2. Version (2 bytes)
         let raw_version = bytes.get_u16();
         let version = ProtocolVersion::try_from(raw_version).map_err(|e| {

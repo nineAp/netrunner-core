@@ -1,16 +1,19 @@
 use bytes::{Buf, Bytes, BytesMut};
 
 use crate::{
-    protocol::interceptors::{
-        error_interceptor::interceptor_error::{ErrorAction, ErrorType, InterceptorError},
-        interceptor::Interceptor,
+    protocol::{
+        interceptors::error_interceptor::{ErrorAction, ErrorType, InterceptorError},
+        parser::parser::FrameParser,
     },
-    tlseng::tls::{ContentType, ProtocolVersion, TlsRecord},
+    tlseng::{
+        tls_record::TlsRecord,
+        types::{ContentType, ProtocolVersion},
+    },
 };
 
-impl Interceptor for TlsRecord {
+impl FrameParser for TlsRecord {
     type Error = InterceptorError;
-    fn can_handle(bytes: &BytesMut) -> bool {
+    fn can_parse(bytes: &BytesMut) -> bool {
         if bytes.is_empty() {
             return false;
         }
@@ -22,7 +25,7 @@ impl Interceptor for TlsRecord {
         };
         is_valid
     }
-    fn intercept(bytes: &mut BytesMut) -> Result<Option<TlsRecord>, Self::Error> {
+    fn parse(bytes: &mut BytesMut) -> Result<Option<TlsRecord>, Self::Error> {
         if bytes.len() < 5 {
             return Ok(None);
         }
@@ -48,11 +51,6 @@ impl Interceptor for TlsRecord {
         })?;
         let _raw_len = bytes.get_u16();
         let payload = bytes.split_to(len as usize).freeze();
-        Ok(Some(TlsRecord {
-            content_type,
-            version,
-            len,
-            payload,
-        }))
+        Ok(Some(TlsRecord::new(content_type, version, payload)))
     }
 }

@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, sync::Arc, vec};
+use std::{net::SocketAddr, sync::Arc};
 use tokio::net::{
     tcp::{OwnedReadHalf, OwnedWriteHalf},
     TcpStream,
@@ -21,7 +21,7 @@ pub struct Connection {
 }
 
 impl Connection {
-    pub fn new(stream: TcpStream, addr: SocketAddr) -> Self {
+    pub fn new(stream: TcpStream, addr: SocketAddr, init: bool) -> Self {
         let (inbound, outbound) = stream.into_split();
         Self {
             addr,
@@ -29,7 +29,7 @@ impl Connection {
             outbound,
             state: ConnectionState::New,
             buffers: BufPair::new(),
-            codec: Codec::new(),
+            codec: Codec::new(init),
         }
     }
     pub async fn handle(
@@ -40,12 +40,12 @@ impl Connection {
             match &mut self.state {
                 ConnectionState::New => {
                     self.state = handler
-                        .do_new(&mut self.inbound, &mut self.outbound, &mut self.buffers)
+                        .init_session(&mut self.inbound, &mut self.outbound, &mut self.buffers)
                         .await?
                 }
                 ConnectionState::Handshake => {
                     self.state = handler
-                        .do_handshake(
+                        .authorize_request(
                             &mut self.inbound,
                             &mut self.outbound,
                             &mut self.buffers,
@@ -55,7 +55,7 @@ impl Connection {
                 }
                 ConnectionState::Tunnel(ref mut stream) => {
                     self.state = handler
-                        .do_tunnel(
+                        .exchange_data(
                             &mut self.inbound,
                             &mut self.outbound,
                             &mut self.buffers,
@@ -67,14 +67,13 @@ impl Connection {
 
                 ConnectionState::Close => {
                     self.state = handler
-                        .do_close(&mut self.inbound, &mut self.outbound, &mut self.buffers)
+                        .finalize_session(&mut self.inbound, &mut self.outbound, &mut self.buffers)
                         .await?;
                 }
                 ConnectionState::Disconnected => {
                     println!("Disconnected");
                     return Ok(ConnectionState::Disconnected);
                 }
-                _ => return Err("Invalid transition".to_string()),
             }
         }
     }

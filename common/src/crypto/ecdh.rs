@@ -2,7 +2,7 @@ use aead::OsRng;
 use x25519_dalek::{EphemeralSecret, PublicKey};
 pub struct ECDH {
     pub public_key: PublicKey,
-    secret_key: EphemeralSecret,
+    pub private_key: Option<EphemeralSecret>,
 }
 
 impl ECDH {
@@ -10,13 +10,14 @@ impl ECDH {
         let secret = EphemeralSecret::random_from_rng(&mut OsRng);
         let public = PublicKey::from(&secret);
         Self {
-            secret_key: secret,
+            private_key: Some(secret),
             public_key: public,
         }
     }
 
-    pub fn get_shared(self, public: &PublicKey) -> [u8; 32] {
-        let shared = self.secret_key.diffie_hellman(&public);
-        *shared.as_bytes()
+    pub fn get_shared(&mut self, public: &PublicKey) -> Option<[u8; 32]> {
+        let private_key = self.private_key.take()?;
+        let shared = private_key.diffie_hellman(&public);
+        Some(*shared.as_bytes())
     }
 }

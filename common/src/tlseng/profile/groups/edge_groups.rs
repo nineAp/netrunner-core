@@ -1,4 +1,4 @@
-use crate::tlseng::etype::*;
+use crate::tlseng::consts::*;
 use crate::tlseng::params::{TlsGroups, TlsSignatures};
 use crate::tlseng::values::{
     GROUP_SECP256R1, GROUP_SECP384R1, GROUP_X25519, SIG_ECDSA_SECP256R1_SHA256,

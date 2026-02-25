@@ -34,7 +34,7 @@ impl Network {
             let (stream, addr) = listener.accept().await.expect("Error on connection");
             let handler = self.inbound_handler.clone();
             tokio::spawn(async move {
-                let mut conection: Connection = Connection::new(stream, addr);
+                let mut conection: Connection = Connection::new(stream, addr, false);
 
                 let res = conection.handle(handler).await;
                 match res {
@@ -45,7 +45,7 @@ impl Network {
                         ConnectionState::Handshake => {
                             println!("Connection {} handshaked", addr)
                         }
-                        ConnectionState::Tunnel(stream) => {
+                        ConnectionState::Tunnel(_stream) => {
                             println!("Connection {} tunnel", addr)
                         }
                         ConnectionState::Close => {

@@ -3,16 +3,22 @@ use rand::Rng;
 
 // Using your provided constants and types
 use crate::tlseng::{
-    etype::*,
+    consts::*,
     params::{TlsGroups, TlsSignatures, TlsVersions},
     profile::profile::BrowserProfile,
     values::*,
 };
 
+#[derive(Debug)]
 pub struct Extension {
     pub etype: u16,
     pub elen: u16,
     pub data: Bytes,
+}
+
+#[derive(Debug)]
+pub struct ExtensionStack {
+    pub extensions: Vec<Extension>,
 }
 
 impl Extension {

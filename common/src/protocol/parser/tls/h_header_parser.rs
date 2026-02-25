@@ -1,17 +1,17 @@
 use bytes::{Buf, Bytes};
 
 use crate::{
-    protocol::interceptors::{
-        error_interceptor::interceptor_error::{ErrorAction, ErrorType, InterceptorError},
-        interceptor::Interceptor,
+    protocol::{
+        interceptors::error_interceptor::{ErrorAction, ErrorType, InterceptorError},
+        parser::parser::FrameParser,
     },
-    tlseng::tls::{HelloHeader, HelloType},
+    tlseng::{handshake::hello_header::HelloHeader, types::HelloType},
     utils::u24::{BufExt, U24},
 };
 
-impl Interceptor for HelloHeader {
+impl FrameParser for HelloHeader {
     type Error = InterceptorError;
-    fn can_handle(bytes: &bytes::BytesMut) -> bool {
+    fn can_parse(bytes: &bytes::BytesMut) -> bool {
         if bytes.is_empty() {
             return false;
         }
@@ -23,7 +23,7 @@ impl Interceptor for HelloHeader {
         is_valid
     }
 
-    fn intercept(bytes: &mut bytes::BytesMut) -> Result<Option<Self>, Self::Error>
+    fn parse(bytes: &mut bytes::BytesMut) -> Result<Option<Self>, Self::Error>
     where
         Self: Sized,
     {
@@ -42,7 +42,6 @@ impl Interceptor for HelloHeader {
         Ok(Some(Self {
             header_type,
             len: U24::from_u32(len),
-            body: bytes.split_to(len as usize).freeze(),
         }))
     }
 }

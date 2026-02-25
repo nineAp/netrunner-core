@@ -1,23 +1,23 @@
-use bytes::{Buf, Bytes};
+use bytes::{Buf, Bytes, BytesMut};
 
 use crate::{
-    protocol::interceptors::{
-        error_interceptor::interceptor_error::{ErrorAction, ErrorType, InterceptorError},
-        interceptor::Interceptor,
+    protocol::{
+        interceptors::error_interceptor::{ErrorAction, ErrorType, InterceptorError},
+        parser::parser::FrameParser,
     },
-    tlseng::tls::{ProtocolVersion, ServerHello},
+    tlseng::{handshake::server_hello::ServerHello, types::ProtocolVersion},
 };
 
-impl Interceptor for ServerHello {
+impl FrameParser for ServerHello {
     type Error = InterceptorError;
 
-    fn can_handle(bytes: &bytes::BytesMut) -> bool {
+    fn can_parse(bytes: &bytes::BytesMut) -> bool {
         // Минимальный ServerHello:
         // Version(2) + Random(32) + SessionID_len(1) + Cipher(2) + Compression(1) = 38 байт
         bytes.len() >= 38
     }
 
-    fn intercept(bytes: &mut bytes::BytesMut) -> Result<Option<Self>, Self::Error>
+    fn parse(bytes: &mut bytes::BytesMut) -> Result<Option<Self>, Self::Error>
     where
         Self: Sized,
     {
@@ -67,7 +67,7 @@ impl Interceptor for ServerHello {
                 random,
                 session_id,
                 cipher_suite,
-                extensions: Bytes::new(),
+                extensions: BytesMut::new(),
             }));
         }
 
@@ -81,7 +81,7 @@ impl Interceptor for ServerHello {
             return Ok(None);
         }
 
-        let extensions = bytes.split_to(extensions_len).freeze();
+        let extensions = bytes.split_to(extensions_len);
 
         Ok(Some(Self {
             version,

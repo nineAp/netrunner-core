@@ -9,7 +9,7 @@ impl HKDF {
         extracted_key
     }
 
-    pub fn expand<const N: usize>(
+    pub fn expand_key<const N: usize>(
         extracted_key: &Hkdf<Sha256>,
         mark: &[u8],
     ) -> Result<[u8; N], String> {

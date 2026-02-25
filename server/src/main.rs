@@ -21,7 +21,7 @@ struct Args {
 fn main() {
     let args = Args::parse();
     let inbound_handler = Arc::new(Netr2Tcp); //change here to Netr2tcp
-    let outbound_handler = Arc::new(Tcp2Netr);
+    let outbound_handler = Arc::new(Tcp2Netr::new(false, String::from("")));
     let net = Network::new(inbound_handler, outbound_handler, args.port);
 
     // Создаем движок (Runtime)
