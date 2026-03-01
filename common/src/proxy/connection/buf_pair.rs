@@ -18,7 +18,6 @@ impl BufPair {
         }
     }
     pub async fn read_from(&mut self, reader: &mut OwnedReadHalf) -> Result<usize, String> {
-        self.read_buf.clear(); // Вот она, автоматическая чистка
         let n = reader
             .read_buf(&mut self.read_buf)
             .await
@@ -27,11 +26,10 @@ impl BufPair {
         if n == 0 {
             return Err("Connection closed by peer".to_string());
         }
-        //println!("Reader {:?}", self.read_buf);
         Ok(n)
     }
 
-    pub async fn write_to(&mut self, writer: &mut OwnedWriteHalf) -> Result<(), String> {
+    pub async fn write_from(&mut self, writer: &mut OwnedWriteHalf) -> Result<(), String> {
         writer
             .write_all_buf(&mut self.write_buf)
             .await

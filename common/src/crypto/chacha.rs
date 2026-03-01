@@ -1,80 +1,139 @@
+use bytes::{Bytes, BytesMut};
 use chacha20poly1305::aead::generic_array::GenericArray;
-use chacha20poly1305::aead::{Buffer, OsRng};
-use chacha20poly1305::{
-    AeadCore, AeadInPlace, ChaCha20Poly1305, ChaChaPoly1305, Key, KeyInit, Nonce,
-};
+use chacha20poly1305::{AeadInPlace, ChaCha20Poly1305, Key, KeyInit, Nonce};
 
 use crate::crypto::aead::AeadPacker;
 
 pub struct NonceState {
     counter: u64,
-    nonce: Nonce,
-    handshake: bool,
+    base_iv: [u8; 12],
 }
 
 impl NonceState {
-    pub fn new() -> Self {
-        let nonce = ChaCha20Poly1305::generate_nonce(&mut OsRng);
+    pub fn new(base_iv: [u8; 12]) -> Self {
         Self {
             counter: 0,
-            nonce,
-            handshake: false,
+            base_iv,
         }
     }
 
-    pub fn get_handshake(&self) -> bool {
-        return self.handshake;
-    }
-
-    pub fn set_nonce(&mut self, nonce: Nonce) {
-        self.nonce = nonce;
-        self.handshake = true
-    }
-
-    pub fn increase_counter(&mut self) {
-        self.counter += 1;
+    // Возвращает nonce для текущего пакета и ПЕРЕХОДИТ к следующему
+    pub fn next_nonce(&mut self) -> Nonce {
+        let mut iv = self.base_iv;
+        // В TLS 1.3 используется Little Endian для счетчика при XOR
+        // Но если ты сам пишешь протокол, BE тоже пойдет.
+        // Главное — единообразие.
         let counter_bytes = self.counter.to_be_bytes();
-        self.nonce[4..12].copy_from_slice(&counter_bytes);
+
+        for i in 0..8 {
+            iv[i + 4] ^= counter_bytes[i];
+        }
+
+        self.counter += 1;
+        *GenericArray::from_slice(&iv)
     }
 }
 
 pub struct ChaChaCipher {
-    key: Key,
+    pub encrypt_cipher: ChaCha20Poly1305,
+    pub decrypt_cipher: ChaCha20Poly1305,
     pub encrypt_state: NonceState,
     pub decrypt_state: NonceState,
-    pub cipher: ChaCha20Poly1305,
 }
 
 impl ChaChaCipher {
     pub fn new() -> Self {
-        let key = GenericArray::clone_from_slice(&[0; 32]);
-        let cipher = ChaCha20Poly1305::new(&key);
+        let start_key = Key::from([0u8; 32]);
+        let encrypt_cipher = ChaCha20Poly1305::new(&start_key);
+        let decrypt_cipher = ChaCha20Poly1305::new(&start_key);
         Self {
-            key,
-            encrypt_state: NonceState::new(),
-            decrypt_state: NonceState::new(),
-            cipher,
+            encrypt_state: NonceState::new([0u8; 12]),
+            decrypt_state: NonceState::new([0u8; 12]),
+            encrypt_cipher,
+            decrypt_cipher,
         }
     }
 
-    pub fn set_key(&mut self, key: Key) -> () {
-        self.key = key;
-        self.cipher = ChaChaPoly1305::new(&self.key);
+    pub fn set_keys(
+        &mut self,
+        w_key: [u8; 32],
+        w_iv: [u8; 12], // Write (исходящие)
+        r_key: [u8; 32],
+        r_iv: [u8; 12], // Read (входящие)
+    ) {
+        self.encrypt_cipher = ChaCha20Poly1305::new(Key::from_slice(&w_key));
+        self.decrypt_cipher = ChaCha20Poly1305::new(Key::from_slice(&r_key));
+
+        self.encrypt_state = NonceState::new(w_iv);
+        self.decrypt_state = NonceState::new(r_iv);
+
+        tracing::debug!("Cipher keys and IVs updated for both directions");
     }
 }
-
 impl AeadPacker for ChaChaCipher {
-    fn encrypt<B: Buffer>(&mut self, data: &mut B) -> Result<(), chacha20poly1305::aead::Error> {
-        self.cipher
-            .encrypt_in_place(&self.encrypt_state.nonce, &[], data)?;
-        self.encrypt_state.increase_counter();
-        Ok(())
+    fn encrypt(&mut self, data: &mut BytesMut) -> Result<Bytes, chacha20poly1305::aead::Error> {
+        // Сначала получаем текущий counter для лога (до того, как next_nonce его инкрементирует)
+        let current_counter = self.encrypt_state.counter;
+        let nonce = self.encrypt_state.next_nonce();
+        let nonce_hex = hex::encode(nonce);
+        let data_len = data.len();
+
+        match self.encrypt_cipher.encrypt_in_place(&nonce, &[], data) {
+            Ok(_) => {
+                tracing::trace!(
+                    counter = current_counter,
+                    nonce = %nonce_hex,
+                    len = data_len,
+                    "Encryption successful"
+                );
+                Ok(data.split().freeze())
+            }
+            Err(e) => {
+                tracing::error!(
+                    counter = current_counter,
+                    nonce = %nonce_hex,
+                    len = data_len,
+                    error = ?e,
+                    "AEAD encryption failure"
+                );
+                Err(e)
+            }
+        }
     }
 
-    fn decrypt<B: Buffer>(&mut self, data: &mut B) -> Result<(), chacha20poly1305::aead::Error> {
-        self.cipher
-            .decrypt_in_place(&self.decrypt_state.nonce, &[], data)?;
-        self.decrypt_state.increase_counter();
-        Ok(())
+    fn decrypt(&mut self, data: &mut BytesMut) -> Result<Bytes, chacha20poly1305::aead::Error> {
+        let current_counter = self.decrypt_state.counter;
+        let nonce = self.decrypt_state.next_nonce();
+        let nonce_hex = hex::encode(nonce);
+        let data_len = data.len();
+
+        let data_prefix = if data.len() >= 8 {
+            hex::encode(&data[..8])
+        } else {
+            hex::encode(data.as_ref())
+        };
+
+        match self.decrypt_cipher.decrypt_in_place(&nonce, &[], data) {
+            Ok(_) => {
+                tracing::trace!(
+                    counter = current_counter,
+                    nonce = %nonce_hex,
+                    len = data_len,
+                    "Decryption successful"
+                );
+                Ok(data.split().freeze())
+            }
+            Err(e) => {
+                tracing::error!(
+                    counter = current_counter,
+                    nonce = %nonce_hex,
+                    len = data_len,
+                    prefix = %data_prefix,
+                    error = ?e,
+                    "AEAD decryption failure! Verification failed or data malformed"
+                );
+                Err(e)
+            }
+        }
     }
 }

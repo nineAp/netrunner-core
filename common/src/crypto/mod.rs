@@ -1,6 +1,7 @@
 pub mod aead;
 pub mod chacha;
-pub mod ecdh;
-pub mod hkdf;
-pub mod hmac;
-pub mod salt_pair;
+mod ecdh;
+mod hkdf;
+mod hmac;
+mod salt_pair;
+pub mod session;

@@ -1,6 +1,6 @@
-use chacha20poly1305::aead::Buffer;
+use bytes::{Bytes, BytesMut};
 
 pub trait AeadPacker {
-    fn encrypt<B: Buffer>(&mut self, data: &mut B) -> Result<(), chacha20poly1305::aead::Error>;
-    fn decrypt<B: Buffer>(&mut self, data: &mut B) -> Result<(), chacha20poly1305::aead::Error>;
+    fn encrypt(&mut self, data: &mut BytesMut) -> Result<Bytes, chacha20poly1305::aead::Error>;
+    fn decrypt(&mut self, data: &mut BytesMut) -> Result<Bytes, chacha20poly1305::aead::Error>;
 }

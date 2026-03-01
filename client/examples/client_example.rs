@@ -1,13 +1,11 @@
-use std::sync::Arc;
-
-use netrunner_common::proxy::{
-    connection::handler::{netr2tcp::Netr2Tcp, tcp2netr::Tcp2Netr},
-    network::Network,
+use netrunner_common::{
+    logger_init,
+    proxy::{connection::connection::ConnectionRole, network::Network},
 };
 fn main() {
-    let inbound_handler = Arc::new(Tcp2Netr::new(true, String::from("127.0.0.1:4443")));
-    let outbound_handler = Arc::new(Netr2Tcp);
-    let net = Network::new(inbound_handler, outbound_handler, 8080);
+    logger_init();
+    //todo normal address
+    let net = Network::new(8080, ConnectionRole::Client, Some("0.0.0.0:4443".into()));
 
     // Создаем движок (Runtime)
     let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");

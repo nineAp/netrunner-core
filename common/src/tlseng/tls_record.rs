@@ -17,6 +17,17 @@ pub struct TlsRecord {
 }
 
 impl TlsRecord {
+    /// Creates a new TLS Record Layer from the given parameters.
+    ///
+    /// # Arguments
+    ///
+    /// * `content_type`: The type of data contained (Handshake, ApplicationData, etc.).
+    /// * `version`: The record layer version (usually 0x0301 for legacy support).
+    /// * `payload`: The actual data being transported (e.g., a serialized ClientHello).
+    ///
+    /// # Returns
+    ///
+    /// A new TLS Record Layer structure with the given parameters.
     pub fn new(content_type: ContentType, version: ProtocolVersion, payload: Bytes) -> Self {
         Self {
             content_type,
@@ -37,5 +48,16 @@ impl TlsRecord {
         buf.put_slice(&self.payload);
 
         buf.freeze()
+    }
+
+    pub fn build_application_data(payload: Bytes) -> Bytes {
+        tracing::trace!(payload_len = payload.len(), "Building TlsRecord from Bytes");
+
+        let record = Self::new(
+            ContentType::ApplicationData,
+            ProtocolVersion::Tls12,
+            payload,
+        );
+        record.serialize()
     }
 }

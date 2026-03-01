@@ -1,8 +1,6 @@
-use std::sync::Arc;
-
-use netrunner_common::proxy::{
-    connection::handler::{netr2tcp::Netr2Tcp, tcp2netr::Tcp2Netr},
-    network::Network,
+use netrunner_common::{
+    logger_init,
+    proxy::{connection::connection::ConnectionRole, network::Network},
 };
 
 use clap::Parser;
@@ -19,10 +17,9 @@ struct Args {
 }
 
 fn main() {
+    logger_init();
     let args = Args::parse();
-    let inbound_handler = Arc::new(Netr2Tcp); //change here to Netr2tcp
-    let outbound_handler = Arc::new(Tcp2Netr::new(false, String::from("")));
-    let net = Network::new(inbound_handler, outbound_handler, args.port);
+    let net = Network::new(args.port, ConnectionRole::Server, None);
 
     // Создаем движок (Runtime)
     let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
