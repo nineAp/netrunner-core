@@ -36,34 +36,26 @@ impl Network {
 
         match self.role {
             ConnectionRole::Client => {
-                // --- ЛОГИКА КЛИЕНТА ---
-                // 1. Создаем ОДИН туннель до прокси-сервера при старте
                 info!("Starting Client mode: Initializing persistent tunnel to proxy...");
 
                 let muxer = match self.initialize_client_tunnel().await {
                     Ok(m) => m,
                     Err(e) => {
-                        error!(error = %e, "Failed to initialize global tunnel. Exiting.");
+                        error!(error = %e, "Global tunnel failed. Exit.");
                         return;
                     }
                 };
 
-                // 2. Теперь слушаем SOCKS-запросы от браузера
-                let listener = TcpListener::bind(&addr)
-                    .await
-                    .expect("Failed to bind SOCKS port");
-                info!(socks_addr = %addr, "SOCKS5 server ready for browser connections");
+                let listener = TcpListener::bind(&addr).await.expect("SOCKS bind failed");
+                info!(socks_addr = %addr, "SOCKS5 ready");
 
                 loop {
                     if let Ok((stream, client_addr)) = listener.accept().await {
                         let current_muxer = muxer.clone();
-
                         tokio::spawn(async move {
-                            // Используем новый метод handle_socks_client
+                            // Здесь мы просто создаем Connection и сразу в SOCKS
                             let connection = Connection::new(stream, client_addr, false);
-                            if let Err(e) = connection.handle_socks_client(current_muxer).await {
-                                error!(client = %client_addr, error = %e, "SOCKS stream error");
-                            }
+                            let _ = connection.handle_socks_client(current_muxer).await;
                         });
                     }
                 }
@@ -93,71 +85,61 @@ impl Network {
 
     /// Вспомогательный метод для Клиента: создает TLS туннель и запускает TunnelEngine
     async fn initialize_client_tunnel(&self) -> Result<Muxer, String> {
-        let server_addr = self
-            .remote_proxy_addr
-            .as_ref()
-            .ok_or("Remote proxy address not configured")?;
+        let server_addr = self.remote_proxy_addr.as_ref().ok_or("No proxy addr")?;
 
-        // 1. Устанавливаем TCP соединение с сервером
+        // Вместо создания Connection (который нужен для обработки клиентов),
+        // работаем напрямую с TcpStream для первичного TLS-хендшейка.
         let stream = TcpStream::connect(server_addr)
             .await
-            .map_err(|e| format!("Connect to proxy failed: {}", e))?;
+            .map_err(|e| e.to_string())?;
+        let (mut inbound, mut outbound) = stream.into_split();
 
-        // 2. Создаем временный Connection
-        let dummy_addr = server_addr.parse().unwrap_or("0.0.0.0:0".parse().unwrap());
-        // Передаем stream (Connection сам сделает into_split внутри, если у тебя так написано в new)
-        let mut conn = Connection::new(stream, dummy_addr, false);
+        // Кодек создаем «с чистого листа»
+        let mut codec = crate::protocol::codec::codec::Codec::new(false);
 
-        // 3. TLS Handshake (Клиентская часть)
-        debug!("Starting persistent TLS handshake with proxy");
-        let ch = conn
-            .codec
+        // --- TLS Handshake ---
+        let ch = codec
             .make_client_handshake(&BrowserProfile::CHROME_131, "proxy.server")
             .map_err(|e| format!("{:?}", e))?;
-
-        conn.outbound
-            .write_all(&ch)
-            .await
-            .map_err(|e| e.to_string())?;
+        outbound.write_all(&ch).await.map_err(|e| e.to_string())?;
 
         let mut sh_buf = BytesMut::with_capacity(2048);
-        while let Err(e) = conn.codec.process_handshake(&mut sh_buf) {
-            if e.action != ErrorAction::Wait {
-                return Err(format!("Fatal handshake error: {:?}", e));
-            }
-            // Теперь read_buf найдется, так как мы импортировали AsyncReadExt
-            let n = conn
-                .inbound
-                .read_buf(&mut sh_buf)
-                .await
-                .map_err(|e| e.to_string())?;
-            if n == 0 {
-                return Err("Server closed connection during handshake".into());
+        loop {
+            // Пытаемся обработать то, что уже есть в буфере
+            match codec.process_handshake(&mut sh_buf) {
+                Ok(_) => break, // Готово!
+                Err(e) if e.action == ErrorAction::Wait => {
+                    let n = inbound
+                        .read_buf(&mut sh_buf)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    if n == 0 {
+                        return Err("EOF during handshake".into());
+                    }
+                }
+                Err(e) => return Err(format!("TLS error: {:?}", e)),
             }
         }
-        info!("Persistent TLS Tunnel established successfully!");
 
-        // 4. Инициализируем Muxer и TunnelEngine
-        // Явно указываем тип сообщения для канала, чтобы убрать "cannot infer type"
-        let (mux_tx, mux_rx) = tokio::sync::mpsc::channel::<MuxMessage>(1024);
+        // --- Запуск инфраструктуры ---
+        let (mux_tx, mux_rx) = tokio::sync::mpsc::channel(16384);
         let muxer = Muxer::new(mux_tx, true);
 
-        // 5. Запускаем TunnelEngine в фоне.
+        let handler = std::sync::Arc::new(crate::proxy::connection::handler::StreamHandler::new(
+            muxer.clone(),
+            ConnectionRole::Client,
+        ));
+
         let engine = TunnelEngine {
-            inbound: conn.inbound,
-            outbound: conn.outbound,
-            codec: conn.codec,
-            buffers: conn.buffers,
+            inbound,
+            outbound,
+            codec,
+            read_buf: sh_buf, // Передаем остатки данных из буфера хендшейка в движок!
             mux_rx,
-            muxer: muxer.clone(),
-            role: ConnectionRole::Client,
+            handler,
         };
 
-        tokio::spawn(async move {
-            if let Err(e) = engine.run().await {
-                error!("Main TunnelEngine died: {}", e);
-            }
-        });
+        tokio::spawn(async move { engine.run().await });
 
         Ok(muxer)
     }

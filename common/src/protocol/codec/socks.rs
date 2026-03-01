@@ -1,5 +1,7 @@
 use bytes::{BufMut, Bytes, BytesMut};
 
+use crate::protocol::parser::parser::Parser;
+
 pub const SOCKS5_VERSION: u8 = 0x05;
 pub const REPLY_SUCCESS: u8 = 0x00;
 pub const REPLY_AUTH_FAILURE: u8 = 0xFF;
@@ -16,6 +18,48 @@ pub enum SocksRequest {
     Handshake { methods: Vec<u8> },
     Connect { command: u8, target: SocksTarget },
     Unknown,
+}
+impl SocksRequest {
+    pub async fn handle_handshake<S>(
+        stream: &mut S,
+        buf: &mut BytesMut,
+    ) -> Result<SocksTarget, String>
+    where
+        S: tokio::io::AsyncReadExt + tokio::io::AsyncWriteExt + Unpin,
+    {
+        // 1. Handshake Phase
+        loop {
+            // Используем трейт Parser
+            if let Some(req) = Self::parse(buf)? {
+                if let SocksRequest::Handshake { .. } = req {
+                    let mut reply = BytesMut::with_capacity(2);
+                    SocksReply::HandshakeSelect { method: 0x00 }.write_to(&mut reply);
+                    stream.write_all(&reply).await.map_err(|e| e.to_string())?;
+                    break;
+                }
+                return Err("Expected Handshake, got something else".into());
+            }
+            if stream.read_buf(buf).await.map_err(|e| e.to_string())? == 0 {
+                return Err("Client closed during greeting".into());
+            }
+        }
+
+        // 2. Connect Request Phase
+        loop {
+            if let Some(req) = Self::parse(buf)? {
+                if let SocksRequest::Connect { command, target } = req {
+                    // Проверяем, что это именно CONNECT (0x01)
+                    if command != 0x01 {
+                        return Err(format!("Unsupported SOCKS command: 0x{:02X}", command));
+                    }
+                    return Ok(target);
+                }
+            }
+            if stream.read_buf(buf).await.map_err(|e| e.to_string())? == 0 {
+                return Err("Client closed during connect request".into());
+            }
+        }
+    }
 }
 
 #[derive(Debug)]

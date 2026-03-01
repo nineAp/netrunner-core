@@ -7,7 +7,7 @@ pub fn logger_init() {
         .with_line_number(true); // Показывать строку кода (очень полезно для дебага)
 
     let filter_layer = EnvFilter::try_from_default_env()
-        .or_else(|_| EnvFilter::try_new("trace")) // По умолчанию уровень info
+        .or_else(|_| EnvFilter::try_new("info")) // По умолчанию уровень info
         .unwrap();
 
     tracing_subscriber::registry()

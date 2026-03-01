@@ -46,7 +46,6 @@ impl Muxer {
         }
     }
 
-    // Прокси-метод для получения ID
     pub fn next_id(&self) -> u32 {
         self.id_gen.next()
     }
@@ -63,6 +62,22 @@ impl Muxer {
     }
     pub async fn remove_stream(&self, stream_id: u32) {
         self.streams.write().await.remove(&stream_id);
+    }
+
+    pub async fn send_control(
+        &self,
+        stream_id: u32,
+        f_type: FrameType,
+        data: Bytes,
+    ) -> Result<(), String> {
+        self.to_network
+            .send(MuxMessage {
+                stream_id,
+                frame_type: f_type,
+                data,
+            })
+            .await
+            .map_err(|e| e.to_string())
     }
 
     /// Отправляет входящие данные конкретному локальному обработчику

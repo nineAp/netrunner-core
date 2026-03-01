@@ -75,14 +75,13 @@ impl AeadPacker for ChaChaCipher {
         // Сначала получаем текущий counter для лога (до того, как next_nonce его инкрементирует)
         let current_counter = self.encrypt_state.counter;
         let nonce = self.encrypt_state.next_nonce();
-        let nonce_hex = hex::encode(nonce);
         let data_len = data.len();
 
         match self.encrypt_cipher.encrypt_in_place(&nonce, &[], data) {
             Ok(_) => {
                 tracing::trace!(
                     counter = current_counter,
-                    nonce = %nonce_hex,
+                    nonce = %hex::encode(nonce),
                     len = data_len,
                     "Encryption successful"
                 );
@@ -91,7 +90,7 @@ impl AeadPacker for ChaChaCipher {
             Err(e) => {
                 tracing::error!(
                     counter = current_counter,
-                    nonce = %nonce_hex,
+                    nonce = %hex::encode(nonce),
                     len = data_len,
                     error = ?e,
                     "AEAD encryption failure"
@@ -104,29 +103,27 @@ impl AeadPacker for ChaChaCipher {
     fn decrypt(&mut self, data: &mut BytesMut) -> Result<Bytes, chacha20poly1305::aead::Error> {
         let current_counter = self.decrypt_state.counter;
         let nonce = self.decrypt_state.next_nonce();
-        let nonce_hex = hex::encode(nonce);
         let data_len = data.len();
-
-        let data_prefix = if data.len() >= 8 {
-            hex::encode(&data[..8])
-        } else {
-            hex::encode(data.as_ref())
-        };
 
         match self.decrypt_cipher.decrypt_in_place(&nonce, &[], data) {
             Ok(_) => {
                 tracing::trace!(
                     counter = current_counter,
-                    nonce = %nonce_hex,
+                    nonce = %hex::encode(nonce),
                     len = data_len,
                     "Decryption successful"
                 );
                 Ok(data.split().freeze())
             }
             Err(e) => {
+                let data_prefix = if data.len() >= 8 {
+                    hex::encode(&data[..8])
+                } else {
+                    hex::encode(data.as_ref())
+                };
                 tracing::error!(
                     counter = current_counter,
-                    nonce = %nonce_hex,
+                    nonce = %hex::encode(nonce),
                     len = data_len,
                     prefix = %data_prefix,
                     error = ?e,

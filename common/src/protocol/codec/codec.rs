@@ -3,7 +3,7 @@ use bytes::{Bytes, BytesMut};
 use crate::crypto::aead::AeadPacker;
 use crate::crypto::chacha::ChaChaCipher;
 use crate::crypto::session::SessionKeys;
-use crate::protocol::codec::bridges::tls_bridge::TlsBridge;
+use crate::protocol::codec::bridge::TlsBridge;
 use crate::protocol::codec::frame::{Frame, FrameHeader, FrameType};
 use crate::protocol::codec::padding::Padding;
 use crate::protocol::errors::{ErrorAction, ErrorStage, TlsError};
@@ -24,30 +24,24 @@ impl Codec {
             staging: BytesMut::new(),
         }
     }
-    //maybe generator?
-    //should anwer socks5 and open connection to proxy server
-    /// Логика для Клиента: Генерирует байты ClientHello для инициализации соединения.
-    /// Клиент: генерирует TLS Record [ ClientHello ]
+
     pub fn make_client_handshake(
         &mut self,
         profile: &BrowserProfile,
         host: &str,
     ) -> Result<Bytes, TlsError> {
-        // 1. Извлекаем публичный ключ нашей текущей сессии
-        let my_pub_key = self.session_keys.ecdh.public_key.to_bytes();
-        // (Убедись, что метод возвращает [u8; 32])
+        let pub_key = self.session_keys.ecdh.public_key.to_bytes();
 
         // 2. Передаем его в мост
         Ok(TlsBridge::wrap_client_hello(
             profile,
             host,
-            &my_pub_key,
+            &pub_key,
             self.session_keys.salt.get_local(),
         ))
     }
-    /// Сервер: берет буфер, достает ClientHello и генерирует в ответ TLS Record [ ServerHello ]
+
     pub fn make_server_handshake(&mut self, buffer: &mut BytesMut) -> Result<Bytes, TlsError> {
-        // 1. Распаковываем сообщение клиента
         let client_msg = TlsBridge::unpack_handshake(buffer)?.ok_or_else(|| {
             TlsError::new(
                 ErrorStage::Handshake("No CH"),
@@ -56,7 +50,6 @@ impl Codec {
             )
         })?;
 
-        // 2. Генерируем ответный ServerHello рекорд
         let server_pub_key = self.session_keys.ecdh.public_key.to_bytes();
         let server_hello_record = TlsBridge::wrap_server_hello(
             &client_msg,
@@ -64,8 +57,6 @@ impl Codec {
             self.session_keys.salt.get_local(),
         )?;
 
-        // 3. ОБНОВЛЕНИЕ КЛЮЧЕЙ НА СЕРВЕРЕ
-        // Передаем true, так как сервер ПАРСИТ ClientHello (смещение 6 байт)
         let (w_key, w_iv, r_key, r_iv) = self
             .session_keys
             .update_keys(client_msg.random(), client_msg.extensions(), true)
@@ -170,68 +161,51 @@ impl Codec {
     }
 
     pub fn inbound(&mut self, buffer: &mut BytesMut) -> Result<Option<Frame>, TlsError> {
-        // Логгируем входящее состояние сетевого буфера (TLS слой)
-        if !buffer.is_empty() {
-            let header = &buffer[..std::cmp::min(buffer.len(), 5)];
-            tracing::debug!(
-                buf_len = buffer.len(),
-                header_hex = %hex::encode(header),
-                "RAW TLS buffer state"
-            );
+        // 1. Сначала проверяем, нет ли уже готового фрейма в staging с прошлого раза
+        if !self.staging.is_empty() {
+            if let Some(frame) = self.try_parse_frame()? {
+                return Ok(Some(frame));
+            }
         }
 
-        // --- ШАГ 1: Извлекаем ВСЕ доступные TLS-рекорды и расшифровываем в staging ---
-        // Мы крутим цикл, пока TlsBridge может "откусить" целый TLS-рекорд из buffer
+        // 2. Распаковываем ВСЕ доступные TLS-рекорды из сетевого буфера
         while let Some(app_data) = TlsBridge::unpack_app_data(buffer)? {
-            let mut encrypted_chunk = BytesMut::from(app_data.payload.as_ref());
-            let raw_len = encrypted_chunk.len();
+            // Берем Bytes напрямую (app_data.payload — это уже Bytes)
+            let mut data_to_decrypt = BytesMut::from(app_data.payload);
 
-            // Расшифровываем кусок
-            let decrypted_chunk = self.crypto.decrypt(&mut encrypted_chunk).map_err(|e| {
-                tracing::error!(len = raw_len, "Decryption failed: {:?}", e);
+            // Дешифруем "на месте" (In-place decryption)
+            // Твоя библиотека ChaCha скорее всего поддерживает дешифровку прямо в том же буфере
+            let decrypted = self.crypto.decrypt(&mut data_to_decrypt).map_err(|_| {
                 TlsError::new(
-                    ErrorStage::Tls("Decryption error"),
+                    ErrorStage::Tls("Decr error"),
                     ErrorAction::Drop,
                     Bytes::new(),
                 )
             })?;
 
-            // КЛАДЕМ В ЧИСТУЮ ЗОНУ: расшифрованный поток байтов нашего протокола
-            self.staging.extend_from_slice(&decrypted_chunk);
+            // ВАЖНО: Вместо extend_from_slice (копирование), используем split_off/unsplit или просто Bytes
+            // Если staging — это BytesMut, используй put или reserve
+            self.staging.extend_from_slice(&decrypted); // Увы, BytesMut требует копирования для конкатенации
 
-            tracing::debug!(
-                added = decrypted_chunk.len(),
-                total_staging = self.staging.len(),
-                "Decrypted data moved to staging"
-            );
-        }
-
-        // --- ШАГ 2: Парсим Frame из "чистых" данных в staging ---
-        if !self.staging.is_empty() {
-            // Важно: Frame::parse должен вызывать advance() или split_to() у staging
-            match Frame::parse(&mut self.staging) {
-                Ok(Some(frame)) => {
-                    tracing::info!(
-                        stream_id = frame.header.stream_id,
-                        "Frame successfully parsed from staging"
-                    );
-                    return Ok(Some(frame));
-                }
-                Ok(None) => {
-                    tracing::debug!("Frame is incomplete in staging, waiting for more TLS records");
-                    return Ok(None);
-                }
-                Err(e) => {
-                    tracing::error!("Frame parse error: {:?}", e);
-                    return Err(TlsError::new(
-                        ErrorStage::Tls("Frame parse error"),
-                        ErrorAction::Drop,
-                        Bytes::new(),
-                    ));
-                }
+            // НО! Мы можем попытаться распарсить фрейм сразу после добавления каждого рекорда
+            if let Some(frame) = self.try_parse_frame()? {
+                return Ok(Some(frame));
             }
         }
 
         Ok(None)
+    }
+
+    // Выносим парсинг в отдельный метод, чтобы не дублировать код
+    fn try_parse_frame(&mut self) -> Result<Option<Frame>, TlsError> {
+        match Frame::parse(&mut self.staging) {
+            Ok(Some(frame)) => Ok(Some(frame)),
+            Ok(None) => Ok(None),
+            Err(_) => Err(TlsError::new(
+                ErrorStage::Tls("Parse error"),
+                ErrorAction::Drop,
+                Bytes::new(),
+            )),
+        }
     }
 }

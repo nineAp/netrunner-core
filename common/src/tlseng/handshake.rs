@@ -1,4 +1,3 @@
-use aead::rand_core::RngCore;
 use bytes::{BufMut, Bytes, BytesMut};
 
 use crate::{
@@ -98,25 +97,16 @@ impl ClientHello {
         public_key: &[u8; 32],
         salt: [u8; 32],
     ) -> Bytes {
-        // 1. Key Exchange: Generate ECDH pair and get public key
+        let tls_random = salt;
 
-        // 2. Authentication: Generate 32 bytes for TLS Random
-        // [16 bytes entropy] + [16 bytes HMAC(timestamp)]
-        let mut tls_random = salt;
-        //todo
-        let auth_token = [0; 16]; //generate_auth_tag(&[]);
-                                  // tls_random[16..32].copy_from_slice(&auth_token);
-
-        // 3. Extensions: Build the extensions block using the profile
         let mut ext_builder = ExtensionBuilder::new();
-        // Pass the public key into the KeyShare extension via apply_profile
+
         ext_builder.apply_profile(profile, host, public_key);
         let extensions_bytes = ext_builder.build();
 
         let mut session_id = BytesMut::with_capacity(32);
         session_id.put_slice(&[0u8; 32]);
 
-        // 4. Assemble ClientHello Handshake message
         let client_hello = ClientHello {
             version: ProtocolVersion::Tls12, // Legacy version for compatibility
             random: tls_random,
@@ -125,14 +115,12 @@ impl ClientHello {
             extensions: extensions_bytes,
         };
 
-        // 5. Wrap ClientHello into a TLS Record
         let record = TlsRecord::new(
             ContentType::Handshake,
             ProtocolVersion::Tls10,
             client_hello.serialize(),
         );
 
-        // Final result: Byte buffer ready for the wire
         record.serialize()
     }
 }
@@ -151,7 +139,7 @@ impl ServerHello {
         server_public_key: &[u8],
         salt: [u8; 32],
     ) -> Self {
-        let mut server_random = salt;
+        let server_random = salt;
 
         let selected_suite = client_hello
             .cipher_suites

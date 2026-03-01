@@ -168,12 +168,6 @@ impl TlsBridge {
         }
     }
 
-    /// Вспомогательный метод для упаковки уже готового Handshake-сообщения в TlsRecord
-    pub fn pack_handshake(payload: Bytes) -> Bytes {
-        let record = TlsRecord::new(ContentType::Handshake, ProtocolVersion::Tls12, payload);
-        record.serialize()
-    }
-
     pub fn pack_app_data(buffer: Bytes) -> Bytes {
         TlsRecord::build_application_data(buffer)
     }

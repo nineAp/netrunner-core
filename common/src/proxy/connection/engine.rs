@@ -1,149 +1,109 @@
-use crate::{
-    protocol::{
-        codec::{
-            codec::Codec,
-            frame::{Frame, FrameType},
-        },
-        errors::ErrorAction,
-    },
-    proxy::connection::{
-        buf_pair::BufPair,
-        connection::ConnectionRole,
-        handler::spawn_server_target_handler,
-        muxer::{MuxMessage, Muxer},
-    },
+use std::sync::Arc;
+
+use bytes::BytesMut;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::tcp::{OwnedReadHalf, OwnedWriteHalf},
+    sync::mpsc::Receiver,
 };
-use bytes::Bytes;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::sync::mpsc::Receiver;
-use tracing::{debug, error, info, trace, warn};
+use tracing::error;
+
+use crate::{
+    protocol::{codec::codec::Codec, errors::ErrorAction},
+    proxy::connection::{handler::StreamHandler, muxer::MuxMessage},
+};
 
 pub struct TunnelEngine {
     pub inbound: OwnedReadHalf,
     pub outbound: OwnedWriteHalf,
     pub codec: Codec,
-    pub buffers: BufPair,
+    pub read_buf: BytesMut,
     pub mux_rx: Receiver<MuxMessage>,
-    pub muxer: Muxer,
-    pub role: ConnectionRole,
+    pub handler: Arc<StreamHandler>, // Добавь это вместо прямого вызова логики
 }
 
 impl TunnelEngine {
-    pub async fn run(mut self) -> Result<(), String> {
-        info!(role = ?self.role, "TunnelEngine spinning up");
-
+    pub async fn run(self) -> Result<(), String> {
+        let mut inbound = self.inbound;
+        let mut outbound = self.outbound;
+        let mut codec = self.codec;
+        let mut read_buf = self.read_buf;
+        let mut mux_rx = self.mux_rx;
+        let handler = self.handler;
         loop {
             tokio::select! {
-                // 1. Физический Inbound (Сеть -> Muxer)
-                // Теперь возвращает Vec<Frame>, чтобы обработать всё накопленное
-                res = Self::process_inbound(&mut self.inbound, &mut self.codec, &mut self.buffers) => {
-                    match res {
-                        Ok(frames) => {
-                            for frame in frames {
-                                self.handle_incoming_frame(frame).await;
-                            }
-                        }
-                        Err(e) => {
-                            if e == "EOF" {
-                                info!("Physical connection closed by remote (EOF)");
-                            } else {
-                                error!(error = %e, "Critical error in process_inbound");
-                            }
-                            return Err(e);
-                        }
-                    }
+                res = Self::process_inbound(&mut inbound, &mut codec, &mut read_buf, &handler) => {
+                    res?
                 }
 
-                // 2. Физический Outbound (Muxer -> Сеть)
-                Some(msg) = self.mux_rx.recv() => {
-                    if let Err(e) = self.handle_outbound_msg(msg).await {
-                        return Err(e);
-                    }
+                // НУЖНО ОТПРАВИТЬ В СЕТЬ (В сторону удаленного прокси)
+                Some(msg) = mux_rx.recv() => {
+                    Self::handle_outbound( &mut outbound, &mut codec, msg).await?;
                 }
             }
         }
     }
 
-    /// Логика обработки конкретного фрейма (разгружаем основной loop)
-    async fn handle_incoming_frame(&mut self, frame: Frame) {
-        let stream_id = frame.header.stream_id;
-        let frame_type = frame.header.frame_type;
-
-        trace!(stream_id = frame.header.stream_id, f_type = ?frame.header.frame_type, len = frame.payload.len(), "Engine received frame from network");
-        match frame_type {
-            FrameType::Connect => {
-                match self.role {
-                    ConnectionRole::Server => {
-                        let target = String::from_utf8_lossy(&frame.payload);
-                        info!(stream_id, target = %target, "New Connect request received");
-                        spawn_server_target_handler(stream_id, frame.payload, self.muxer.clone())
-                            .await;
-                    }
-                    ConnectionRole::Client => {
-                        // Тот самый фикс: клиент получает Connect как подтверждение (ACK)
-                        debug!(stream_id, "Connection confirmed by server");
-                        self.muxer.dispatch_to_local(stream_id, frame.payload).await;
-                    }
-                }
-            }
-            FrameType::Data => {
-                self.muxer.dispatch_to_local(stream_id, frame.payload).await;
-            }
-            FrameType::Close => {
-                info!(stream_id, "Received Close frame, tearing down stream");
-                // Важно: muxer должен не просто удалить, а послать EOF в локальный канал
-                self.muxer.dispatch_to_local(stream_id, Bytes::new()).await;
-                self.muxer.remove_stream(stream_id).await;
-            }
-            _ => debug!(stream_id, ?frame_type, "Received unhandled frame type"),
-        }
-    }
-
-    /// Вспомогательная функция для чтения из сети
     async fn process_inbound(
         inbound: &mut OwnedReadHalf,
         codec: &mut Codec,
-        buffers: &mut BufPair,
-    ) -> Result<Vec<Frame>, String> {
-        let mut frames = Vec::new();
-
-        // Сначала читаем данные из сокета в буфер
+        read_buf: &mut BytesMut,
+        handler: &Arc<StreamHandler>,
+    ) -> Result<(), String> {
         let n = inbound
-            .read_buf(&mut buffers.read_buf)
+            .read_buf(read_buf)
             .await
             .map_err(|e| e.to_string())?;
 
-        if n == 0 && buffers.read_buf.is_empty() {
+        if n == 0 && read_buf.is_empty() {
             return Err("EOF".into());
         }
 
-        // Теперь пытаемся достать столько фреймов, сколько получится
         loop {
-            match codec.inbound(&mut buffers.read_buf) {
-                Ok(Some(frame)) => frames.push(frame),
-                Ok(None) => break, // Больше полных фреймов нет
-                Err(e) if e.action == ErrorAction::Wait => break,
-                Err(e) => return Err(format!("Codec error: {:?}", e)),
+            match codec.inbound(read_buf) {
+                // 1. Успешно достали фрейм
+                Ok(Some(frame)) => {
+                    handler.handle(frame).await;
+                }
+                // 2. Данных в буфере недостаточно (нужно подождать еще)
+                Ok(None) => break,
+
+                // 3. Ошибка кодека
+                Err(e) => {
+                    // Если кодек говорит "подожди", выходим из цикла парсинга
+                    if e.action == ErrorAction::Wait {
+                        break;
+                    }
+                    // Иначе — это реальная проблема (кривой TLS и т.д.)
+                    return Err(format!("Codec error: {:?}", e));
+                }
             }
         }
-
-        Ok(frames)
+        Ok(())
     }
 
-    async fn handle_outbound_msg(&mut self, msg: MuxMessage) -> Result<(), String> {
-        match self
-            .codec
-            .encrypt_data(msg.stream_id, msg.frame_type, msg.data)
-        {
+    async fn handle_outbound(
+        outbound: &mut OwnedWriteHalf,
+        codec: &mut Codec,
+        msg: MuxMessage,
+    ) -> Result<(), String> {
+        // 1. Шифруем данные, используя только кодек
+        match codec.encrypt_data(msg.stream_id, msg.frame_type, msg.data) {
             Ok(pkt) => {
-                self.outbound
+                // 2. Пишем в сокет, используя только outbound
+                outbound
                     .write_all(&pkt)
                     .await
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|e| {
+                        error!(stream_id = msg.stream_id, error = %e, "Failed to write encrypted data to network");
+                        e.to_string()
+                    })?;
                 Ok(())
             }
-            Err(e) => Err(format!("Encryption error: {:?}", e)),
+            Err(e) => {
+                error!(stream_id = msg.stream_id, error = ?e, "Encryption failed for outbound message");
+                Err(format!("Encryption error: {:?}", e))
+            }
         }
     }
 }
