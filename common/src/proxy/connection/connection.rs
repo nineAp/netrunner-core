@@ -25,10 +25,6 @@ use crate::{
     },
 };
 
-pub struct BufPair {
-    pub write_buf: BytesMut,
-    pub read_buf: BytesMut,
-}
 pub const BUF_SIZE: usize = 16384;
 
 
@@ -208,7 +204,7 @@ impl Connection {
         info!("Acting as TLS Server, waiting for ClientHello");
 
         // Создаем Muxer для сервера
-        let (mux_tx, mux_rx) = mpsc::channel(16384);
+        let (mux_tx, mux_rx) = mpsc::channel(BUF_SIZE);
         let muxer = Muxer::new(mux_tx.clone(), false); // false, так как это Сервер
 
         // 1. TLS Handshake

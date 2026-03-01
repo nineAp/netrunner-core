@@ -4,7 +4,7 @@ use crate::tlseng::extension::ExtensionStack;
 use crate::tlseng::handshake::{ClientHello, HelloHeader, ServerHello};
 use crate::tlseng::profile::BrowserProfile;
 use crate::tlseng::tls_record::TlsRecord;
-use crate::tlseng::types::{ContentType, HelloType, ProtocolVersion};
+use crate::tlseng::types::{ContentType, HelloType};
 use crate::tlseng::ApplicationData;
 use bytes::{Bytes, BytesMut};
 

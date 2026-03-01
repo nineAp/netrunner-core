@@ -1,4 +1,5 @@
 use crate::protocol::codec::frame::FrameType;
+use crate::proxy::connection::connection::BUF_SIZE;
 use crate::proxy::connection::muxer::{MuxMessage, Muxer};
 use bytes::{Bytes, BytesMut};
 use tokio::sync::mpsc;
@@ -13,7 +14,7 @@ pub async fn run_proxy_bridge<R, W>(
     R: tokio::io::AsyncReadExt + Unpin,
     W: tokio::io::AsyncWriteExt + Unpin,
 {
-    let mut buf = BytesMut::with_capacity(16384);
+    let mut buf = BytesMut::with_capacity(BUF_SIZE);
 
     loop {
         tokio::select! {

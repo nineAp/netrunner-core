@@ -1,9 +1,9 @@
 use crate::{
     protocol::errors::ErrorAction,
     proxy::connection::{
-        connection::{Connection, ConnectionRole},
+        connection::{Connection, ConnectionRole, BUF_SIZE},
         engine::TunnelEngine,
-        muxer::{MuxMessage, Muxer},
+        muxer::Muxer,
     },
     tlseng::profile::BrowserProfile,
 };
@@ -12,7 +12,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
 };
-use tracing::{debug, error, info, instrument}; // Импортируем макросы
+use tracing::{error, info, instrument}; // Импортируем макросы
 
 pub struct Network {
     port: u16,
@@ -99,7 +99,7 @@ impl Network {
 
         // --- TLS Handshake ---
         let ch = codec
-            .make_client_handshake(&BrowserProfile::CHROME_131, "proxy.server")
+            .make_client_handshake(&BrowserProfile::CHROME_131, "google.com")
             .map_err(|e| format!("{:?}", e))?;
         outbound.write_all(&ch).await.map_err(|e| e.to_string())?;
 
@@ -122,7 +122,7 @@ impl Network {
         }
 
         // --- Запуск инфраструктуры ---
-        let (mux_tx, mux_rx) = tokio::sync::mpsc::channel(16384);
+        let (mux_tx, mux_rx) = tokio::sync::mpsc::channel(BUF_SIZE);
         let muxer = Muxer::new(mux_tx, true);
 
         let handler = std::sync::Arc::new(crate::proxy::connection::handler::StreamHandler::new(

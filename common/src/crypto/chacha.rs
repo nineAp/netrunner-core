@@ -76,8 +76,8 @@ impl AeadPacker for ChaChaCipher {
         let current_counter = self.encrypt_state.counter;
         let nonce = self.encrypt_state.next_nonce();
         let data_len = data.len();
-
-        match self.encrypt_cipher.encrypt_in_place(&nonce, &[], data) {
+        // maybe ad should be stream id
+        match self.encrypt_cipher.encrypt_in_place(&nonce, &nonce, data) {
             Ok(_) => {
                 tracing::trace!(
                     counter = current_counter,
@@ -104,8 +104,8 @@ impl AeadPacker for ChaChaCipher {
         let current_counter = self.decrypt_state.counter;
         let nonce = self.decrypt_state.next_nonce();
         let data_len = data.len();
-
-        match self.decrypt_cipher.decrypt_in_place(&nonce, &[], data) {
+        // maybe ad should be stream id
+        match self.decrypt_cipher.decrypt_in_place(&nonce, &nonce, data) {
             Ok(_) => {
                 tracing::trace!(
                     counter = current_counter,

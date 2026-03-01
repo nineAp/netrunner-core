@@ -35,13 +35,12 @@ pub const FRAME_HEADER_SIZE: u16 =
     AUTH_TAG_SIZE + STREAM_ID_SIZE + FRAME_TYPE_SIZE + PAYLOAD_LEN_SIZE + PADDING_LEN_SIZE;
 
 impl Frame {
-    pub fn into_bytes(self) -> BytesMut {
+    pub fn into_bytes(self, auth_key: &[u8; 16]) -> BytesMut {
         let updated_padding = Padding::generate_padding();
         let total_size = FRAME_HEADER_SIZE as usize + self.payload.len() + self.padding.len();
         let mut buf = BytesMut::with_capacity(total_size);
-        let hmac = [0; 16]; //generate_auth_tag(&[0; 16]);
 
-        buf.put_slice(&hmac);
+        buf.put_slice(auth_key);
         buf.put_u32(self.header.stream_id);
         buf.put_u8(self.header.frame_type as u8);
         buf.put_u16(self.header.payload_len);

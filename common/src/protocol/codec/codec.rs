@@ -119,6 +119,14 @@ impl Codec {
     ) -> Result<Bytes, TlsError> {
         let padding = Padding::generate_padding();
 
+        let tag = self.session_keys.generate_auth_tag();
+        tracing::debug!(
+            step = %(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() / 60),
+            auth_key_hash = %hex::encode(&self.session_keys.auth_key[..4]),
+            generated_tag = %hex::encode(&tag[..4]),
+            "OUTBOUND: Generated auth tag"
+        );
+
         let header = FrameHeader {
             auth_tag: [0u8; 16],
             stream_id,
@@ -132,8 +140,7 @@ impl Codec {
             payload,
             padding: padding.data,
         };
-
-        let mut frame_bytes = frame.into_bytes();
+        let mut frame_bytes = frame.into_bytes(&tag);
 
         // ВАЖНО: вызываем шифрование ОДИН РАЗ.
         // Метод encrypt возвращает Result<Bytes, chacha20poly1305::Error>
@@ -161,20 +168,17 @@ impl Codec {
     }
 
     pub fn inbound(&mut self, buffer: &mut BytesMut) -> Result<Option<Frame>, TlsError> {
-        // 1. Сначала проверяем, нет ли уже готового фрейма в staging с прошлого раза
+        // 1. Проверка старых данных
         if !self.staging.is_empty() {
             if let Some(frame) = self.try_parse_frame()? {
                 return Ok(Some(frame));
             }
         }
 
-        // 2. Распаковываем ВСЕ доступные TLS-рекорды из сетевого буфера
+        // 2. Цикл обработки новых рекордов
         while let Some(app_data) = TlsBridge::unpack_app_data(buffer)? {
-            // Берем Bytes напрямую (app_data.payload — это уже Bytes)
             let mut data_to_decrypt = BytesMut::from(app_data.payload);
 
-            // Дешифруем "на месте" (In-place decryption)
-            // Твоя библиотека ChaCha скорее всего поддерживает дешифровку прямо в том же буфере
             let decrypted = self.crypto.decrypt(&mut data_to_decrypt).map_err(|_| {
                 TlsError::new(
                     ErrorStage::Tls("Decr error"),
@@ -183,11 +187,35 @@ impl Codec {
                 )
             })?;
 
-            // ВАЖНО: Вместо extend_from_slice (копирование), используем split_off/unsplit или просто Bytes
-            // Если staging — это BytesMut, используй put или reserve
-            self.staging.extend_from_slice(&decrypted); // Увы, BytesMut требует копирования для конкатенации
+            // --- КРИТИЧЕСКАЯ ПРОВЕРКА ТЕГА ---
+            if decrypted.len() < 16 {
+                return Err(TlsError::new(
+                    ErrorStage::Tls("Packet too short for auth"),
+                    ErrorAction::Drop,
+                    Bytes::new(),
+                ));
+            }
 
-            // НО! Мы можем попытаться распарсить фрейм сразу после добавления каждого рекорда
+            let mut received_tag = [0u8; 16];
+            received_tag.copy_from_slice(&decrypted[..16]);
+
+            // Используем метод verify_auth_tag, который мы обсуждали ранее
+            if !self.session_keys.verify_auth_tag(&received_tag) {
+                tracing::error!(
+                    expected_hash = %hex::encode(&self.session_keys.auth_key[..4]),
+                    received = %hex::encode(&received_tag[..4]),
+                    "AUTH MISMATCH: Potential replay or MITM attack. Dropping connection."
+                );
+                return Err(TlsError::new(
+                    ErrorStage::Tls("Auth tag mismatch"),
+                    ErrorAction::Drop, // Убиваем соединение
+                    Bytes::new(),
+                ));
+            }
+            // ---------------------------------
+
+            self.staging.extend_from_slice(&decrypted);
+
             if let Some(frame) = self.try_parse_frame()? {
                 return Ok(Some(frame));
             }
@@ -195,7 +223,6 @@ impl Codec {
 
         Ok(None)
     }
-
     // Выносим парсинг в отдельный метод, чтобы не дублировать код
     fn try_parse_frame(&mut self) -> Result<Option<Frame>, TlsError> {
         match Frame::parse(&mut self.staging) {

@@ -5,9 +5,15 @@ use crate::{
     tlseng::extension::ExtensionStack,
 };
 
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
+
+type HmacSha256 = Hmac<Sha256>;
+
 pub struct SessionKeys {
     pub salt: SaltPair,
     pub ecdh: ECDH,
+    pub auth_key: [u8; 32],
 }
 
 impl SessionKeys {
@@ -15,6 +21,7 @@ impl SessionKeys {
         Self {
             salt: SaltPair::new(is_initiator),
             ecdh: ECDH::new(),
+            auth_key: [0u8; 32],
         }
     }
 
@@ -112,6 +119,8 @@ impl SessionKeys {
         let s_key = HKDF::expand_key::<32>(&hkdf, b"server_aead").map_err(|e| e.to_string())?;
         let s_iv = HKDF::expand_key::<12>(&hkdf, b"server_iv").map_err(|e| e.to_string())?;
 
+        let auth_secret = HKDF::expand_key::<32>(&hkdf, b"auth_key").map_err(|e| e.to_string())?;
+        self.auth_key = auth_secret;
         tracing::info!(
             client_key_short = %hex::encode(&c_key[..4]),
             server_key_short = %hex::encode(&s_key[..4]),
@@ -125,4 +134,48 @@ impl SessionKeys {
             Ok((c_key, c_iv, s_key, s_iv)) // Клиент пишет своим, читает серверным
         }
     }
+
+    fn compute_tag(secret: &[u8], step: u64) -> [u8; 16] {
+        let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC error");
+        mac.update(&step.to_be_bytes());
+        let result = mac.finalize().into_bytes();
+        let mut tag = [0u8; 16];
+        tag.copy_from_slice(&result[..16]);
+        tag
+    }
+
+    pub fn generate_auth_tag(&self) -> [u8; 16] {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // Генерируем на основе текущей минуты
+        Self::compute_tag(&self.auth_key, now / 60)
+    }
+
+    pub fn verify_auth_tag(&self, received_tag: &[u8; 16]) -> bool {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("Time went backwards")
+            .as_secs();
+
+        let current_step = now / 60;
+
+        // 1. Проверяем текущую минуту (самый вероятный случай)
+        if &Self::compute_tag(&self.auth_key, current_step) == received_tag {
+            return true;
+        }
+
+        // 2. Проверяем предыдущую минуту (на случай стыка минут или задержки сети)
+        if &Self::compute_tag(&self.auth_key, current_step - 1) == received_tag {
+            tracing::debug!("Auth tag valid (matched previous minute window)");
+            return true;
+        }
+
+        // Если ни один не подошел — тег невалиден
+        false
+    }
+
+    // Вспомогательная функция для генерации конкретного тега
 }
