@@ -106,7 +106,18 @@ impl SocksReply {
 
 impl SocksTarget {
     pub fn to_string(&self) -> String {
-        let host_str = String::from_utf8_lossy(&self.host);
-        format!("{}:{}", host_str, self.port)
+        if self.host.len() == 4 {
+            // Похоже на IPv4
+            let ip =
+                std::net::Ipv4Addr::new(self.host[0], self.host[1], self.host[2], self.host[3]);
+            format!("{}:{}", ip, self.port)
+        } else if self.host.len() == 16 {
+            // Похоже на IPv6
+            format!("[...]:{}", self.port)
+        } else {
+            // Считаем, что это домен (текст)
+            let host_str = String::from_utf8_lossy(&self.host);
+            format!("{}:{}", host_str, self.port)
+        }
     }
 }

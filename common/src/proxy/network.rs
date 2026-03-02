@@ -29,6 +29,22 @@ impl Network {
         }
     }
 
+    pub async fn run_with_muxer(&self, muxer: Muxer) {
+        let addr = format!("127.0.0.1:{}", self.port);
+        let listener = TcpListener::bind(&addr).await.expect("SOCKS bind failed");
+        info!(socks_addr = %addr, "SOCKS5 server listener started");
+
+        loop {
+            if let Ok((stream, client_addr)) = listener.accept().await {
+                let current_muxer = muxer.clone();
+                tokio::spawn(async move {
+                    let connection = Connection::new(stream, client_addr, false);
+                    let _ = connection.handle_socks_client(current_muxer).await;
+                });
+            }
+        }
+    }
+
     // Добавляем инструмент, чтобы видеть параметры запуска сети в логах
     #[instrument(skip(self), fields(role = ?self.role, port = self.port))]
     pub async fn run(&self) {
@@ -84,7 +100,7 @@ impl Network {
     }
 
     /// Вспомогательный метод для Клиента: создает TLS туннель и запускает TunnelEngine
-    async fn initialize_client_tunnel(&self) -> Result<Muxer, String> {
+    pub async fn initialize_client_tunnel(&self) -> Result<Muxer, String> {
         let server_addr = self.remote_proxy_addr.as_ref().ok_or("No proxy addr")?;
 
         // Вместо создания Connection (который нужен для обработки клиентов),
