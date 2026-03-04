@@ -1,26 +1,22 @@
-use std::sync::atomic::Ordering;
-
-use netrunner_client::{
-    interface::NetStack,
-    tun::{
-        linux_tun_device::create_linux_tun,
-        virt_device::{TokenBuffer, VirtTunDevice},
-    },
-};
+use netrunner_client::{stack::NetStack, tun::tun_builder::TunBuilder};
 use netrunner_common::{
     logger_init,
     proxy::{connection::connection::ConnectionRole, network::Network},
 };
-use smoltcp::phy::{DeviceCapabilities, Medium};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{error, info};
 
 #[tokio::main]
 async fn main() {
-    let mut tun = create_linux_tun();
+    let mut tun_result = TunBuilder::new().build().await;
     logger_init();
 
     let net = Network::new(8080, ConnectionRole::Client, Some("0.0.0.0:4443".into()));
+
+    let Ok(tun) = tun_result else {
+        error!("Tun creation error");
+        return;
+    };
 
     let muxer = match net.initialize_client_tunnel().await {
         Ok(m) => m,
@@ -41,7 +37,6 @@ async fn main() {
     let mut net_stack = NetStack::new(muxer);
 
     loop {
-        // 1. Сначала ВСЕГДА даем стеку поработать (обработать то, что уже пришло)
         net_stack.poll();
 
         let mut buf = [0u8; 1600];
