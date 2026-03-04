@@ -1,29 +1,27 @@
-mod stack;
-mod tun;
+use std::sync::atomic::Ordering;
 
-use netrunner_common::{
-    logger_init, proxy::connection::connection::ConnectionRole, proxy::network::Network,
+use netrunner_client::{
+    interface::NetStack,
+    tun::{
+        linux_tun_device::create_linux_tun,
+        virt_device::{TokenBuffer, VirtTunDevice},
+    },
 };
-use stack::interface::NetStack;
+use netrunner_common::{
+    logger_init,
+    proxy::{connection::connection::ConnectionRole, network::Network},
+};
+use smoltcp::phy::{DeviceCapabilities, Medium};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{error, info};
-use tun::{desktop::create_linux_tun, device::TunDevice};
 
 #[tokio::main]
 async fn main() {
-    // 1. Инициализация логов
+    let mut tun = create_linux_tun();
     logger_init();
-    info!("Starting NetRunner VPN Bridge...");
 
-    // 2. Настройка физического уровня (TUN)
-    let tun_dev = create_linux_tun();
-    let my_phy = TunDevice::new(tun_dev, 1500);
-
-    // 3. Создаем объект Network
     let net = Network::new(8080, ConnectionRole::Client, Some("0.0.0.0:4443".into()));
 
-    // 4. Инициализируем ЕДИНЫЙ туннель для всего приложения.
-    // Этот метод внутри создает TLS-подключение, Muxer и запускает TunnelEngine.
-    info!("Initializing global TLS tunnel to proxy...");
     let muxer = match net.initialize_client_tunnel().await {
         Ok(m) => m,
         Err(e) => {
@@ -32,13 +30,7 @@ async fn main() {
         }
     };
 
-    // 5. Создаем стек, передавая ему РАБОЧИЙ муксер.
-    // Теперь данные из TUN будут уходить в реальный TLS-туннель.
-    let mut stack = NetStack::new(my_phy, muxer.clone());
-
-    // 6. Запускаем SOCKS-сервер (Network), чтобы он слушал порт 8080
-    // и использовал тот же самый муксер для обычных прокси-запросов.
-    let net_handle = {
+    let mut net_handle = {
         let muxer_for_net = muxer.clone();
         tokio::spawn(async move {
             info!("SOCKS5 server starting on 127.0.0.1:8080");
@@ -46,22 +38,39 @@ async fn main() {
         })
     };
 
-    info!("VPN BRIDGE IS RUNNING");
+    let mut net_stack = NetStack::new(muxer);
 
-    // 7. Запускаем цикл обработки стека (блокирующий поток)
-    let stack_loop = tokio::task::spawn_blocking(move || loop {
-        stack.poll();
-    });
+    loop {
+        // 1. Сначала ВСЕГДА даем стеку поработать (обработать то, что уже пришло)
+        net_stack.poll();
 
-    // Ждем завершения (по сути бесконечно)
-    tokio::select! {
-        res = stack_loop => {
-            if let Err(e) = res {
-                error!("Stack loop panicked: {:?}", e);
+        let mut buf = [0u8; 1600];
+
+        tokio::select! {
+            // Читаем из реального мира (TUN) и закидываем в очередь стека
+            tun_res = tun.read(&mut buf) => {
+                if let Ok(n) = tun_res {
+                    // Прямой вызов обработки (без лишних каналов, если это один поток)
+                    // Или через твой метод, если логика разделена:
+                    net_stack.process_tun_input(&buf[..n]);
+                }
             }
-        }
-        _ = net_handle => {
-            error!("Network server stopped unexpectedly");
+
+            // Читаем из очереди стека и отдаем в реальный мир (TUN)
+            Some(packet_to_tun) = net_stack.next_outbound_packet() => {
+                let _ = tun.write_all(&packet_to_tun).await;
+            }
+
+            // Ждем, пока стек сам попросит проснуться (таймеры TCP)
+            _ = net_stack.poll_delay() => {
+                // Просто просыпаемся. На следующей итерации вызовется poll()
+            }
+
+            // Ошибка прокси
+            net_res = &mut net_handle => {
+                error!("SOCKS5 server stopped: {:?}", net_res);
+                break;
+            }
         }
     }
 }
