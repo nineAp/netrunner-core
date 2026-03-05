@@ -1,3 +1,4 @@
 pub mod interface;
-pub mod tun;
+pub mod socks;
 pub mod stack;
+pub mod tun;

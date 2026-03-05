@@ -1,30 +1,48 @@
 use std::sync::{Arc, atomic::AtomicBool};
 
-use smoltcp::{iface::{Config, Interface as InterfaceInstance, SocketSet}, phy::DeviceCapabilities, socket::tcp::{Socket, SocketBuffer}, time::Instant, wire::IpListenEndpoint};
+use smoltcp::{
+    iface::{Config, Interface as InterfaceInstance, SocketSet},
+    phy::DeviceCapabilities,
+    socket::tcp::{Socket, SocketBuffer},
+    time::Instant,
+    wire::IpListenEndpoint,
+};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tracing::error;
 
-use crate::tun::virt_device::{TokenBuffer, VirtTunDevice};
+use crate::tun::{
+    Tun, TunBuilder,
+    virt_device::{TokenBuffer, VirtTunDevice},
+};
+
 pub struct Interface {
-    instance: InterfaceInstance,
-    socket_set: SocketSet<'static>,
-    input: UnboundedSender<TokenBuffer>,
-    output: UnboundedReceiver<TokenBuffer>,
-    available: Arc<AtomicBool>
+    instance: InterfaceInstance,            //smoltcp interface instance
+    tun: Tun,                               //real device that gets data
+    socket_set: SocketSet<'static>,         //opened sockets
+    input: UnboundedSender<TokenBuffer>,    //virtual device input
+    output: UnboundedReceiver<TokenBuffer>, //virtual device output
+    available: Arc<AtomicBool>,             //virtual device buffer available
 }
 
 lazy_static::lazy_static! {
     static ref START_TIME: std::time::Instant = std::time::Instant::now();
 }
 
-
 fn current_smoltcp_time() -> Instant {
     let nanos = START_TIME.elapsed().as_micros() as i64;
     smoltcp::time::Instant::from_micros(nanos)
 }
-
-
+//Interface is a wrapper for smoltcp interface. It works with virtual device for async
 impl Interface {
-    pub fn new(caps: DeviceCapabilities, config: Config) -> Self {
+    pub async fn new(caps: DeviceCapabilities, config: Config) -> Self {
+        //creating real tun device
+        let tun_result = TunBuilder::new().build().await;
+
+        let Ok(tun) = tun_result else {
+            error!("Tun creation error");
+            panic!();
+        };
+
         //create virtual tun device (async device)
         let (virt_device, output, input, available) = VirtTunDevice::new(caps);
         let device = Box::leak(Box::new(virt_device));
@@ -48,7 +66,6 @@ impl Interface {
             .add_default_ipv4_route(smoltcp::wire::Ipv4Address::new(10, 0, 0, 2))
             .unwrap();
 
-
         let socket_set = SocketSet::new(vec![]);
 
         let endpoint = IpListenEndpoint {
@@ -64,40 +81,13 @@ impl Interface {
 
         Self {
             instance,
+            tun,
             socket_set,
             input,
             output,
-            available
+            available,
         }
     }
 
-    pub fn run(&mut self) {
-
-    }
-
-    pub fn process_tun_input(&mut self, data: &[u8]) {
-        let mut token = TokenBuffer::with_capacity(data.len());
-        token.extend_from_slice(data);
-
-        if self.input.send(token).is_ok() {
-            self.available
-                .store(true, std::sync::atomic::Ordering::Release);
-        }
-    }
-
-    pub async fn next_outbound_packet(&mut self) -> Option<TokenBuffer> {
-        self.output.recv().await
-    }
-
-    pub fn poll_delay(&mut self) -> tokio::time::Sleep {
-        let timestamp = current_smoltcp_time();
-        let ms = self
-            .instance
-            .poll_delay(timestamp, &self.socket_set)
-            .map(|d| d.total_millis())
-            .unwrap_or(10); // Порог отзывчивости стека
-
-        tokio::time::sleep(std::time::Duration::from_millis(ms))
-    }
+    pub fn poll(&mut self) {}
 }
-

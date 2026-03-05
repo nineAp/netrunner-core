@@ -1,14 +1,17 @@
+use std::net::SocketAddr;
 use std::os::unix::io::RawFd;
 use std::{io, mem, net::IpAddr, time::Duration};
 
 use byte_string::ByteStr;
 use ipnet::IpNet;
 use log::{error, info, trace, warn};
+use smoltcp::wire::{IpProtocol, TcpPacket, UdpPacket};
 use tokio::io::AsyncReadExt;
 
+use tracing::debug;
 use tun::{
-    create_as_async, AbstractDevice, AsyncDevice, Configuration as TunConfiguration,
-    Error as TunError, Layer,
+    AbstractDevice, AsyncDevice, Configuration as TunConfiguration, Error as TunError, Layer,
+    create_as_async,
 };
 
 use crate::tun::ip_packet::IpPacket;
@@ -76,8 +79,9 @@ pub struct Tun {
     device: AsyncDevice,
 }
 
+//Ther is a real tun device that creates by Os, it should transfer data to virtual device by itself or bridge
+//Maybe bridge should be in interface
 impl Tun {
-    /// Start serving
     pub async fn run(mut self) -> io::Result<()> {
         info!(
             "tun device {}",
@@ -116,9 +120,7 @@ impl Tun {
 
         trace!(
             "[TUN] tun device network: {} (address: {}, netmask: {})",
-            address_net,
-            address,
-            netmask
+            address_net, address, netmask
         );
 
         let address_broadcast = address_net.broadcast();
@@ -185,13 +187,113 @@ impl Tun {
         if src_non_unicast || dst_non_unicast {
             trace!(
                 "[TUN] IP packet {} (unicast? {}) -> {} (unicast? {}) throwing away",
-                src_ip_addr,
-                !src_non_unicast,
-                dst_ip_addr,
-                !dst_non_unicast
+                src_ip_addr, !src_non_unicast, dst_ip_addr, !dst_non_unicast
             );
             return Ok(());
         }
+
+        match packet.protocol() {
+            IpProtocol::Tcp => {
+                if !self.mode.enable_tcp() {
+                    trace!(
+                        "received TCP packet but mode is {}, throwing away",
+                        self.mode
+                    );
+                    return Ok(());
+                }
+
+                let tcp_packet = match TcpPacket::new_checked(packet.payload()) {
+                    Ok(p) => p,
+                    Err(err) => {
+                        error!(
+                            "invalid TCP packet err: {}, src_ip: {}, dst_ip: {}, payload: {:?}",
+                            err,
+                            packet.src_addr(),
+                            packet.dst_addr(),
+                            ByteStr::new(packet.payload())
+                        );
+                        return Ok(());
+                    }
+                };
+
+                let src_port = tcp_packet.src_port();
+                let dst_port = tcp_packet.dst_port();
+
+                let src_addr = SocketAddr::new(packet.src_addr(), src_port);
+                let dst_addr = SocketAddr::new(packet.dst_addr(), dst_port);
+
+                trace!(
+                    "[TUN] TCP packet {} (unicast? {}) -> {} (unicast? {}) {}",
+                    src_addr, !src_non_unicast, dst_addr, !dst_non_unicast, tcp_packet
+                );
+
+                // TCP first handshake packet.
+                if let Err(err) = self
+                    .tcp
+                    .handle_packet(src_addr, dst_addr, &tcp_packet)
+                    .await
+                {
+                    error!(
+                        "handle TCP packet failed, error: {}, {} <-> {}, packet: {:?}",
+                        err, src_addr, dst_addr, tcp_packet
+                    );
+                }
+
+                self.tcp.drive_interface_state(frame).await;
+            }
+            IpProtocol::Udp => {
+                if !self.mode.enable_udp() {
+                    trace!(
+                        "received UDP packet but mode is {}, throwing away",
+                        self.mode
+                    );
+                    return Ok(());
+                }
+
+                let udp_packet = match UdpPacket::new_checked(packet.payload()) {
+                    Ok(p) => p,
+                    Err(err) => {
+                        error!(
+                            "invalid UDP packet err: {}, src_ip: {}, dst_ip: {}, payload: {:?}",
+                            err,
+                            packet.src_addr(),
+                            packet.dst_addr(),
+                            ByteStr::new(packet.payload())
+                        );
+                        return Ok(());
+                    }
+                };
+
+                let src_port = udp_packet.src_port();
+                let dst_port = udp_packet.dst_port();
+
+                let src_addr = SocketAddr::new(src_ip_addr, src_port);
+                let dst_addr = SocketAddr::new(packet.dst_addr(), dst_port);
+
+                let payload = udp_packet.payload();
+                trace!(
+                    "[TUN] UDP packet {} (unicast? {}) -> {} (unicast? {}) {}",
+                    src_addr, !src_non_unicast, dst_addr, !dst_non_unicast, udp_packet
+                );
+
+                if let Err(err) = self.udp.handle_packet(src_addr, dst_addr, payload).await {
+                    error!(
+                        "handle UDP packet failed, err: {}, packet: {:?}",
+                        err, udp_packet
+                    );
+                }
+            }
+            IpProtocol::Icmp | IpProtocol::Icmpv6 => {
+                // ICMP is handled by TCP's Interface.
+                // smoltcp's interface will always send replies to EchoRequest
+                self.tcp.drive_interface_state(frame).await;
+            }
+            _ => {
+                debug!("IP packet ignored (protocol: {:?})", packet.protocol());
+                return Ok(());
+            }
+        }
+
         Ok(())
     }
 }

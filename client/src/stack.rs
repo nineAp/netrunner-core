@@ -19,16 +19,16 @@ pub struct NetStack {
     muxer: Muxer,
 }
 
+//Net stack is a core. There is logic for work with my proxy
 
 impl NetStack {
     pub fn new(muxer: Muxer) -> Self {
         Self {
             socket_buffers: HashMap::new(),
             bridges: HashMap::new(),
-            muxer
+            muxer,
         }
     }
 
-    pub fn poll(&mut self) {}
-
+    pub fn run(&mut self) {}
 }
