@@ -9,9 +9,11 @@ use std::{
 };
 use tracing::{debug, info};
 
-use crate::tun::engine::START_TIME;
+use crate::{connections::tcp_connection::TcpConnection, tun::engine::START_TIME};
 pub struct ConnectionManager {
     last_activity: HashMap<SocketHandle, StdInstant>,
+    active_tcp_sessions: HashMap<SocketHandle, TcpConnection>,
+    //active_udp_sessions: HashMap<SocketHandle, UdpSession>,
     proxy_ip: String,
 }
 
@@ -19,6 +21,7 @@ impl ConnectionManager {
     pub fn new(ip: String) -> Self {
         Self {
             last_activity: HashMap::new(),
+            active_tcp_sessions: HashMap::new(),
             proxy_ip: ip,
         }
     }
@@ -45,31 +48,33 @@ impl ConnectionManager {
             }
         }
     }
-
     fn handle_tcp(&mut self, handle: SocketHandle, socket: &mut tcp::Socket) {
-        // Важно: проверяем, есть ли что принимать
-        if socket.can_recv() {
-            let mut data_processed = false;
+        if socket.state() == tcp::State::Established {
+            let proxy_ip = self.proxy_ip.clone(); // Берем из конфига менеджера
 
-            // Используем recv_slice или проверяем длину в recv
-            let result = socket.recv(|data| {
-                if !data.is_empty() {
-                    debug!(handle=%handle, len=data.len(), "TCP: received data");
-                    data_processed = true;
-                    (data.len(), ())
-                } else {
-                    (0, ())
-                }
+            let conn = self.active_tcp_sessions.entry(handle).or_insert_with(|| {
+                // 1. Получаем endpoint и безопасно распаковываем его
+                let endpoint = socket
+                    .remote_endpoint()
+                    .expect("TCP socket in Established state must have a remote endpoint");
+
+                // 2. Конвертируем smoltcp::wire::IpAddress в std::net::IpAddr
+                let ip: std::net::IpAddr = match endpoint.addr {
+                    smoltcp::wire::IpAddress::Ipv4(v4) => std::net::IpAddr::V4(v4.into()),
+                    smoltcp::wire::IpAddress::Ipv6(v6) => std::net::IpAddr::V6(v6.into()),
+                };
+
+                // 3. Собираем финальный SocketAddr
+                let target_addr = std::net::SocketAddr::new(ip, endpoint.port);
+
+                info!(handle=%handle, target=%target_addr, "Creating new TcpConnection bridge");
+                TcpConnection::new(handle, proxy_ip, target_addr)
             });
 
-            if let Err(e) = result {
-                debug!(handle=%handle, "TCP recv error: {:?}", e);
-            }
+            conn.poll_and_process(socket);
         }
-
-        // Если сокет закрывается, нужно дать ему закрыться, а не крутить вечно
-        if !socket.may_recv() && socket.state() == tcp::State::CloseWait {
-            socket.close();
+        if socket.state() == tcp::State::Closed {
+            self.active_tcp_sessions.remove(&handle);
         }
     }
 
@@ -126,16 +131,43 @@ impl ConnectionManager {
         const TARGET_FREE_TCP: usize = 16;
         const TARGET_FREE_UDP: usize = 8;
 
-        let tcp_listeners = socket_set
-            .iter()
-            .filter(|(_, s)| {
-                if let Some(tcp) = tcp::Socket::downcast(s) {
-                    tcp.state() == tcp::State::Listen
-                } else {
-                    false
+        for &port in &[80, 443, 8080] {
+            let current_port_sockets = socket_set
+                .iter()
+                .filter(|(_, s)| {
+                    if let Some(tcp) = tcp::Socket::downcast(s) {
+                        // Если эндпоинт есть - сверяем порт
+                        if let Some(endpoint) = tcp.local_endpoint() {
+                            return endpoint.port == port;
+                        }
+
+                        // КЛЮЧЕВОЙ МОМЕНТ:
+                        // Если эндпоинта НЕТ, но сокет НЕ в состоянии CLOSED,
+                        // или он только что был создан для прослушивания.
+                        // В smoltcp после listen() сокет переходит в LISTEN,
+                        // но local_endpoint может появиться чуть позже.
+                        tcp.state() == tcp::State::Listen
+                    } else {
+                        false
+                    }
+                })
+                .count();
+
+            if current_port_sockets < 5 {
+                let mut s = Self::create_tcp_socket();
+                let endpoint = IpListenEndpoint { addr: None, port };
+
+                // Попробуй сначала listen, а потом добавлять
+                if s.listen(endpoint).is_ok() {
+                    socket_set.add(s);
+                    info!(
+                        "--- REAL ADD --- Port: {}, Sockets for this port: {}",
+                        port,
+                        current_port_sockets + 1
+                    );
                 }
-            })
-            .count();
+            }
+        }
 
         let udp_active = socket_set
             .iter()
@@ -145,20 +177,6 @@ impl ConnectionManager {
         let has_icmp = socket_set
             .iter()
             .any(|(_, s)| icmp::Socket::downcast(s).is_some());
-
-        if tcp_listeners < TARGET_FREE_TCP {
-            let diff = TARGET_FREE_TCP - tcp_listeners;
-            debug!("Refilling TCP pool: adding {} listeners", diff);
-            for _ in 0..diff {
-                let mut s = Self::create_tcp_socket();
-                let endpoint = IpListenEndpoint {
-                    addr: None,
-                    port: 8080,
-                };
-                s.listen(endpoint).unwrap();
-                socket_set.add(s);
-            }
-        }
 
         if udp_active < TARGET_FREE_UDP {
             let diff = TARGET_FREE_UDP - udp_active;

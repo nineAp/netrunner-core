@@ -3,6 +3,7 @@ use smoltcp::{
     iface::{Config, Interface, SocketSet},
     phy::DeviceCapabilities,
 };
+use std::net::Ipv4Addr;
 use std::{
     mem,
     sync::{Arc, LazyLock, atomic::AtomicBool},
@@ -13,7 +14,7 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::time::{Duration, sleep};
 use tun::{DeviceReader, DeviceWriter};
 
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::tun::connection_manager::ConnectionManager;
 use crate::tun::device::{TokenBuffer, VirtTunDevice};
@@ -34,7 +35,8 @@ impl Engine {
     pub fn new(config: Config, caps: DeviceCapabilities, ip: String) -> Self {
         let now = Engine::current_time();
         let (mut device, bridge_rx, bridge_tx, avail) = VirtTunDevice::new(caps);
-        let interface = Interface::new(config, &mut device, now);
+        let mut interface = Interface::new(config, &mut device, now);
+
         let socket_set = SocketSet::new(vec![]);
         Self {
             interface,
@@ -140,5 +142,40 @@ impl Engine {
             .routes_mut()
             .add_default_ipv4_route(smoltcp::wire::Ipv4Address::new(10, 0, 0, 1))
             .ok();
+    }
+
+    pub fn set_any_ip(&mut self, state: bool) -> () {
+        self.interface.set_any_ip(state)
+    }
+
+    pub fn set_transparent_mode(&mut self) {
+        info!("Switching engine to transparent mode (AnyIP + 0.0.0.0/0)");
+
+        self.interface.set_any_ip(true);
+        self.interface.update_ip_addrs(|addrs| {
+            addrs.clear();
+            addrs
+                .push(smoltcp::wire::IpCidr::new(
+                    smoltcp::wire::IpAddress::v4(0, 0, 0, 0),
+                    0,
+                ))
+                .expect("Failed to set 0.0.0.0/0");
+        });
+
+        // Устанавливаем дефолтный маршрут "в никуда" (локально)
+        self.interface.routes_mut().remove_default_ipv4_route();
+        self.interface
+            .routes_mut()
+            .add_default_ipv4_route(smoltcp::wire::Ipv4Address::new(0, 0, 0, 0))
+            .ok();
+    }
+
+    pub fn set_default_gateway(&mut self, gateway: smoltcp::wire::Ipv4Address) {
+        info!("Setting default IPv4 gateway to: {}", gateway);
+        self.interface.routes_mut().remove_default_ipv4_route();
+        self.interface
+            .routes_mut()
+            .add_default_ipv4_route(gateway)
+            .expect("Failed to set default gateway");
     }
 }

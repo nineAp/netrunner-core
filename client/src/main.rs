@@ -13,11 +13,16 @@ async fn main() {
     info!("Initializing NetRunner Stack...");
     let tun_device = Tun::create(|config| {
         config
+            .tun_name("tun0")
             .address((10, 0, 0, 1))
             .netmask((255, 255, 255, 0))
+            .destination((10, 0, 0, 2))
             .up();
     })
     .expect("Failed to initialize TUN device");
+
+    tun_device.clear_default_route();
+    tun_device.setup_linux_routes();
 
     info!("TUN interface is UP: 10.0.0.1/24");
 
@@ -40,11 +45,8 @@ async fn main() {
     });
 
     let mut engine = Engine::new(config, caps, socks_addr);
-
-    engine.add_address(smoltcp::wire::IpCidr::new(
-        smoltcp::wire::IpAddress::v4(10, 0, 0, 2),
-        24,
-    ));
+    engine.set_any_ip(true);
+    engine.set_transparent_mode();
 
     info!("Stack IP initialized: 10.0.0.2");
 

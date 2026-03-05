@@ -143,9 +143,7 @@ impl Connection {
         };
 
         let stream_id = muxer.next_id();
-        let target_str = match &target {
-            SocksTarget { host, port } => format!("{}:{}", String::from_utf8_lossy(host), port),
-        };
+        let target_str = target.to_string();
 
         // --- НОВАЯ ЛОГИКА ОЖИДАНИЯ ---
         // Регистрируем временный канал, чтобы получить Connect-подтверждение от сервера

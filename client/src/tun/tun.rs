@@ -1,5 +1,5 @@
 use std::io;
-use tracing::error;
+use tracing::{error, info, warn};
 use tun::{AsyncDevice, Configuration, DeviceReader, DeviceWriter, create_as_async};
 
 pub struct Tun {
@@ -41,5 +41,39 @@ impl Tun {
     pub fn split(self) -> io::Result<(DeviceWriter, DeviceReader)> {
         let (writer, reader) = self.device.split()?;
         Ok((writer, reader))
+    }
+
+    pub fn setup_linux_routes(&self) -> io::Result<()> {
+        use std::process::Command;
+
+        // Направляем трафик через IP, который слушает твой smoltcp Engine
+        // Предположим, smoltcp настроен на 10.0.0.2
+        let status = Command::new("ip")
+            .args(&["route", "add", "default", "via", "10.0.0.2", "dev", "tun0"])
+            .status()?;
+
+        if !status.success() {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "Failed to setup routes",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn clear_default_route(&self) -> io::Result<()> {
+        use std::process::Command;
+
+        info!("Removing existing default route...");
+
+        // Удаляем текущий маршрут по умолчанию
+        let status = Command::new("sudo")
+            .args(&["ip", "route", "del", "default"])
+            .status()?;
+
+        if !status.success() {
+            warn!("Could not delete default route (maybe it doesn't exist?)");
+        }
+        Ok(())
     }
 }

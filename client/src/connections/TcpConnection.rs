@@ -1,3 +1,0 @@
-struct TcpConnection {}
-
-impl TcpConnection {}

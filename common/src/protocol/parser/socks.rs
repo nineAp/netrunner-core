@@ -43,18 +43,27 @@ impl Parser for SocksTarget {
         let mut packet = bytes.split_to(total_len);
         packet.advance(SOCKS5_MIN_HEADER);
 
-        let host = if atyp == ATYP_DOMAIN {
-            let len = packet.get_u8() as usize;
-            packet.split_to(len).freeze()
-        } else if atyp == ATYP_IPV4 {
-            packet.split_to(IPV4_SIZE).freeze()
-        } else {
-            packet.split_to(IPV6_SIZE).freeze()
+        let addr = match atyp {
+            ATYP_IPV4 => {
+                let octets: [u8; 4] = packet.split_to(4)[..].try_into().unwrap();
+                TargetAddress::Ipv4(octets.into())
+            }
+            ATYP_DOMAIN => {
+                let len = packet.get_u8() as usize;
+                let domain_bytes = packet.split_to(len);
+                let domain = String::from_utf8(domain_bytes.to_vec())
+                    .map_err(|_| "Invalid UTF-8 domain".to_string())?;
+                TargetAddress::Domain(domain)
+            }
+            ATYP_IPV6 => {
+                let octets: [u8; 16] = packet.split_to(16)[..].try_into().unwrap();
+                TargetAddress::Ipv6(octets.into())
+            }
+            _ => unreachable!(),
         };
 
         let port = packet.get_u16();
-
-        Ok(Some(SocksTarget { host, port }))
+        Ok(Some(SocksTarget { addr, port }))
     }
 }
 
