@@ -33,8 +33,4 @@ tun = { version = "0.8", features = ["async"] }
 lazy_static = "1.4.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-byte_string = "1.0"
-ipnet = "2.10"
-spin = { version = "0.10" }
-etherparse = { version = "0.19" }
 thiserror = "2.0"

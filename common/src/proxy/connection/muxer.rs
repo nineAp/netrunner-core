@@ -50,17 +50,6 @@ impl Muxer {
         self.id_gen.next()
     }
 
-    pub fn try_register_stream(&self, id: u32, tx: tokio::sync::mpsc::Sender<Bytes>) -> bool {
-        // 1. Исправлено имя поля: streams вместо active_streams
-        // 2. Добавлена аннотация типа для guard, чтобы Rust понимал, что внутри HashMap
-        if let Ok(mut guard) = self.streams.try_write() {
-            let guard: &mut HashMap<u32, Sender<Bytes>> = &mut *guard;
-            guard.insert(id, tx);
-            true
-        } else {
-            false
-        }
-    }
     pub async fn register_stream(&self, stream_id: u32, tx: Sender<Bytes>) {
         let mut lock = self.streams.write().await;
         lock.insert(stream_id, tx);

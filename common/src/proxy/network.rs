@@ -29,22 +29,6 @@ impl Network {
         }
     }
 
-    pub async fn run_with_muxer(&self, muxer: Muxer) {
-        let addr = format!("127.0.0.1:{}", self.port);
-        let listener = TcpListener::bind(&addr).await.expect("SOCKS bind failed");
-        info!(socks_addr = %addr, "SOCKS5 server listener started");
-
-        loop {
-            if let Ok((stream, client_addr)) = listener.accept().await {
-                let current_muxer = muxer.clone();
-                tokio::spawn(async move {
-                    let connection = Connection::new(stream, client_addr, false);
-                    let _ = connection.handle_socks_client(current_muxer).await;
-                });
-            }
-        }
-    }
-
     // Добавляем инструмент, чтобы видеть параметры запуска сети в логах
     #[instrument(skip(self), fields(role = ?self.role, port = self.port))]
     pub async fn run(&self) {
@@ -158,5 +142,9 @@ impl Network {
         tokio::spawn(async move { engine.run().await });
 
         Ok(muxer)
+    }
+
+    pub fn get_self_local_address(&self) -> String {
+        format!("127.0.0.1:{}", self.port)
     }
 }
