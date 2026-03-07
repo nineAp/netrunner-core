@@ -34,3 +34,5 @@ lazy_static = "1.4.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 thiserror = "2.0"
+hickory-proto = "0.25.2"
+lru = "0.16.3"

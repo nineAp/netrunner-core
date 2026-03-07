@@ -43,37 +43,19 @@ impl Tun {
         Ok((writer, reader))
     }
 
-    pub fn setup_linux_routes(&self) -> io::Result<()> {
+    pub fn setup_routing(&self) -> io::Result<()> {
         use std::process::Command;
 
-        // Направляем трафик через IP, который слушает твой smoltcp Engine
-        // Предположим, smoltcp настроен на 10.0.0.2
-        let status = Command::new("ip")
-            .args(&["route", "add", "default", "via", "10.0.0.2", "dev", "tun0"])
-            .status()?;
+        // Теперь, когда мы знаем, что tun0 имеет IP 10.0.0.1,
+        // мы можем смело ставить его шлюзом.
 
-        if !status.success() {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                "Failed to setup routes",
-            ));
-        }
-        Ok(())
-    }
+        // 1. Устанавливаем маршрут через созданный интерфейс tun0
+        let _ = Command::new("sudo")
+            .args(&[
+                "ip", "route", "add", "default", "via", "10.0.0.2", "dev", "tun0", "metric", "1",
+            ])
+            .status();
 
-    pub fn clear_default_route(&self) -> io::Result<()> {
-        use std::process::Command;
-
-        info!("Removing existing default route...");
-
-        // Удаляем текущий маршрут по умолчанию
-        let status = Command::new("sudo")
-            .args(&["ip", "route", "del", "default"])
-            .status()?;
-
-        if !status.success() {
-            warn!("Could not delete default route (maybe it doesn't exist?)");
-        }
         Ok(())
     }
 }

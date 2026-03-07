@@ -1,19 +1,26 @@
+use netrunner_common::protocol::codec::socks::TargetAddress;
 use smoltcp::{
     iface::{SocketHandle, SocketSet},
     socket::{AnySocket, icmp, tcp, udp},
-    wire::IpListenEndpoint,
+    wire::{IpAddress, IpListenEndpoint},
 };
 use std::{
     collections::HashMap,
     time::{Duration, Instant as StdInstant},
 };
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
-use crate::{connections::tcp_connection::TcpConnection, tun::engine::START_TIME};
+use crate::{
+    connections::{
+        ip_store::FakeIpStore, tcp_connection::TcpConnection, udp_connection::UdpConnection,
+    },
+    tun::engine::START_TIME,
+};
 pub struct ConnectionManager {
     last_activity: HashMap<SocketHandle, StdInstant>,
     active_tcp_sessions: HashMap<SocketHandle, TcpConnection>,
     //active_udp_sessions: HashMap<SocketHandle, UdpSession>,
+    fake_ip_store: FakeIpStore,
     proxy_ip: String,
 }
 
@@ -23,79 +30,113 @@ impl ConnectionManager {
             last_activity: HashMap::new(),
             active_tcp_sessions: HashMap::new(),
             proxy_ip: ip,
+            fake_ip_store: FakeIpStore::new(),
         }
     }
 
-    /// Основной метод, который вызывается в цикле Engine
+    pub fn start_listening(&mut self, socket_set: &mut SocketSet) {
+        for (_, socket) in socket_set.iter_mut() {
+            if let Some(tcp) = tcp::Socket::downcast_mut(socket) {
+                if !tcp.is_open() {
+                    let endpoint = IpListenEndpoint {
+                        addr: None,
+                        port: 443,
+                    };
+
+                    match tcp.listen(endpoint) {
+                        Ok(_) => debug!("Socket is now listening"),
+                        Err(e) => warn!(error=?e, "Failed to listen on socket"),
+                    }
+                }
+            }
+        }
+    }
+
+    fn resolve_target(&self, socket: &tcp::Socket) -> TargetAddress {
+        // Безопасно получаем эндпоинт
+        let remote_endpoint = match socket.remote_endpoint() {
+            Some(ep) => ep,
+            None => {
+                warn!(handle=?socket, "Attempted to resolve target for an unconnected socket");
+                // Возвращаем дефолт, чтобы не падать
+                return TargetAddress::Domain("disconnected".to_string(), 0);
+            }
+        };
+
+        let port = remote_endpoint.port;
+        let ip = remote_endpoint.addr;
+
+        match ip {
+            smoltcp::wire::IpAddress::Ipv4(ipv4_addr) => {
+                let std_ip = std::net::Ipv4Addr::from(ipv4_addr);
+
+                // Ищем домен в нашем FakeIpStore
+                if let Some(domain) = self.fake_ip_store.lookup_by_ip(&std_ip) {
+                    debug!(target=%domain, port=%port, "Resolved fake IP to domain");
+                    return TargetAddress::Domain(domain, port);
+                }
+
+                debug!(ip=%std_ip, port=%port, "Using raw IP target");
+                TargetAddress::Ipv4(std_ip, port)
+            }
+            smoltcp::wire::IpAddress::Ipv6(ipv6_addr) => {
+                let std_ip = std::net::Ipv6Addr::from(ipv6_addr);
+                debug!(ip=%std_ip, port=%port, "Using IPv6 target");
+                TargetAddress::Ipv6(std_ip, port)
+            }
+        }
+    }
     pub fn process_sockets(&mut self, socket_set: &mut SocketSet) {
         for (handle, socket) in socket_set.iter_mut() {
-            // 1. Пытаемся даункастить сокет до TCP
             if let Some(tcp) = tcp::Socket::downcast_mut(socket) {
                 self.handle_tcp(handle, tcp);
-                continue;
-            }
-
-            // 2. До UDP
-            if let Some(udp) = udp::Socket::downcast_mut(socket) {
+            } else if let Some(udp) = udp::Socket::downcast_mut(socket) {
                 self.handle_udp(handle, udp);
-                continue;
-            }
-
-            // 3. До ICMP
-            if let Some(icmp) = icmp::Socket::downcast_mut(socket) {
+            } else if let Some(icmp) = icmp::Socket::downcast_mut(socket) {
                 self.handle_icmp(handle, icmp);
-                continue;
             }
         }
     }
+
     fn handle_tcp(&mut self, handle: SocketHandle, socket: &mut tcp::Socket) {
         if socket.state() == tcp::State::Established {
-            let proxy_ip = self.proxy_ip.clone(); // Берем из конфига менеджера
+            let target = self.resolve_target(socket);
+            debug!(
+                handle=%handle,
+                local=?socket.local_endpoint(),
+                remote=?socket.remote_endpoint(),
+                "Socket details"
+            );
 
-            let conn = self.active_tcp_sessions.entry(handle).or_insert_with(|| {
-                // 1. Получаем endpoint и безопасно распаковываем его
-                let endpoint = socket
-                    .remote_endpoint()
-                    .expect("TCP socket in Established state must have a remote endpoint");
+            let mut conn = TcpConnection::new(handle, self.proxy_ip.clone(), target);
 
-                // 2. Конвертируем smoltcp::wire::IpAddress в std::net::IpAddr
-                let ip: std::net::IpAddr = match endpoint.addr {
-                    smoltcp::wire::IpAddress::Ipv4(v4) => std::net::IpAddr::V4(v4.into()),
-                    smoltcp::wire::IpAddress::Ipv6(v6) => std::net::IpAddr::V6(v6.into()),
-                };
+            conn.tick(socket);
 
-                // 3. Собираем финальный SocketAddr
-                let target_addr = std::net::SocketAddr::new(ip, endpoint.port);
-
-                info!(handle=%handle, target=%target_addr, "Creating new TcpConnection bridge");
-                TcpConnection::new(handle, proxy_ip, target_addr)
-            });
-
-            conn.poll_and_process(socket);
+            if conn.is_active() {
+                self.active_tcp_sessions.insert(handle, conn);
+            } else {
+                socket.abort();
+            }
         }
-        if socket.state() == tcp::State::Closed {
-            self.active_tcp_sessions.remove(&handle);
+
+        if let Some(conn) = self.active_tcp_sessions.get_mut(&handle) {
+            if !conn.tick(socket) {
+                self.active_tcp_sessions.remove(&handle);
+            }
         }
     }
 
     fn handle_udp(&mut self, handle: SocketHandle, socket: &mut udp::Socket) {
-        if socket.can_recv() {
-            match socket.recv() {
-                Ok((data, endpoint)) => {
-                    info!(handle=%handle, from=?endpoint, len=data.len(), "UDP: packet received");
-                    // МОК: Обработка UDP датаграммы
-                }
-                Err(_) => {}
-            }
-        }
+        self.last_activity.insert(handle, StdInstant::now());
+
+        UdpConnection::process_incoming(socket, &mut self.fake_ip_store);
     }
 
     fn handle_icmp(&mut self, handle: SocketHandle, socket: &mut icmp::Socket) {
         if socket.can_recv() {
             match socket.recv() {
                 Ok((data, endpoint)) => {
-                    debug!(handle=%handle, from=?endpoint, "ICMP: packet received");
-                    // МОК: Ответ на пинг или обработка ошибок
+                    debug!(handle=%handle, from=?endpoint, data=?data, "ICMP: packet received");
                 }
                 Err(_) => {}
             }
@@ -126,106 +167,25 @@ impl ConnectionManager {
         icmp::Socket::new(icmp_rx_buffer, icmp_tx_buffer)
     }
 
-    pub fn refill_sockets(&mut self, socket_set: &mut SocketSet) {
-        self.prune_sockets(socket_set);
-        const TARGET_FREE_TCP: usize = 16;
-        const TARGET_FREE_UDP: usize = 8;
+    pub fn setup_sockets(n_tcp: usize, n_udp: usize, n_icmp: usize) -> SocketSet<'static> {
+        // Создаем хранилище с запасом на все типы сокетов
+        let mut sockets = SocketSet::new(Vec::with_capacity(n_tcp + n_udp + n_icmp));
 
-        for &port in &[80, 443, 8080] {
-            let current_port_sockets = socket_set
-                .iter()
-                .filter(|(_, s)| {
-                    if let Some(tcp) = tcp::Socket::downcast(s) {
-                        // Если эндпоинт есть - сверяем порт
-                        if let Some(endpoint) = tcp.local_endpoint() {
-                            return endpoint.port == port;
-                        }
-
-                        // КЛЮЧЕВОЙ МОМЕНТ:
-                        // Если эндпоинта НЕТ, но сокет НЕ в состоянии CLOSED,
-                        // или он только что был создан для прослушивания.
-                        // В smoltcp после listen() сокет переходит в LISTEN,
-                        // но local_endpoint может появиться чуть позже.
-                        tcp.state() == tcp::State::Listen
-                    } else {
-                        false
-                    }
-                })
-                .count();
-
-            if current_port_sockets < 5 {
-                let mut s = Self::create_tcp_socket();
-                let endpoint = IpListenEndpoint { addr: None, port };
-
-                // Попробуй сначала listen, а потом добавлять
-                if s.listen(endpoint).is_ok() {
-                    socket_set.add(s);
-                    info!(
-                        "--- REAL ADD --- Port: {}, Sockets for this port: {}",
-                        port,
-                        current_port_sockets + 1
-                    );
-                }
-            }
+        // 1. Добавляем TCP сокеты
+        for _ in 0..n_tcp {
+            sockets.add(Self::create_tcp_socket());
         }
 
-        let udp_active = socket_set
-            .iter()
-            .filter(|(_, s)| udp::Socket::downcast(s).is_some())
-            .count();
-
-        let has_icmp = socket_set
-            .iter()
-            .any(|(_, s)| icmp::Socket::downcast(s).is_some());
-
-        if udp_active < TARGET_FREE_UDP {
-            let diff = TARGET_FREE_UDP - udp_active;
-            debug!("Refilling UDP pool: adding {} sockets", diff);
-            for _ in 0..diff {
-                let s = Self::create_udp_socket();
-                socket_set.add(s);
-            }
+        // 2. Добавляем UDP сокеты
+        for _ in 0..n_udp {
+            sockets.add(Self::create_udp_socket());
         }
 
-        if !has_icmp {
-            debug!("Adding ICMP socket for echo requests");
-            let s = Self::create_icmp_socket();
-            socket_set.add(s);
-        }
-    }
-
-    fn prune_sockets(&mut self, socket_set: &mut SocketSet) {
-        let now = StdInstant::now();
-        let udp_timeout = Duration::from_secs(60); // 1 минута для UDP
-        let mut to_remove = Vec::new();
-
-        for (handle, socket) in socket_set.iter() {
-            if let Some(tcp) = tcp::Socket::downcast(socket) {
-                if tcp.state() == tcp::State::Closed {
-                    to_remove.push(handle);
-                    continue;
-                }
-            }
-
-            if let Some(udp) = udp::Socket::downcast(socket) {
-                if udp.endpoint().port == 0 {
-                    continue;
-                }
-                let last = self.last_activity.get(&handle).unwrap_or(&START_TIME);
-                if now.duration_since(*last) > udp_timeout {
-                    debug!(handle=%handle, "UDP socket timeout reached");
-                    to_remove.push(handle);
-                }
-            }
-
-            if let Some(_icmp) = icmp::Socket::downcast(socket) {
-                continue;
-            }
+        // 3. Добавляем ICMP сокет
+        for _ in 0..n_icmp {
+            sockets.add(Self::create_icmp_socket());
         }
 
-        for handle in to_remove {
-            socket_set.remove(handle);
-            self.last_activity.remove(&handle);
-        }
+        sockets
     }
 }

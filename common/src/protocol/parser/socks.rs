@@ -6,21 +6,25 @@ impl Parser for SocksTarget {
     type Error = String;
 
     fn can_parse(bytes: &BytesMut) -> bool {
-        if bytes.len() < SOCKS5_MIN_HEADER {
+        // Минимальная длина SOCKS5 CONNECT (VER, CMD, RSV, ATYP) = 4 байта
+        if bytes.len() < 4 {
             return false;
         }
 
         let atyp = bytes[3];
         match atyp {
-            ATYP_IPV4 => bytes.len() >= SOCKS5_MIN_HEADER + IPV4_SIZE + PORT_SIZE,
+            // IPv4: 4 байта IP + 2 байта порт
+            ATYP_IPV4 => bytes.len() >= 4 + 4 + 2,
+            // IPv6: 16 байт IP + 2 байта порт
+            ATYP_IPV6 => bytes.len() >= 4 + 16 + 2,
+            // Domain: 1 байт длины + N байт домена + 2 байта порт
             ATYP_DOMAIN => {
-                if bytes.len() < SOCKS5_MIN_HEADER + 1 {
+                if bytes.len() < 5 {
                     return false;
                 }
                 let domain_len = bytes[4] as usize;
-                bytes.len() >= SOCKS5_MIN_HEADER + 1 + domain_len + PORT_SIZE
+                bytes.len() >= 4 + 1 + domain_len + 2
             }
-            ATYP_IPV6 => bytes.len() >= SOCKS5_MIN_HEADER + IPV6_SIZE + PORT_SIZE,
             _ => false,
         }
     }
@@ -31,8 +35,7 @@ impl Parser for SocksTarget {
         }
 
         let atyp = bytes[3];
-
-        // Вычисляем длину еще раз для split_to (либо можно вынести в хелпер)
+        // Вычисляем длину (включая ATYP и порт)
         let total_len = match atyp {
             ATYP_IPV4 => SOCKS5_MIN_HEADER + IPV4_SIZE + PORT_SIZE,
             ATYP_DOMAIN => SOCKS5_MIN_HEADER + 1 + (bytes[4] as usize) + PORT_SIZE,
@@ -41,29 +44,32 @@ impl Parser for SocksTarget {
         };
 
         let mut packet = bytes.split_to(total_len);
-        packet.advance(SOCKS5_MIN_HEADER);
+        packet.advance(4); // Пропускаем [VER, CMD, RSV, ATYP]
 
         let addr = match atyp {
             ATYP_IPV4 => {
                 let octets: [u8; 4] = packet.split_to(4)[..].try_into().unwrap();
-                TargetAddress::Ipv4(octets.into())
+                let port = packet.get_u16(); // Достаем порт сразу
+                TargetAddress::Ipv4(octets.into(), port)
             }
             ATYP_DOMAIN => {
                 let len = packet.get_u8() as usize;
                 let domain_bytes = packet.split_to(len);
                 let domain = String::from_utf8(domain_bytes.to_vec())
                     .map_err(|_| "Invalid UTF-8 domain".to_string())?;
-                TargetAddress::Domain(domain)
+                let port = packet.get_u16(); // Достаем порт сразу
+                TargetAddress::Domain(domain, port)
             }
             ATYP_IPV6 => {
                 let octets: [u8; 16] = packet.split_to(16)[..].try_into().unwrap();
-                TargetAddress::Ipv6(octets.into())
+                let port = packet.get_u16(); // Достаем порт сразу
+                TargetAddress::Ipv6(octets.into(), port)
             }
             _ => unreachable!(),
         };
 
-        let port = packet.get_u16();
-        Ok(Some(SocksTarget { addr, port }))
+        // Теперь SocksTarget — это просто оболочка над новым TargetAddress
+        Ok(Some(SocksTarget { addr }))
     }
 }
 

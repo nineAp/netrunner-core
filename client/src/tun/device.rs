@@ -16,6 +16,7 @@ use smoltcp::{
     time::Instant,
 };
 use tokio::sync::mpsc;
+use tracing::trace;
 
 pub struct VirtTunDevice {
     capabilities: DeviceCapabilities,
@@ -63,6 +64,7 @@ impl Device for VirtTunDevice {
 
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         if let Ok(buffer) = self.in_buf.try_recv() {
+            trace!("--- TUN RX: {} bytes ---", buffer.len()); // Посмотри, что именно прилетает
             let rx = Self::RxToken {
                 buffer,
                 phantom_device: PhantomData,

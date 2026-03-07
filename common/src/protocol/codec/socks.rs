@@ -63,7 +63,7 @@ impl SocksRequest {
 
     pub async fn perform_client_handshake<S>(
         stream: &mut S,
-        target_addr: &std::net::SocketAddr,
+        target_addr: &TargetAddress,
     ) -> Result<(), String>
     where
         S: tokio::io::AsyncReadExt + tokio::io::AsyncWriteExt + Unpin,
@@ -90,22 +90,31 @@ impl SocksRequest {
         }
 
         // 3. Формируем CONNECT запрос
-        let mut connect_req = BytesMut::with_capacity(10);
+        let mut connect_req = BytesMut::with_capacity(32);
         connect_req.put_u8(SOCKS5_VERSION);
         connect_req.put_u8(0x01); // CMD: Connect
         connect_req.put_u8(0x00); // RSV
 
         match target_addr {
-            std::net::SocketAddr::V4(a) => {
+            TargetAddress::Ipv4(ip, port) => {
                 connect_req.put_u8(ATYP_IPV4);
-                connect_req.put_slice(&a.ip().octets());
+                connect_req.put_slice(&ip.octets());
+                connect_req.put_u16(*port);
             }
-            std::net::SocketAddr::V6(a) => {
+            TargetAddress::Ipv6(ip, port) => {
                 connect_req.put_u8(ATYP_IPV6);
-                connect_req.put_slice(&a.ip().octets());
+                connect_req.put_slice(&ip.octets());
+                connect_req.put_u16(*port);
+            }
+            TargetAddress::Domain(host, port) => {
+                connect_req.put_u8(ATYP_DOMAIN);
+                // SOCKS5 для домена требует: [1 байт длина] + [строка]
+                let host_bytes = host.as_bytes();
+                connect_req.put_u8(host_bytes.len() as u8);
+                connect_req.put_slice(host_bytes);
+                connect_req.put_u16(*port);
             }
         }
-        connect_req.put_u16(target_addr.port());
 
         stream
             .write_all(&connect_req)
@@ -163,17 +172,16 @@ pub enum SocksReply {
     },
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum TargetAddress {
-    Ipv4(std::net::Ipv4Addr),
-    Domain(String),
-    Ipv6(std::net::Ipv6Addr),
+    Ipv4(std::net::Ipv4Addr, u16), // Теперь 2 поля
+    Domain(String, u16),           // Теперь 2 поля
+    Ipv6(std::net::Ipv6Addr, u16), // Теперь 2 поля
 }
 
 #[derive(Debug)]
 pub struct SocksTarget {
     pub addr: TargetAddress,
-    pub port: u16,
 }
 
 impl SocksReply {
@@ -203,20 +211,20 @@ impl SocksReply {
 impl SocksTarget {
     pub fn to_string(&self) -> String {
         match &self.addr {
-            // Если это IPv4, у нас уже есть объект Ipv4Addr
-            TargetAddress::Ipv4(ip) => {
-                format!("{}:{}", ip, self.port)
+            // Теперь в каждом варианте TargetAddress уже есть порт (port)
+            TargetAddress::Ipv4(ip, port) => {
+                format!("{}:{}", ip, port)
             }
 
-            // Если это IPv6, объект Ipv6Addr (автоматически добавит скобки при надобности или используй формат)
-            TargetAddress::Ipv6(ip) => {
-                format!("[{}]:{}", ip, self.port)
+            TargetAddress::Ipv6(ip, port) => {
+                // IPv6 адреса принято заключать в квадратные скобки при наличии порта
+                format!("[{}]:{}", ip, port)
             }
 
-            // Если это домен, то это String. Вычищаем нули на всякий случай
-            TargetAddress::Domain(domain) => {
+            TargetAddress::Domain(domain, port) => {
+                // Вычищаем нулевые байты, если они случайно попали в строку
                 let clean_domain = domain.replace('\0', "");
-                format!("{}:{}", clean_domain, self.port)
+                format!("{}:{}", clean_domain, port)
             }
         }
     }

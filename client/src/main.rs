@@ -1,3 +1,5 @@
+use std::net::Ipv4Addr;
+
 use netrunner_client::{tun::engine::Engine, tun::tun::Tun};
 use netrunner_common::{
     logger_init,
@@ -21,8 +23,7 @@ async fn main() {
     })
     .expect("Failed to initialize TUN device");
 
-    tun_device.clear_default_route();
-    tun_device.setup_linux_routes();
+    tun_device.setup_routing();
 
     info!("TUN interface is UP: 10.0.0.1/24");
 
@@ -35,7 +36,7 @@ async fn main() {
 
     let network = Network::new(8080, ConnectionRole::Client, Some(remote_address));
 
-    let socks_addr = network.get_self_local_address();
+    let proxy_ip = network.get_self_local_address();
 
     // 2. ВЫНОСИМ СЕТЬ В ОТДЕЛЬНЫЙ ЦИКЛ
     // Это запустит SOCKS5 сервер и TLS туннель параллельно движку
@@ -44,10 +45,11 @@ async fn main() {
         network.run().await;
     });
 
-    let mut engine = Engine::new(config, caps, socks_addr);
+    let mut engine = Engine::new(config, caps, proxy_ip);
     engine.set_any_ip(true);
     engine.set_transparent_mode();
-
+    engine.set_default_gateway(Ipv4Addr::new(10, 0, 0, 2)); // to smoltcp
+    engine.activate();
     info!("Stack IP initialized: 10.0.0.2");
 
     // 5. Запуск

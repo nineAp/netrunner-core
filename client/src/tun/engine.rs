@@ -1,4 +1,5 @@
 use smoltcp::time::Instant;
+use smoltcp::wire::{IpAddress, IpCidr};
 use smoltcp::{
     iface::{Config, Interface, SocketSet},
     phy::DeviceCapabilities,
@@ -35,9 +36,10 @@ impl Engine {
     pub fn new(config: Config, caps: DeviceCapabilities, ip: String) -> Self {
         let now = Engine::current_time();
         let (mut device, bridge_rx, bridge_tx, avail) = VirtTunDevice::new(caps);
-        let mut interface = Interface::new(config, &mut device, now);
+        let interface = Interface::new(config, &mut device, now);
 
-        let socket_set = SocketSet::new(vec![]);
+        let mut socket_set = ConnectionManager::setup_sockets(16, 4, 1);
+        let mut manager = ConnectionManager::new(ip);
         Self {
             interface,
             socket_set,
@@ -45,11 +47,12 @@ impl Engine {
             bridge_tx,
             bridge_rx,
             avail,
-            manager: ConnectionManager::new(ip),
+            manager,
         }
     }
 
     pub async fn run(&mut self, tun: Tun) {
+        info!("Current routes: {:?}", self.interface.routes());
         //Bridge from tun to stack and stack to tun
         let (writer, reader) = tun.split().expect("Failed to split TUN");
         // Забираем bridge_rx, так как он нам нужен только в одной задаче
@@ -58,25 +61,27 @@ impl Engine {
         Self::spawn_engine_to_tun(writer, from_engine);
 
         loop {
-            self.manager.refill_sockets(&mut self.socket_set);
-            self.poll();
-            self.manager.process_sockets(&mut self.socket_set);
-            if self.avail.load(std::sync::atomic::Ordering::Acquire) {
-                tokio::task::yield_now().await;
-                continue;
+            loop {
+                self.poll();
+
+                self.manager.process_sockets(&mut self.socket_set);
+
+                if self.avail.load(std::sync::atomic::Ordering::Acquire) {
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+                self.poll_delay().await;
             }
-            self.poll_delay().await;
         }
     }
 
-    pub fn poll(&mut self) {
+    fn poll(&mut self) {
         let now = Self::current_time();
-        // Передаем девайс и сокеты в интерфейс
         self.interface
             .poll(now, &mut self.device, &mut self.socket_set);
     }
 
-    pub async fn poll_delay(&mut self) {
+    async fn poll_delay(&mut self) {
         let timestamp = Self::current_time();
         let delay = self.interface.poll_delay(timestamp, &self.socket_set);
         let sleep_duration = match delay {
@@ -97,6 +102,13 @@ impl Engine {
             while let Ok(n) = reader.read(&mut buf).await {
                 if n == 0 {
                     break;
+                }
+
+                if n >= 20 {
+                    let dst_ip = std::net::Ipv4Addr::new(buf[16], buf[17], buf[18], buf[19]);
+                    let dst_port = u16::from_be_bytes([buf[22], buf[23]]); // Порт для TCP
+
+                    debug!("Сырой пакет: назначение {}:{}", dst_ip, dst_port);
                 }
 
                 let mut token = TokenBuffer::with_capacity(n);
@@ -132,42 +144,20 @@ impl Engine {
         Instant::from_micros(duration.as_micros() as i64)
     }
 
-    pub fn add_address(&mut self, address: smoltcp::wire::IpCidr) {
-        self.interface.update_ip_addrs(|addrs| {
-            addrs
-                .push(address)
-                .expect("Failed to add IP: address list is full");
-        });
-        self.interface
-            .routes_mut()
-            .add_default_ipv4_route(smoltcp::wire::Ipv4Address::new(10, 0, 0, 1))
-            .ok();
-    }
-
     pub fn set_any_ip(&mut self, state: bool) -> () {
         self.interface.set_any_ip(state)
     }
 
     pub fn set_transparent_mode(&mut self) {
-        info!("Switching engine to transparent mode (AnyIP + 0.0.0.0/0)");
-
-        self.interface.set_any_ip(true);
         self.interface.update_ip_addrs(|addrs| {
             addrs.clear();
+            //accept all internet
             addrs
-                .push(smoltcp::wire::IpCidr::new(
-                    smoltcp::wire::IpAddress::v4(0, 0, 0, 0),
-                    0,
-                ))
-                .expect("Failed to set 0.0.0.0/0");
+                .push(IpCidr::new(IpAddress::v4(10, 0, 0, 2), 24))
+                .unwrap();
         });
 
-        // Устанавливаем дефолтный маршрут "в никуда" (локально)
         self.interface.routes_mut().remove_default_ipv4_route();
-        self.interface
-            .routes_mut()
-            .add_default_ipv4_route(smoltcp::wire::Ipv4Address::new(0, 0, 0, 0))
-            .ok();
     }
 
     pub fn set_default_gateway(&mut self, gateway: smoltcp::wire::Ipv4Address) {
@@ -177,5 +167,12 @@ impl Engine {
             .routes_mut()
             .add_default_ipv4_route(gateway)
             .expect("Failed to set default gateway");
+    }
+
+    pub fn activate(&mut self) {
+        let now = Self::current_time();
+        self.interface
+            .poll(now, &mut self.device, &mut self.socket_set);
+        self.manager.start_listening(&mut self.socket_set);
     }
 }
