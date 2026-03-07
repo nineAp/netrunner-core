@@ -19,7 +19,7 @@ struct Args {
 fn main() {
     logger_init();
     let args = Args::parse();
-    let net = Network::new(args.port, ConnectionRole::Server, None);
+    let net = Network::new(args.host, args.port, ConnectionRole::Server, None);
 
     // Создаем движок (Runtime)
     let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");

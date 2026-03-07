@@ -17,6 +17,7 @@ pub fn handle_dns_query(data: &[u8], store: &mut FakeIpStore) -> Option<Vec<u8>>
     // 4. Формируем ответ
     let mut response = Message::new();
     response
+        .set_recursion_available(true)
         .set_id(request.id())
         .set_message_type(MessageType::Response)
         .set_response_code(ResponseCode::NoError)

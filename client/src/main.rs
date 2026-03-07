@@ -24,17 +24,23 @@ async fn main() {
     .expect("Failed to initialize TUN device");
 
     tun_device.setup_routing();
+    tun_device.setup_dns_redirection();
 
     info!("TUN interface is UP: 10.0.0.1/24");
 
     let config = Config::new(smoltcp::wire::HardwareAddress::Ip);
 
     let mut caps = DeviceCapabilities::default();
-    let remote_address: String = "127.0.0.1:4443".into();
+    let remote_address: String = "172.18.151.121:4443".into();
     caps.max_transmission_unit = 1500;
     caps.medium = smoltcp::phy::Medium::Ip;
 
-    let network = Network::new(8080, ConnectionRole::Client, Some(remote_address));
+    let network = Network::new(
+        "0.0.0.0".into(),
+        8080,
+        ConnectionRole::Client,
+        Some(remote_address),
+    );
 
     let proxy_ip = network.get_self_local_address();
 

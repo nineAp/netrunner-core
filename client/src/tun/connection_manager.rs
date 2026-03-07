@@ -33,19 +33,29 @@ impl ConnectionManager {
             fake_ip_store: FakeIpStore::new(),
         }
     }
-
     pub fn start_listening(&mut self, socket_set: &mut SocketSet) {
         for (_, socket) in socket_set.iter_mut() {
+            // Обработка TCP (как было)
             if let Some(tcp) = tcp::Socket::downcast_mut(socket) {
                 if !tcp.is_open() {
                     let endpoint = IpListenEndpoint {
                         addr: None,
                         port: 443,
                     };
-
-                    match tcp.listen(endpoint) {
-                        Ok(_) => debug!("Socket is now listening"),
-                        Err(e) => warn!(error=?e, "Failed to listen on socket"),
+                    let _ = tcp.listen(endpoint);
+                }
+            }
+            // Добавляем обработку UDP
+            else if let Some(udp) = udp::Socket::downcast_mut(socket) {
+                if !udp.is_open() {
+                    // Биндим на 53 порт, чтобы ловить DNS-запросы
+                    let endpoint = IpListenEndpoint {
+                        addr: None,
+                        port: 53,
+                    };
+                    match udp.bind(endpoint) {
+                        Ok(_) => debug!("UDP socket bound to port 53"),
+                        Err(e) => warn!(error=?e, "Failed to bind UDP socket"),
                     }
                 }
             }
@@ -54,7 +64,7 @@ impl ConnectionManager {
 
     fn resolve_target(&self, socket: &tcp::Socket) -> TargetAddress {
         // Безопасно получаем эндпоинт
-        let remote_endpoint = match socket.remote_endpoint() {
+        let local_endpoint = match socket.local_endpoint() {
             Some(ep) => ep,
             None => {
                 warn!(handle=?socket, "Attempted to resolve target for an unconnected socket");
@@ -62,18 +72,21 @@ impl ConnectionManager {
                 return TargetAddress::Domain("disconnected".to_string(), 0);
             }
         };
+        debug!(remote_addr = %local_endpoint.addr, remote_port = %local_endpoint.port, "SMOLTCP RAW REMOTE ENDPOINT");
 
-        let port = remote_endpoint.port;
-        let ip = remote_endpoint.addr;
+        let port = local_endpoint.port;
+        let ip = local_endpoint.addr;
 
         match ip {
             smoltcp::wire::IpAddress::Ipv4(ipv4_addr) => {
                 let std_ip = std::net::Ipv4Addr::from(ipv4_addr);
 
-                // Ищем домен в нашем FakeIpStore
+                debug!(ip=%std_ip, "Trying to resolve IP in FakeIpStore");
                 if let Some(domain) = self.fake_ip_store.lookup_by_ip(&std_ip) {
                     debug!(target=%domain, port=%port, "Resolved fake IP to domain");
                     return TargetAddress::Domain(domain, port);
+                } else {
+                    warn!(ip=%std_ip, "IP not found in FakeIpStore! SOCKS request will fail.");
                 }
 
                 debug!(ip=%std_ip, port=%port, "Using raw IP target");

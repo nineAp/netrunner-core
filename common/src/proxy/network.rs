@@ -15,14 +15,21 @@ use tokio::{
 use tracing::{error, info, instrument}; // Импортируем макросы
 
 pub struct Network {
+    host: String,
     port: u16,
     role: ConnectionRole,
     remote_proxy_addr: Option<String>,
 }
 
 impl Network {
-    pub fn new(port: u16, role: ConnectionRole, remote_proxy_addr: Option<String>) -> Self {
+    pub fn new(
+        host: String,
+        port: u16,
+        role: ConnectionRole,
+        remote_proxy_addr: Option<String>,
+    ) -> Self {
         Self {
+            host,
             port,
             role,
             remote_proxy_addr,
@@ -32,7 +39,7 @@ impl Network {
     // Добавляем инструмент, чтобы видеть параметры запуска сети в логах
     #[instrument(skip(self), fields(role = ?self.role, port = self.port))]
     pub async fn run(&self) {
-        let addr = format!("127.0.0.1:{}", self.port);
+        let addr = format!("{}:{}", self.host, self.port);
 
         match self.role {
             ConnectionRole::Client => {

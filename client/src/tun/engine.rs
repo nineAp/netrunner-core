@@ -4,7 +4,6 @@ use smoltcp::{
     iface::{Config, Interface, SocketSet},
     phy::DeviceCapabilities,
 };
-use std::net::Ipv4Addr;
 use std::{
     mem,
     sync::{Arc, LazyLock, atomic::AtomicBool},
@@ -38,8 +37,8 @@ impl Engine {
         let (mut device, bridge_rx, bridge_tx, avail) = VirtTunDevice::new(caps);
         let interface = Interface::new(config, &mut device, now);
 
-        let mut socket_set = ConnectionManager::setup_sockets(16, 4, 1);
-        let mut manager = ConnectionManager::new(ip);
+        let socket_set = ConnectionManager::setup_sockets(16, 4, 1);
+        let manager = ConnectionManager::new(ip);
         Self {
             interface,
             socket_set,
@@ -102,13 +101,6 @@ impl Engine {
             while let Ok(n) = reader.read(&mut buf).await {
                 if n == 0 {
                     break;
-                }
-
-                if n >= 20 {
-                    let dst_ip = std::net::Ipv4Addr::new(buf[16], buf[17], buf[18], buf[19]);
-                    let dst_port = u16::from_be_bytes([buf[22], buf[23]]); // Порт для TCP
-
-                    debug!("Сырой пакет: назначение {}:{}", dst_ip, dst_port);
                 }
 
                 let mut token = TokenBuffer::with_capacity(n);
