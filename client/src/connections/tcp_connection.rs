@@ -3,7 +3,7 @@ use smoltcp::iface::SocketHandle;
 use smoltcp::socket::tcp;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream; // Твой код парсера
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, trace, warn};
 
@@ -21,6 +21,7 @@ pub struct TcpConnection {
     rx: mpsc::UnboundedReceiver<Vec<u8>>,
     pending_data: Vec<u8>,
     token: CancellationToken,
+    handshake_rx: Option<oneshot::Receiver<()>>,
 }
 
 const MAX_PENDING: usize = 256 * 1024;
@@ -29,6 +30,7 @@ impl TcpConnection {
     pub fn new(handle: SocketHandle, proxy_addr: String, target_addr: TargetAddress) -> Self {
         let (tx_to_proxy, mut rx_from_smol) = mpsc::unbounded_channel::<Vec<u8>>();
         let (tx_to_smol, rx_from_proxy) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (handshake_tx, handshake_rx) = oneshot::channel();
 
         let token = CancellationToken::new();
         let task_token = token.clone();
@@ -51,6 +53,8 @@ impl TcpConnection {
                 debug!(%handle, error = %e, "SOCKS handshake failed");
                 return;
             }
+
+            let _ = handshake_tx.send(());
 
             debug!(%handle, "SOCKS handshake successful, starting data bridge");
 
@@ -95,15 +99,32 @@ impl TcpConnection {
             rx: rx_from_proxy,
             pending_data: vec![],
             token,
+            handshake_rx: Some(handshake_rx),
         }
     }
+
     pub fn tick(&mut self, socket: &mut tcp::Socket) -> bool {
         let state = socket.state();
         //trace!(handle=%self.handle, ?state, "Tick");
 
         match self.state {
             ConnectionState::Handshaking => {
-                return true;
+                if let Some(rx) = &mut self.handshake_rx {
+                    match rx.try_recv() {
+                        Ok(_) => {
+                            self.state = ConnectionState::Active;
+                            self.handshake_rx = None;
+                            return true; // Успех
+                        }
+                        Err(oneshot::error::TryRecvError::Empty) => return true, // Ждем
+                        Err(oneshot::error::TryRecvError::Closed) => {
+                            self.state = ConnectionState::Closed; // ФЕЙЛ
+                            return false; // СКАЗАТЬ МЕНЕДЖЕРУ УДАЛИТЬ НАС
+                        }
+                    }
+                } else {
+                    return false; // Если rx пропал, но мы не Active — закрываем
+                }
             }
 
             ConnectionState::Active => {

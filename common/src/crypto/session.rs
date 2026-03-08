@@ -203,20 +203,23 @@ impl SessionKeys {
 
         let current_step = now / 60;
 
-        // 1. Проверяем текущую минуту (самый вероятный случай)
-        if &Self::compute_tag(&self.auth_key, current_step) == received_tag {
-            return true;
+        // Вставляем цикл проверки расширенного окна [-2, +2]
+        // Это дает запас по времени в обе стороны
+        for step in (current_step.saturating_sub(2))..=(current_step.saturating_add(2)) {
+            if &Self::compute_tag(&self.auth_key, step) == received_tag {
+                // Если подошел не текущий, а другой шаг — логируем это для диагностики
+                if step != current_step {
+                    tracing::debug!(expected = %current_step, matched = %step, "Auth tag valid with time offset");
+                }
+                return true;
+            }
         }
 
-        // 2. Проверяем предыдущую минуту (на случай стыка минут или задержки сети)
-        if &Self::compute_tag(&self.auth_key, current_step - 1) == received_tag {
-            tracing::debug!("Auth tag valid (matched previous minute window)");
-            return true;
-        }
-
-        // Если ни один не подошел — тег невалиден
+        // Если ни один не подошел — логируем для отладки
+        tracing::warn!(
+            current_step = %current_step,
+            "AUTH MISMATCH: All tags rejected for current window"
+        );
         false
     }
-
-    // Вспомогательная функция для генерации конкретного тега
 }

@@ -22,6 +22,7 @@ pub struct ConnectionManager {
     //active_udp_sessions: HashMap<SocketHandle, UdpSession>,
     fake_ip_store: FakeIpStore,
     proxy_ip: String,
+    failed_until: HashMap<SocketHandle, StdInstant>,
 }
 
 impl ConnectionManager {
@@ -31,6 +32,7 @@ impl ConnectionManager {
             active_tcp_sessions: HashMap::new(),
             proxy_ip: ip,
             fake_ip_store: FakeIpStore::new(),
+            failed_until: HashMap::new(),
         }
     }
     pub fn start_listening(&mut self, socket_set: &mut SocketSet) {
@@ -116,6 +118,12 @@ impl ConnectionManager {
 
         // 1. Если сокет закрыт, просто чистим и возвращаем в LISTEN
         if socket.state() == State::Closed {
+            if let Some(until) = self.failed_until.get(&handle) {
+                if StdInstant::now() < *until {
+                    return; // Сокет в штрафе, не открываем его
+                }
+            }
+
             self.active_tcp_sessions.remove(&handle);
             socket.abort();
             let _ = socket.listen(443);
@@ -144,12 +152,15 @@ impl ConnectionManager {
         if let Some(conn) = self.active_tcp_sessions.get_mut(&handle) {
             if !conn.tick(socket) {
                 // Если tick вернул false, значит сессия завершена или произошла ошибка в tokio-задаче
+                debug!(%handle, "Connection handshake failed or closed, aborting socket.");
                 self.active_tcp_sessions.remove(&handle);
                 socket.abort(); // Принудительно закрываем "битый" сокет
+                self.failed_until
+                    .insert(handle, StdInstant::now() + Duration::from_secs(5));
             }
         } else if socket.state() == State::Established {
-            // Если мы дошли сюда, значит сессия была, но удалилась (tick вернул false),
-            // а сокет всё еще висит в Established. Убиваем его.
+            self.failed_until
+                .insert(handle, StdInstant::now() + Duration::from_secs(5));
             socket.abort();
         }
 
@@ -176,7 +187,7 @@ impl ConnectionManager {
     }
 
     fn create_tcp_socket<'a>() -> tcp::Socket<'a> {
-        const BUF_SIZE: usize = 65535;
+        const BUF_SIZE: usize = 16384;
         tcp::Socket::new(
             tcp::SocketBuffer::new(vec![0; BUF_SIZE]),
             tcp::SocketBuffer::new(vec![0; BUF_SIZE]),
@@ -184,7 +195,7 @@ impl ConnectionManager {
     }
 
     fn create_udp_socket<'a>() -> udp::Socket<'a> {
-        const BUF_SIZE: usize = 65535;
+        const BUF_SIZE: usize = 16384;
         udp::Socket::new(
             udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 16], vec![0; BUF_SIZE]),
             udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 16], vec![0; BUF_SIZE]),
