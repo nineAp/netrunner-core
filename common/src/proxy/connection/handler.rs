@@ -93,6 +93,5 @@ impl StreamHandler {
 
     async fn on_close(&self, stream_id: u32) {
         self.muxer.dispatch_to_local(stream_id, Bytes::new()).await;
-        self.muxer.remove_stream(stream_id).await;
     }
 }

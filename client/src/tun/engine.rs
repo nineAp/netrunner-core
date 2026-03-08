@@ -1,9 +1,11 @@
+use smoltcp::iface::PollResult;
 use smoltcp::time::Instant;
 use smoltcp::wire::{IpAddress, IpCidr};
 use smoltcp::{
     iface::{Config, Interface, SocketSet},
     phy::DeviceCapabilities,
 };
+use std::sync::atomic::Ordering;
 use std::{
     mem,
     sync::{Arc, LazyLock, atomic::AtomicBool},
@@ -37,7 +39,7 @@ impl Engine {
         let (mut device, bridge_rx, bridge_tx, avail) = VirtTunDevice::new(caps);
         let interface = Interface::new(config, &mut device, now);
 
-        let socket_set = ConnectionManager::setup_sockets(16, 4, 1);
+        let socket_set = ConnectionManager::setup_sockets(128, 8, 4);
         let manager = ConnectionManager::new(ip);
         Self {
             interface,
@@ -52,32 +54,41 @@ impl Engine {
 
     pub async fn run(&mut self, tun: Tun) {
         info!("Current routes: {:?}", self.interface.routes());
-        //Bridge from tun to stack and stack to tun
+
         let (writer, reader) = tun.split().expect("Failed to split TUN");
-        // Забираем bridge_rx, так как он нам нужен только в одной задаче
+
         let from_engine = mem::replace(&mut self.bridge_rx, mpsc::unbounded_channel().1);
+
         Self::spawn_tun_to_engine(reader, self.bridge_tx.clone(), self.avail.clone());
         Self::spawn_engine_to_tun(writer, from_engine);
-
+        let mut last_log = StdInstant::now();
         loop {
-            loop {
-                self.poll();
+            let result = self.poll();
 
-                self.manager.process_sockets(&mut self.socket_set);
+            self.manager.process_sockets(&mut self.socket_set);
 
-                if self.avail.load(std::sync::atomic::Ordering::Acquire) {
-                    tokio::task::yield_now().await;
-                    continue;
-                }
-                self.poll_delay().await;
+            if last_log.elapsed() >= Duration::from_secs(5) {
+                self.manager.log_status(&self.socket_set);
+                last_log = StdInstant::now();
             }
+
+            if matches!(result, PollResult::SocketStateChanged) {
+                continue;
+            }
+
+            if self.avail.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+                continue;
+            }
+
+            self.poll_delay().await;
         }
     }
 
-    fn poll(&mut self) {
+    fn poll(&mut self) -> PollResult {
         let now = Self::current_time();
         self.interface
-            .poll(now, &mut self.device, &mut self.socket_set);
+            .poll(now, &mut self.device, &mut self.socket_set)
     }
 
     async fn poll_delay(&mut self) {
@@ -97,7 +108,7 @@ impl Engine {
     ) {
         tokio::spawn(async move {
             debug!("TUN-to-Engine bridge task started");
-            let mut buf = [0u8; 4096];
+            let mut buf = [0u8; 65536];
             while let Ok(n) = reader.read(&mut buf).await {
                 if n == 0 {
                     break;

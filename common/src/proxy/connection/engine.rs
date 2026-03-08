@@ -6,7 +6,7 @@ use tokio::{
     net::tcp::{OwnedReadHalf, OwnedWriteHalf},
     sync::mpsc::Receiver,
 };
-use tracing::error;
+use tracing::{debug, error};
 
 use crate::{
     protocol::{codec::codec::Codec, errors::ErrorAction},
@@ -75,6 +75,7 @@ impl TunnelEngine {
                         break;
                     }
                     // Иначе — это реальная проблема (кривой TLS и т.д.)
+                    error!(error = ?e, "Codec inbound failed");
                     return Err(format!("Codec error: {:?}", e));
                 }
             }
@@ -98,6 +99,7 @@ impl TunnelEngine {
                         error!(stream_id = msg.stream_id, error = %e, "Failed to write encrypted data to network");
                         e.to_string()
                     })?;
+                debug!(stream_id = msg.stream_id, "Outbound packet sent");
                 Ok(())
             }
             Err(e) => {

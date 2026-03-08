@@ -66,6 +66,6 @@ pub async fn run_proxy_bridge<R, W>(
             data: Bytes::new(),
         })
         .await;
-
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     muxer.remove_stream(stream_id).await;
 }

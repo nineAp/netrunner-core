@@ -112,33 +112,52 @@ impl ConnectionManager {
     }
 
     fn handle_tcp(&mut self, handle: SocketHandle, socket: &mut tcp::Socket) {
-        if socket.state() == tcp::State::Established {
-            let target = self.resolve_target(socket);
-            debug!(
-                handle=%handle,
-                local=?socket.local_endpoint(),
-                remote=?socket.remote_endpoint(),
-                "Socket details"
-            );
+        use tcp::State;
 
-            let mut conn = TcpConnection::new(handle, self.proxy_ip.clone(), target);
-
-            conn.tick(socket);
-
-            if conn.is_active() {
-                self.active_tcp_sessions.insert(handle, conn);
-            } else {
-                socket.abort();
-            }
+        // 1. Если сокет закрыт, просто чистим и возвращаем в LISTEN
+        if socket.state() == State::Closed {
+            self.active_tcp_sessions.remove(&handle);
+            socket.abort();
+            let _ = socket.listen(443);
+            return;
         }
 
+        // 2. Если сокет установлен, но в менеджере нет записи
+        if socket.state() == State::Established && !self.active_tcp_sessions.contains_key(&handle) {
+            let target = self.resolve_target(socket);
+
+            // ВАЖНО: Тут можно добавить проверку: если target "плохой" или не резолвится,
+            // сразу убиваем сокет, чтобы не зацикливаться.
+            if let TargetAddress::Domain(d, _) = &target {
+                if d == "disconnected" {
+                    // Или другая логика проверки
+                    socket.abort();
+                    return;
+                }
+            }
+
+            let conn = TcpConnection::new(handle, self.proxy_ip.clone(), target);
+            self.active_tcp_sessions.insert(handle, conn);
+        }
+
+        // 3. Обработка активной сессии
         if let Some(conn) = self.active_tcp_sessions.get_mut(&handle) {
             if !conn.tick(socket) {
+                // Если tick вернул false, значит сессия завершена или произошла ошибка в tokio-задаче
                 self.active_tcp_sessions.remove(&handle);
+                socket.abort(); // Принудительно закрываем "битый" сокет
             }
+        } else if socket.state() == State::Established {
+            // Если мы дошли сюда, значит сессия была, но удалилась (tick вернул false),
+            // а сокет всё еще висит в Established. Убиваем его.
+            socket.abort();
+        }
+
+        // 4. Обработка FIN
+        if socket.state() == State::CloseWait {
+            socket.close();
         }
     }
-
     fn handle_udp(&mut self, handle: SocketHandle, socket: &mut udp::Socket) {
         self.last_activity.insert(handle, StdInstant::now());
 
@@ -200,5 +219,26 @@ impl ConnectionManager {
         }
 
         sockets
+    }
+
+    pub fn log_status(&self, socket_set: &SocketSet) {
+        let mut established = 0;
+        let mut total_tcp = 0;
+
+        for (_, socket) in socket_set.iter() {
+            if let Some(tcp) = tcp::Socket::downcast(socket) {
+                total_tcp += 1;
+                if tcp.state() == tcp::State::Established {
+                    established += 1;
+                }
+            }
+        }
+
+        debug!(
+            "TCP Stats: Total_Sockets={}, Established={}, Active_Sessions={}",
+            total_tcp,
+            established,
+            self.active_tcp_sessions.len()
+        );
     }
 }

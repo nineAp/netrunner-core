@@ -4,7 +4,8 @@ use smoltcp::socket::tcp;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream; // Твой код парсера
 use tokio::sync::mpsc;
-use tracing::{debug, info, trace};
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, info, trace, warn};
 
 pub enum ConnectionState {
     Established,
@@ -18,25 +19,21 @@ pub struct TcpConnection {
     state: ConnectionState,
     tx: mpsc::UnboundedSender<Vec<u8>>,
     rx: mpsc::UnboundedReceiver<Vec<u8>>,
-    pending_data: Option<Vec<u8>>,
+    pending_data: Vec<u8>,
+    token: CancellationToken,
 }
+
+const MAX_PENDING: usize = 256 * 1024;
 
 impl TcpConnection {
     pub fn new(handle: SocketHandle, proxy_addr: String, target_addr: TargetAddress) -> Self {
         let (tx_to_proxy, mut rx_from_smol) = mpsc::unbounded_channel::<Vec<u8>>();
         let (tx_to_smol, rx_from_proxy) = mpsc::unbounded_channel::<Vec<u8>>();
 
-        let proxy_addr_clone = proxy_addr.clone();
-        let target_addr_clone = target_addr.clone();
+        let token = CancellationToken::new();
+        let task_token = token.clone();
 
         tokio::spawn(async move {
-            debug!(
-                %handle,
-                target = ?target_addr_clone,
-                proxy = %proxy_addr_clone,
-                "Attempting to connect through proxy"
-            );
-
             let mut stream = match TcpStream::connect(&proxy_addr).await {
                 Ok(s) => {
                     debug!(%handle, "Connected to proxy successfully");
@@ -49,8 +46,7 @@ impl TcpConnection {
             };
 
             // 2. SOCKS Handshake
-            if let Err(e) =
-                SocksRequest::perform_client_handshake(&mut stream, &target_addr_clone).await
+            if let Err(e) = SocksRequest::perform_client_handshake(&mut stream, &target_addr).await
             {
                 debug!(%handle, error = %e, "SOCKS handshake failed");
                 return;
@@ -72,7 +68,7 @@ impl TcpConnection {
 
             // Читаем из прокси -> Пишем в канал для smoltcp
             let from_proxy = async {
-                let mut buf = [0u8; 4096];
+                let mut buf = [0u8; 65536];
                 loop {
                     match reader.read(&mut buf).await {
                         Ok(0) | Err(_) => break,
@@ -86,53 +82,60 @@ impl TcpConnection {
             };
 
             tokio::select! {
-                _ = to_proxy => {},
-                _ = from_proxy => {},
+                _ = to_proxy => {}
+                _ = from_proxy => {}
+                _ = task_token.cancelled() => { debug!(%handle, "Task cancelled by Manager"); }
             }
         });
 
         Self {
             handle,
-            state: ConnectionState::Handshaking, // Сразу переходим в Active, т.к. задача пошла
+            state: ConnectionState::Active, // Сразу переходим в Active, т.к. задача пошла
             tx: tx_to_proxy,
             rx: rx_from_proxy,
-            pending_data: None,
+            pending_data: vec![],
+            token,
         }
     }
-
     pub fn tick(&mut self, socket: &mut tcp::Socket) -> bool {
-        trace!(handle=%self.handle, state=?socket.state(), "Tick");
+        let state = socket.state();
+        //trace!(handle=%self.handle, ?state, "Tick");
+
         match self.state {
             ConnectionState::Handshaking => {
-                info!("Connection handshaking");
                 return true;
             }
+
             ConnectionState::Active => {
                 self.poll_and_process(socket);
 
-                // Проверяем условия закрытия
+                // FIN от удалённой стороны
+                if state == tcp::State::CloseWait {
+                    socket.close();
+                    self.state = ConnectionState::Closed;
+                    return false;
+                }
+
                 if self.is_finished(socket) {
                     self.state = ConnectionState::Closed;
-                    socket.abort(); // Принудительно разрываем стек
-                    return false; // Сигнализируем, что соединение мертво
+                    socket.close();
+                    return false;
                 }
             }
-            ConnectionState::Closed => return false,
+
+            ConnectionState::Closed => {
+                return false;
+            }
+
             _ => {}
         }
+
         true
     }
-
     pub fn is_finished(&self, socket: &tcp::Socket) -> bool {
         use tcp::State;
-        let socket_closed = matches!(
-            socket.state(),
-            State::Closed | State::TimeWait | State::FinWait1 | State::FinWait2
-        );
 
-        let task_finished = self.rx.is_closed();
-
-        socket_closed || task_finished
+        matches!(socket.state(), State::Closed | State::TimeWait)
     }
 
     pub fn is_active(&self) -> bool {
@@ -140,14 +143,7 @@ impl TcpConnection {
     }
 
     fn poll_and_process(&mut self, socket: &mut tcp::Socket) {
-        if let Some(data) = self.pending_data.take() {
-            if socket.send_slice(&data).is_ok() {
-            } else {
-                self.pending_data = Some(data);
-                return;
-            }
-        }
-
+        // 1. сначала читаем smoltcp
         if socket.can_recv() {
             let _ = socket.recv(|data| {
                 let len = data.len();
@@ -158,22 +154,37 @@ impl TcpConnection {
             });
         }
 
+        // 2. потом отправляем proxy → smoltcp
+        if !self.pending_data.is_empty() {
+            if self.pending_data.len() > MAX_PENDING {
+                warn!(%self.handle, "Buffer overflow! Aborting connection.");
+                socket.abort(); // Убиваем сокет
+                self.token.cancel(); // Говорим tokio-задаче умереть
+                return;
+            }
+
+            match socket.send_slice(&self.pending_data) {
+                Ok(n) => {
+                    self.pending_data.drain(0..n);
+                }
+                Err(_) => {} // Оставляем в pending_data на следующий тик
+            }
+        }
+
         if socket.can_send() {
             while let Ok(data) = self.rx.try_recv() {
                 match socket.send_slice(&data) {
-                    Ok(_) => { /* Успешно */ }
+                    Ok(n) if n < data.len() => {
+                        self.pending_data = data[n..].to_vec();
+                        break;
+                    }
+                    Ok(_) => {}
                     Err(_) => {
-                        // Стек полон, запоминаем данные для следующего вызова
-                        self.pending_data = Some(data);
+                        self.pending_data = data;
                         break;
                     }
                 }
             }
-        }
-
-        if socket.state() == tcp::State::CloseWait {
-            debug!(handle=%self.handle, "!!! Triggering socket.close() for CLOSE-WAIT");
-            socket.close();
         }
     }
 }
