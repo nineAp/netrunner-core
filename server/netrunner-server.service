@@ -1,0 +1,20 @@
+[Unit]
+Description=Netrunner Remote Proxy
+After=network.target
+
+[Service]
+# Запускаем от root, так как файл лежит в /root/
+User=root
+
+# Путь к папке
+WorkingDirectory=/root/netr-core
+
+# Точный путь к файлу
+ExecStart=/root/netr-core/netrunner-server --host=0.0.0.0 --port=443
+
+Restart=always
+RestartSec=3
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

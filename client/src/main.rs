@@ -31,7 +31,7 @@ async fn main() {
     let config = Config::new(smoltcp::wire::HardwareAddress::Ip);
 
     let mut caps = DeviceCapabilities::default();
-    let remote_address: String = "172.18.151.121:4443".into();
+    let remote_address: String = "62.60.244.156:443".into();
     caps.max_transmission_unit = 1500;
     caps.medium = smoltcp::phy::Medium::Ip;
 
