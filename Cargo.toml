@@ -1,7 +1,9 @@
 [workspace]
 members = [
-    "common",
+    "core",
     "client",
     "server",
+    "tools/uniffi-bindgen",
+    "app/src-tauri",
 ]
 resolver = "2"

@@ -1,0 +1,11 @@
+[package]
+name = "my-bindgen-tool"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "bindgen-tool"  
+path = "main.rs"
+
+[dependencies]
+uniffi = { version = "0.31.0", features = ["tokio", "cli"] }

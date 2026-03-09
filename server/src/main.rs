@@ -1,4 +1,4 @@
-use netrunner_common::{
+use netrunner_core::{
     logger_init,
     proxy::{connection::connection::ConnectionRole, network::Network},
 };

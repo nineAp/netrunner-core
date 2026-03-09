@@ -4,6 +4,6 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-netrunner-common = { path = "../common" }
+netrunner-core = { path = "../core" }
 tokio = { version = "1.36", features = ["full"] }
 clap = { version = "4.4", features = ["derive"] }

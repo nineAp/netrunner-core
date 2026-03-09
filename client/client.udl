@@ -1,0 +1,11 @@
+namespace netrunner {
+};
+
+interface SessionManager {
+    constructor();
+    Session start(string remote_address, optional i32 tun_fd);
+};
+
+interface Session {
+    void stop();
+};

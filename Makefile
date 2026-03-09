@@ -4,11 +4,23 @@ REMOTE_USER = root
 REMOTE_PATH = /root/netr-core
 SERVICE_NAME = netrunner-server
 
-.PHONY: build-client build-server deploy-server logs
+.PHONY: debug-client debug-server build-android build-server deploy-server logs
+
+debug-client:
+	@echo "--- Сборка клиента (Debug) ---"
+	cargo build --bin netrunner-client
+	@echo "--- Запуск клиента через sudo ---"
+	sudo ./target/debug/netrunner-client
+
+debug-server:
+	@echo "--- Сборка сервера (Debug) ---"
+	cargo build --bin netrunner-server
+	@echo "--- Запуск сервера локально ---"
+	sudo ./target/debug/netrunner-server --port=4443 --host=0.0.0.0
 
 # Сборка
-build-client:
-	cargo build --bin netrunner-client --release
+build-android:
+	cargo ndk -t arm64-v8a -o ./jniLibs build --release
 
 build-server:
 	cargo build --bin netrunner-server --release

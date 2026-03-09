@@ -43,6 +43,7 @@ impl Tun {
         Ok((writer, reader))
     }
 
+    #[cfg(target_os = "linux")]
     pub fn setup_routing(&self) -> io::Result<()> {
         use std::process::Command;
 
@@ -84,6 +85,7 @@ impl Tun {
         Ok(())
     }
 
+    #[cfg(target_os = "linux")]
     pub fn setup_dns_redirection(&self) -> io::Result<()> {
         // 1. Создаем временный файл resolv.conf
         // Мы говорим системе: "Твой DNS-сервер теперь 10.0.0.1" (твой TUN-IP)
@@ -95,6 +97,18 @@ impl Tun {
             .status();
 
         info!("DNS перенаправлен на 10.0.0.1");
+        Ok(())
+    }
+
+    #[cfg(target_os = "android")]
+    pub fn setup_routing(&self) -> io::Result<()> {
+        info!("Skipping routing setup on Android (handled by VpnService)");
+        Ok(())
+    }
+
+    #[cfg(target_os = "android")]
+    pub fn setup_dns_redirection(&self) -> io::Result<()> {
+        info!("Skipping DNS setup on Android (handled by VpnService)");
         Ok(())
     }
 }

@@ -1,4 +1,4 @@
-use netrunner_common::protocol::codec::socks::{SocksRequest, TargetAddress};
+use netrunner_core::protocol::codec::socks::{SocksRequest, TargetAddress};
 use smoltcp::iface::SocketHandle;
 use smoltcp::socket::tcp;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};

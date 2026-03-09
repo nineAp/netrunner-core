@@ -1,7 +1,7 @@
 use std::net::Ipv4Addr;
 
 use netrunner_client::{tun::engine::Engine, tun::tun::Tun};
-use netrunner_common::{
+use netrunner_core::{
     logger_init,
     proxy::{connection::connection::ConnectionRole, network::Network},
 };

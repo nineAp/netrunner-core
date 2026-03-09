@@ -3,15 +3,12 @@ name = "netrunner-client"
 version = "0.1.0"
 edition = "2024"
 
-[[example]]
-name = "client_example"
-path = "examples/client_example.rs"
-
 [lib]
-crate-type = ["cdylib", "rlib"]
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib", "staticlib"]
 
 [dependencies]
-netrunner-common = { path = "../common" } # Наша общая либа
+netrunner-core = { path = "../core" }
 smoltcp = { version = "0.12", default-features = false, features = [
     "std",
     "log",
@@ -25,9 +22,8 @@ smoltcp = { version = "0.12", default-features = false, features = [
     "socket-tcp-cubic",
 ] }
 tokio = { version = "1.36", features = ["full"] }
-jni = "0.21"
 bytes = "1.5"
-android_logger = "0.13"
+android_logger = "0.15.1"
 log = "0.4"
 tun = { version = "0.8", features = ["async"] }
 lazy_static = "1.4.0"
@@ -37,3 +33,7 @@ thiserror = "2.0"
 hickory-proto = "0.25.2"
 lru = "0.16.3"
 tokio-util = "0.7.18"
+uniffi = { version = "0.31.0", features = ["tokio"] }
+
+[build-dependencies]
+uniffi = { version = "0.31.0", features = ["build"] }

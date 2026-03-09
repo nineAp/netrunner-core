@@ -1,4 +1,4 @@
-use netrunner_common::protocol::codec::socks::TargetAddress;
+use netrunner_core::protocol::codec::socks::TargetAddress;
 use smoltcp::{
     iface::{SocketHandle, SocketSet},
     socket::{AnySocket, icmp, tcp, udp},
