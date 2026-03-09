@@ -132,17 +132,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5f0e0fee31ef5ed1ba1316088939cea399010ed7731dba877ed44aeb407a75ea"
 
 [[package]]
-name = "app"
-version = "0.1.0"
-dependencies = [
- "netrunner-client",
- "netrunner-core",
- "serde",
- "tauri",
- "tauri-build",
-]
-
-[[package]]
 name = "askama"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2446,6 +2435,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ee6cda3051665f1fb8d9e08fc35c96d5a244fb1be711a03b71118828afc9a873"
 dependencies = [
  "jni-sys",
+]
+
+[[package]]
+name = "netrunner-app"
+version = "0.1.0"
+dependencies = [
+ "netrunner-client",
+ "netrunner-core",
+ "serde",
+ "tauri",
+ "tauri-build",
 ]
 
 [[package]]

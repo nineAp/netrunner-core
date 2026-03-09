@@ -1,16 +1,14 @@
 [package]
-name = "app"
+name = "netrunner-app"
 version = "0.1.0"
 edition = "2021"
 
-[[bin]]
-name = "netrunner-app"  
-path = "main.rs"
-
-
+[lib]
+crate-type = ["cdylib", "staticlib"]
+name = "netrunner_app"
 
 [build-dependencies]
-tauri-build = { version = "2.0.0" }
+tauri-build = { version = "2.0.0", features = [] }
 
 [dependencies]
 netrunner-client = { path = "../../client" }
