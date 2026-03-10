@@ -3,17 +3,27 @@ import { motion, AnimatePresence } from "framer-motion";
 import { Power } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useTranslation } from "react-i18next";
+import { invoke } from "@tauri-apps/api/core";
 
 export function VpnControl() {
   const [status, setStatus] = useState<"idle" | "connecting" | "connected">(
     "idle",
   );
 
-  const handleToggle = () => {
-    if (status === "idle") {
-      setStatus("connecting");
-      setTimeout(() => setStatus("connected"), 5000);
-    } else {
+  const handleToggle = async () => {
+    try {
+      if (status === "idle") {
+        setStatus("connecting");
+        await invoke("start_vpn_android", {
+          remoteAddress: "62.60.244.156",
+        });
+
+        setStatus("connected");
+      } else {
+        setStatus("idle");
+      }
+    } catch (error) {
+      console.error("Ошибка VPN:", error);
       setStatus("idle");
     }
   };

@@ -20,7 +20,8 @@ debug-server:
 
 # Сборка
 build-android:
-	cargo ndk -t arm64-v8a -o ./jniLibs build --release
+	cargo ndk -t arm64-v8a -o ./gen build --bin netrunner-client --release
+	cargo run --bin bindgen-tool generate --library gen/arm64-v8a/libnetrunner_client.so --language kotlin --out-dir gen/arm64-v8a
 
 build-server:
 	cargo build --bin netrunner-server --release

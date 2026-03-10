@@ -3,7 +3,7 @@ members = [
     "core",
     "client",
     "server",
-    "tools/uniffi-bindgen",
+    "tools/bindgen",
     "app/src-tauri",
 ]
 resolver = "2"
