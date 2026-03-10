@@ -1,6 +1,5 @@
 import { Link } from "react-router-dom";
-import { cn } from "@/lib/utils";
-
+import { useTranslation } from "react-i18next";
 interface BurgerMenuProps {
   isOpen: boolean;
   onClose: () => void;
@@ -8,34 +7,37 @@ interface BurgerMenuProps {
 
 export function BurgerMenu({ isOpen, onClose }: BurgerMenuProps) {
   if (!isOpen) return null;
-
+  const { t } = useTranslation();
   return (
     <>
-      {/* Затемнение фона при открытом меню */}
+      {/* затемнение только под хедером */}
       <div
-        className="fixed inset-0 z-30 bg-black/20 backdrop-blur-sm"
+        className="fixed inset-x-0 bottom-0 top-25 z-30 bg-black/20 backdrop-blur-sm"
         onClick={onClose}
       />
 
-      <div className="absolute left-0 top-16 z-40 w-64 h-[calc(100vh-4rem)] bg-card border-r p-6 shadow-xl animate-in slide-in-from-left">
+      {/* меню */}
+      <div className="fixed left-0 top-25 z-60 h-[calc(100vh-4rem)] w-64 bg-card border-r p-6 shadow-xl animate-in slide-in-from-left">
         <nav className="flex flex-col gap-6" onClick={onClose}>
           <Link
             to="/"
             className="text-lg font-medium hover:text-primary transition-colors"
           >
-            Подключение
+            {t("home_label")}
           </Link>
+
           <Link
             to="/settings"
             className="text-lg font-medium hover:text-primary transition-colors"
           >
-            Настройки
+            {t("settings")}
           </Link>
+
           <Link
             to="/about"
             className="text-lg font-medium hover:text-primary transition-colors"
           >
-            О программе
+            {t("about_title")}
           </Link>
         </nav>
       </div>

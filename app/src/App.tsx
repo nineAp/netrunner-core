@@ -12,13 +12,15 @@ function App() {
 
   return (
     <BrowserRouter>
-      <div className="min-h-screen w-full bg-background relative overflow-x-hidden">
+      <div className="fixed inset-0 h-screen w-full overflow-hidden bg-background">
         <AnimatedBackground />
-        <Header onMenuClick={() => setIsMenuOpen(!isMenuOpen)} />
+
+        <div className="bg-background">
+          <Header onMenuClick={() => setIsMenuOpen(!isMenuOpen)} />
+        </div>
 
         <BurgerMenu isOpen={isMenuOpen} onClose={() => setIsMenuOpen(false)} />
-
-        <main className="flex flex-col items-center justify-center min-h-[calc(100vh-80px)] gap-[10px] p-6">
+        <main className="flex h-[calc(100vh-4rem)] flex-col items-center justify-center px-6 py-6 overflow-hidden">
           <Routes>
             <Route path="/" element={<Home />} />
             <Route path="/settings" element={<Settings />} />

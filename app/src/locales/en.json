@@ -14,7 +14,6 @@
   "version_info": "Version 1.0.0-stable | 2026",
   "footer_text": "Developed with care for network freedom.",
   "select_location_placeholder": "Select a VPN location",
-  "settings": "Settings",
   "section_network": "Network",
   "kill_switch": "Kill Switch",
   "kill_switch_desc": "Block internet on connection loss",
@@ -24,5 +23,8 @@
   "reduce_motion": "Reduce Motion",
   "reduce_motion_desc": "For resource efficiency",
   "theme_toggle": "Appearance Theme",
-  "language_toggle": "Interface Language"
+  "language_toggle": "Interface Language",
+  "home_label": "Home",
+  "settings": "Settings",
+  "about_menu": "About"
 }

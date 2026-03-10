@@ -4,7 +4,7 @@ import { ThemeToggle } from "./ThemeToggle";
 
 export function Header({ onMenuClick }: { onMenuClick: () => void }) {
   return (
-    <header className="sticky top-0 z-50 w-full border-b border-border/40 bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60 shadow-sm">
+    <header className="sticky top-0 z-50 w-full border-b border-border/40 bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60 shadow-sm pt-[env(safe-area-inset-top)]">
       {/* Используем grid для идеальной центровки */}
       <div className="grid h-16 w-full grid-cols-[auto_1fr_auto] items-center px-4">
         {/* Слева: Бургер (занимает место по контенту) */}
