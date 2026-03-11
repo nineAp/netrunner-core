@@ -1,7 +1,3 @@
 /target
 things.txt
 /gen
-/app/node_modules
-/app/src-tauri/gen
-/app/src-tauri/icons
-/app/dist
