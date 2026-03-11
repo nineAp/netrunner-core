@@ -1,5 +1,4 @@
 mod core;
-use core::start_vpn_android::start_vpn_android;
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     #[cfg(target_os = "android")]
@@ -9,7 +8,6 @@ pub fn run() {
             .with_tag("NetrunnerRust"),
     );
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![start_vpn_android])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

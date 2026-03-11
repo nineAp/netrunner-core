@@ -1,0 +1,5 @@
+[[permission]]
+identifier = "vpn-control"
+description = "Allows access to VPN Service"
+name = "allow-vpn-control"
+commands = { allow = ["ping", "prepare_vpn", "start_vpn", "stop_vpn"] }
