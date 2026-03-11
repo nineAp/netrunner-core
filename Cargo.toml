@@ -3,7 +3,6 @@ members = [
     "core",
     "client",
     "server",
-    "tools/bindgen",
-    "app/src-tauri",
+    "tools/bindgen"
 ]
 resolver = "2"

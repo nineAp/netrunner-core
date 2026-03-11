@@ -8,6 +8,5 @@
     "aarch64-linux-android",
     "x86_64-unknown-linux-gnu"
   ],
-  "makefile.configureOnOpen": false,
-  "kotlin.java.home": "/usr/lib/jvm/java-17-openjdk-amd64"
+  "makefile.configureOnOpen": false
 }
