@@ -33,7 +33,7 @@ thiserror = "2.0"
 hickory-proto = "0.25.2"
 lru = "0.16.3"
 tokio-util = "0.7.18"
-uniffi = { version = "0.31.0", features = ["tokio"] }
+uniffi = { version = "0.31.0", features = ["tokio", ] }
 
 [build-dependencies]
 uniffi = { version = "0.31.0", features = ["build"] }

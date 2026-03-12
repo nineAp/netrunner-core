@@ -18,10 +18,19 @@ debug-server:
 	@echo "--- Запуск сервера локально ---"
 	sudo ./target/debug/netrunner-server --port=4443 --host=0.0.0.0
 
-# Сборка
+
+ABIS = arm64-v8a armeabi-v7a x86_64 x86
+
 build-android:
-	cargo ndk -t arm64-v8a -o ./gen build --bin netrunner-client --release
-	cargo run --bin bindgen-tool generate --library gen/arm64-v8a/libnetrunner_client.so --language kotlin --out-dir gen/arm64-v8a
+	@for abi in $(ABIS); do \
+		echo "Building for $$abi..."; \
+		cargo ndk -t $$abi -o ./gen build --bin netrunner-client --release; \
+		cargo run --bin bindgen-tool generate \
+			--library gen/$$abi/libnetrunner_client.so \
+			--language kotlin \
+			--no-format \
+			--out-dir gen/$$abi; \
+	done
 
 build-server:
 	cargo build --bin netrunner-server --release
