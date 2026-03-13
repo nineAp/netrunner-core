@@ -22,8 +22,8 @@ async fn main() {
             .up();
     })
     .expect("Failed to initialize TUN device");
-
-    tun_device.setup_routing();
+    let remote_address: String = "62.60.244.156:443".into();
+    tun_device.setup_routing(&remote_address);
     tun_device.setup_dns_redirection();
 
     info!("TUN interface is UP: 10.0.0.1/24");
@@ -31,7 +31,7 @@ async fn main() {
     let config = Config::new(smoltcp::wire::HardwareAddress::Ip);
 
     let mut caps = DeviceCapabilities::default();
-    let remote_address: String = "62.60.244.156:443".into();
+
     caps.max_transmission_unit = 1500;
     caps.medium = smoltcp::phy::Medium::Ip;
 

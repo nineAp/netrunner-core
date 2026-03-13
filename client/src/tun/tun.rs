@@ -43,49 +43,78 @@ impl Tun {
         Ok((writer, reader))
     }
 
-    #[cfg(target_os = "linux")]
-    pub fn setup_routing(&self) -> io::Result<()> {
+    fn get_route_part<'a>(parts: &'a [&'a str], key: &str) -> Option<&'a str> {
+        parts
+            .iter()
+            .position(|&x| x == key)
+            .and_then(|i| parts.get(i + 1))
+            .copied()
+    }
+
+    #[cfg(feature = "desktop")]
+    pub fn setup_routing(&self, remote_address: &str) -> io::Result<()> {
         use std::process::Command;
 
-        // 1. Удаляем существующий default-маршрут (чтобы не было конфликтов)
-        // Игнорируем ошибку, если его вдруг нет
+        info!(
+            "Начинаем настройку маршрутизации для прокси: {}",
+            remote_address
+        );
+
+        // 1. Находим текущий маршрут до прокси (до изменения default)
+        let output = Command::new("ip")
+            .args(&["route", "get", remote_address])
+            .output()?;
+        let route_info = String::from_utf8_lossy(&output.stdout);
+        let parts: Vec<&str> = route_info.split_whitespace().collect();
+
+        let dev = Self::get_route_part(&parts, "dev").unwrap_or("eth0");
+        let via = Self::get_route_part(&parts, "via");
+
+        info!("Обнаружен физический маршрут: dev={}, via={:?}", dev, via);
+
+        // 2. Добавляем статическое исключение для прокси
+        info!("Добавляем статический маршрут для прокси...");
+        let mut proxy_route = vec!["ip", "route", "add", remote_address, "dev", dev];
+        if let Some(gw) = via {
+            proxy_route.extend_from_slice(&["via", gw]);
+        }
+        let status = Command::new("sudo").args(proxy_route).status()?;
+        if !status.success() {
+            warn!("Маршрут к прокси уже существует или возникла ошибка (это нормально).");
+        }
+
+        // 3. Удаляем старый default, если он есть
+        info!("Переключаем default маршрут на tun0...");
         let _ = Command::new("sudo")
             .args(&["ip", "route", "del", "default"])
             .status();
 
-        // 2. Добавляем tun0 как ГЛАВНЫЙ маршрут (метрика 1 — самый высокий приоритет)
-        let _ = Command::new("sudo")
+        // 4. Устанавливаем tun0 как основной default
+        let status = Command::new("sudo")
             .args(&[
                 "ip", "route", "add", "default", "via", "10.0.0.2", "dev", "tun0", "metric", "1",
             ])
-            .status();
+            .status()?;
+        if status.success() {
+            info!("TUN успешно установлен как основной default.");
+        } else {
+            error!("Не удалось установить tun0 как default!");
+        }
 
-        // 3. Добавляем eth0 как РЕЗЕРВНЫЙ маршрут (метрика 100 — низкий приоритет)
-        // ВАЖНО: Тебе нужно знать IP шлюза твоего eth0.
-        // Если ты не знаешь его заранее, можешь попробовать вытащить его из `ip route`
-        // или просто оставить как есть, если eth0 — единственный физический интерфейс.
-        let _ = Command::new("sudo")
-            .args(&[
-                "ip",
-                "route",
-                "add",
-                "default",
-                "via",
-                "172.18.144.1",
-                "dev",
-                "eth0",
-                "metric",
-                "100",
-            ])
-            .status();
+        // 5. Добавляем резервный маршрут через физический интерфейс
+        if let Some(gw) = via {
+            info!("Добавляем резервный маршрут через {} с метрикой 100", dev);
+            let _ = Command::new("sudo")
+                .args(&[
+                    "ip", "route", "add", "default", "via", gw, "dev", dev, "metric", "100",
+                ])
+                .status();
+        }
 
-        info!(
-            "Маршрутизация настроена: tun0 (metric 1) -> основной, eth0 (metric 100) -> резервный"
-        );
+        info!("Маршрутизация полностью настроена.");
         Ok(())
     }
-
-    #[cfg(target_os = "linux")]
+    #[cfg(feature = "desktop")]
     pub fn setup_dns_redirection(&self) -> io::Result<()> {
         // 1. Создаем временный файл resolv.conf
         // Мы говорим системе: "Твой DNS-сервер теперь 10.0.0.1" (твой TUN-IP)
@@ -97,18 +126,6 @@ impl Tun {
             .status();
 
         info!("DNS перенаправлен на 10.0.0.1");
-        Ok(())
-    }
-
-    #[cfg(target_os = "android")]
-    pub fn setup_routing(&self) -> io::Result<()> {
-        info!("Skipping routing setup on Android (handled by VpnService)");
-        Ok(())
-    }
-
-    #[cfg(target_os = "android")]
-    pub fn setup_dns_redirection(&self) -> io::Result<()> {
-        info!("Skipping DNS setup on Android (handled by VpnService)");
         Ok(())
     }
 }

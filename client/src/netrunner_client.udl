@@ -1,4 +1,4 @@
-namespace netrunner_client_core {};
+namespace netrunner_client {};
 
 interface SessionManager {
     constructor();

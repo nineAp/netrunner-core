@@ -23,7 +23,6 @@ smoltcp = { version = "0.12", default-features = false, features = [
 ] }
 tokio = { version = "1.36", features = ["full"] }
 bytes = "1.5"
-android_logger = "0.15.1"
 log = "0.4"
 tun = { version = "0.8", features = ["async"] }
 lazy_static = "1.4.0"
@@ -37,3 +36,14 @@ uniffi = { version = "0.31.0", features = ["tokio", ] }
 
 [build-dependencies]
 uniffi = { version = "0.31.0", features = ["build"] }
+
+
+[features]
+default = ["desktop"]
+desktop = []
+mobile = [] 
+
+linux = ["desktop"]
+windows = ["desktop"]
+android = ["mobile"]
+ios = ["mobile"]
