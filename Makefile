@@ -14,7 +14,7 @@ debug-client:
 
 debug-server:
 	@echo "--- Сборка сервера (Debug) ---"
-	cargo build --bin netrunner-server
+	cargo build --bin netrunner-server --features desktop
 	@echo "--- Запуск сервера локально ---"
 	sudo ./target/debug/netrunner-server --port=4443 --host=0.0.0.0
 
@@ -24,7 +24,7 @@ ABIS = arm64-v8a armeabi-v7a x86_64 x86
 build-android:
 	@for abi in $(ABIS); do \
 		echo "Building for $$abi..."; \
-		cargo ndk -t $$abi -o ./gen build --bin netrunner-client --release --features mobile; \
+		cargo ndk -t $$abi -o ./gen build --bin netrunner-client --features mobile --release; \
 		cargo run --bin bindgen-tool generate \
 			--library gen/$$abi/libnetrunner_client.so \
 			--language kotlin \
@@ -33,7 +33,7 @@ build-android:
 	done
 
 build-server:
-	cargo build --bin netrunner-server --release
+	cargo build --bin netrunner-server --release --features desktop
 
 setup-server:
 	@echo "--- Обновление системы и установка зависимостей ---"
@@ -44,7 +44,7 @@ setup-server:
 		mkdir -p $(REMOTE_PATH)"
 
 # Деплой
-deploy-server: build-server
+deploy-server:
 	@echo "--- Останавливаем старый сервер ---"
 	ssh $(REMOTE_USER)@$(SERVER_IP) "systemctl stop $(SERVICE_NAME)" || true
 	

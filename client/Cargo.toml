@@ -39,7 +39,6 @@ uniffi = { version = "0.31.0", features = ["build"] }
 
 
 [features]
-default = ["desktop"]
 desktop = []
 mobile = [] 
 

@@ -1,5 +1,5 @@
 {
-  "rust-analyzer.cargo.features": ["desktop", "mobile"],
+  "rust-analyzer.cargo.features": ["desktop"],
   "rust-analyzer.linkedProjects": ["Cargo.toml"],
   "rust-analyzer.cargo.buildScripts.enable": true,
   "rust-analyzer.procMacro.enable": true,

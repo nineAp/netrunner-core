@@ -1,6 +1,9 @@
 use std::net::Ipv4Addr;
 
-use netrunner_client::{tun::engine::Engine, tun::tun::Tun};
+use netrunner_client::{
+    platform::setup_platform_routing,
+    tun::{engine::Engine, tun::Tun},
+};
 use netrunner_core::{
     logger_init,
     proxy::{connection::connection::ConnectionRole, network::Network},
@@ -23,8 +26,7 @@ async fn main() {
     })
     .expect("Failed to initialize TUN device");
     let remote_address: String = "62.60.244.156:443".into();
-    tun_device.setup_routing(&remote_address);
-    tun_device.setup_dns_redirection();
+    setup_platform_routing(&tun_device, &remote_address);
 
     info!("TUN interface is UP: 10.0.0.1/24");
 

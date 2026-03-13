@@ -13,8 +13,12 @@ use std::sync::OnceLock;
 use tokio::runtime::Runtime;
 use tokio::sync::oneshot;
 use tracing::{error, info};
+pub mod platform;
 
-use crate::tun::{engine::Engine, tun::Tun};
+use crate::{
+    platform::setup_platform_routing,
+    tun::{engine::Engine, tun::Tun},
+};
 static RUNTIME: OnceLock<Runtime> = OnceLock::new();
 
 fn get_runtime() -> &'static Runtime {
@@ -75,12 +79,7 @@ impl SessionManager {
                 .expect("Failed to init TUN")
             };
 
-            #[cfg(feature = "desktop")]
-            {
-                let proxy_ip = remote_address.split(':').next().unwrap_or(&remote_address);
-                tun_device.setup_routing(proxy_ip).expect("Routing failed");
-                tun_device.setup_dns_redirection().expect("DNS failed");
-            }
+            setup_platform_routing(&tun_device, &remote_address);
 
             // 2. Инициализация сети
             let config = Config::new(smoltcp::wire::HardwareAddress::Ip);
