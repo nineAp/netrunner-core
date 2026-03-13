@@ -13,7 +13,6 @@ use tracing::{error, info};
 
 #[tokio::main]
 async fn main() {
-    // 1. Инициализируем систему логирования
     logger_init();
     info!("Initializing NetRunner Stack...");
     let tun_device = Tun::create(|config| {
@@ -46,8 +45,6 @@ async fn main() {
 
     let proxy_ip = network.get_self_local_address();
 
-    // 2. ВЫНОСИМ СЕТЬ В ОТДЕЛЬНЫЙ ЦИКЛ
-    // Это запустит SOCKS5 сервер и TLS туннель параллельно движку
     tokio::spawn(async move {
         info!("Network thread started");
         network.run().await;
@@ -56,11 +53,10 @@ async fn main() {
     let mut engine = Engine::new(config, caps, proxy_ip);
     engine.set_any_ip(true);
     engine.set_transparent_mode();
-    engine.set_default_gateway(Ipv4Addr::new(10, 0, 0, 2)); // to smoltcp
+    engine.set_default_gateway(Ipv4Addr::new(10, 0, 0, 2));
     engine.activate();
     info!("Stack IP initialized: 10.0.0.2");
 
-    // 5. Запуск
     info!("Engine starting process loop...");
     engine.run(tun_device).await;
 }

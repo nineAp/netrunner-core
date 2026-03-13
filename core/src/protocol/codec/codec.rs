@@ -32,7 +32,6 @@ impl Codec {
     ) -> Result<Bytes, TlsError> {
         let pub_key = self.session_keys.ecdh.public_key.to_bytes();
 
-        // 2. Передаем его в мост
         Ok(TlsBridge::wrap_client_hello(
             profile,
             host,
@@ -69,7 +68,6 @@ impl Codec {
                 )
             })?;
 
-        // Инициализируем шифратор сервера
         self.crypto.set_keys(w_key, w_iv, r_key, r_iv);
 
         Ok(server_hello_record)
@@ -85,8 +83,6 @@ impl Codec {
             )
         })?;
 
-        // ОБНОВЛЕНИЕ КЛЮЧЕЙ НА КЛИЕНТЕ
-        // Передаем false, так как клиент ПАРСИТ ServerHello (смещение 4 байта)
         let (w_key, w_iv, r_key, r_iv) = self
             .session_keys
             .update_keys(mes.random(), mes.extensions(), false)
@@ -142,9 +138,6 @@ impl Codec {
         };
         let mut frame_bytes = frame.into_bytes(&tag);
 
-        // ВАЖНО: вызываем шифрование ОДИН РАЗ.
-        // Метод encrypt возвращает Result<Bytes, chacha20poly1305::Error>
-        // Мы вручную превращаем его ошибку в твой TlsError.
         let encrypted_payload = self.crypto.encrypt(&mut frame_bytes).map_err(|e| {
             tracing::error!("Encryption failed: {:?}", e);
             TlsError::new(
@@ -154,7 +147,6 @@ impl Codec {
             )
         })?;
 
-        // Теперь передаем зашифрованные байты в новый метод упаковки
         Ok(TlsBridge::pack_app_data(encrypted_payload))
     }
 
@@ -168,14 +160,12 @@ impl Codec {
     }
 
     pub fn inbound(&mut self, buffer: &mut BytesMut) -> Result<Option<Frame>, TlsError> {
-        // 1. Проверка старых данных
         if !self.staging.is_empty() {
             if let Some(frame) = self.try_parse_frame()? {
                 return Ok(Some(frame));
             }
         }
 
-        // 2. Цикл обработки новых рекордов
         while let Some(app_data) = TlsBridge::unpack_app_data(buffer)? {
             let mut data_to_decrypt = BytesMut::from(app_data.payload);
 
@@ -187,7 +177,6 @@ impl Codec {
                 )
             })?;
 
-            // --- КРИТИЧЕСКАЯ ПРОВЕРКА ТЕГА ---
             if decrypted.len() < 16 {
                 return Err(TlsError::new(
                     ErrorStage::Tls("Packet too short for auth"),
@@ -199,7 +188,6 @@ impl Codec {
             let mut received_tag = [0u8; 16];
             received_tag.copy_from_slice(&decrypted[..16]);
 
-            // Используем метод verify_auth_tag, который мы обсуждали ранее
             if !self.session_keys.verify_auth_tag(&received_tag) {
                 tracing::error!(
                     expected_hash = %hex::encode(&self.session_keys.auth_key[..4]),
@@ -208,11 +196,10 @@ impl Codec {
                 );
                 return Err(TlsError::new(
                     ErrorStage::Tls("Auth tag mismatch"),
-                    ErrorAction::Drop, // Убиваем соединение
+                    ErrorAction::Drop,
                     Bytes::new(),
                 ));
             }
-            // ---------------------------------
 
             self.staging.extend_from_slice(&decrypted);
 
@@ -223,7 +210,7 @@ impl Codec {
 
         Ok(None)
     }
-    // Выносим парсинг в отдельный метод, чтобы не дублировать код
+
     fn try_parse_frame(&mut self) -> Result<Option<Frame>, TlsError> {
         match Frame::parse(&mut self.staging) {
             Ok(Some(frame)) => Ok(Some(frame)),

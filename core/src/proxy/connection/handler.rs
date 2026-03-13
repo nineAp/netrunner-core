@@ -9,7 +9,6 @@ use crate::{
     proxy::connection::{bridge::run_proxy_bridge, connection::ConnectionRole, muxer::Muxer},
 };
 
-// proxy/connection/stream_handler.rs
 pub struct StreamHandler {
     muxer: Muxer,
     role: ConnectionRole,
@@ -44,7 +43,6 @@ impl StreamHandler {
 
                 match tokio::net::TcpStream::connect(&target_str).await {
                     Ok(stream) => {
-                        // --- ШАГ 2: ШЛЕМ ПОДТВЕРЖДЕНИЕ ---
                         let mut reply_buf = BytesMut::with_capacity(10);
                         let reply = SocksReply::ConnectResult {
                             reply_code: 0x00,
@@ -58,13 +56,12 @@ impl StreamHandler {
                             .send_control(stream_id, FrameType::Connect, reply_buf.freeze())
                             .await;
 
-                        // --- ШАГ 3: ЗАПУСКАЕМ МОСТ ---
                         let (r, w) = stream.into_split();
                         run_proxy_bridge(stream_id, r, w, muxer, v_rx).await;
                     }
                     Err(e) => {
                         error!(stream_id, error = %e, "Connection failed");
-                        // Если не подключились — удаляем стрим, чтобы не висел в мапе
+
                         muxer.remove_stream(stream_id).await;
 
                         let mut reply_buf = BytesMut::with_capacity(10);
@@ -82,7 +79,6 @@ impl StreamHandler {
                 }
             });
         } else {
-            // Логика для клиента (проброс ответа сервера браузеру)
             self.muxer.dispatch_to_local(stream_id, payload).await;
         }
     }

@@ -58,18 +58,18 @@ impl Connection {
         }
     }
 
-    /// Читает и парсит запрос SOCKS5 из входящего потока
+    
     async fn read_socks_request(&mut self) -> Result<SocksRequest, String> {
         loop {
-            // Попытка парсинга из текущего буфера
+            
             match SocksRequest::parse(&mut self.read_buf) {
                 Ok(Some(req)) => {
-                    // Используем Debug-вывод (?req), так как SocksRequest обычно Enum
+                    
                     info!(client = %self.addr, request = ?req, "SOCKS request successfully parsed");
                     return Ok(req);
                 }
                 Ok(None) => {
-                    // Это не ошибка, просто данных в сокете пока меньше, чем размер структуры SOCKS
+                    
                     trace!(client = %self.addr, buffer_len = self.read_buf.len(), "SOCKS parse: need more data");
                 } 
                 Err(e) => {
@@ -78,7 +78,7 @@ impl Connection {
                 }
             }
 
-            // Чтение новых данных из сокета
+            
             let n = self
                 .inbound
                 .read_buf(&mut self.read_buf)
@@ -97,7 +97,7 @@ impl Connection {
         }
     }
 
-    /// Отправляет SOCKS ответ
+    
     async fn send_socks_reply(&mut self, reply: SocksReply) -> Result<(), String> {
         let mut buf = BytesMut::with_capacity(24);
         debug!(client = %self.addr, reply = ?reply, "Sending SOCKS reply to client");
@@ -124,7 +124,7 @@ impl Connection {
     pub async fn handle_socks_client(mut self, muxer: Muxer) -> Result<(), String> {
         info!("Starting SOCKS multiplexed handling");
 
-        // 1. SOCKS Handshake
+        
         debug!("Reading SOCKS handshake request");
         let _ = self.read_socks_request().await.map_err(|e| {
             error!("SOCKS handshake failed: {}", e);
@@ -133,8 +133,8 @@ impl Connection {
         
         self.send_socks_reply(SocksReply::HandshakeSelect { method: 0x00 }).await?;
 
-        // 2. SOCKS Connect
-    // 2. SOCKS Connect - читаем, КУДА хочет браузер
+        
+    
         let req = self.read_socks_request().await?;
         let target = if let SocksRequest::Connect { target, .. } = req {
             target
@@ -145,12 +145,12 @@ impl Connection {
         let stream_id = muxer.next_id();
         let target_str = target.to_string();
 
-        // --- НОВАЯ ЛОГИКА ОЖИДАНИЯ ---
-        // Регистрируем временный канал, чтобы получить Connect-подтверждение от сервера
+        
+        
         let (v_tx, mut v_rx) = mpsc::channel::<Bytes>(1024);
         muxer.register_stream(stream_id, v_tx).await;
 
-        // Отправляем Connect-кадр на сервер
+        
         muxer.to_network.send(MuxMessage {
             stream_id,
             frame_type: FrameType::Connect,
@@ -161,7 +161,7 @@ impl Connection {
             Ok(Some(data)) => data,
             _ => {
                 error!(stream_id, "Server timeout or failed to send Connect confirmation");
-                // Шлем браузеру ошибку, если сервер промолчал
+                
                 self.send_socks_reply(SocksReply::ConnectResult {
                     reply_code: 0x01, atyp: 0x01, addr: [0, 0, 0, 0], port: 0,
                 }).await.ok();
@@ -169,20 +169,20 @@ impl Connection {
             }
         };
 
-        // Проверяем код ответа (второй байт в SOCKS5)
+        
         if first_payload.len() >= 2 && first_payload[1] == 0x00 {
             debug!(stream_id, "Server confirmed connection, forwarding SOCKS reply to browser");
             
-            // ВАЖНО: Отправляем браузеру ТО, что прислал сервер (те самые 10 байт)
-            // Не создаем новый SocksReply вручную, а пробрасываем байты сервера
+            
+            
             self.outbound.write_all(&first_payload).await.map_err(|e| e.to_string())?;
         } else {
-            // Если сервер прислал ошибку (reply_code != 0), тоже пробрасываем её браузеру и выходим
+            
             self.outbound.write_all(&first_payload).await.ok();
             return Err("Server rejected connection".into());
         }
 
-        // 4. Разбираем self и запускаем хендлер
+        
         let Self { inbound: browser_in, outbound: browser_out, .. } = self;
         
         let muxer_clone = muxer.clone();
@@ -201,11 +201,11 @@ impl Connection {
     pub async fn handle_server_tunnel(mut self) -> Result<(), String> {
         info!("Acting as TLS Server, waiting for ClientHello");
 
-        // Создаем Muxer для сервера
+        
         let (mux_tx, mux_rx) = mpsc::channel(BUF_SIZE);
-        let muxer = Muxer::new(mux_tx.clone(), false); // false, так как это Сервер
+        let muxer = Muxer::new(mux_tx.clone(), false); 
 
-        // 1. TLS Handshake
+        
         let server_hello_bytes = loop {
             match self.codec.make_server_handshake(&mut self.read_buf) {
                 Ok(bytes) => {
@@ -227,7 +227,7 @@ impl Connection {
 
         let handler = std::sync::Arc::new(StreamHandler::new(muxer.clone(), ConnectionRole::Server));
 
-        // 2. Передача управления в TunnelEngine
+        
         debug!("Handover to TunnelEngine");
         let engine = TunnelEngine {
             inbound: self.inbound,

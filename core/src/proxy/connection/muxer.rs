@@ -62,7 +62,7 @@ impl Muxer {
 
     pub async fn remove_stream(&self, stream_id: u32) {
         let mut lock = self.streams.write().await;
-        lock.remove(&stream_id); // Просто удаляем, если есть
+        lock.remove(&stream_id);
     }
 
     pub async fn send_control(

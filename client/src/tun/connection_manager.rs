@@ -19,7 +19,7 @@ use crate::{
 pub struct ConnectionManager {
     last_activity: HashMap<SocketHandle, StdInstant>,
     active_tcp_sessions: HashMap<SocketHandle, TcpConnection>,
-    //active_udp_sessions: HashMap<SocketHandle, UdpSession>,
+
     fake_ip_store: FakeIpStore,
     proxy_ip: String,
     failed_until: HashMap<SocketHandle, StdInstant>,
@@ -37,7 +37,6 @@ impl ConnectionManager {
     }
     pub fn start_listening(&mut self, socket_set: &mut SocketSet) {
         for (_, socket) in socket_set.iter_mut() {
-            // Обработка TCP (как было)
             if let Some(tcp) = tcp::Socket::downcast_mut(socket) {
                 if !tcp.is_open() {
                     let endpoint = IpListenEndpoint {
@@ -46,11 +45,8 @@ impl ConnectionManager {
                     };
                     let _ = tcp.listen(endpoint);
                 }
-            }
-            // Добавляем обработку UDP
-            else if let Some(udp) = udp::Socket::downcast_mut(socket) {
+            } else if let Some(udp) = udp::Socket::downcast_mut(socket) {
                 if !udp.is_open() {
-                    // Биндим на 53 порт, чтобы ловить DNS-запросы
                     let endpoint = IpListenEndpoint {
                         addr: None,
                         port: 53,
@@ -65,12 +61,11 @@ impl ConnectionManager {
     }
 
     fn resolve_target(&self, socket: &tcp::Socket) -> TargetAddress {
-        // Безопасно получаем эндпоинт
         let local_endpoint = match socket.local_endpoint() {
             Some(ep) => ep,
             None => {
                 warn!(handle=?socket, "Attempted to resolve target for an unconnected socket");
-                // Возвращаем дефолт, чтобы не падать
+
                 return TargetAddress::Domain("disconnected".to_string(), 0);
             }
         };
@@ -116,11 +111,10 @@ impl ConnectionManager {
     fn handle_tcp(&mut self, handle: SocketHandle, socket: &mut tcp::Socket) {
         use tcp::State;
 
-        // 1. Если сокет закрыт, просто чистим и возвращаем в LISTEN
         if socket.state() == State::Closed {
             if let Some(until) = self.failed_until.get(&handle) {
                 if StdInstant::now() < *until {
-                    return; // Сокет в штрафе, не открываем его
+                    return;
                 }
             }
 
@@ -130,15 +124,11 @@ impl ConnectionManager {
             return;
         }
 
-        // 2. Если сокет установлен, но в менеджере нет записи
         if socket.state() == State::Established && !self.active_tcp_sessions.contains_key(&handle) {
             let target = self.resolve_target(socket);
 
-            // ВАЖНО: Тут можно добавить проверку: если target "плохой" или не резолвится,
-            // сразу убиваем сокет, чтобы не зацикливаться.
             if let TargetAddress::Domain(d, _) = &target {
                 if d == "disconnected" {
-                    // Или другая логика проверки
                     socket.abort();
                     return;
                 }
@@ -148,13 +138,11 @@ impl ConnectionManager {
             self.active_tcp_sessions.insert(handle, conn);
         }
 
-        // 3. Обработка активной сессии
         if let Some(conn) = self.active_tcp_sessions.get_mut(&handle) {
             if !conn.tick(socket) {
-                // Если tick вернул false, значит сессия завершена или произошла ошибка в tokio-задаче
                 debug!(%handle, "Connection handshake failed or closed, aborting socket.");
                 self.active_tcp_sessions.remove(&handle);
-                socket.abort(); // Принудительно закрываем "битый" сокет
+                socket.abort();
                 self.failed_until
                     .insert(handle, StdInstant::now() + Duration::from_secs(5));
             }
@@ -164,7 +152,6 @@ impl ConnectionManager {
             socket.abort();
         }
 
-        // 4. Обработка FIN
         if socket.state() == State::CloseWait {
             socket.close();
         }
@@ -211,20 +198,16 @@ impl ConnectionManager {
     }
 
     pub fn setup_sockets(n_tcp: usize, n_udp: usize, n_icmp: usize) -> SocketSet<'static> {
-        // Создаем хранилище с запасом на все типы сокетов
         let mut sockets = SocketSet::new(Vec::with_capacity(n_tcp + n_udp + n_icmp));
 
-        // 1. Добавляем TCP сокеты
         for _ in 0..n_tcp {
             sockets.add(Self::create_tcp_socket());
         }
 
-        // 2. Добавляем UDP сокеты
         for _ in 0..n_udp {
             sockets.add(Self::create_udp_socket());
         }
 
-        // 3. Добавляем ICMP сокет
         for _ in 0..n_icmp {
             sockets.add(Self::create_icmp_socket());
         }

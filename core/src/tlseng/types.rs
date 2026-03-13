@@ -1,25 +1,15 @@
-/// TLS Content Types as defined in the TLS Record Protocol.
-/// These identify what is contained within the TLS Record payload.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContentType {
-    /// Handshake messages (e.g., ClientHello, ServerHello)
     Handshake = 0x16,
-    /// Encrypted application data (the actual traffic)
+
     ApplicationData = 0x17,
-    /// Notification messages (e.g., CloseNotify or error signals)
+
     Alert = 0x15,
 }
 
 impl TryFrom<u8> for ContentType {
     type Error = &'static str;
-    /// Attempts to convert a given `u8` value into a `ContentType`.
-    ///
-    /// Returns `Ok(ContentType)` if the conversion is successful, and `Err(&str)` if not.
-    ///
-    /// # Examples
-    ///
-    ///
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
@@ -31,14 +21,6 @@ impl TryFrom<u8> for ContentType {
     }
 }
 
-///
-/// Represents known TLS protocol versions.
-///
-/// Note that TLS 1.3 often uses legacy versions in headers for compatibility.
-///
-/// # Examples
-///
-///
 #[repr(u16)]
 #[derive(Copy, Clone, Debug)]
 pub enum ProtocolVersion {
@@ -50,66 +32,28 @@ pub enum ProtocolVersion {
 impl TryFrom<u16> for ProtocolVersion {
     type Error = &'static str;
 
-    /// Attempts to convert a given `u16` value into a `ProtocolVersion`.
-    ///
-    /// Returns `Ok(ProtocolVersion)` if the conversion is successful, and `Err(&str)` if not.
-    ///
-    /// # Examples
-    ///
-    ///
     fn try_from(value: u16) -> Result<Self, Self::Error> {
         match value {
-            // TLS 1.0 (RFC 2246)
             0x0301 => Ok(ProtocolVersion::Tls10),
-            // TLS 1.2 (RFC 4346)
+
             0x0303 => Ok(ProtocolVersion::Tls12),
-            // TLS 1.3 (draft-ietf-tls-tls13-28)
+
             0x0304 => Ok(ProtocolVersion::Tls13),
             _ => Err("This is not Protocol Version"),
         }
     }
 }
 
-/// Hello types as defined in the TLS Handshake Protocol.
-///
-/// These identify the type of the message in the TLS Handshake protocol.
-///
-/// # Examples
-///
-///
-/// # Notes
-///
-/// The values of these enum variants are used as the first byte of the TLS
-/// Handshake protocol message.
-///
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum HelloType {
-    /// Client hello message type
     Client = 0x01,
-    /// Server hello message type
+
     Server = 0x02,
 }
 
-/// Attempts to convert a given `u8` value into a `HelloType`.
-///
-/// Returns `Ok(HelloType)` if the conversion is successful, and `Err(&str)` if not.
-///
-/// # Examples
-///
-///
-/// # Notes
-///
-/// This function is used to convert raw bytes into a `HelloType`.
-/// It is used in the `HelloHeader` parsing process.
 impl TryFrom<u8> for HelloType {
     type Error = &'static str;
-    /// Attempts to convert a given `u8` value into a `HelloType`.
-    ///
-    /// Returns `Ok(HelloType)` if the conversion is successful, and `Err(&str)` if not.
-    ///
-    /// # Examples
-    ///
-    ///
+
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
             0x01 => Ok(HelloType::Client),
@@ -119,10 +63,6 @@ impl TryFrom<u8> for HelloType {
     }
 }
 
-/// A collection of supported TLS groups.
-///
-/// This is a list of 16-bit group identifiers that the client supports.
-/// The server will select one of these groups to use for the key exchange.
 #[derive(Clone, Copy)]
 pub struct TlsGroups(pub &'static [u16]);
 
@@ -131,17 +71,11 @@ impl TlsGroups {
     pub const SECP256R1: u16 = 0x0017;
     pub const SECP384R1: u16 = 0x0018;
 
-    /// Стандартный набор для Chrome/Edge (X25519 + P-256)
     pub const CHROMIUM: Self = Self(&[Self::X25519, Self::SECP256R1, Self::SECP384R1]);
 
-    /// Набор "только современные кривые"
     pub const MODERN: Self = Self(&[Self::X25519, Self::SECP256R1]);
 }
 
-/// A collection of supported TLS signature algorithms.
-///
-/// This is a list of 16-bit signature algorithm identifiers that the client supports.
-/// The server will select one of these algorithms to use for the digital signature.
 #[derive(Clone, Copy)]
 pub struct TlsSignatures(pub &'static [u16]);
 
@@ -155,7 +89,6 @@ impl TlsSignatures {
     pub const RSA_PSS_RSAE_SHA512: u16 = 0x0806;
     pub const RSA_PKCS1_SHA512: u16 = 0x0601;
 
-    /// Типичный набор для современных браузеров
     pub const BROWSER_STANDARD: Self = Self(&[
         Self::ECDSA_SECP256R1_SHA256,
         Self::RSA_PSS_RSAE_SHA256,
@@ -167,10 +100,6 @@ impl TlsSignatures {
     ]);
 }
 
-/// A collection of supported TLS protocol versions.
-///
-/// This is a list of 16-bit protocol version identifiers that the client supports.
-/// The server will select one of these versions to use for the TLS connection.
 #[derive(Clone, Copy)]
 pub struct TlsVersions(pub &'static [u16]);
 
@@ -218,7 +147,7 @@ impl<'a> IntoIterator for &'a ExtensionOrder {
 
 impl ExtensionOrder {
     pub const CHROMIUM_131: Self = Self(&[
-        0xaaaa, // GREASE
+        0xaaaa,
         TlsExtensions::SNI,
         TlsExtensions::EMS,
         TlsExtensions::SESSION_TICKET,
@@ -237,7 +166,7 @@ impl ExtensionOrder {
     ]);
 
     pub const EDGE_130: Self = Self(&[
-        0x1a1a, // GREASE
+        0x1a1a,
         TlsExtensions::SNI,
         TlsExtensions::EMS,
         TlsExtensions::SESSION_TICKET,
@@ -254,6 +183,6 @@ impl ExtensionOrder {
         TlsExtensions::SCT,
         TlsExtensions::DELEGATED_CREDENTIAL,
         TlsExtensions::PADDING,
-        0x3a3a, // GREASE
+        0x3a3a,
     ]);
 }

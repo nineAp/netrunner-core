@@ -154,7 +154,7 @@ impl Engine {
     pub fn set_transparent_mode(&mut self) {
         self.interface.update_ip_addrs(|addrs| {
             addrs.clear();
-            //accept all internet
+
             addrs
                 .push(IpCidr::new(IpAddress::v4(10, 0, 0, 2), 24))
                 .unwrap();

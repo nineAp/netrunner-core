@@ -9,7 +9,7 @@ pub struct FakeIpStore {
     next_ip: u32,
 }
 
-const START_IP: u32 = 0x64400001; // 100.64.0.1 (IP for Service Networks/Shared Address Space)
+const START_IP: u32 = 0x64400001;
 
 impl FakeIpStore {
     pub fn new() -> Self {

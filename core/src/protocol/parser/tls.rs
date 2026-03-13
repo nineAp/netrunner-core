@@ -14,20 +14,14 @@ use crate::{
 };
 use bytes::{Buf, Bytes, BytesMut};
 
-// =================================================================
-// 1. RECORD LAYER
-// =================================================================
-
 impl Parser for TlsRecord {
     type Error = TlsError;
 
     fn can_parse(bytes: &BytesMut) -> bool {
-        // 1. Минимум 5 байт для заголовка
         if bytes.len() < 5 {
             return false;
         }
 
-        // 2. Проверяем ContentType
         let content_type = bytes[0];
         let is_valid_type = content_type == ContentType::Handshake as u8
             || content_type == ContentType::ApplicationData as u8
@@ -37,21 +31,14 @@ impl Parser for TlsRecord {
             return false;
         }
 
-        // 3. Извлекаем заявленную длину тела рекорда
         let record_len = u16::from_be_bytes([bytes[3], bytes[4]]) as usize;
 
-        // 4. Специфика TLS 1.3:
-        // Если это зашифрованные данные (0x17), они ДОЛЖНЫ содержать тег (16 байт)
-        // + как минимум 1 байт зашифрованного типа контента.
         if content_type == ContentType::ApplicationData as u8 {
             if record_len < 17 {
-                // Если длина < 17, это либо неполный пакет, либо ошибка протокола.
-                // Возвращаем false, чтобы подождать еще данных из сокета.
                 return false;
             }
         }
 
-        // 5. Ждем, пока в буфере будет заголовок + всё тело
         bytes.len() >= 5 + record_len
     }
 
@@ -60,7 +47,6 @@ impl Parser for TlsRecord {
             return Ok(None);
         }
 
-        // --- ТОЛЬКО ТЕПЕРЬ МЫ ИЗМЕНЯЕМ БУФЕР ---
         let raw_content_type = bytes.get_u8();
         let raw_version = bytes.get_u16();
         let record_len = bytes.get_u16() as usize;
@@ -71,16 +57,11 @@ impl Parser for TlsRecord {
         let version = ProtocolVersion::try_from(raw_version)
             .map_err(|e| TlsError::new(ErrorStage::Tls(e), ErrorAction::Drop, Bytes::new()))?;
 
-        // Забираем ровно столько, сколько указано в заголовке
         let payload = bytes.split_to(record_len).freeze();
 
         Ok(Some(TlsRecord::new(content_type, version, payload)))
     }
 }
-
-// =================================================================
-// 2. PAYLOAD TYPES
-// =================================================================
 
 impl Parser for ApplicationData {
     type Error = TlsError;
@@ -128,15 +109,11 @@ impl Parser for HelloHeader {
     }
 }
 
-// =================================================================
-// 3. HELLO MESSAGES
-// =================================================================
-
 impl Parser for ClientHello {
     type Error = TlsError;
 
     fn can_parse(bytes: &BytesMut) -> bool {
-        let mut offset = 34; // ProtocolVersion (2) + Random (32)
+        let mut offset = 34;
         if bytes.len() < offset + 1 {
             return false;
         }
@@ -165,8 +142,7 @@ impl Parser for ClientHello {
     }
 
     fn parse(bytes: &mut BytesMut) -> Result<Option<Self>, Self::Error> {
-        // --- ШАГ 1: Атомарная проверка всего пакета ---
-        let mut offset = 34; // Version + Random
+        let mut offset = 34;
         if bytes.len() < offset + 1 {
             return Ok(None);
         }
@@ -190,13 +166,10 @@ impl Parser for ClientHello {
             offset += 2 + ext_len;
         }
 
-        // Если нам не хватает данных для полного ClientHello, выходим, не трогая буфер
         if bytes.len() < offset {
             return Ok(None);
         }
 
-        // --- ШАГ 2: Безопасное чтение ---
-        // Изолируем ровно тот кусок, который проверили.
         let mut msg = bytes.split_to(offset);
 
         let version = ProtocolVersion::try_from(msg.get_u16())
@@ -216,7 +189,7 @@ impl Parser for ClientHello {
         }
 
         let cmp_len = msg.get_u8() as usize;
-        msg.advance(cmp_len); // пропускаем методы сжатия
+        msg.advance(cmp_len);
 
         let extensions = if msg.remaining() >= 2 {
             let ext_len = msg.get_u16() as usize;
@@ -239,7 +212,7 @@ impl Parser for ServerHello {
     type Error = TlsError;
 
     fn can_parse(bytes: &BytesMut) -> bool {
-        let mut offset = 34; // ProtocolVersion (2) + Random (32)
+        let mut offset = 34;
         if bytes.len() < offset + 1 {
             return false;
         }
@@ -247,7 +220,6 @@ impl Parser for ServerHello {
         let session_id_len = bytes[offset] as usize;
         offset += 1 + session_id_len;
 
-        // Cipher suite (2) + Compression (1)
         offset += 3;
 
         if bytes.len() >= offset + 2 {
@@ -259,15 +231,14 @@ impl Parser for ServerHello {
     }
 
     fn parse(bytes: &mut bytes::BytesMut) -> Result<Option<Self>, Self::Error> {
-        // --- ШАГ 1: Атомарная проверка всего пакета ---
-        let mut offset = 34; // Version + Random
+        let mut offset = 34;
         if bytes.len() < offset + 1 {
             return Ok(None);
         }
         let session_id_len = bytes[offset] as usize;
         offset += 1 + session_id_len;
 
-        offset += 3; // Cipher Suite (2) + Compression (1)
+        offset += 3;
 
         if bytes.len() >= offset + 2 {
             let ext_len = u16::from_be_bytes([bytes[offset], bytes[offset + 1]]) as usize;
@@ -278,7 +249,6 @@ impl Parser for ServerHello {
             return Ok(None);
         }
 
-        // --- ШАГ 2: Безопасное чтение ---
         let mut msg = bytes.split_to(offset);
 
         let version = ProtocolVersion::try_from(msg.get_u16())
@@ -291,7 +261,7 @@ impl Parser for ServerHello {
         let session_id = msg.split_to(sid_len).freeze();
 
         let cipher_suite = msg.get_u16();
-        msg.advance(1); // compression
+        msg.advance(1);
 
         let extensions = if msg.remaining() >= 2 {
             let ext_len = msg.get_u16() as usize;
@@ -310,10 +280,6 @@ impl Parser for ServerHello {
     }
 }
 
-// =================================================================
-// 4. EXTENSIONS
-// =================================================================
-
 impl Parser for ExtensionStack {
     type Error = TlsError;
 
@@ -330,7 +296,6 @@ impl Parser for ExtensionStack {
     }
 
     fn parse(bytes: &mut BytesMut) -> Result<Option<Self>, Self::Error> {
-        // Проверяем на целостность всех расширений
         let mut offset = 0;
         let data_len = bytes.len();
 
@@ -339,13 +304,10 @@ impl Parser for ExtensionStack {
             offset += 4 + elen;
         }
 
-        // Если offset > data_len, значит кусок данных расширения отсечен, ждем еще данных
         if offset > data_len {
             return Ok(None);
         }
 
-        // Если offset < data_len, есть лишние байты (Trailing garbage). Но так как мы
-        // обычно передаем сюда точный срез `extensions`, это может быть ошибкой формата.
         if offset != data_len {
             return Err(TlsError::new(
                 ErrorStage::Tls("Malformed extension stack: trailing data"),
@@ -354,7 +316,6 @@ impl Parser for ExtensionStack {
             ));
         }
 
-        // Теперь гарантированно безопасно парсить всё до конца
         let mut extensions = Vec::new();
         while bytes.remaining() >= 4 {
             let etype = bytes.get_u16();

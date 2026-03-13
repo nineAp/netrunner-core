@@ -38,11 +38,11 @@ pub async fn run_proxy_bridge<R, W>(
                     }
                 }
             }
-            // Читаем из туннеля (v_rx) -> шлем в сокет
+
             maybe_data = v_rx.recv() => {
                 match maybe_data {
                     Some(data) => {
-                        if data.is_empty() { break; } // EOF от другой стороны
+                        if data.is_empty() { break; }
                         if let Err(e) = writer.write_all(&data).await {
                             error!(stream_id, error = %e, "Socket write error");
                             break;
@@ -57,7 +57,6 @@ pub async fn run_proxy_bridge<R, W>(
         }
     }
 
-    // Финализация (общая для всех)
     let _ = muxer
         .to_network
         .send(MuxMessage {

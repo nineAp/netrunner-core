@@ -45,7 +45,6 @@ impl Session {
     }
 }
 
-// --- Фабрика (SessionManager) ---
 #[derive(uniffi::Object)]
 pub struct SessionManager;
 
@@ -70,18 +69,13 @@ impl SessionManager {
             } else {
                 info!("Creating TUN device manually");
                 Tun::create(|config| {
-                    config
-                        .tun_name("tun0")
-                        .address((10, 0, 0, 1))
-                        // ... настройки ...
-                        .up();
+                    config.tun_name("tun0").address((10, 0, 0, 1)).up();
                 })
                 .expect("Failed to init TUN")
             };
 
             setup_platform_routing(&tun_device, &remote_address);
 
-            // 2. Инициализация сети
             let config = Config::new(smoltcp::wire::HardwareAddress::Ip);
             let mut caps = DeviceCapabilities::default();
             caps.max_transmission_unit = 1500;
@@ -97,13 +91,13 @@ impl SessionManager {
 
             let proxy_ip = network.get_self_local_address();
             info!("Proxy self address: {:?}", proxy_ip);
-            // Запускаем сетевой поток
+
             let net_handle = tokio::spawn(async move {
                 network.run().await;
             });
 
             info!("Configuring Engine...");
-            // 3. Инициализация Engine
+
             let mut engine = Engine::new(config, caps, proxy_ip);
             engine.set_any_ip(true);
             engine.set_transparent_mode();
@@ -112,7 +106,6 @@ impl SessionManager {
 
             info!("Engine activated");
 
-            // 4. Главный цикл с поддержкой остановки
             tokio::select! {
                 res = engine.run(tun_device) => {
                     error!("Engine loop terminated unexpectedly: {:?}", res);

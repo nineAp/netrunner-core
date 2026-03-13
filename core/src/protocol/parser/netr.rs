@@ -50,13 +50,10 @@ impl Parser for Frame {
     type Error = String;
 
     fn can_parse(bytes: &BytesMut) -> bool {
-        // 1. Сначала проверяем, есть ли хотя бы заголовок
         if bytes.len() < FRAME_HEADER_SIZE as usize {
             return false;
         }
 
-        // 2. Извлекаем длины из заголовка (БЕЗ удаления байтов из буфера)
-        // По твоей структуре: Auth(16) + Stream(4) + Type(1) = 21 байт смещения
         let p_len = u16::from_be_bytes([bytes[21], bytes[22]]) as usize;
         let pad_len = u16::from_be_bytes([bytes[23], bytes[24]]) as usize;
 
@@ -68,7 +65,6 @@ impl Parser for Frame {
             bytes.len()
         );
 
-        // 3. Проверяем, есть ли в буфере весь фрейм целиком
         bytes.len() >= (FRAME_HEADER_SIZE as usize + p_len + pad_len)
     }
 
@@ -77,13 +73,11 @@ impl Parser for Frame {
             return Ok(None);
         }
 
-        // Извлекаем заголовок (теперь split_to удалит эти байты из начала bytes)
         let header = FrameHeader::parse(bytes)?.ok_or("Failed to parse header")?;
 
         let p_len = header.payload_len as usize;
         let pad_len = header.padding_len as usize;
 
-        // Теперь байты заголовка уже удалены, и в начале 'bytes' лежит Payload
         if bytes.len() < p_len + pad_len {
             return Err("Buffer corrupted: length mismatch after header parse".into());
         }

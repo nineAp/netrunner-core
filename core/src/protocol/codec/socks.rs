@@ -27,9 +27,7 @@ impl SocksRequest {
     where
         S: tokio::io::AsyncReadExt + tokio::io::AsyncWriteExt + Unpin,
     {
-        // 1. Handshake Phase
         loop {
-            // Используем трейт Parser
             if let Some(req) = Self::parse(buf)? {
                 if let SocksRequest::Handshake { .. } = req {
                     let mut reply = BytesMut::with_capacity(2);
@@ -44,11 +42,9 @@ impl SocksRequest {
             }
         }
 
-        // 2. Connect Request Phase
         loop {
             if let Some(req) = Self::parse(buf)? {
                 if let SocksRequest::Connect { command, target } = req {
-                    // Проверяем, что это именно CONNECT (0x01)
                     if command != 0x01 {
                         return Err(format!("Unsupported SOCKS command: 0x{:02X}", command));
                     }
@@ -68,14 +64,12 @@ impl SocksRequest {
     where
         S: tokio::io::AsyncReadExt + tokio::io::AsyncWriteExt + Unpin,
     {
-        // 1. Отправляем Greeting (SOCKS5, 1 метод: No Auth)
         let greeting = [SOCKS5_VERSION, 0x01, 0x00];
         stream
             .write_all(&greeting)
             .await
             .map_err(|e| e.to_string())?;
 
-        // 2. Читаем выбор метода (должно быть 0x05 0x00)
         let mut method_selection = [0u8; 2];
         stream
             .read_exact(&mut method_selection)
@@ -89,11 +83,10 @@ impl SocksRequest {
             ));
         }
 
-        // 3. Формируем CONNECT запрос
         let mut connect_req = BytesMut::with_capacity(32);
         connect_req.put_u8(SOCKS5_VERSION);
-        connect_req.put_u8(0x01); // CMD: Connect
-        connect_req.put_u8(0x00); // RSV
+        connect_req.put_u8(0x01);
+        connect_req.put_u8(0x00);
 
         match target_addr {
             TargetAddress::Ipv4(ip, port) => {
@@ -108,7 +101,7 @@ impl SocksRequest {
             }
             TargetAddress::Domain(host, port) => {
                 connect_req.put_u8(ATYP_DOMAIN);
-                // SOCKS5 для домена требует: [1 байт длина] + [строка]
+
                 let host_bytes = host.as_bytes();
                 connect_req.put_u8(host_bytes.len() as u8);
                 connect_req.put_slice(host_bytes);
@@ -121,8 +114,6 @@ impl SocksRequest {
             .await
             .map_err(|e| e.to_string())?;
 
-        // 4. Читаем ответ на Connect (REP)
-        // Нам нужно как минимум 4 байта, чтобы узнать статус (REPLY_SUCCESS)
         let mut reply_header = [0u8; 4];
         stream
             .read_exact(&mut reply_header)
@@ -136,8 +127,6 @@ impl SocksRequest {
             ));
         }
 
-        // Дочитываем оставшуюся часть адреса в ответе (BND.ADDR + BND.PORT),
-        // чтобы очистить поток перед передачей данных.
         let atyp = reply_header[3];
         let remain_len = match atyp {
             ATYP_IPV4 => IPV4_SIZE + PORT_SIZE,
@@ -174,9 +163,9 @@ pub enum SocksReply {
 
 #[derive(Debug, Clone)]
 pub enum TargetAddress {
-    Ipv4(std::net::Ipv4Addr, u16), // Теперь 2 поля
-    Domain(String, u16),           // Теперь 2 поля
-    Ipv6(std::net::Ipv6Addr, u16), // Теперь 2 поля
+    Ipv4(std::net::Ipv4Addr, u16),
+    Domain(String, u16),
+    Ipv6(std::net::Ipv6Addr, u16),
 }
 
 #[derive(Debug)]
@@ -199,7 +188,7 @@ impl SocksReply {
             } => {
                 buf.put_u8(SOCKS5_VERSION);
                 buf.put_u8(reply_code);
-                buf.put_u8(0x00); // Reserved
+                buf.put_u8(0x00);
                 buf.put_u8(atyp);
                 buf.put_slice(&addr);
                 buf.put_u16(port);
@@ -211,18 +200,15 @@ impl SocksReply {
 impl SocksTarget {
     pub fn to_string(&self) -> String {
         match &self.addr {
-            // Теперь в каждом варианте TargetAddress уже есть порт (port)
             TargetAddress::Ipv4(ip, port) => {
                 format!("{}:{}", ip, port)
             }
 
             TargetAddress::Ipv6(ip, port) => {
-                // IPv6 адреса принято заключать в квадратные скобки при наличии порта
                 format!("[{}]:{}", ip, port)
             }
 
             TargetAddress::Domain(domain, port) => {
-                // Вычищаем нулевые байты, если они случайно попали в строку
                 let clean_domain = domain.replace('\0', "");
                 format!("{}:{}", clean_domain, port)
             }

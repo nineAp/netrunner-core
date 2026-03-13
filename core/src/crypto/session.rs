@@ -70,9 +70,8 @@ impl SessionKeys {
         &mut self,
         salt: [u8; 32],
         extensions: &ExtensionStack,
-        is_server: bool, // true если мы Сервер (парсим ClientHello), false если Клиент
+        is_server: bool,
     ) -> Result<([u8; 32], [u8; 12], [u8; 32], [u8; 12]), String> {
-        // Сохраняем соль от удаленной стороны
         self.salt.set_remote_salt(salt);
 
         tracing::debug!(
@@ -88,8 +87,6 @@ impl SessionKeys {
             let mut key_bytes = [0u8; 32];
 
             if is_server {
-                // МЫ СЕРВЕР: Парсим ClientHello KeyShare (там список)
-                // Минимум: 2 (длина списка) + 2 (группа) + 2 (длина ключа) + 32 (ключ) = 38
                 if dh_data.len() < 38 {
                     return Err(format!(
                         "Client KeyShare too short: {} bytes",
@@ -98,7 +95,7 @@ impl SessionKeys {
                 }
 
                 let mut found = false;
-                // Ищем маркер x25519 (00 1d) и длину 32 (00 20)
+
                 for i in 2..=(dh_data.len() - 34) {
                     if dh_data[i..i + 4] == [0x00, 0x1d, 0x00, 0x20] {
                         key_bytes.copy_from_slice(&dh_data[i + 4..i + 36]);
@@ -111,15 +108,12 @@ impl SessionKeys {
                     return Err("Could not find x25519 key in ClientHello".into());
                 }
             } else {
-                // МЫ КЛИЕНТ: Парсим ServerHello KeyShare (там сразу группа и ключ)
-                // [Group:2] [KeyLen:2] [Key:32] = 36 байт
                 if dh_data.len() < 36 {
                     return Err("Server KeyShare too short".into());
                 }
                 key_bytes.copy_from_slice(&dh_data[4..36]);
             }
 
-            // Проверка на "кривой" ключ
             if key_bytes.iter().all(|&x| x == 0) {
                 return Err("Extracted remote public key is all ZEROS!".into());
             }
@@ -132,7 +126,6 @@ impl SessionKeys {
                 "Key exchange successful, deriving material..."
             );
 
-            // Вызываем генерацию, которая вернет (w_key, w_iv, r_key, r_iv)
             self.generate_keys(&public_key, is_server)
         } else {
             Err("No KeyShare extension found in handshake".into())
@@ -168,11 +161,10 @@ impl SessionKeys {
             "HKDF expansion complete"
         );
 
-        // Распределяем: (write_key, write_iv, read_key, read_iv)
         if is_server {
-            Ok((s_key, s_iv, c_key, c_iv)) // Сервер пишет своим, читает клиентским
+            Ok((s_key, s_iv, c_key, c_iv))
         } else {
-            Ok((c_key, c_iv, s_key, s_iv)) // Клиент пишет своим, читает серверным
+            Ok((c_key, c_iv, s_key, s_iv))
         }
     }
 
@@ -191,7 +183,6 @@ impl SessionKeys {
             .unwrap()
             .as_secs();
 
-        // Генерируем на основе текущей минуты
         Self::compute_tag(&self.auth_key, now / 60)
     }
 
@@ -203,11 +194,8 @@ impl SessionKeys {
 
         let current_step = now / 60;
 
-        // Вставляем цикл проверки расширенного окна [-2, +2]
-        // Это дает запас по времени в обе стороны
         for step in (current_step.saturating_sub(2))..=(current_step.saturating_add(2)) {
             if &Self::compute_tag(&self.auth_key, step) == received_tag {
-                // Если подошел не текущий, а другой шаг — логируем это для диагностики
                 if step != current_step {
                     tracing::debug!(expected = %current_step, matched = %step, "Auth tag valid with time offset");
                 }
@@ -215,7 +203,6 @@ impl SessionKeys {
             }
         }
 
-        // Если ни один не подошел — логируем для отладки
         tracing::warn!(
             current_step = %current_step,
             "AUTH MISMATCH: All tags rejected for current window"

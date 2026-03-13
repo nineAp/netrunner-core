@@ -17,12 +17,9 @@ impl NonceState {
         }
     }
 
-    // Возвращает nonce для текущего пакета и ПЕРЕХОДИТ к следующему
     pub fn next_nonce(&mut self) -> Nonce {
         let mut iv = self.base_iv;
-        // В TLS 1.3 используется Little Endian для счетчика при XOR
-        // Но если ты сам пишешь протокол, BE тоже пойдет.
-        // Главное — единообразие.
+
         let counter_bytes = self.counter.to_be_bytes();
 
         for i in 0..8 {
@@ -54,13 +51,7 @@ impl ChaChaCipher {
         }
     }
 
-    pub fn set_keys(
-        &mut self,
-        w_key: [u8; 32],
-        w_iv: [u8; 12], // Write (исходящие)
-        r_key: [u8; 32],
-        r_iv: [u8; 12], // Read (входящие)
-    ) {
+    pub fn set_keys(&mut self, w_key: [u8; 32], w_iv: [u8; 12], r_key: [u8; 32], r_iv: [u8; 12]) {
         self.encrypt_cipher = ChaCha20Poly1305::new(Key::from_slice(&w_key));
         self.decrypt_cipher = ChaCha20Poly1305::new(Key::from_slice(&r_key));
 
@@ -72,11 +63,10 @@ impl ChaChaCipher {
 }
 impl AeadPacker for ChaChaCipher {
     fn encrypt(&mut self, data: &mut BytesMut) -> Result<Bytes, chacha20poly1305::aead::Error> {
-        // Сначала получаем текущий counter для лога (до того, как next_nonce его инкрементирует)
         let current_counter = self.encrypt_state.counter;
         let nonce = self.encrypt_state.next_nonce();
         let data_len = data.len();
-        // maybe ad should be stream id
+
         match self.encrypt_cipher.encrypt_in_place(&nonce, &nonce, data) {
             Ok(_) => {
                 tracing::trace!(
@@ -104,7 +94,7 @@ impl AeadPacker for ChaChaCipher {
         let current_counter = self.decrypt_state.counter;
         let nonce = self.decrypt_state.next_nonce();
         let data_len = data.len();
-        // maybe ad should be stream id
+
         match self.decrypt_cipher.decrypt_in_place(&nonce, &nonce, data) {
             Ok(_) => {
                 tracing::trace!(

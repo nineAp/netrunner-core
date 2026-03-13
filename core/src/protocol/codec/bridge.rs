@@ -8,7 +8,6 @@ use crate::tlseng::types::{ContentType, HelloType};
 use crate::tlseng::ApplicationData;
 use bytes::{Bytes, BytesMut};
 
-// --- 1. Общий интерфейс перехвата ---
 pub trait TlsInterceptor {
     type Output;
 
@@ -23,7 +22,6 @@ pub trait TlsInterceptor {
     fn handle_record(record: TlsRecord) -> Result<Option<Self::Output>, TlsError>;
 }
 
-// --- 2. Обработка Handshake ---
 pub enum HandshakeMessage {
     Client {
         base: ClientHello,
@@ -106,7 +104,6 @@ impl TlsInterceptor for HandshakeMessage {
     }
 }
 
-// --- 3. Обработка Application Data ---
 impl TlsInterceptor for ApplicationData {
     type Output = ApplicationData;
 
@@ -125,12 +122,9 @@ impl TlsInterceptor for ApplicationData {
     }
 }
 
-// --- 4. Высокоуровневый Bridge API ---
 pub struct TlsBridge;
 
 impl TlsBridge {
-    // --- Распаковка (уже была) ---
-
     pub fn unpack_handshake(buffer: &mut BytesMut) -> Result<Option<HandshakeMessage>, TlsError> {
         HandshakeMessage::start_process(buffer)
     }
@@ -139,19 +133,15 @@ impl TlsBridge {
         ApplicationData::start_process(buffer)
     }
 
-    // --- Запаковка (новое) ---
-
-    /// Создает полный TLS Record с ClientHello внутри
     pub fn wrap_client_hello(
         profile: &BrowserProfile,
         host: &str,
         public_key: &[u8; 32],
         salt: [u8; 32],
     ) -> Bytes {
-        ClientHello::make_client_hello(profile, host, public_key, salt) // Передаем ключ дальше
+        ClientHello::make_client_hello(profile, host, public_key, salt)
     }
 
-    /// Создает полный TLS Record с ServerHello, базируясь на данных из HandshakeMessage::Client
     pub fn wrap_server_hello(
         client_msg: &HandshakeMessage,
         server_pub_key: &[u8],

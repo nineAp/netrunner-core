@@ -19,7 +19,7 @@ pub struct TunnelEngine {
     pub codec: Codec,
     pub read_buf: BytesMut,
     pub mux_rx: Receiver<MuxMessage>,
-    pub handler: Arc<StreamHandler>, // Добавь это вместо прямого вызова логики
+    pub handler: Arc<StreamHandler>,
 }
 
 impl TunnelEngine {
@@ -36,7 +36,7 @@ impl TunnelEngine {
                     res?
                 }
 
-                // НУЖНО ОТПРАВИТЬ В СЕТЬ (В сторону удаленного прокси)
+
                 Some(msg) = mux_rx.recv() => {
                     Self::handle_outbound( &mut outbound, &mut codec, msg).await?;
                 }
@@ -61,20 +61,17 @@ impl TunnelEngine {
 
         loop {
             match codec.inbound(read_buf) {
-                // 1. Успешно достали фрейм
                 Ok(Some(frame)) => {
                     handler.handle(frame).await;
                 }
-                // 2. Данных в буфере недостаточно (нужно подождать еще)
+
                 Ok(None) => break,
 
-                // 3. Ошибка кодека
                 Err(e) => {
-                    // Если кодек говорит "подожди", выходим из цикла парсинга
                     if e.action == ErrorAction::Wait {
                         break;
                     }
-                    // Иначе — это реальная проблема (кривой TLS и т.д.)
+
                     error!(error = ?e, "Codec inbound failed");
                     return Err(format!("Codec error: {:?}", e));
                 }
@@ -88,10 +85,8 @@ impl TunnelEngine {
         codec: &mut Codec,
         msg: MuxMessage,
     ) -> Result<(), String> {
-        // 1. Шифруем данные, используя только кодек
         match codec.encrypt_data(msg.stream_id, msg.frame_type, msg.data) {
             Ok(pkt) => {
-                // 2. Пишем в сокет, используя только outbound
                 outbound
                     .write_all(&pkt)
                     .await

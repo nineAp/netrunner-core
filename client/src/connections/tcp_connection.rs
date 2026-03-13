@@ -2,7 +2,7 @@ use netrunner_core::protocol::codec::socks::{SocksRequest, TargetAddress};
 use smoltcp::iface::SocketHandle;
 use smoltcp::socket::tcp;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream; // Твой код парсера
+use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, trace, warn};
@@ -44,10 +44,9 @@ impl TcpConnection {
                 Err(e) => {
                     debug!(%handle, error = %e, "Failed to connect to proxy");
                     return;
-                } // Тут можно добавить логирование
+                }
             };
 
-            // 2. SOCKS Handshake
             if let Err(e) = SocksRequest::perform_client_handshake(&mut stream, &target_addr).await
             {
                 debug!(%handle, error = %e, "SOCKS handshake failed");
@@ -58,10 +57,8 @@ impl TcpConnection {
 
             debug!(%handle, "SOCKS handshake successful, starting data bridge");
 
-            // 3. Копирование данных (Bridge)
             let (mut reader, mut writer) = stream.into_split();
 
-            // Читаем из канала -> Пишем в прокси
             let to_proxy = async {
                 while let Some(data) = rx_from_smol.recv().await {
                     if writer.write_all(&data).await.is_err() {
@@ -70,7 +67,6 @@ impl TcpConnection {
                 }
             };
 
-            // Читаем из прокси -> Пишем в канал для smoltcp
             let from_proxy = async {
                 let mut buf = [0u8; 65536];
                 loop {
@@ -94,7 +90,7 @@ impl TcpConnection {
 
         Self {
             handle,
-            state: ConnectionState::Active, // Сразу переходим в Active, т.к. задача пошла
+            state: ConnectionState::Active,
             tx: tx_to_proxy,
             rx: rx_from_proxy,
             pending_data: vec![],
@@ -105,7 +101,6 @@ impl TcpConnection {
 
     pub fn tick(&mut self, socket: &mut tcp::Socket) -> bool {
         let state = socket.state();
-        //trace!(handle=%self.handle, ?state, "Tick");
 
         match self.state {
             ConnectionState::Handshaking => {
@@ -114,23 +109,22 @@ impl TcpConnection {
                         Ok(_) => {
                             self.state = ConnectionState::Active;
                             self.handshake_rx = None;
-                            return true; // Успех
+                            return true;
                         }
-                        Err(oneshot::error::TryRecvError::Empty) => return true, // Ждем
+                        Err(oneshot::error::TryRecvError::Empty) => return true,
                         Err(oneshot::error::TryRecvError::Closed) => {
-                            self.state = ConnectionState::Closed; // ФЕЙЛ
-                            return false; // СКАЗАТЬ МЕНЕДЖЕРУ УДАЛИТЬ НАС
+                            self.state = ConnectionState::Closed;
+                            return false;
                         }
                     }
                 } else {
-                    return false; // Если rx пропал, но мы не Active — закрываем
+                    return false;
                 }
             }
 
             ConnectionState::Active => {
                 self.poll_and_process(socket);
 
-                // FIN от удалённой стороны
                 if state == tcp::State::CloseWait {
                     socket.close();
                     self.state = ConnectionState::Closed;
@@ -164,7 +158,6 @@ impl TcpConnection {
     }
 
     fn poll_and_process(&mut self, socket: &mut tcp::Socket) {
-        // 1. сначала читаем smoltcp
         if socket.can_recv() {
             let _ = socket.recv(|data| {
                 let len = data.len();
@@ -175,12 +168,11 @@ impl TcpConnection {
             });
         }
 
-        // 2. потом отправляем proxy → smoltcp
         if !self.pending_data.is_empty() {
             if self.pending_data.len() > MAX_PENDING {
                 warn!(%self.handle, "Buffer overflow! Aborting connection.");
-                socket.abort(); // Убиваем сокет
-                self.token.cancel(); // Говорим tokio-задаче умереть
+                socket.abort();
+                self.token.cancel();
                 return;
             }
 
@@ -188,7 +180,7 @@ impl TcpConnection {
                 Ok(n) => {
                     self.pending_data.drain(0..n);
                 }
-                Err(_) => {} // Оставляем в pending_data на следующий тик
+                Err(_) => {}
             }
         }
 

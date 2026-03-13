@@ -12,7 +12,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
 };
-use tracing::{error, info, instrument}; // Импортируем макросы
+use tracing::{error, info, instrument};
 
 pub struct Network {
     host: String,
@@ -36,7 +36,6 @@ impl Network {
         }
     }
 
-    // Добавляем инструмент, чтобы видеть параметры запуска сети в логах
     #[instrument(skip(self), fields(role = ?self.role, port = self.port))]
     pub async fn run(&self) {
         let addr = format!("{}:{}", self.host, self.port);
@@ -60,7 +59,6 @@ impl Network {
                     if let Ok((stream, client_addr)) = listener.accept().await {
                         let current_muxer = muxer.clone();
                         tokio::spawn(async move {
-                            // Здесь мы просто создаем Connection и сразу в SOCKS
                             let connection = Connection::new(stream, client_addr, false);
                             let _ = connection.handle_socks_client(current_muxer).await;
                         });
@@ -69,7 +67,6 @@ impl Network {
             }
 
             ConnectionRole::Server => {
-                // --- ЛОГИКА СЕРВЕРА ---
                 let listener = TcpListener::bind(&addr)
                     .await
                     .expect("Failed to bind Server port");
@@ -78,7 +75,6 @@ impl Network {
                 loop {
                     if let Ok((stream, client_addr)) = listener.accept().await {
                         tokio::spawn(async move {
-                            // Сервер использует handle_server_tunnel
                             let connection = Connection::new(stream, client_addr, true);
                             if let Err(e) = connection.handle_server_tunnel().await {
                                 error!(client = %client_addr, error = %e, "Tunnel error");
@@ -90,21 +86,16 @@ impl Network {
         }
     }
 
-    /// Вспомогательный метод для Клиента: создает TLS туннель и запускает TunnelEngine
     pub async fn initialize_client_tunnel(&self) -> Result<Muxer, String> {
         let server_addr = self.remote_proxy_addr.as_ref().ok_or("No proxy addr")?;
 
-        // Вместо создания Connection (который нужен для обработки клиентов),
-        // работаем напрямую с TcpStream для первичного TLS-хендшейка.
         let stream = TcpStream::connect(server_addr)
             .await
             .map_err(|e| e.to_string())?;
         let (mut inbound, mut outbound) = stream.into_split();
 
-        // Кодек создаем «с чистого листа»
         let mut codec = crate::protocol::codec::codec::Codec::new(false);
 
-        // --- TLS Handshake ---
         let ch = codec
             .make_client_handshake(&BrowserProfile::CHROME_131, "google.com")
             .map_err(|e| format!("{:?}", e))?;
@@ -112,9 +103,8 @@ impl Network {
 
         let mut sh_buf = BytesMut::with_capacity(2048);
         loop {
-            // Пытаемся обработать то, что уже есть в буфере
             match codec.process_handshake(&mut sh_buf) {
-                Ok(_) => break, // Готово!
+                Ok(_) => break,
                 Err(e) if e.action == ErrorAction::Wait => {
                     let n = inbound
                         .read_buf(&mut sh_buf)
@@ -128,7 +118,6 @@ impl Network {
             }
         }
 
-        // --- Запуск инфраструктуры ---
         let (mux_tx, mux_rx) = tokio::sync::mpsc::channel(BUF_SIZE);
         let muxer = Muxer::new(mux_tx, true);
 
@@ -141,7 +130,7 @@ impl Network {
             inbound,
             outbound,
             codec,
-            read_buf: sh_buf, // Передаем остатки данных из буфера хендшейка в движок!
+            read_buf: sh_buf,
             mux_rx,
             handler,
         };

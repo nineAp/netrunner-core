@@ -1,7 +1,6 @@
 use bytes::{BufMut, Bytes, BytesMut};
 use rand::RngExt;
 
-// Using your provided constants and types
 use crate::tlseng::{
     consts::{
         CERT_COMPRESSION_BROTLI, GREASE_IDENTIFIERS, OCSP_STATUS_TYPE, PSK_DHE_KE_MODE,
@@ -33,16 +32,6 @@ impl ExtensionStack {
 }
 
 impl Extension {
-    /// Creates a new Extension from the given parameters.
-    ///
-    /// # Arguments
-    ///
-    /// * `etype`: The type of extension (e.g., EXT_SUPPORTED_VERSIONS).
-    /// * `data`: The actual data being transported (e.g., a serialized list of supported versions).
-    ///
-    /// # Returns
-    ///
-    /// A new Extension structure with the given parameters.
     pub fn new(etype: u16, data: Bytes) -> Self {
         Self {
             etype,
@@ -50,16 +39,7 @@ impl Extension {
             data,
         }
     }
-    /// Packs an extension into a single byte array.
-    ///
-    /// # Arguments
-    ///
-    /// * `etype`: The type of extension (e.g., EXT_SUPPORTED_VERSIONS).
-    /// * `data`: The actual data being transported (e.g., a serialized list of supported versions).
-    ///
-    /// # Returns
-    ///
-    /// A single byte array containing the type and length of the extension, followed by the actual extension data.
+
     pub fn pack(etype: u16, data: &[u8]) -> Bytes {
         let mut ext = BytesMut::with_capacity(4 + data.len());
         ext.put_u16(etype);
@@ -139,9 +119,9 @@ impl ExtensionBuilder {
 
     pub fn key_share(&mut self, pub_key: &[u8]) {
         let mut data = BytesMut::with_capacity(38);
-        data.put_u16(34); // Total Key Share List Length
+        data.put_u16(34);
         data.put_u16(TlsGroups::X25519);
-        data.put_u16(32); // Public Key length
+        data.put_u16(32);
         data.put_slice(pub_key);
         self.add_extension(TlsExtensions::KEY_SHARE, &data);
     }
@@ -152,7 +132,7 @@ impl ExtensionBuilder {
             let p_bytes = proto.as_bytes();
             data.put_u8(p_bytes.len() as u8);
             data.put_slice(p_bytes);
-            data.put_u16(0); // Empty settings per-protocol
+            data.put_u16(0);
         }
         self.add_extension(TlsExtensions::ALPS, &data);
     }
@@ -189,15 +169,15 @@ impl ExtensionBuilder {
     pub fn status_request(&mut self) {
         let mut data = BytesMut::with_capacity(5);
         data.put_u8(OCSP_STATUS_TYPE);
-        data.put_u16(0); // responder_id_list
-        data.put_u16(0); // request_extensions
+        data.put_u16(0);
+        data.put_u16(0);
         self.add_extension(TlsExtensions::STATUS_REQUEST, &data);
     }
 
     pub fn ec_point_formats(&mut self) {
         let mut data = BytesMut::with_capacity(2);
         data.put_u8(1);
-        data.put_u8(0x00); // Uncompressed
+        data.put_u8(0x00);
         self.add_extension(TlsExtensions::EC_POINT_FORMATS, &data);
     }
 
@@ -263,7 +243,7 @@ impl ExtensionBuilder {
                         self.add_extension(TlsExtensions::PADDING, &[]);
                     }
                 }
-                // Обработка GREASE по маске
+
                 id if (id & 0x0f0f) == 0x0a0a => self.grease(),
                 _ => {}
             }

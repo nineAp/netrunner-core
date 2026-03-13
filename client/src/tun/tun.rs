@@ -32,8 +32,8 @@ impl Tun {
 
     pub fn from_android_fd(fd: i32) -> io::Result<Self> {
         let mut config = Configuration::default();
-        config.raw_fd(fd); // Передаем дескриптор, который нам дал Android VpnService
-        config.up(); // Убеждаемся, что он поднят
+        config.raw_fd(fd);
+        config.up();
 
         Self::new(&config)
     }
@@ -60,7 +60,6 @@ impl Tun {
             remote_address
         );
 
-        // 1. Находим текущий маршрут до прокси (до изменения default)
         let output = Command::new("ip")
             .args(&["route", "get", remote_address])
             .output()?;
@@ -72,7 +71,6 @@ impl Tun {
 
         info!("Обнаружен физический маршрут: dev={}, via={:?}", dev, via);
 
-        // 2. Добавляем статическое исключение для прокси
         info!("Добавляем статический маршрут для прокси...");
         let mut proxy_route = vec!["ip", "route", "add", remote_address, "dev", dev];
         if let Some(gw) = via {
@@ -83,13 +81,11 @@ impl Tun {
             warn!("Маршрут к прокси уже существует или возникла ошибка (это нормально).");
         }
 
-        // 3. Удаляем старый default, если он есть
         info!("Переключаем default маршрут на tun0...");
         let _ = Command::new("sudo")
             .args(&["ip", "route", "del", "default"])
             .status();
 
-        // 4. Устанавливаем tun0 как основной default
         let status = Command::new("sudo")
             .args(&[
                 "ip", "route", "add", "default", "via", "10.0.0.2", "dev", "tun0", "metric", "1",
@@ -101,7 +97,6 @@ impl Tun {
             error!("Не удалось установить tun0 как default!");
         }
 
-        // 5. Добавляем резервный маршрут через физический интерфейс
         if let Some(gw) = via {
             info!("Добавляем резервный маршрут через {} с метрикой 100", dev);
             let _ = Command::new("sudo")
@@ -116,11 +111,8 @@ impl Tun {
     }
     #[cfg(feature = "desktop")]
     pub fn setup_dns_redirection(&self) -> io::Result<()> {
-        // 1. Создаем временный файл resolv.conf
-        // Мы говорим системе: "Твой DNS-сервер теперь 10.0.0.1" (твой TUN-IP)
         let _ = std::fs::write("/tmp/resolv.conf.netrunner", "nameserver 10.0.0.2\n");
 
-        // 2. Применяем его (для Linux/systemd)
         let _ = std::process::Command::new("sudo")
             .args(&["cp", "/tmp/resolv.conf.netrunner", "/etc/resolv.conf"])
             .status();

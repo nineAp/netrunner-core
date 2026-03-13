@@ -1,4 +1,4 @@
-use crate::tun::tun::Tun; // Убедись, что путь к Tun верный
+use crate::tun::tun::Tun;
 use std::io;
 
 pub fn setup_platform_routing(tun_device: &Tun, remote_address: &str) -> io::Result<()> {
