@@ -8,13 +8,13 @@ SERVICE_NAME = netrunner-server
 
 debug-client:
 	@echo "--- Сборка клиента (Debug) ---"
-	cargo build --bin netrunner-client --features desktop
+	cargo build --bin netrunner-client --features linux
 	@echo "--- Запуск клиента через sudo ---"
 	sudo ./target/debug/netrunner-client
 
 debug-server:
 	@echo "--- Сборка сервера (Debug) ---"
-	cargo build --bin netrunner-server --features desktop
+	cargo build --bin netrunner-server
 	@echo "--- Запуск сервера локально ---"
 	sudo ./target/debug/netrunner-server --port=4443 --host=0.0.0.0
 

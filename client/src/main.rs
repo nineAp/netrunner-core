@@ -1,8 +1,9 @@
 use std::net::Ipv4Addr;
 
-use netrunner_client::{
-    platform::setup_platform_routing,
-    tun::{engine::Engine, tun::Tun},
+use netrunner_client::tun::{
+    engine::Engine,
+    routing::{reset_platform_routing, setup_platform_routing},
+    tun::Tun,
 };
 use netrunner_core::{
     logger_init,
@@ -17,7 +18,7 @@ async fn main() {
     info!("Initializing NetRunner Stack...");
     let tun_device = Tun::create(|config| {
         config
-            .tun_name("tun0")
+            .tun_name("netr0")
             .address((10, 0, 0, 1))
             .netmask((255, 255, 255, 0))
             .destination((10, 0, 0, 2))
@@ -25,7 +26,7 @@ async fn main() {
     })
     .expect("Failed to initialize TUN device");
     let remote_address: String = "62.60.244.156:443".into();
-    setup_platform_routing(&tun_device, &remote_address);
+    setup_platform_routing(&remote_address).expect("Failed to setup routing");
 
     info!("TUN interface is UP: 10.0.0.1/24");
 
@@ -58,5 +59,24 @@ async fn main() {
     info!("Stack IP initialized: 10.0.0.2");
 
     info!("Engine starting process loop...");
-    engine.run(tun_device).await;
+
+    // 3. Используем select для перехвата сигнала завершения
+    let ctrl_c = tokio::signal::ctrl_c();
+
+    tokio::select! {
+        res = engine.run(tun_device) => {
+            error!("Engine loop error: {:?}", res);
+        },
+        _ = ctrl_c => {
+            info!("Ctrl+C received, shutting down...");
+        }
+    }
+
+    // 4. ГАРАНТИРОВАННЫЙ СБРОС
+    info!("Restoring system routing...");
+    if let Err(e) = reset_platform_routing() {
+        error!("Failed to reset routing: {}", e);
+    } else {
+        info!("System routing restored successfully.");
+    }
 }
