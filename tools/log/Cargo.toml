@@ -1,0 +1,26 @@
+[package]
+name = "netrunner-logger"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib", "staticlib"]
+
+[dependencies]
+log = "0.4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+tracing-android = "0.2"
+
+[features]
+default = []
+desktop = ["linux", "windows"]
+mobile = ["android", "ios"]
+
+linux = []
+windows = []
+android = []
+ios = []

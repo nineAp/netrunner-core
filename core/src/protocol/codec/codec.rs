@@ -60,7 +60,7 @@ impl Codec {
             .session_keys
             .update_keys(client_msg.random(), client_msg.extensions(), true)
             .map_err(|e| {
-                tracing::error!(error = %e, "Server failed to update keys from ClientHello");
+                netrunner_logger::error!(error = %e, "Server failed to update keys from ClientHello");
                 TlsError::new(
                     ErrorStage::Handshake("Key Err"),
                     ErrorAction::Drop,
@@ -87,7 +87,7 @@ impl Codec {
             .session_keys
             .update_keys(mes.random(), mes.extensions(), false)
             .map_err(|e| {
-                tracing::error!(error = %e, "Client failed to update keys from ServerHello");
+                netrunner_logger::error!(error = %e, "Client failed to update keys from ServerHello");
                 TlsError::new(
                     ErrorStage::Handshake("Keys update error"),
                     ErrorAction::Drop,
@@ -116,7 +116,7 @@ impl Codec {
         let padding = Padding::generate_padding();
 
         let tag = self.session_keys.generate_auth_tag();
-        tracing::debug!(
+        netrunner_logger::debug!(
             step = %(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() / 60),
             auth_key_hash = %hex::encode(&self.session_keys.auth_key[..4]),
             generated_tag = %hex::encode(&tag[..4]),
@@ -139,7 +139,7 @@ impl Codec {
         let mut frame_bytes = frame.into_bytes(&tag);
 
         let encrypted_payload = self.crypto.encrypt(&mut frame_bytes).map_err(|e| {
-            tracing::error!("Encryption failed: {:?}", e);
+            netrunner_logger::error!("Encryption failed: {:?}", e);
             TlsError::new(
                 ErrorStage::Tls("Encryption failed"),
                 ErrorAction::Drop,
@@ -189,7 +189,7 @@ impl Codec {
             received_tag.copy_from_slice(&decrypted[..16]);
 
             if !self.session_keys.verify_auth_tag(&received_tag) {
-                tracing::error!(
+                netrunner_logger::error!(
                     expected_hash = %hex::encode(&self.session_keys.auth_key[..4]),
                     received = %hex::encode(&received_tag[..4]),
                     "AUTH MISMATCH: Potential replay or MITM attack. Dropping connection."

@@ -58,7 +58,7 @@ impl ChaChaCipher {
         self.encrypt_state = NonceState::new(w_iv);
         self.decrypt_state = NonceState::new(r_iv);
 
-        tracing::debug!("Cipher keys and IVs updated for both directions");
+        netrunner_logger::debug!("Cipher keys and IVs updated for both directions");
     }
 }
 impl AeadPacker for ChaChaCipher {
@@ -69,7 +69,7 @@ impl AeadPacker for ChaChaCipher {
 
         match self.encrypt_cipher.encrypt_in_place(&nonce, &nonce, data) {
             Ok(_) => {
-                tracing::trace!(
+                netrunner_logger::trace!(
                     counter = current_counter,
                     nonce = %hex::encode(nonce),
                     len = data_len,
@@ -78,7 +78,7 @@ impl AeadPacker for ChaChaCipher {
                 Ok(data.split().freeze())
             }
             Err(e) => {
-                tracing::error!(
+                netrunner_logger::error!(
                     counter = current_counter,
                     nonce = %hex::encode(nonce),
                     len = data_len,
@@ -97,7 +97,7 @@ impl AeadPacker for ChaChaCipher {
 
         match self.decrypt_cipher.decrypt_in_place(&nonce, &nonce, data) {
             Ok(_) => {
-                tracing::trace!(
+                netrunner_logger::trace!(
                     counter = current_counter,
                     nonce = %hex::encode(nonce),
                     len = data_len,
@@ -111,7 +111,7 @@ impl AeadPacker for ChaChaCipher {
                 } else {
                     hex::encode(data.as_ref())
                 };
-                tracing::error!(
+                netrunner_logger::error!(
                     counter = current_counter,
                     nonce = %hex::encode(nonce),
                     len = data_len,

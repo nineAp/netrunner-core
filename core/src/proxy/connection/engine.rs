@@ -1,15 +1,19 @@
 use std::sync::Arc;
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
+use netrunner_logger::{debug, error, info};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::tcp::{OwnedReadHalf, OwnedWriteHalf},
     sync::mpsc::Receiver,
 };
-use tracing::{debug, error};
+use tokio_util::sync::CancellationToken;
 
 use crate::{
-    protocol::{codec::codec::Codec, errors::ErrorAction},
+    protocol::{
+        codec::{codec::Codec, frame::FrameType},
+        errors::ErrorAction,
+    },
     proxy::connection::{handler::StreamHandler, muxer::MuxMessage},
 };
 
@@ -20,6 +24,7 @@ pub struct TunnelEngine {
     pub read_buf: BytesMut,
     pub mux_rx: Receiver<MuxMessage>,
     pub handler: Arc<StreamHandler>,
+    pub token: CancellationToken,
 }
 
 impl TunnelEngine {
@@ -30,18 +35,35 @@ impl TunnelEngine {
         let mut read_buf = self.read_buf;
         let mut mux_rx = self.mux_rx;
         let handler = self.handler;
+
+        let token = self.token;
+        let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(15));
         loop {
             tokio::select! {
+                _ = token.cancelled() => {
+                    info!("TunnelEngine: Shutdown signal received. Closing...");
+                    return Ok(());
+                }
+
                 res = Self::process_inbound(&mut inbound, &mut codec, &mut read_buf, &handler) => {
                     res?
                 }
 
+                _ = heartbeat.tick() => {
+                let msg = MuxMessage { stream_id: 0, frame_type: FrameType::Heartbeat, data: Bytes::new() };
+                Self::handle_outbound(&mut outbound, &mut codec, msg).await?;
+                }
 
-                Some(msg) = mux_rx.recv() => {
-                    Self::handle_outbound( &mut outbound, &mut codec, msg).await?;
+                msg_opt = mux_rx.recv() => {
+                    if let Some(msg) = msg_opt {
+                        Self::handle_outbound(&mut outbound, &mut codec, msg).await?;
+                    } else {
+                        break;
+                    }
                 }
             }
         }
+        Ok(())
     }
 
     async fn process_inbound(
@@ -56,6 +78,7 @@ impl TunnelEngine {
             .map_err(|e| e.to_string())?;
 
         if n == 0 && read_buf.is_empty() {
+            netrunner_logger::error!("Connection closed by peer (EOF detected)");
             return Err("EOF".into());
         }
 

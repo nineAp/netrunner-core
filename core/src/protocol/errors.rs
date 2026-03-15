@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use tracing::{error, trace, warn};
+use netrunner_logger::{error, trace, warn};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorAction {

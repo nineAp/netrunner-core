@@ -57,7 +57,7 @@ impl Parser for Frame {
         let p_len = u16::from_be_bytes([bytes[21], bytes[22]]) as usize;
         let pad_len = u16::from_be_bytes([bytes[23], bytes[24]]) as usize;
 
-        tracing::debug!(
+        netrunner_logger::debug!(
             "CAN_PARSE: p_len={}, pad_len={}, total_needed={}, have={}",
             p_len,
             pad_len,

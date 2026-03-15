@@ -14,7 +14,6 @@ use smoltcp::{
     time::Instant,
 };
 use tokio::sync::mpsc;
-use tracing::trace;
 
 pub struct VirtTunDevice {
     capabilities: DeviceCapabilities,

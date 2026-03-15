@@ -1,46 +1,35 @@
 uniffi::setup_scaffolding!();
 mod connections;
 pub mod tun;
-use std::sync::Mutex;
+use netrunner_logger::info;
 use std::sync::OnceLock;
 use tokio::runtime::Runtime;
-use tokio::sync::oneshot;
-use tracing::info;
-mod session;
+use tokio_util::sync::CancellationToken;
+
+use crate::tun::routing::reset_platform_routing;
+pub mod session;
 
 static RUNTIME: OnceLock<Runtime> = OnceLock::new();
 
-fn get_runtime() -> &'static Runtime {
-    RUNTIME.get_or_init(|| {
-        tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .expect("Failed to create tokio runtime")
-    })
-}
 #[derive(uniffi::Object)]
 pub struct Session {
-    pub(crate) shutdown_tx: Mutex<Option<oneshot::Sender<()>>>,
+    pub(crate) cancel_token: CancellationToken,
+    pub(crate) proxy_ip: String,
 }
 
 #[uniffi::export]
 impl Session {
     pub fn stop(&self) {
-        let mut guard = self.shutdown_tx.lock().unwrap();
-        if let Some(tx) = guard.take() {
-            let _ = tx.send(());
-        }
+        info!("Stopping session...");
+        self.cancel_token.cancel();
+        let _ = reset_platform_routing(Some(&self.proxy_ip));
     }
 }
 
 impl Drop for Session {
     fn drop(&mut self) {
-        info!("Session dropped, resetting platform routing...");
-        if let Ok(mut tx) = self.shutdown_tx.lock() {
-            if let Some(tx) = tx.take() {
-                let _ = tx.send(());
-            }
-        }
-        let _ = crate::tun::routing::reset_platform_routing();
+        info!("Session dropped, stopping all tasks...");
+        self.cancel_token.cancel();
+        let _ = reset_platform_routing(Some(&self.proxy_ip));
     }
 }

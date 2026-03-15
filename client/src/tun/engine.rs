@@ -16,7 +16,7 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::time::{Duration, sleep};
 use tun::{DeviceReader, DeviceWriter};
 
-use tracing::{debug, info, warn};
+use netrunner_logger::{debug, info, warn};
 
 use crate::tun::connection_manager::ConnectionManager;
 use crate::tun::device::{TokenBuffer, VirtTunDevice};

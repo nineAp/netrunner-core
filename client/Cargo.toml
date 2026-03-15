@@ -26,23 +26,18 @@ bytes = "1.5"
 log = "0.4"
 tun = { version = "0.8", features = ["async"] }
 lazy_static = "1.4.0"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 thiserror = "2.0"
 hickory-proto = "0.25.2"
 lru = "0.16.3"
 tokio-util = "0.7.18"
+shlex = "1.3"
 uniffi = { version = "0.31.0", features = ["tokio", ] }
+netrunner-logger = { path = "../tools/log" }
 
 [build-dependencies]
 uniffi = { version = "0.31.0", features = ["build"] }
 
 
-[features]
-desktop = []
-mobile = [] 
+[target.'cfg(target_os = "windows")'.dependencies]
+wintun = "0.5.1"
 
-linux = ["desktop"]
-windows = ["desktop"]
-android = ["mobile"]
-ios = ["mobile"]

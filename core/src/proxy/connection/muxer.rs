@@ -1,11 +1,11 @@
 use crate::protocol::codec::frame::FrameType;
 use bytes::Bytes;
+use netrunner_logger::{debug, error};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::RwLock;
-use tracing::{debug, error};
 
 pub struct IdGenerator {
     counter: AtomicU32,
@@ -53,7 +53,7 @@ impl Muxer {
     pub async fn register_stream(&self, stream_id: u32, tx: Sender<Bytes>) {
         let mut lock = self.streams.write().await;
         lock.insert(stream_id, tx);
-        tracing::debug!(
+        netrunner_logger::debug!(
             stream_id,
             total_active = lock.len(),
             "MUXER: [REGISTER] Stream added"
@@ -89,9 +89,9 @@ impl Muxer {
 
         if let Some(tx) = tx {
             if data.is_empty() {
-                tracing::debug!(stream_id, "MUXER: [EOF] Forwarding EOF to local handler");
+                netrunner_logger::debug!(stream_id, "MUXER: [EOF] Forwarding EOF to local handler");
             } else {
-                tracing::trace!(
+                netrunner_logger::trace!(
                     stream_id,
                     len = data.len(),
                     "MUXER: [DISPATCH] Sending data"
@@ -99,14 +99,14 @@ impl Muxer {
             }
 
             if let Err(_e) = tx.send(data).await {
-                tracing::debug!(
+                netrunner_logger::debug!(
                     stream_id,
                     "MUXER: [WARN] Local channel closed, dropping packet"
                 );
                 self.remove_stream(stream_id).await;
             }
         } else {
-            tracing::trace!(
+            netrunner_logger::trace!(
                 stream_id,
                 "MUXER: [IGNORE] Packet for already closed stream"
             );

@@ -1,27 +1,33 @@
-#[cfg(feature = "desktop")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 pub mod desktop;
 
-#[cfg(feature = "mobile")]
+#[cfg(any(target_os = "android", target_os = "ios"))]
 pub mod mobile;
 
 use crate::{
-    Session, get_runtime,
+    RUNTIME, Session,
     tun::{
         engine::Engine,
         routing::{reset_platform_routing, setup_platform_routing},
         tun::Tun,
     },
 };
-use netrunner_core::{
-    logger_init,
-    proxy::{connection::connection::ConnectionRole, network::Network},
-};
+use netrunner_core::proxy::{connection::connection::ConnectionRole, network::Network};
+use netrunner_logger::{error, info};
 use smoltcp::{iface::Config, phy::DeviceCapabilities};
 use std::net::Ipv4Addr;
-use std::sync::{Arc, Mutex};
-use tokio::signal;
-use tokio::sync::oneshot;
-use tracing::{error, info};
+use std::sync::Arc;
+use tokio::{runtime::Runtime, signal};
+use tokio_util::sync::CancellationToken;
+
+fn get_runtime() -> &'static Runtime {
+    RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("Failed to create tokio runtime")
+    })
+}
 
 #[derive(uniffi::Object)]
 pub struct SessionManager;
@@ -30,7 +36,7 @@ pub struct SessionManager;
 impl SessionManager {
     #[uniffi::constructor]
     pub fn new() -> Self {
-        logger_init();
+        netrunner_logger::Logger::init();
         info!("SessionManager initialized");
         Self
     }
@@ -42,34 +48,47 @@ impl SessionManager {
         remote_address: String,
         tun_fd: Option<i32>,
     ) -> Arc<Session> {
-        let (tx, rx) = oneshot::channel();
         let runtime = get_runtime();
-
+        let cancel_token = CancellationToken::new();
+        let sesison_token = cancel_token.clone();
+        let net_token = cancel_token.clone();
         let shutdown_signal = signal::ctrl_c();
+
+        let addr: std::net::SocketAddr = remote_address.parse().expect("Invalid address format");
+        let remote_proxy_ip = addr.ip().to_string();
+        let proxy_ip_for_thread = remote_proxy_ip.clone();
 
         runtime.spawn(async move {
             info!("Starting VPN session thread...");
 
             let tun_device = {
-                #[cfg(feature = "mobile")]
+                #[cfg(any(target_os = "android", target_os = "ios"))]
                 {
                     Tun::from_fd(tun_fd.expect("TUN FD required on mobile"))
                         .expect("Failed to init TUN from FD")
                 }
-                #[cfg(feature = "desktop")]
+                #[cfg(target_os = "linux")]
                 {
                     Tun::create(|config| {
                         config
                             .tun_name("netr0")
                             .address((10, 0, 0, 1))
                             .netmask((255, 255, 255, 0))
+                            .mtu(1200)
                             .up();
+                    })
+                    .expect("Failed to init TUN")
+                }
+                #[cfg(target_os = "windows")]
+                {
+                    Tun::create(|config| {
+                        config.tun_name("netr0");
                     })
                     .expect("Failed to init TUN")
                 }
             };
 
-            setup_platform_routing(&remote_address).expect("Failed to setup routing");
+            setup_platform_routing(&remote_address);
 
             let config = Config::new(smoltcp::wire::HardwareAddress::Ip);
             let mut caps = DeviceCapabilities::default();
@@ -84,8 +103,8 @@ impl SessionManager {
             );
             let proxy_ip = network.get_self_local_address();
 
-            let net_handle = tokio::spawn(async move {
-                network.run().await;
+            tokio::spawn(async move {
+                network.run(net_token).await;
             });
 
             let mut engine = Engine::new(config, caps, proxy_ip);
@@ -96,21 +115,20 @@ impl SessionManager {
 
             tokio::select! {
                 res = engine.run(tun_device) => error!("Engine loop error: {:?}", res),
-                _ = rx => {
+                _ = cancel_token.cancelled() => {
                     info!("Shutdown signal received");
-                    let _ = reset_platform_routing(); // Очистка при сигнале
+
+                    let _ = reset_platform_routing(Some(&proxy_ip_for_thread));
                 },
                 _ = shutdown_signal => {
-                    info!("Ctrl+C detected, shutting down gracefully...");
-                    info!("Restoring routing...");
-                    let _ = reset_platform_routing();
-                    net_handle.abort();
+                    cancel_token.cancel();
                 }
             }
         });
 
         Arc::new(Session {
-            shutdown_tx: Mutex::new(Some(tx)),
+            cancel_token: sesison_token,
+            proxy_ip: remote_proxy_ip,
         })
     }
 }

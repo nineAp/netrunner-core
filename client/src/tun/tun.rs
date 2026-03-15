@@ -1,5 +1,5 @@
+use netrunner_logger::{error, info, warn};
 use std::io;
-use tracing::{error, info, warn};
 use tun::{AsyncDevice, Configuration, DeviceReader, DeviceWriter, create_as_async};
 
 pub struct Tun {
@@ -21,7 +21,6 @@ impl Tun {
         }
     }
 
-    #[cfg(feature = "desktop")]
     pub fn create<F>(f: F) -> io::Result<Self>
     where
         F: FnOnce(&mut Configuration),
@@ -31,7 +30,6 @@ impl Tun {
         Self::new(&config)
     }
 
-    #[cfg(feature = "mobile")]
     pub fn from_fd(fd: i32) -> io::Result<Self> {
         let mut config = Configuration::default();
         config.raw_fd(fd);

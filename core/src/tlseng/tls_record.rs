@@ -35,7 +35,7 @@ impl TlsRecord {
     }
 
     pub fn build_application_data(payload: Bytes) -> Bytes {
-        tracing::trace!(payload_len = payload.len(), "Building TlsRecord from Bytes");
+        netrunner_logger::trace!(payload_len = payload.len(), "Building TlsRecord from Bytes");
 
         let record = Self::new(
             ContentType::ApplicationData,

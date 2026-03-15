@@ -1,9 +1,7 @@
-use netrunner_core::{
-    logger_init,
-    proxy::{connection::connection::ConnectionRole, network::Network},
-};
-
 use clap::Parser;
+use netrunner_core::proxy::{connection::connection::ConnectionRole, network::Network};
+use netrunner_logger::Logger;
+use tokio_util::sync::CancellationToken;
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Netrunner Proxy Server")]
 struct Args {
@@ -15,13 +13,13 @@ struct Args {
 }
 
 fn main() {
-    logger_init();
+    Logger::init();
     let args = Args::parse();
     let net = Network::new(args.host, args.port, ConnectionRole::Server, None);
 
     let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
 
     rt.block_on(async {
-        net.run().await;
+        net.run(CancellationToken::new()).await;
     });
 }

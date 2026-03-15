@@ -1,160 +1,169 @@
-use crate::tun::tun::Tun;
+use netrunner_logger::{error, info, warn};
 use std::io;
-use tracing::{error, info, warn};
-
-#[cfg(any(feature = "linux", feature = "windows"))]
 use std::process::Command;
+
+fn run_cmd_ext(full_cmd: &str, ignore_errors: bool) -> io::Result<()> {
+    let parts = shlex::split(full_cmd)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid syntax"))?;
+
+    if parts.is_empty() {
+        return Ok(());
+    }
+
+    let status = Command::new(&parts[0]).args(&parts[1..]).status()?;
+
+    if !status.success() && !ignore_errors {
+        let err = format!("Command failed: {} with status {}", full_cmd, status);
+        error!("{}", err);
+        return Err(io::Error::new(io::ErrorKind::Other, err));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn get_active_interface_index() -> Option<u32> {
+    // Получаем список интерфейсов через netsh
+    let output = Command::new("netsh")
+        .args(["interface", "ipv4", "show", "interfaces"])
+        .output()
+        .ok()?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    for line in stdout.lines() {
+        if line.contains("Connected") && !line.contains("netr0") {
+            if let Some(idx_str) = line.split_whitespace().next() {
+                if let Ok(idx) = idx_str.parse::<u32>() {
+                    return Some(idx);
+                }
+            }
+        }
+    }
+    None
+}
 
 pub fn setup_platform_routing(remote_address: &str) -> io::Result<()> {
     let proxy_ip = remote_address.split(':').next().unwrap_or(remote_address);
 
-    #[cfg(feature = "linux")]
+    #[cfg(target_os = "linux")]
     {
-        // 1. Бэкап и получение текущего маршрута по умолчанию
-        let _ = Command::new("sudo")
-            .args(&["cp", "/etc/resolv.conf", "/etc/resolv.conf.bak"])
-            .status();
+        // 1. Предварительная настройка ядра (rp_filter и пересылка)
+        let _ = run_cmd_ext("sysctl -w net.ipv4.conf.all.rp_filter=0", true);
+        let _ = run_cmd_ext("sysctl -w net.ipv4.conf.netr0.rp_filter=0", true);
+        let _ = run_cmd_ext("sysctl -w net.ipv4.ip_forward=1", true);
 
-        let output = Command::new("ip")
-            .args(&["route", "show", "default"])
-            .output()?;
-        let default_route = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        // 3. Маршрутизация (игнорируем ошибки, если правила уже есть)
+        let _ = run_cmd_ext("ip rule add fwmark 0x1 table 100", true);
+        let _ = run_cmd_ext("ip route add default dev netr0 table 100", true);
 
-        if default_route.is_empty() {
-            error!("Default route не найден!");
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "No default route found",
-            ));
-        }
-        std::fs::write("/tmp/netrunner_default_route", &default_route)?;
+        // 4. NFTables
+        let _ = run_cmd_ext("nft delete table ip netrunner", true);
+        run_cmd_ext("nft add table ip netrunner", false)?;
+        run_cmd_ext(
+            "nft add chain ip netrunner output { type route hook output priority 0; }",
+            false,
+        )?;
 
-        // 2. Парсинг параметров из маршрута по умолчанию
-        let parts: Vec<&str> = default_route.split_whitespace().collect();
-        let dev = parts
-            .iter()
-            .position(|&x| x == "dev")
-            .and_then(|i| parts.get(i + 1))
-            .copied()
-            .unwrap_or("eth0");
-        let via = parts
-            .iter()
-            .position(|&x| x == "via")
-            .and_then(|i| parts.get(i + 1))
-            .copied();
-
-        // 3. Добавляем маршрут до прокси-сервера
-        let mut proxy_route = vec!["ip", "route", "add", proxy_ip, "dev", dev];
-        if let Some(gw) = via {
-            proxy_route.extend_from_slice(&["via", gw]);
-        }
-        let _ = Command::new("sudo").args(proxy_route).status();
-
-        // 4. Заменяем default маршрут на наш TUN
-        let _ = Command::new("sudo")
-            .args(&["ip", "route", "del", "default"])
-            .status();
-        let status = Command::new("sudo")
-            .args(&[
-                "ip", "route", "add", "default", "via", "10.0.0.2", "dev", "netr0", "metric", "1",
-            ])
-            .status()?;
-
-        if status.success() {
-            info!("Linux TUN default set.");
-        }
+        let mark_rule = format!(
+            "nft add rule ip netrunner output ip daddr != {} oifname != \"netr0\" mark set 0x1",
+            proxy_ip
+        );
+        run_cmd_ext(&mark_rule, false)?;
 
         // 5. DNS
-        std::fs::write("/tmp/resolv.conf.netrunner", "nameserver 10.0.0.2\n")?;
-        Command::new("sudo")
-            .args(&["cp", "/tmp/resolv.conf.netrunner", "/etc/resolv.conf"])
-            .status()?;
-    }
+        let _ = Command::new("resolvectl")
+            .args(["dns", "netr0", "10.0.0.2"])
+            .status();
+        let _ = Command::new("resolvectl")
+            .args(["domain", "netr0", "~."])
+            .status();
 
-    #[cfg(feature = "windows")]
+        info!("Linux network auto-configured: RPF=0, MTU=1280, Rules active.");
+    }
+    #[cfg(target_os = "windows")]
     {
-        // Логика Windows
-        Command::new("route")
-            .args(&[
-                "add",
-                proxy_ip,
-                "mask",
-                "255.255.255.255",
-                "0.0.0.0",
-                "metric",
-                "1",
-            ])
-            .status()?;
-        Command::new("netsh")
-            .args(&[
-                "interface",
-                "ipv4",
-                "set",
-                "address",
-                "name=netr0",
-                "static",
-                "10.0.0.1",
-                "255.255.255.0",
-                "10.0.0.2",
-            ])
-            .status()?;
+        use std::{process::Command, thread, time::Duration};
 
-        // DNS
-        Command::new("netsh")
-            .args(&[
-                "interface",
-                "ipv4",
-                "set",
-                "dnsservers",
-                "name=netr0",
-                "static",
-                "10.0.0.2",
-                "primary",
-            ])
-            .status()?;
+        // 1. Инициализация Wintun
+        let wintun = unsafe { wintun::load_from_path("wintun.dll") }.map_err(|e| {
+            io::Error::new(io::ErrorKind::Other, format!("Wintun load error: {}", e))
+        })?;
+
+        let adapter = match wintun::Adapter::open(&wintun, "netr0") {
+            Ok(a) => a,
+            Err(_) => {
+                wintun::Adapter::create(&wintun, "netr0", "Wintun Tunnel", None).map_err(|e| {
+                    io::Error::new(io::ErrorKind::Other, format!("Wintun create error: {}", e))
+                })?
+            }
+        };
+
+        // 2. Получаем индекс активного интерфейса для маршрутизации прокси
+        let if_idx = get_active_interface_index().unwrap_or(1);
+        info!(
+            "Wintun adapter active. Routing proxy traffic via interface index: {}",
+            if_idx
+        );
+
+        // 3. Добавляем маршрут к IP прокси через ИНДЕКС (самый надежный способ)
+        let route_cmd = format!(
+            "netsh interface ipv4 add route {}/32 interface={} metric=1",
+            proxy_ip, if_idx
+        );
+        // Игнорируем ошибку, если маршрут уже существует
+        let _ = run_cmd_ext(&route_cmd, true);
+
+        // 4. Настраиваем адрес (БЕЗ шлюза 10.0.0.2, чтобы не перехватить весь трафик)
+        let addr_cmd =
+            "netsh interface ipv4 set address name=\"netr0\" static 10.0.0.1 255.255.255.0";
+
+        // 5. Задаем DNS и применяем настройки
+        let dns_cmd = "netsh interface ipv4 set dnsservers name=\"netr0\" static 10.0.0.2 primary validate=no";
+
+        let mut attempt = 0;
+        while attempt < 5 {
+            if run_cmd_ext(addr_cmd, false).is_ok() {
+                let _ = run_cmd_ext(dns_cmd, false);
+                break;
+            }
+            attempt += 1;
+            thread::sleep(Duration::from_millis(1000));
+        }
     }
 
-    #[cfg(feature = "mobile")]
+    #[cfg(any(target_os = "android", target_os = "ios"))]
     {
         eprintln!("Android/Mobile routing on native side");
     }
-
     Ok(())
 }
 
-pub fn reset_platform_routing() -> io::Result<()> {
-    #[cfg(feature = "linux")]
+pub fn reset_platform_routing(proxy_ip: Option<&str>) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
     {
-        // 1. Возвращаем дефолтный маршрут из файла
-        if let Ok(saved_route) = std::fs::read_to_string("/tmp/netrunner_default_route") {
-            let _ = Command::new("sudo")
-                .args(&["ip", "route", "del", "default"])
-                .status();
-            let args: Vec<&str> = saved_route.split_whitespace().collect();
-            let _ = Command::new("sudo")
-                .args(&["ip", "route", "add"])
-                .args(args)
-                .status();
+        let _ = run_cmd_ext("ip rule del fwmark 0x1 table 100", true);
+        let _ = run_cmd_ext("ip route flush table 100", true);
+        let _ = run_cmd_ext("nft delete table ip netrunner", true);
+        info!("Linux routing reset.");
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(ip) = proxy_ip {
+            // Удаляем только маршрут к конкретному IP прокси-сервера.
+            // Это гораздо безопаснее, чем удалять маршрут по умолчанию (0.0.0.0).
+            let cmd = format!("route delete {}", ip);
+            let _ = run_cmd_ext(&cmd, true);
+            let _ = run_cmd_ext("netsh interface delete interface name=\"netr0\"", true);
+            info!("Windows routing for proxy {} removed.", ip);
+        } else {
+            error!("Cannot reset Windows routing: proxy_ip is missing.");
         }
-
-        // 2. Удаляем наш специфичный маршрут к прокси
-        // (Опционально, если он был добавлен)
-
-        // 3. Восстанавливаем DNS (если есть бэкап)
-        let _ = Command::new("sudo")
-            .args(&["cp", "/etc/resolv.conf.bak", "/etc/resolv.conf"])
-            .status();
-
-        info!("Linux routing restored.");
     }
 
-    #[cfg(feature = "windows")]
+    #[cfg(any(target_os = "android", target_os = "ios"))]
     {
-        // В Windows можно просто удалить маршрут и интерфейс
-        let _ = Command::new("route").args(&["delete", "0.0.0.0"]).status();
-        // При переподключении сети (или ipconfig /renew) Windows сам подтянет настройки
-        info!("Windows routing reset requested.");
+        eprintln!("Android/Mobile routing on native side");
     }
-
     Ok(())
 }

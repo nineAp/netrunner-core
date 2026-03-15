@@ -1,5 +1,5 @@
 use bytes::{Bytes, BytesMut};
-use tracing::{debug, error, info};
+use netrunner_logger::{debug, error, info};
 
 use crate::{
     protocol::codec::{

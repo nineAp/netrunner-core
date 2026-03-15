@@ -1,4 +1,5 @@
 use netrunner_core::protocol::codec::socks::TargetAddress;
+use netrunner_logger::{debug, info, warn};
 use smoltcp::{
     iface::{SocketHandle, SocketSet},
     socket::{AnySocket, icmp, tcp, udp},
@@ -8,7 +9,6 @@ use std::{
     collections::HashMap,
     time::{Duration, Instant as StdInstant},
 };
-use tracing::{debug, info, warn};
 
 use crate::{
     connections::{

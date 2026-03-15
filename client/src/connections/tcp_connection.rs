@@ -5,7 +5,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, trace, warn};
 
 pub enum ConnectionState {
     Established,
@@ -38,24 +37,24 @@ impl TcpConnection {
         tokio::spawn(async move {
             let mut stream = match TcpStream::connect(&proxy_addr).await {
                 Ok(s) => {
-                    debug!(%handle, "Connected to proxy successfully");
+                    netrunner_logger::debug!(%handle, "Connected to proxy successfully");
                     s
                 }
                 Err(e) => {
-                    debug!(%handle, error = %e, "Failed to connect to proxy");
+                    netrunner_logger::debug!(%handle, error = %e, "Failed to connect to proxy");
                     return;
                 }
             };
 
             if let Err(e) = SocksRequest::perform_client_handshake(&mut stream, &target_addr).await
             {
-                debug!(%handle, error = %e, "SOCKS handshake failed");
+                netrunner_logger::debug!(%handle, error = %e, "SOCKS handshake failed");
                 return;
             }
 
             let _ = handshake_tx.send(());
 
-            debug!(%handle, "SOCKS handshake successful, starting data bridge");
+            netrunner_logger::debug!(%handle, "SOCKS handshake successful, starting data bridge");
 
             let (mut reader, mut writer) = stream.into_split();
 
@@ -84,7 +83,7 @@ impl TcpConnection {
             tokio::select! {
                 _ = to_proxy => {}
                 _ = from_proxy => {}
-                _ = task_token.cancelled() => { debug!(%handle, "Task cancelled by Manager"); }
+                _ = task_token.cancelled() => { netrunner_logger::debug!(%handle, "Task cancelled by Manager"); }
             }
         });
 
@@ -170,7 +169,7 @@ impl TcpConnection {
 
         if !self.pending_data.is_empty() {
             if self.pending_data.len() > MAX_PENDING {
-                warn!(%self.handle, "Buffer overflow! Aborting connection.");
+                netrunner_logger::warn!(%self.handle, "Buffer overflow! Aborting connection.");
                 socket.abort();
                 self.token.cancel();
                 return;

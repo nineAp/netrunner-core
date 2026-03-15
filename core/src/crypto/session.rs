@@ -74,7 +74,7 @@ impl SessionKeys {
     ) -> Result<([u8; 32], [u8; 12], [u8; 32], [u8; 12]), String> {
         self.salt.set_remote_salt(salt);
 
-        tracing::debug!(
+        netrunner_logger::debug!(
             remote_salt = %hex::encode(&salt[..8]),
             local_salt = %hex::encode(&self.salt.get_local()[..8]),
             total_salt = %hex::encode(&self.salt.get_total()[28..36]),
@@ -120,7 +120,7 @@ impl SessionKeys {
 
             let public_key = PublicKey::from(key_bytes);
 
-            tracing::debug!(
+            netrunner_logger::debug!(
                 remote_pub = %hex::encode(&key_bytes[..4]),
                 role = if is_server { "Server" } else { "Client" },
                 "Key exchange successful, deriving material..."
@@ -141,7 +141,7 @@ impl SessionKeys {
             .get_shared(public_key)
             .ok_or_else(|| "No shared secret".to_string())?;
 
-        tracing::debug!(
+        netrunner_logger::debug!(
             shared_prefix = %hex::encode(&shared_key[..8]),
             "DH Shared secret derived"
         );
@@ -155,7 +155,7 @@ impl SessionKeys {
 
         let auth_secret = HKDF::expand_key::<32>(&hkdf, b"auth_key").map_err(|e| e.to_string())?;
         self.auth_key = auth_secret;
-        tracing::info!(
+        netrunner_logger::info!(
             client_key_short = %hex::encode(&c_key[..4]),
             server_key_short = %hex::encode(&s_key[..4]),
             "HKDF expansion complete"
@@ -197,13 +197,13 @@ impl SessionKeys {
         for step in (current_step.saturating_sub(2))..=(current_step.saturating_add(2)) {
             if &Self::compute_tag(&self.auth_key, step) == received_tag {
                 if step != current_step {
-                    tracing::debug!(expected = %current_step, matched = %step, "Auth tag valid with time offset");
+                    netrunner_logger::debug!(expected = %current_step, matched = %step, "Auth tag valid with time offset");
                 }
                 return true;
             }
         }
 
-        tracing::warn!(
+        netrunner_logger::warn!(
             current_step = %current_step,
             "AUTH MISMATCH: All tags rejected for current window"
         );

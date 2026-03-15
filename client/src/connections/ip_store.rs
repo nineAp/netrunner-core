@@ -1,7 +1,7 @@
 use lru::LruCache;
+use netrunner_logger::{debug, info};
 use std::net::Ipv4Addr;
 use std::num::NonZeroUsize;
-use tracing::{debug, info};
 
 pub struct FakeIpStore {
     cache: LruCache<String, Ipv4Addr>,

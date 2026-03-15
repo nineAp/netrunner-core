@@ -1,4 +1,4 @@
-use crate::session::{Session, SessionManager};
+use super::{Session, SessionManager};
 use std::sync::Arc;
 use uniffi;
 

@@ -62,7 +62,7 @@ impl ClientHello {
         let ext_len = self.extensions.len();
         let total_handshake_len = (buf.len() - length_pos - 3) as u32;
 
-        tracing::debug!(
+        netrunner_logger::debug!(
             handshake_type = "ClientHello",
             body_len = total_handshake_len,
             extensions_len = ext_len,
@@ -193,7 +193,7 @@ impl ServerHello {
         let total_handshake_len = (buf.len() - length_pos - 3) as u32;
         let ext_len = self.extensions.len();
 
-        tracing::debug!(
+        netrunner_logger::debug!(
             handshake_type = "ServerHello",
             body_len = total_handshake_len,
             extensions_len = ext_len,

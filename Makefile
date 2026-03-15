@@ -8,8 +8,10 @@ SERVICE_NAME = netrunner-server
 
 debug-client:
 	@echo "--- Сборка клиента (Debug) ---"
-	cargo build --bin netrunner-client --features linux
-	@echo "--- Запуск клиента через sudo ---"
+	cargo build --bin netrunner-client
+	@echo "--- Применение прав ---"
+	sudo setcap cap_net_admin,cap_net_raw,cap_dac_override=eip ./target/debug/netrunner-client
+	@echo "--- Запуск клиента ---"
 	sudo ./target/debug/netrunner-client
 
 debug-server:
@@ -24,7 +26,7 @@ ABIS = arm64-v8a armeabi-v7a x86_64 x86
 build-android:
 	@for abi in $(ABIS); do \
 		echo "Building for $$abi..."; \
-		cargo ndk -t $$abi -o ./gen build --bin netrunner-client --features mobile --release; \
+		cargo ndk -t $$abi -o ./gen build --bin netrunner-client --release; \
 		cargo run --bin bindgen-tool generate \
 			--library gen/$$abi/libnetrunner_client.so \
 			--language kotlin \
@@ -33,7 +35,7 @@ build-android:
 	done
 
 build-server:
-	cargo build --bin netrunner-server --release --features desktop
+	cargo build --bin netrunner-server --release 
 
 setup-server:
 	@echo "--- Обновление системы и установка зависимостей ---"
