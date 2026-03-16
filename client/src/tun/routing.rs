@@ -91,7 +91,6 @@ pub fn setup_platform_routing(remote_address: &str) -> io::Result<()> {
     {
         use std::{process::Command, thread, time::Duration};
 
-        // 1. Инициализация Wintun
         let wintun = unsafe { wintun::load_from_path("wintun.dll") }.map_err(|e| {
             io::Error::new(io::ErrorKind::Other, format!("Wintun load error: {}", e))
         })?;
@@ -105,26 +104,20 @@ pub fn setup_platform_routing(remote_address: &str) -> io::Result<()> {
             }
         };
 
-        // 2. Получаем индекс активного интерфейса для маршрутизации прокси
         let if_idx = get_active_interface_index().unwrap_or(1);
         info!(
             "Wintun adapter active. Routing proxy traffic via interface index: {}",
             if_idx
         );
 
-        // 3. Добавляем маршрут к IP прокси через ИНДЕКС (самый надежный способ)
-        let route_cmd = format!(
-            "netsh interface ipv4 add route {}/32 interface={} metric=1",
-            proxy_ip, if_idx
-        );
-        // Игнорируем ошибку, если маршрут уже существует
+        let route_cmd =
+            format!("route add 62.60.244.156 mask 255.255.255.255 192.168.110.1 metric 1");
+
         let _ = run_cmd_ext(&route_cmd, true);
 
-        // 4. Настраиваем адрес (БЕЗ шлюза 10.0.0.2, чтобы не перехватить весь трафик)
         let addr_cmd =
             "netsh interface ipv4 set address name=\"netr0\" static 10.0.0.1 255.255.255.0";
 
-        // 5. Задаем DNS и применяем настройки
         let dns_cmd = "netsh interface ipv4 set dnsservers name=\"netr0\" static 10.0.0.2 primary validate=no";
 
         let mut attempt = 0;
@@ -161,7 +154,6 @@ pub fn reset_platform_routing(proxy_ip: Option<&str>) -> io::Result<()> {
             // Это гораздо безопаснее, чем удалять маршрут по умолчанию (0.0.0.0).
             let cmd = format!("route delete {}", ip);
             let _ = run_cmd_ext(&cmd, true);
-            let _ = run_cmd_ext("netsh interface delete interface name=\"netr0\"", true);
             info!("Windows routing for proxy {} removed.", ip);
         } else {
             error!("Cannot reset Windows routing: proxy_ip is missing.");
