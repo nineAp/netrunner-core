@@ -16,7 +16,7 @@ use crate::{
         codec::{
             codec::Codec,
             frame::FrameType,
-            socks::{SocksReply, SocksRequest, SocksTarget},
+            socks::{SocksReply, SocksRequest},
         },
         errors::ErrorAction,
         parser::parser::Parser,
