@@ -22,8 +22,7 @@ fn run_cmd_ext(full_cmd: &str, ignore_errors: bool) -> io::Result<()> {
 
 #[cfg(target_os = "windows")]
 fn get_active_interface_index() -> Option<u32> {
-    // Получаем список интерфейсов через netsh
-    let output = Command::new("netsh")
+    let output = std::process::Command::new("netsh")
         .args(["interface", "ipv4", "show", "interfaces"])
         .output()
         .ok()?;
@@ -31,7 +30,15 @@ fn get_active_interface_index() -> Option<u32> {
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     for line in stdout.lines() {
-        if line.contains("Connected") && !line.contains("netr0") {
+        // Мы ищем строку с "connected", НЕ содержащую виртуальные интерфейсы
+        // и НЕ являющуюся нашим туннелем (netr0)
+        if line.contains("connected")
+            && !line.contains("netr0")
+            && !line.contains("vEthernet")
+            && !line.contains("Loopback")
+            && !line.contains("Bluetooth")
+        {
+            // Берем индекс из первого столбца (Инд)
             if let Some(idx_str) = line.split_whitespace().next() {
                 if let Ok(idx) = idx_str.parse::<u32>() {
                     return Some(idx);
