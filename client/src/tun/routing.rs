@@ -48,6 +48,20 @@ fn get_active_interface_index() -> Option<u32> {
     }
     None
 }
+#[cfg(target_os = "windows")]
+fn get_default_gateway() -> Option<String> {
+    let output = Command::new("route")
+        .args(["print", "0.0.0.0"])
+        .output()
+        .ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Простой парсинг: ищем строку с 0.0.0.0 и берем IP из колонки шлюза
+    stdout
+        .lines()
+        .find(|line| line.contains("0.0.0.0"))
+        .and_then(|line| line.split_whitespace().nth(2))
+        .map(|s| s.to_string())
+}
 
 pub fn setup_platform_routing(remote_address: &str) -> io::Result<()> {
     let proxy_ip = remote_address.split(':').next().unwrap_or(remote_address);
@@ -89,46 +103,48 @@ pub fn setup_platform_routing(remote_address: &str) -> io::Result<()> {
     }
     #[cfg(target_os = "windows")]
     {
-        use std::{process::Command, thread, time::Duration};
+        let gateway = get_default_gateway().unwrap_or_else(|| "192.168.110.1".to_string());
+        info!("Detected gateway: {}", gateway);
 
         let wintun = unsafe { wintun::load_from_path("wintun.dll") }.map_err(|e| {
             io::Error::new(io::ErrorKind::Other, format!("Wintun load error: {}", e))
         })?;
 
-        let adapter = match wintun::Adapter::open(&wintun, "netr0") {
-            Ok(a) => a,
-            Err(_) => {
-                wintun::Adapter::create(&wintun, "netr0", "Wintun Tunnel", None).map_err(|e| {
-                    io::Error::new(io::ErrorKind::Other, format!("Wintun create error: {}", e))
-                })?
-            }
-        };
+        let adapter = wintun::Adapter::open(&wintun, "netr0")
+            .or_else(|_| wintun::Adapter::create(&wintun, "netr0", "Wintun Tunnel", None))?;
 
-        let if_idx = get_active_interface_index().unwrap_or(1);
-        info!(
-            "Wintun adapter active. Routing proxy traffic via interface index: {}",
-            if_idx
+        let if_idx = adapter.get_adapter_index().unwrap_or(49);
+
+        // 2. Настройка IP адаптера
+        let addr_cmd = format!(
+            "netsh interface ipv4 set address name=\"netr0\" static 10.0.0.1 255.255.255.0"
+        );
+        let _ = run_cmd_ext(&addr_cmd, true);
+
+        // 3. Маршрут к прокси (через реальный шлюз)
+        let proxy_ip = "62.60.244.156";
+        let _ = run_cmd_ext(&format!("route delete {}", proxy_ip), false);
+        let _ = run_cmd_ext(
+            &format!(
+                "route add {} mask 255.255.255.255 {} metric 1",
+                proxy_ip, gateway
+            ),
+            true,
         );
 
-        let route_cmd =
-            format!("route add 62.60.244.156 mask 255.255.255.255 192.168.110.1 metric 1");
+        // 4. МАРШРУТ В TUN: Направляем подсеть smoltcp в адаптер 49
+        // Используем метрику 5 (меньше 25, чтобы трафик шел в VPN приоритетно)
+        let tun_route_cmd = format!(
+            "route add 100.64.0.0 mask 255.192.0.0 0.0.0.0 if {} metric 5",
+            if_idx
+        );
+        let _ = run_cmd_ext(&format!("route delete 100.64.0.0"), false);
+        let _ = run_cmd_ext(&tun_route_cmd, true);
 
-        let _ = run_cmd_ext(&route_cmd, true);
-
-        let addr_cmd =
-            "netsh interface ipv4 set address name=\"netr0\" static 10.0.0.1 255.255.255.0";
-
-        let dns_cmd = "netsh interface ipv4 set dnsservers name=\"netr0\" static 10.0.0.2 primary validate=no";
-
-        let mut attempt = 0;
-        while attempt < 5 {
-            if run_cmd_ext(addr_cmd, false).is_ok() {
-                let _ = run_cmd_ext(dns_cmd, false);
-                break;
-            }
-            attempt += 1;
-            thread::sleep(Duration::from_millis(1000));
-        }
+        info!(
+            "Routing configured: Proxy via {}, Tunnel via netr0 (if {})",
+            gateway, if_idx
+        );
     }
 
     #[cfg(any(target_os = "android", target_os = "ios"))]
