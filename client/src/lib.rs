@@ -1,5 +1,5 @@
 uniffi::setup_scaffolding!();
-mod connections;
+pub mod connections;
 pub mod tun;
 use netrunner_logger::info;
 use std::sync::OnceLock;

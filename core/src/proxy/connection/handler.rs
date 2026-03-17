@@ -36,7 +36,7 @@ impl StreamHandler {
             let muxer = self.muxer.clone();
 
             // Канал для передачи данных из мультиплексора в мост (bridge)
-            let (v_tx, v_rx) = tokio::sync::mpsc::channel(1024);
+            let (v_tx, v_rx) = tokio::sync::mpsc::channel(2048);
             muxer.register_stream(stream_id, v_tx).await;
 
             tokio::spawn(async move {
@@ -45,7 +45,7 @@ impl StreamHandler {
 
                 // Обертываем коннект в таймаут, чтобы не плодить зомби-таски
                 let connect_timeout = tokio::time::timeout(
-                    std::time::Duration::from_secs(10),
+                    std::time::Duration::from_secs(5),
                     tokio::net::TcpStream::connect(&target_str),
                 )
                 .await;

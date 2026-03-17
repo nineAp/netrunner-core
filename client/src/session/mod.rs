@@ -6,6 +6,7 @@ pub mod mobile;
 
 use crate::{
     RUNTIME, Session,
+    connections::dns::DnsHandler,
     tun::{
         engine::Engine,
         routing::{reset_platform_routing, setup_platform_routing},
@@ -103,11 +104,16 @@ impl SessionManager {
             );
             let proxy_ip = network.get_self_local_address();
 
+            let mut dns_handler = DnsHandler::new();
+            if let Err(e) = dns_handler.init() {
+                error!("Failed to initialize DNS blocklist: {}", e);
+            }
+
             tokio::spawn(async move {
                 network.run(net_token).await;
             });
 
-            let mut engine = Engine::new(config, caps, proxy_ip);
+            let mut engine = Engine::new(config, caps, proxy_ip, dns_handler);
             engine.set_any_ip(true);
             engine.set_transparent_mode();
             engine.set_default_gateway(Ipv4Addr::new(10, 0, 0, 2));

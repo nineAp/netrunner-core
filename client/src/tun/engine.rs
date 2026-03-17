@@ -18,6 +18,7 @@ use tun::{DeviceReader, DeviceWriter};
 
 use netrunner_logger::{debug, info, warn};
 
+use crate::connections::dns::{self, DnsHandler};
 use crate::tun::connection_manager::ConnectionManager;
 use crate::tun::device::{TokenBuffer, VirtTunDevice};
 use crate::tun::tun::Tun;
@@ -34,13 +35,18 @@ pub struct Engine {
 }
 
 impl Engine {
-    pub fn new(config: Config, caps: DeviceCapabilities, ip: String) -> Self {
+    pub fn new(
+        config: Config,
+        caps: DeviceCapabilities,
+        ip: String,
+        dns_handler: DnsHandler,
+    ) -> Self {
         let now = Engine::current_time();
         let (mut device, bridge_rx, bridge_tx, avail) = VirtTunDevice::new(caps);
         let interface = Interface::new(config, &mut device, now);
 
-        let socket_set = ConnectionManager::setup_sockets(128, 8, 4);
-        let manager = ConnectionManager::new(ip);
+        let socket_set = ConnectionManager::setup_sockets(128, 128, 4);
+        let manager = ConnectionManager::new(ip, dns_handler);
         Self {
             interface,
             socket_set,

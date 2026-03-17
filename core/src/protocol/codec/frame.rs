@@ -8,8 +8,9 @@ pub enum FrameType {
     Data = 0x01,
     Close = 0x02,
     Heartbeat = 0x03,
+    UdpConnect = 0x04,
+    UdpData = 0x05,
 }
-
 #[derive(Copy, Clone)]
 pub struct FrameHeader {
     pub auth_tag: [u8; 16],
