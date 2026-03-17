@@ -68,20 +68,27 @@ pub fn setup_platform_routing(remote_address: &str) -> io::Result<()> {
 
     #[cfg(target_os = "linux")]
     {
-        // 1. Предварительная настройка ядра (rp_filter и пересылка)
+        // 1. Ядро
         let _ = run_cmd_ext("sysctl -w net.ipv4.conf.all.rp_filter=0", true);
         let _ = run_cmd_ext("sysctl -w net.ipv4.conf.netr0.rp_filter=0", true);
         let _ = run_cmd_ext("sysctl -w net.ipv4.ip_forward=1", true);
 
-        // 3. Маршрутизация (игнорируем ошибки, если правила уже есть)
+        // 2. Маршрутизация
         let _ = run_cmd_ext("ip rule add fwmark 0x1 table 100", true);
         let _ = run_cmd_ext("ip route add default dev netr0 table 100", true);
 
-        // 4. NFTables
-        let _ = run_cmd_ext("nft delete table ip netrunner", true);
-        run_cmd_ext("nft add table ip netrunner", false)?;
+        // 3. NFTables (Чиним ошибку удаления и синтаксис)
+        // Добавляем таблицу (если есть — ничего не сделает, если нет — создаст)
+        run_cmd_ext("nft add table ip netrunner", true)?;
+        // Очищаем таблицу перед работой, чтобы не плодить дубликаты
+        run_cmd_ext("nft flush table ip netrunner", true)?;
+
         run_cmd_ext(
             "nft add chain ip netrunner output { type route hook output priority 0; }",
+            false,
+        )?;
+        run_cmd_ext(
+            "nft add chain ip netrunner nat_out { type nat hook output priority -100; }",
             false,
         )?;
 
@@ -91,15 +98,17 @@ pub fn setup_platform_routing(remote_address: &str) -> io::Result<()> {
         );
         run_cmd_ext(&mark_rule, false)?;
 
-        // 5. DNS
-        let _ = Command::new("resolvectl")
-            .args(["dns", "netr0", "10.0.0.2"])
-            .status();
-        let _ = Command::new("resolvectl")
-            .args(["domain", "netr0", "~."])
-            .status();
+        let dns_redir = format!(
+            "nft add rule ip netrunner nat_out udp dport 53 ip daddr != {} dnat to 10.0.0.2:53",
+            proxy_ip
+        );
+        run_cmd_ext(&dns_redir, false)?;
 
-        info!("Linux network auto-configured: RPF=0, MTU=1280, Rules active.");
+        // 4. DNS (resolvectl не знает 'metric', используем стандартный синтаксис)
+        let _ = run_cmd_ext("resolvectl dns netr0 10.0.0.2", true);
+        let _ = run_cmd_ext("resolvectl domain netr0 ~.", true);
+
+        info!("Linux network: NFTables flushed and re-configured.");
     }
     #[cfg(target_os = "windows")]
     {

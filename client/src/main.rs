@@ -32,7 +32,7 @@ async fn main() {
 
     let mut caps = DeviceCapabilities::default();
 
-    caps.max_transmission_unit = 1500;
+    caps.max_transmission_unit = 1280;
     caps.medium = smoltcp::phy::Medium::Ip;
 
     let network = Network::new(
