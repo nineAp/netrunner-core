@@ -1,9 +1,9 @@
 use crate::protocol::codec::frame::FrameType;
 use bytes::Bytes;
-use netrunner_logger::{debug, error};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use tokio::sync::mpsc::error::SendError;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::RwLock;
 
@@ -32,7 +32,7 @@ pub struct MuxMessage {
 
 #[derive(Clone)]
 pub struct Muxer {
-    pub to_network: Sender<MuxMessage>,
+    to_network: Sender<MuxMessage>,
     streams: Arc<RwLock<HashMap<u32, Sender<Bytes>>>>,
     id_gen: Arc<IdGenerator>,
 }
@@ -48,6 +48,10 @@ impl Muxer {
 
     pub fn next_id(&self) -> u32 {
         self.id_gen.next()
+    }
+
+    pub async fn send_to_netwrok(&self, message: MuxMessage) -> Result<(), SendError<MuxMessage>> {
+        self.to_network.send(message).await
     }
 
     pub async fn register_stream(&self, stream_id: u32, tx: Sender<Bytes>) {

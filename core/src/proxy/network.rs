@@ -1,14 +1,16 @@
 use crate::{
     protocol::errors::ErrorAction,
     proxy::connection::{
-        connection::{Connection, ConnectionRole, BUF_SIZE},
+        connection::{
+            ClientHandler, Connection, ConnectionRole, ServerHandler, TunnelHandler, BUF_SIZE,
+        },
         engine::TunnelEngine,
         muxer::Muxer,
     },
     tlseng::profile::BrowserProfile,
 };
 use bytes::BytesMut;
-use netrunner_logger::{error, info, instrument};
+use netrunner_logger::{error, info};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -21,7 +23,6 @@ pub struct Network {
     role: ConnectionRole,
     remote_proxy_addr: Option<String>,
 }
-
 impl Network {
     pub fn new(
         host: String,
@@ -42,64 +43,52 @@ impl Network {
 
         match self.role {
             ConnectionRole::Client => {
-                info!("Starting Client mode: Initializing persistent tunnel to proxy...");
-
-                let muxer = match self.initialize_client_tunnel(token.clone()).await {
+                info!("Starting Client mode");
+                let server_addr = self
+                    .remote_proxy_addr
+                    .as_ref()
+                    .ok_or("No proxy addr")
+                    .unwrap();
+                let muxer = match ClientHandler::connect(server_addr, token.clone()).await {
                     Ok(m) => m,
                     Err(e) => {
-                        error!(error = %e, "Global tunnel failed. Exit.");
+                        error!(error = %e, "Global tunnel failed.");
                         return;
                     }
                 };
 
                 let listener = TcpListener::bind(&addr).await.expect("SOCKS bind failed");
-                info!(socks_addr = %addr, "SOCKS5 ready");
-
                 loop {
                     tokio::select! {
-                        _ = token.cancelled() => {
-                            info!("SOCKS listener: Shutting down...");
-                            break;
-                        }
+                        _ = token.cancelled() => break,
                         res = listener.accept() => {
-                            if let Ok((stream, client_addr)) = listener.accept().await {
-                                let current_muxer = muxer.clone();
+                            if let Ok((stream, client_addr)) = res {
+                                let conn = Connection::new(stream, client_addr, false);
+                                let handler = ClientHandler{ conn, muxer: muxer.clone() };
                                 tokio::spawn(async move {
-                                    let connection = Connection::new(stream, client_addr, false);
-                                    let _ = connection.handle_socks_client(current_muxer).await;
+                                    if let Err(e) = handler.run().await {
+                                        error!(error = %e, "Client handler error");
+                                    }
                                 });
                             }
                         }
                     }
                 }
             }
-
             ConnectionRole::Server => {
-                let listener = TcpListener::bind(&addr)
-                    .await
-                    .expect("Failed to bind Server port");
-                info!(listen_addr = %addr, "Proxy Server listening for incoming tunnels");
-
+                let listener = TcpListener::bind(&addr).await.expect("Server bind failed");
                 loop {
                     tokio::select! {
-                        _ = token.cancelled() => {
-                            info!("Server listener: Shutting down...");
-                            break;
-                        }
+                        _ = token.cancelled() => break,
                         res = listener.accept() => {
-                            match res {
-                                Ok((stream, client_addr)) => {
-                                    let connection = Connection::new(stream, client_addr, true);
-                                    let connection_token = token.clone();
-                                    tokio::spawn(async move {
-                                        if let Err(e) = connection.handle_server_tunnel(connection_token).await {
-                                            error!(client = %client_addr, error = %e, "Tunnel error");
-                                        }
-                                    });
-                                }
-                                Err(e) => {
-                                    error!(error = %e, "Failed to accept connection");
-                                }
+                            if let Ok((stream, client_addr)) = res {
+                                let conn = Connection::new(stream, client_addr, true);
+                                let handler = ServerHandler { conn, token: token.clone() };
+                                tokio::spawn(async move {
+                                    if let Err(e) = handler.run().await {
+                                        error!(client = %client_addr, error = %e, "Server handler error");
+                                    }
+                                });
                             }
                         }
                     }

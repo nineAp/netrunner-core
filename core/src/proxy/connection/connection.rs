@@ -1,16 +1,3 @@
-use bytes::{Bytes, BytesMut};
-use netrunner_logger::{debug, error, info, instrument, trace, warn};
-use std::net::SocketAddr;
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::{
-        tcp::{OwnedReadHalf, OwnedWriteHalf},
-        TcpStream,
-    },
-    sync::mpsc::{self},
-};
-use tokio_util::sync::CancellationToken;
-
 use crate::{
     protocol::{
         codec::{
@@ -27,7 +14,20 @@ use crate::{
         handler::StreamHandler,
         muxer::{MuxMessage, Muxer},
     },
+    tlseng::profile::BrowserProfile,
 };
+use bytes::{Bytes, BytesMut};
+use netrunner_logger::{debug, error, info, trace, warn};
+use std::net::SocketAddr;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{
+        tcp::{OwnedReadHalf, OwnedWriteHalf},
+        TcpStream,
+    },
+    sync::mpsc,
+};
+use tokio_util::sync::CancellationToken;
 
 pub const BUF_SIZE: usize = 16384;
 
@@ -35,6 +35,11 @@ pub const BUF_SIZE: usize = 16384;
 pub enum ConnectionRole {
     Client,
     Server,
+}
+
+#[async_trait::async_trait]
+pub trait TunnelHandler {
+    async fn run(self) -> Result<(), String>;
 }
 
 pub struct Connection {
@@ -57,188 +62,218 @@ impl Connection {
         }
     }
 
-    async fn read_socks_request(&mut self) -> Result<SocksRequest, String> {
+    pub fn new_raw(inbound: OwnedReadHalf, outbound: OwnedWriteHalf) -> Self {
+        Self {
+            addr: "0.0.0.0:0".parse().unwrap(), // заглушка, если адрес не важен
+            inbound,
+            outbound,
+            read_buf: BytesMut::with_capacity(BUF_SIZE),
+            codec: Codec::new(false),
+        }
+    }
+
+    pub async fn read_socks_request(&mut self) -> Result<SocksRequest, String> {
         loop {
             match SocksRequest::parse(&mut self.read_buf) {
-                Ok(Some(req)) => {
-                    info!(client = %self.addr, request = ?req, "SOCKS request successfully parsed");
-                    return Ok(req);
-                }
-                Ok(None) => {
-                    trace!(client = %self.addr, buffer_len = self.read_buf.len(), "SOCKS parse: need more data");
-                }
-                Err(e) => {
-                    error!(client = %self.addr, error = %e, "SOCKS protocol violation");
-                    return Err(format!("Socks parse error: {}", e));
-                }
+                Ok(Some(req)) => return Ok(req),
+                Ok(None) => {}
+                Err(e) => return Err(format!("Socks parse error: {}", e)),
             }
-
             let n = self
                 .inbound
                 .read_buf(&mut self.read_buf)
                 .await
-                .map_err(|e| {
-                    error!(client = %self.addr, error = %e, "Failed to read from socket during SOCKS handshake");
-                    e.to_string()
-                })?;
-
+                .map_err(|e| e.to_string())?;
             if n == 0 {
-                warn!(client = %self.addr, "Client closed connection prematurely during SOCKS handshake");
-                return Err("Client closed connection during SOCKS handshake".into());
+                return Err("Client closed connection".into());
             }
-
-            trace!(client = %self.addr, read_bytes = n, "Read data from client for SOCKS handshake");
         }
     }
 
-    async fn send_socks_reply(&mut self, reply: SocksReply) -> Result<(), String> {
+    pub async fn send_socks_reply(&mut self, reply: SocksReply) -> Result<(), String> {
         let mut buf = BytesMut::with_capacity(24);
-        debug!(client = %self.addr, reply = ?reply, "Sending SOCKS reply to client");
         reply.write_to(&mut buf);
-
-        self.outbound.write_all(&buf).await.map_err(|e| {
-            error!(client = %self.addr, error = %e, "Failed to send SOCKS reply");
-            e.to_string()
-        })?;
-
-        Ok(())
+        self.outbound
+            .write_all(&buf)
+            .await
+            .map_err(|e| e.to_string())
     }
+}
 
-    pub async fn handle_socks_client(mut self, muxer: Muxer) -> Result<(), String> {
+pub struct ClientHandler {
+    pub conn: Connection,
+    pub muxer: Muxer,
+}
+
+// Внутри connection.rs или где у тебя ClientHandler
+impl ClientHandler {
+    pub async fn connect(
+        remote_proxy_addr: &str,
+        token: CancellationToken,
+    ) -> Result<Muxer, String> {
+        let stream = TcpStream::connect(remote_proxy_addr)
+            .await
+            .map_err(|e| e.to_string())?;
+        let (inbound, outbound) = stream.into_split();
+
+        let mut conn = Connection::new_raw(inbound, outbound);
+
+        // TLS Handshake
+        let ch = conn
+            .codec
+            .make_client_handshake(&BrowserProfile::CHROME_131, "google.com")
+            .map_err(|e| format!("{:?}", e))?;
+        conn.outbound
+            .write_all(&ch)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        loop {
+            match conn.codec.process_handshake(&mut conn.read_buf) {
+                Ok(_) => break,
+                Err(e) if e.action == ErrorAction::Wait => {
+                    let n = conn
+                        .inbound
+                        .read_buf(&mut conn.read_buf)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    if n == 0 {
+                        return Err("EOF during handshake".into());
+                    }
+                }
+                Err(e) => return Err(format!("TLS error: {:?}", e)),
+            }
+        }
+
+        let (mux_tx, mux_rx) = mpsc::channel(BUF_SIZE);
+        let muxer = Muxer::new(mux_tx, true);
+
+        let handler =
+            std::sync::Arc::new(StreamHandler::new(muxer.clone(), ConnectionRole::Client));
+
+        let engine = TunnelEngine {
+            inbound: conn.inbound,
+            outbound: conn.outbound,
+            codec: conn.codec,
+            read_buf: conn.read_buf,
+            mux_rx,
+            handler,
+            token: token.clone(),
+        };
+
+        tokio::spawn(async move { engine.run().await });
+
+        Ok(muxer)
+    }
+}
+
+#[async_trait::async_trait]
+impl TunnelHandler for ClientHandler {
+    async fn run(mut self) -> Result<(), String> {
         info!("Starting SOCKS multiplexed handling");
-
-        debug!("Reading SOCKS handshake request");
-        let _ = self.read_socks_request().await.map_err(|e| {
-            error!("SOCKS handshake failed: {}", e);
-            e
-        })?;
-
-        self.send_socks_reply(SocksReply::HandshakeSelect { method: 0x00 })
+        self.conn.read_socks_request().await?;
+        self.conn
+            .send_socks_reply(SocksReply::HandshakeSelect { method: 0x00 })
             .await?;
 
-        let req = self.read_socks_request().await?;
+        let req = self.conn.read_socks_request().await?;
         let target = if let SocksRequest::Connect { target, .. } = req {
             target
         } else {
             return Err("Expected Connect".into());
         };
 
-        let stream_id = muxer.next_id();
-        let target_str = target.to_string();
+        let stream_id = self.muxer.next_id();
+        let (v_tx, mut v_rx) = mpsc::channel::<bytes::Bytes>(1024);
+        self.muxer.register_stream(stream_id, v_tx).await;
 
-        let (v_tx, mut v_rx) = mpsc::channel::<Bytes>(1024);
-        muxer.register_stream(stream_id, v_tx).await;
-
-        muxer
-            .to_network
-            .send(MuxMessage {
+        self.muxer
+            .send_to_netwrok(MuxMessage {
                 stream_id,
                 frame_type: FrameType::Connect,
-                data: Bytes::from(target_str),
+                data: bytes::Bytes::from(target.to_string()),
             })
             .await
             .map_err(|e| e.to_string())?;
 
-        let first_payload =
-            match tokio::time::timeout(std::time::Duration::from_secs(10), v_rx.recv()).await {
-                Ok(Some(data)) => data,
-                _ => {
-                    error!(
-                        stream_id,
-                        "Server timeout or failed to send Connect confirmation"
-                    );
-
-                    self.send_socks_reply(SocksReply::ConnectResult {
-                        reply_code: 0x01,
-                        atyp: 0x01,
-                        addr: [0, 0, 0, 0],
-                        port: 0,
-                    })
-                    .await
-                    .ok();
-                    return Err("Target connection failed".into());
-                }
-            };
+        let first_payload = tokio::time::timeout(std::time::Duration::from_secs(10), v_rx.recv())
+            .await
+            .map_err(|_| "Timeout")?
+            .ok_or("No data")?;
 
         if first_payload.len() >= 2 && first_payload[1] == 0x00 {
-            debug!(
-                stream_id,
-                "Server confirmed connection, forwarding SOCKS reply to browser"
-            );
-
-            self.outbound
+            self.conn
+                .outbound
                 .write_all(&first_payload)
                 .await
                 .map_err(|e| e.to_string())?;
         } else {
-            self.outbound.write_all(&first_payload).await.ok();
-            return Err("Server rejected connection".into());
+            self.conn.outbound.write_all(&first_payload).await.ok();
+            return Err("Rejected".into());
         }
 
-        let Self {
-            inbound: browser_in,
-            outbound: browser_out,
-            ..
-        } = self;
-
-        let muxer_clone = muxer.clone();
+        let browser_in = self.conn.inbound;
+        let browser_out = self.conn.outbound;
+        let muxer = self.muxer;
         tokio::spawn(async move {
-            run_proxy_bridge(stream_id, browser_in, browser_out, muxer_clone, v_rx).await;
+            run_proxy_bridge(stream_id, browser_in, browser_out, muxer, v_rx).await;
         });
-
         Ok(())
     }
+}
 
-    pub async fn handle_server_tunnel(mut self, token: CancellationToken) -> Result<(), String> {
-        info!("Acting as TLS Server, waiting for ClientHello");
+pub struct ServerHandler {
+    pub conn: Connection,
+    pub token: CancellationToken,
+}
 
+#[async_trait::async_trait]
+impl TunnelHandler for ServerHandler {
+    async fn run(mut self) -> Result<(), String> {
+        info!("Acting as TLS Server");
         let (mux_tx, mux_rx) = mpsc::channel(BUF_SIZE);
-        let muxer = Muxer::new(mux_tx.clone(), false);
+        let muxer = Muxer::new(mux_tx, false);
 
-        let server_hello_bytes = loop {
-            match self.codec.make_server_handshake(&mut self.read_buf) {
-                Ok(bytes) => {
-                    info!("ClientHello received, sending ServerHello");
-                    break bytes;
-                }
+        let hello = loop {
+            match self
+                .conn
+                .codec
+                .make_server_handshake(&mut self.conn.read_buf)
+            {
+                Ok(b) => break b,
                 Err(e) if e.action == ErrorAction::Wait => {
-                    let n = self
+                    if self
+                        .conn
                         .inbound
-                        .read_buf(&mut self.read_buf)
+                        .read_buf(&mut self.conn.read_buf)
                         .await
-                        .map_err(|err| format!("Read error: {}", err))?;
-
-                    if n == 0 {
-                        return Err("Client closed connection".into());
+                        .map_err(|e| e.to_string())?
+                        == 0
+                    {
+                        return Err("Closed".into());
                     }
                 }
-                Err(e) => return Err(format!("TLS error: {:?}", e)),
+                Err(e) => return Err(format!("{:?}", e)),
             }
         };
 
-        self.outbound
-            .write_all(&server_hello_bytes)
+        self.conn
+            .outbound
+            .write_all(&hello)
             .await
             .map_err(|e| e.to_string())?;
-        info!("TLS Tunnel established as server");
 
-        let handler =
-            std::sync::Arc::new(StreamHandler::new(muxer.clone(), ConnectionRole::Server));
-
-        debug!("Handover to TunnelEngine");
-        let engine = TunnelEngine {
-            inbound: self.inbound,
-            outbound: self.outbound,
-            codec: self.codec,
-            read_buf: self.read_buf,
+        let handler = std::sync::Arc::new(StreamHandler::new(muxer, ConnectionRole::Server));
+        TunnelEngine {
+            inbound: self.conn.inbound,
+            outbound: self.conn.outbound,
+            codec: self.conn.codec,
+            read_buf: self.conn.read_buf,
             mux_rx,
             handler,
-            token,
-        };
-
-        engine.run().await.map_err(|e| {
-            error!("TunnelEngine error: {}", e);
-            e
-        })
+            token: self.token,
+        }
+        .run()
+        .await
     }
 }

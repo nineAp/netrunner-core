@@ -35,7 +35,7 @@ impl StreamHandler {
             let target_str = String::from_utf8_lossy(&payload).to_string();
             let muxer = self.muxer.clone();
 
-            let (v_tx, v_rx) = tokio::sync::mpsc::channel(100);
+            let (v_tx, v_rx) = tokio::sync::mpsc::channel(1024);
             muxer.register_stream(stream_id, v_tx).await;
 
             tokio::spawn(async move {
