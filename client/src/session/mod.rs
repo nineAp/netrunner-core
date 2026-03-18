@@ -47,20 +47,36 @@ impl SessionManager {
     pub(crate) fn spawn_session(
         &self,
         remote_address: String,
+        #[cfg(any(target_os = "android", target_os = "ios"))] // Путь обязателен для мобилок
         tun_fd: Option<i32>,
+        #[cfg(any(target_os = "android", target_os = "ios"))] cache_dir: String,
     ) -> Arc<Session> {
         let runtime = get_runtime();
         let cancel_token = CancellationToken::new();
         let sesison_token = cancel_token.clone();
         let net_token = cancel_token.clone();
-        let shutdown_signal = signal::ctrl_c();
 
         let addr: std::net::SocketAddr = remote_address.parse().expect("Invalid address format");
         let remote_proxy_ip = addr.ip().to_string();
-        let proxy_ip_for_thread = remote_proxy_ip.clone();
 
         runtime.spawn(async move {
             info!("Starting VPN session thread...");
+
+            let cache_path = {
+                #[cfg(any(target_os = "android", target_os = "ios"))]
+                {
+                    cache_dir
+                } // Используем путь из мобильного приложения
+                #[cfg(any(target_os = "linux", target_os = "windows"))]
+                {
+                    ".".to_string()
+                } // На ПК пишем в локальную папку
+            };
+
+            let mut dns_handler = DnsHandler::new(&cache_path);
+            if let Err(e) = dns_handler.init().await {
+                error!("Failed to initialize DNS blocklist: {}", e);
+            }
 
             let tun_device = {
                 #[cfg(any(target_os = "android", target_os = "ios"))]
@@ -93,7 +109,7 @@ impl SessionManager {
 
             let config = Config::new(smoltcp::wire::HardwareAddress::Ip);
             let mut caps = DeviceCapabilities::default();
-            caps.max_transmission_unit = 1500;
+            caps.max_transmission_unit = 1280;
             caps.medium = smoltcp::phy::Medium::Ip;
 
             let network = Network::new(
@@ -103,11 +119,6 @@ impl SessionManager {
                 Some(remote_address.clone()),
             );
             let proxy_ip = network.get_self_local_address();
-
-            let mut dns_handler = DnsHandler::new();
-            if let Err(e) = dns_handler.init() {
-                error!("Failed to initialize DNS blocklist: {}", e);
-            }
 
             tokio::spawn(async move {
                 network.run(net_token).await;
@@ -119,17 +130,26 @@ impl SessionManager {
             engine.set_default_gateway(Ipv4Addr::new(10, 0, 0, 2));
             engine.activate();
 
-            tokio::select! {
-                res = engine.run(tun_device) => error!("Engine loop error: {:?}", res),
-                _ = cancel_token.cancelled() => {
-                    info!("Shutdown signal received");
+            let cancel_token_for_engine = cancel_token.clone();
+            std::thread::spawn(move || {
+                info!("Dedicated OS thread started for Engine");
 
-                    let _ = reset_platform_routing(Some(&proxy_ip_for_thread));
-                },
-                _ = shutdown_signal => {
-                    cancel_token.cancel();
-                }
-            }
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+
+                rt.block_on(async {
+                    tokio::select! {
+                        res = engine.run(tun_device) => {
+                            error!("Engine loop error: {:?}", res);
+                        },
+                        _ = cancel_token_for_engine.cancelled() => {
+                            info!("Engine thread shutting down via token");
+                        }
+                    }
+                });
+            });
         });
 
         Arc::new(Session {

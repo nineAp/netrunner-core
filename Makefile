@@ -27,12 +27,13 @@ build-android:
 	@for abi in $(ABIS); do \
 		echo "Building for $$abi..."; \
 		cargo ndk -t $$abi -o ./gen build --bin netrunner-client --release; \
-		cargo run --bin bindgen-tool generate \
-			--library gen/$$abi/libnetrunner_client.so \
-			--language kotlin \
-			--no-format \
-			--out-dir gen/$$abi; \
 	done
+
+	cargo run --bin bindgen-tool generate \
+		--library gen/arm64-v8a/libnetrunner_client.so \
+		--language kotlin \
+		--no-format \
+		--out-dir gen; \
 
 build-server:
 	cargo build --bin netrunner-server --release 

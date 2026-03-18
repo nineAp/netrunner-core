@@ -165,63 +165,105 @@ impl ClientHandler {
 
         Ok(muxer)
     }
+
+    async fn handle_udp_associate(&mut self) -> Result<(), String> {
+        let reply = SocksReply::ConnectResult {
+            reply_code: 0x00,
+            atyp: 0x01,
+            addr: [0, 0, 0, 0],
+            port: 0,
+        };
+        self.conn.send_socks_reply(reply).await?;
+
+        let mut buf = [0u8; 1024];
+        loop {
+            // Просто ждем, пока клиент не разорвет TCP-соединение
+            if self
+                .conn
+                .inbound
+                .read(&mut buf)
+                .await
+                .map_err(|e| e.to_string())?
+                == 0
+            {
+                break;
+            }
+        }
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait]
 impl TunnelHandler for ClientHandler {
     async fn run(mut self) -> Result<(), String> {
         info!("Starting SOCKS multiplexed handling");
+
+        // 1. Приветствие (Handshake)
         self.conn.read_socks_request().await?;
         self.conn
             .send_socks_reply(SocksReply::HandshakeSelect { method: 0x00 })
             .await?;
 
+        // 2. Получаем основной запрос (Connect или UDP Associate)
         let req = self.conn.read_socks_request().await?;
-        let target = if let SocksRequest::Connect { target, .. } = req {
-            target
-        } else {
-            return Err("Expected Connect".into());
-        };
 
-        let stream_id = self.muxer.next_id();
-        let (v_tx, mut v_rx) = mpsc::channel::<bytes::Bytes>(1024);
-        self.muxer.register_stream(stream_id, v_tx).await;
+        match req {
+            // Ветка TCP CONNECT
+            SocksRequest::Connect {
+                command: 0x01,
+                target,
+            } => {
+                let stream_id = self.muxer.next_id();
+                let (v_tx, mut v_rx) = mpsc::channel::<bytes::Bytes>(1024);
+                self.muxer.register_stream(stream_id, v_tx).await;
 
-        self.muxer
-            .send_to_netwrok(MuxMessage {
-                stream_id,
-                frame_type: FrameType::Connect,
-                data: bytes::Bytes::from(target.to_string()),
-            })
-            .await
-            .map_err(|e| e.to_string())?;
+                self.muxer
+                    .send_to_netwrok(MuxMessage {
+                        stream_id,
+                        frame_type: FrameType::Connect,
+                        data: bytes::Bytes::from(target.to_string()),
+                    })
+                    .await
+                    .map_err(|e| e.to_string())?;
 
-        let first_payload = tokio::time::timeout(std::time::Duration::from_secs(10), v_rx.recv())
-            .await
-            .map_err(|_| "Timeout")?
-            .ok_or("No data")?;
+                let first_payload =
+                    tokio::time::timeout(std::time::Duration::from_secs(10), v_rx.recv())
+                        .await
+                        .map_err(|_| "Timeout waiting for proxy response")?
+                        .ok_or("No data from proxy")?;
 
-        if first_payload.len() >= 2 && first_payload[1] == 0x00 {
-            self.conn
-                .outbound
-                .write_all(&first_payload)
-                .await
-                .map_err(|e| e.to_string())?;
-        } else {
-            self.conn.outbound.write_all(&first_payload).await.ok();
-            return Err("Rejected".into());
+                if first_payload.len() >= 2 && first_payload[1] == 0x00 {
+                    self.conn
+                        .outbound
+                        .write_all(&first_payload)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                } else {
+                    self.conn.outbound.write_all(&first_payload).await.ok();
+                    return Err("Proxy rejected connection".into());
+                }
+
+                let browser_in = self.conn.inbound;
+                let browser_out = self.conn.outbound;
+                let muxer = self.muxer;
+
+                tokio::spawn(async move {
+                    run_proxy_bridge(stream_id, browser_in, browser_out, muxer, v_rx).await;
+                });
+                Ok(())
+            }
+
+            // Ветка UDP ASSOCIATE
+            SocksRequest::Connect { command: 0x03, .. } => {
+                info!("Handling UDP Associate request");
+                self.handle_udp_associate().await
+            }
+
+            // Всё остальное (BIND и т.д.)
+            _ => Err("Unsupported SOCKS command".into()),
         }
-
-        let browser_in = self.conn.inbound;
-        let browser_out = self.conn.outbound;
-        let muxer = self.muxer;
-        tokio::spawn(async move {
-            run_proxy_bridge(stream_id, browser_in, browser_out, muxer, v_rx).await;
-        });
-        Ok(())
     }
 }
-
 pub struct ServerHandler {
     pub conn: Connection,
     pub token: CancellationToken,

@@ -175,26 +175,39 @@ impl ConnectionManager {
     }
 
     fn create_tcp_socket<'a>() -> tcp::Socket<'a> {
-        const BUF_SIZE: usize = 65536;
-        tcp::Socket::new(
+        const BUF_SIZE: usize = 128 * 1024; // Увеличил до 128KB для стабильного потока
+        let mut socket = tcp::Socket::new(
             tcp::SocketBuffer::new(vec![0; BUF_SIZE]),
             tcp::SocketBuffer::new(vec![0; BUF_SIZE]),
-        )
+        );
+        socket.set_nagle_enabled(false);
+        socket.set_ack_delay(None);
+        socket.set_keep_alive(Some(smoltcp::time::Duration::from_secs(30)));
+        socket.set_hop_limit(Some(64));
+        socket
     }
 
     fn create_udp_socket<'a>() -> udp::Socket<'a> {
-        const BUF_SIZE: usize = 32768;
+        const BUF_SIZE: usize = 65536;
+        const PACKET_COUNT: usize = 128;
+
         udp::Socket::new(
-            udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 16], vec![0; BUF_SIZE]),
-            udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 16], vec![0; BUF_SIZE]),
+            udp::PacketBuffer::new(
+                vec![udp::PacketMetadata::EMPTY; PACKET_COUNT],
+                vec![0; BUF_SIZE],
+            ),
+            udp::PacketBuffer::new(
+                vec![udp::PacketMetadata::EMPTY; PACKET_COUNT],
+                vec![0; BUF_SIZE],
+            ),
         )
     }
 
     fn create_icmp_socket<'a>() -> icmp::Socket<'a> {
         let icmp_rx_buffer =
-            icmp::PacketBuffer::new(vec![icmp::PacketMetadata::EMPTY; 4], vec![0; 1024]);
+            icmp::PacketBuffer::new(vec![icmp::PacketMetadata::EMPTY; 8], vec![0; 2048]);
         let icmp_tx_buffer =
-            icmp::PacketBuffer::new(vec![icmp::PacketMetadata::EMPTY; 4], vec![0; 1024]);
+            icmp::PacketBuffer::new(vec![icmp::PacketMetadata::EMPTY; 8], vec![0; 2048]);
         icmp::Socket::new(icmp_rx_buffer, icmp_tx_buffer)
     }
 
