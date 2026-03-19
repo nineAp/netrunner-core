@@ -114,6 +114,11 @@ pub fn setup_platform_routing(remote_address: &str) -> io::Result<()> {
     {
         let gateway = get_default_gateway().unwrap_or_else(|| "192.168.1.1".to_string());
 
+        let if_idx = get_active_interface_index().unwrap_or(0);
+        if if_idx == 0 {
+            warn!("Could not find active interface index, routing might fail.");
+        }
+
         let _ = run_cmd_ext(
             &format!(
                 "route add {} mask 255.255.255.255 {} metric 1",
@@ -137,14 +142,15 @@ pub fn setup_platform_routing(remote_address: &str) -> io::Result<()> {
             true,
         );
 
+        // 3. DNS
         let _ = run_cmd_ext(
             &format!("netsh interface ipv4 set dnsservers name=\"netr0\" static 10.0.0.2 primary"),
             true,
         );
 
         info!(
-            "Full tunneling configured: Internet via netr0, Proxy Exception via {}",
-            gateway
+            "Full tunneling configured: Internet via netr0 (if {}), Proxy Exception via {}",
+            if_idx, gateway
         );
     }
 
