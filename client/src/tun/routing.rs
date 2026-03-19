@@ -21,33 +21,24 @@ fn run_cmd_ext(full_cmd: &str, ignore_errors: bool) -> io::Result<()> {
 }
 
 #[cfg(target_os = "windows")]
-fn get_active_interface_index() -> Option<u32> {
-    let output = std::process::Command::new("netsh")
-        .args(["interface", "ipv4", "show", "interfaces"])
+fn get_adapter_index(name: &str) -> Option<u32> {
+    let output = Command::new("powershell")
+        .args([
+            "-Command",
+            &format!(
+                "(Get-NetIPInterface -InterfaceAlias '{}' -AddressFamily IPv4).ifIndex",
+                name
+            ),
+        ])
         .output()
         .ok()?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    for line in stdout.lines() {
-        // Мы ищем строку с "connected", НЕ содержащую виртуальные интерфейсы
-        // и НЕ являющуюся нашим туннелем (netr0)
-        if line.contains("connected")
-            && !line.contains("netr0")
-            && !line.contains("vEthernet")
-            && !line.contains("Loopback")
-            && !line.contains("Bluetooth")
-        {
-            // Берем индекс из первого столбца (Инд)
-            if let Some(idx_str) = line.split_whitespace().next() {
-                if let Ok(idx) = idx_str.parse::<u32>() {
-                    return Some(idx);
-                }
-            }
-        }
-    }
-    None
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<u32>()
+        .ok()
 }
+
 #[cfg(target_os = "windows")]
 fn get_default_gateway() -> Option<String> {
     let output = Command::new("route")
@@ -110,15 +101,22 @@ pub fn setup_platform_routing(remote_address: &str) -> io::Result<()> {
 
         info!("Linux network: NFTables flushed and re-configured.");
     }
+
     #[cfg(target_os = "windows")]
     {
         let gateway = get_default_gateway().unwrap_or_else(|| "192.168.1.1".to_string());
 
-        let if_idx = get_active_interface_index().unwrap_or(0);
-        if if_idx == 0 {
-            warn!("Could not find active interface index, routing might fail.");
-        }
+        // 1. Устанавливаем IP для адаптера
+        let _ = run_cmd_ext(
+            "netsh interface ipv4 set address name=\"netr0\" static 10.0.0.1 255.255.255.0 none",
+            true,
+        );
 
+        // 2. Ждем и получаем индекс именно нашего туннеля
+        let tun_idx = get_adapter_index("netr0")
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Interface netr0 not found"))?;
+
+        // 3. Маршрут-исключение для прокси через физический шлюз
         let _ = run_cmd_ext(
             &format!(
                 "route add {} mask 255.255.255.255 {} metric 1",
@@ -127,30 +125,31 @@ pub fn setup_platform_routing(remote_address: &str) -> io::Result<()> {
             true,
         );
 
-        let _ = run_cmd_ext(
+        // 4. Глобальные маршруты через TUN (теперь с правильным if_idx)
+        run_cmd_ext(
             &format!(
                 "route add 0.0.0.0 mask 128.0.0.0 10.0.0.2 if {} metric 5",
-                if_idx
+                tun_idx
             ),
             true,
-        );
-        let _ = run_cmd_ext(
+        )?;
+        run_cmd_ext(
             &format!(
                 "route add 128.0.0.0 mask 128.0.0.0 10.0.0.2 if {} metric 5",
-                if_idx
+                tun_idx
             ),
             true,
-        );
+        )?;
 
-        // 3. DNS
+        // 5. DNS
         let _ = run_cmd_ext(
-            &format!("netsh interface ipv4 set dnsservers name=\"netr0\" static 10.0.0.2 primary"),
+            "netsh interface ipv4 set dnsservers name=\"netr0\" static 10.0.0.2 primary",
             true,
         );
 
         info!(
-            "Full tunneling configured: Internet via netr0 (if {}), Proxy Exception via {}",
-            if_idx, gateway
+            "Windows: Routing configured on idx {} via 10.0.0.2",
+            tun_idx
         );
     }
 
@@ -172,17 +171,22 @@ pub fn reset_platform_routing(proxy_ip: Option<&str>) -> io::Result<()> {
 
     #[cfg(target_os = "windows")]
     {
-        if let Some(ip) = proxy_ip {
-            // Удаляем только маршрут к конкретному IP прокси-сервера.
-            // Это гораздо безопаснее, чем удалять маршрут по умолчанию (0.0.0.0).
-            let cmd = format!("route delete {}", ip);
-            let _ = run_cmd_ext(&cmd, true);
-            info!("Windows routing for proxy {} removed.", ip);
-        } else {
-            error!("Cannot reset Windows routing: proxy_ip is missing.");
-        }
-    }
+        // Очищаем глобальные маршруты, иначе интернет не вернется
+        let _ = run_cmd_ext("route delete 0.0.0.0 mask 128.0.0.0", true);
+        let _ = run_cmd_ext("route delete 128.0.0.0 mask 128.0.0.0", true);
 
+        if let Some(ip) = proxy_ip {
+            let _ = run_cmd_ext(&format!("route delete {}", ip), true);
+        }
+
+        // Сбрасываем DNS на автоматический (или удаляем наш)
+        let _ = run_cmd_ext(
+            "netsh interface ipv4 set dnsservers name=\"netr0\" source=dhcp",
+            true,
+        );
+
+        info!("Windows routing reset complete.");
+    }
     #[cfg(any(target_os = "android", target_os = "ios"))]
     {
         eprintln!("Android/Mobile routing on native side");
