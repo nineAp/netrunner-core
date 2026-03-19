@@ -109,6 +109,16 @@ impl TlsVersions {
 
     pub const TLS_13_ONLY: Self = Self(&[Self::TLS_1_3]);
     pub const MODERN: Self = Self(&[Self::TLS_1_3, Self::TLS_1_2]);
+
+    pub fn max(&self) -> ProtocolVersion {
+        if self.0.contains(&Self::TLS_1_3) {
+            ProtocolVersion::Tls13
+        } else if self.0.contains(&Self::TLS_1_2) {
+            ProtocolVersion::Tls12
+        } else {
+            ProtocolVersion::Tls10
+        }
+    }
 }
 
 pub struct TlsExtensions;
@@ -131,6 +141,14 @@ impl TlsExtensions {
     pub const KEY_SHARE: u16 = 0x0033;
     pub const ALPS: u16 = 0x44cd;
     pub const RENEGOTIATION_INFO: u16 = 0xff01;
+
+    pub fn is_grease(id: u16) -> bool {
+        if (id & 0x0f0f) != 0x0a0a {
+            return false;
+        }
+        // Убеждаемся, что оба байта идентичны (0x1A1A, а не 0x1A2A)
+        (id & 0xff) == (id >> 8)
+    }
 }
 
 #[derive(Clone, Copy)]

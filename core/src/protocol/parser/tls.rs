@@ -113,87 +113,79 @@ impl Parser for ClientHello {
     type Error = TlsError;
 
     fn can_parse(bytes: &BytesMut) -> bool {
-        let mut offset = 34;
-        if bytes.len() < offset + 1 {
+        let mut reader = &bytes[..];
+
+        // 1. Version (2) + Random (32) + SessionID Len (1) = 35
+        if reader.len() < 35 {
             return false;
         }
+        reader.advance(34);
 
-        let session_id_len = bytes[offset] as usize;
-        offset += 1 + session_id_len;
-        if bytes.len() < offset + 2 {
+        // 2. Session ID
+        let sid_len = reader[0] as usize;
+        reader.advance(1);
+        if reader.len() < sid_len + 2 {
+            return false;
+        } // +2 для Cipher Suites Len
+        reader.advance(sid_len);
+
+        // 3. Cipher Suites
+        let ciphers_len = u16::from_be_bytes([reader[0], reader[1]]) as usize;
+        reader.advance(2);
+        if reader.len() < ciphers_len + 1 {
+            return false;
+        } // +1 для Compression Len
+        reader.advance(ciphers_len);
+
+        // 4. Compression Methods
+        let comp_len = reader[0] as usize;
+        reader.advance(1);
+        if reader.len() < comp_len {
             return false;
         }
+        reader.advance(comp_len);
 
-        let ciphers_len = u16::from_be_bytes([bytes[offset], bytes[offset + 1]]) as usize;
-        offset += 2 + ciphers_len;
-        if bytes.len() < offset + 1 {
-            return false;
+        // 5. Extensions (опционально в TLS, но обычно есть)
+        if reader.len() >= 2 {
+            let ext_len = u16::from_be_bytes([reader[0], reader[1]]) as usize;
+            reader.advance(2);
+            if reader.len() < ext_len {
+                return false;
+            }
         }
 
-        let comp_len = bytes[offset] as usize;
-        offset += 1 + comp_len;
-
-        if bytes.len() >= offset + 2 {
-            let ext_len = u16::from_be_bytes([bytes[offset], bytes[offset + 1]]) as usize;
-            offset += 2 + ext_len;
-        }
-
-        bytes.len() >= offset
+        true
     }
 
     fn parse(bytes: &mut BytesMut) -> Result<Option<Self>, Self::Error> {
-        let mut offset = 34;
-        if bytes.len() < offset + 1 {
-            return Ok(None);
-        }
-        let session_id_len = bytes[offset] as usize;
-        offset += 1 + session_id_len;
-
-        if bytes.len() < offset + 2 {
-            return Ok(None);
-        }
-        let ciphers_len = u16::from_be_bytes([bytes[offset], bytes[offset + 1]]) as usize;
-        offset += 2 + ciphers_len;
-
-        if bytes.len() < offset + 1 {
-            return Ok(None);
-        }
-        let comp_len = bytes[offset] as usize;
-        offset += 1 + comp_len;
-
-        if bytes.len() >= offset + 2 {
-            let ext_len = u16::from_be_bytes([bytes[offset], bytes[offset + 1]]) as usize;
-            offset += 2 + ext_len;
-        }
-
-        if bytes.len() < offset {
+        // Мы уже проверили всё в can_parse, поэтому здесь просто
+        // последовательно забираем данные через get_*
+        if !Self::can_parse(bytes) {
             return Ok(None);
         }
 
-        let mut msg = bytes.split_to(offset);
-
-        let version = ProtocolVersion::try_from(msg.get_u16())
+        let version = ProtocolVersion::try_from(bytes.get_u16())
             .map_err(|e| TlsError::new(ErrorStage::Tls(e), ErrorAction::Drop, Bytes::new()))?;
 
         let mut random = [0u8; 32];
-        msg.copy_to_slice(&mut random);
+        bytes.copy_to_slice(&mut random);
 
-        let sid_len = msg.get_u8() as usize;
-        let session_id = msg.split_to(sid_len).freeze();
+        let sid_len = bytes.get_u8() as usize;
+        let session_id = bytes.split_to(sid_len).freeze();
 
-        let c_len = msg.get_u16() as usize;
+        let c_len = bytes.get_u16() as usize;
         let mut cipher_suites = Vec::with_capacity(c_len / 2);
-        let mut ciphers_data = msg.split_to(c_len);
+        let mut ciphers_data = bytes.split_to(c_len);
         while ciphers_data.has_remaining() {
             cipher_suites.push(ciphers_data.get_u16());
         }
 
-        let cmp_len = msg.get_u8() as usize;
-        msg.advance(cmp_len);
+        let cmp_len = bytes.get_u8() as usize;
+        bytes.advance(cmp_len);
 
-        let extensions = if msg.remaining() >= 2 {
-            let ext_len = msg.get_u16() as usize;
-            msg.split_to(ext_len).freeze()
+        let extensions = if bytes.remaining() >= 2 {
+            let ext_len = bytes.get_u16() as usize;
+            bytes.split_to(ext_len).freeze()
         } else {
             Bytes::new()
         };
@@ -207,7 +199,6 @@ impl Parser for ClientHello {
         }))
     }
 }
-
 impl Parser for ServerHello {
     type Error = TlsError;
 

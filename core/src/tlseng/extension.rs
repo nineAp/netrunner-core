@@ -39,14 +39,6 @@ impl Extension {
             data,
         }
     }
-
-    pub fn pack(etype: u16, data: &[u8]) -> Bytes {
-        let mut ext = BytesMut::with_capacity(4 + data.len());
-        ext.put_u16(etype);
-        ext.put_u16(data.len() as u16);
-        ext.put_slice(data);
-        ext.freeze()
-    }
 }
 
 pub struct ExtensionBuilder {
@@ -61,8 +53,9 @@ impl ExtensionBuilder {
     }
 
     fn add_extension(&mut self, etype: u16, data: &[u8]) {
-        let ext = Extension::pack(etype, data);
-        self.payload.put_slice(&ext);
+        self.payload.put_u16(etype);
+        self.payload.put_u16(data.len() as u16);
+        self.payload.put_slice(data);
     }
 
     pub fn grease(&mut self) {
@@ -70,6 +63,18 @@ impl ExtensionBuilder {
         let rnd = rng.random_range(0..GREASE_IDENTIFIERS.len());
         let etype = GREASE_IDENTIFIERS[rnd];
         self.add_extension(etype, &[]);
+    }
+
+    pub fn grease_with_id(&mut self, etype: u16) {
+        self.add_extension(etype, &[]);
+    }
+
+    pub fn apply_generic_extension(&mut self, etype: u16, profile: &BrowserProfile) {
+        match etype {
+            _ => {
+                netrunner_logger::trace!(etype, "Applying generic or unknown extension");
+            }
+        }
     }
 
     pub fn server_name(&mut self, host: &str) {
@@ -117,15 +122,21 @@ impl ExtensionBuilder {
         self.add_extension(TlsExtensions::SUPPORTED_VERSIONS, &data);
     }
 
-    pub fn key_share(&mut self, pub_key: &[u8]) {
-        let mut data = BytesMut::with_capacity(38);
-        data.put_u16(34);
-        data.put_u16(TlsGroups::X25519);
-        data.put_u16(32);
-        data.put_slice(pub_key);
-        self.add_extension(TlsExtensions::KEY_SHARE, &data);
-    }
+    pub fn key_share(&mut self, profile: &BrowserProfile, pub_key: &[u8]) {
+        let key_len = pub_key.len() as u16;
 
+        let mut entry = BytesMut::with_capacity(key_len as usize + 4);
+        let group = profile.groups.0.first().cloned().unwrap_or(0x001d);
+        entry.put_u16(group);
+        entry.put_u16(key_len);
+        entry.put_slice(pub_key);
+
+        let mut list = BytesMut::with_capacity(entry.len() + 2);
+        list.put_u16(entry.len() as u16);
+        list.put_slice(&entry);
+
+        self.add_extension(TlsExtensions::KEY_SHARE, &list);
+    }
     pub fn application_settings(&mut self, protocols: &[&str]) {
         let mut data = BytesMut::new();
         for proto in protocols {
@@ -202,16 +213,23 @@ impl ExtensionBuilder {
         self.add_extension(TlsExtensions::RENEGOTIATION_INFO, &[0x00]);
     }
 
-    pub fn padding(&mut self, target_size: usize) {
-        let current_size = self.payload.len();
-        if target_size > current_size + 4 {
-            let pad_len = target_size - current_size - 4;
+    pub fn padding(&mut self, target_size: usize, overhead: usize) {
+        let current_total_size = self.payload.len() + overhead;
+
+        if target_size > current_total_size + 4 {
+            let pad_len = target_size - current_total_size - 4;
             let data = vec![0u8; pad_len];
             self.add_extension(TlsExtensions::PADDING, &data);
         }
     }
 
-    pub fn apply_profile(&mut self, profile: &BrowserProfile, host: &str, pub_key: &[u8]) {
+    pub fn apply_profile(
+        &mut self,
+        profile: &BrowserProfile,
+        host: &str,
+        pub_key: &[u8],
+        overhead: usize,
+    ) {
         for &ext_id in &profile.extension_order {
             match ext_id {
                 TlsExtensions::SNI => self.server_name(host),
@@ -231,21 +249,28 @@ impl ExtensionBuilder {
                 TlsExtensions::SESSION_TICKET => self.session_ticket(),
                 TlsExtensions::SUPPORTED_VERSIONS => self.supported_versions(profile.versions),
                 TlsExtensions::PSK_MODES => self.psk_key_exchange_modes(),
-                TlsExtensions::KEY_SHARE => self.key_share(pub_key),
-                TlsExtensions::ALPS => self.application_settings(&["h2"]),
+                TlsExtensions::KEY_SHARE => self.key_share(profile, pub_key),
+                TlsExtensions::ALPS => {
+                    if !profile.alps_protocols.is_empty() {
+                        self.application_settings(profile.alps_protocols);
+                    }
+                }
                 TlsExtensions::STATUS_REQUEST => self.status_request(),
                 TlsExtensions::EC_POINT_FORMATS => self.ec_point_formats(),
                 TlsExtensions::RENEGOTIATION_INFO => self.renegotiation_info(),
                 TlsExtensions::PADDING => {
-                    if profile.is_chromium {
-                        self.padding(512);
-                    } else {
-                        self.add_extension(TlsExtensions::PADDING, &[]);
+                    if profile.target_padding_len > 0 {
+                        // Передаем накопленный оверхед всего пакета
+                        self.padding(profile.target_padding_len as usize, overhead);
                     }
                 }
 
-                id if (id & 0x0f0f) == 0x0a0a => self.grease(),
-                _ => {}
+                id if TlsExtensions::is_grease(id) => {
+                    if profile.has_grease {
+                        self.grease_with_id(id); // Используем конкретный ID из ExtensionOrder
+                    }
+                }
+                _ => self.apply_generic_extension(ext_id, profile),
             }
         }
     }

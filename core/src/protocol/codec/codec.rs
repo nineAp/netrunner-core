@@ -8,7 +8,7 @@ use crate::protocol::codec::frame::{Frame, FrameHeader, FrameType};
 use crate::protocol::codec::padding::Padding;
 use crate::protocol::errors::{ErrorAction, ErrorStage, TlsError};
 use crate::protocol::parser::parser::Parser;
-use crate::tlseng::profile::BrowserProfile;
+use crate::tlseng::profile::{BrowserProfile, ServerProfile};
 
 pub struct Codec {
     crypto: ChaChaCipher,
@@ -30,13 +30,10 @@ impl Codec {
         profile: &BrowserProfile,
         host: &str,
     ) -> Result<Bytes, TlsError> {
-        let pub_key = self.session_keys.ecdh.public_key.to_bytes();
-
         Ok(TlsBridge::wrap_client_hello(
             profile,
             host,
-            &pub_key,
-            self.session_keys.salt.get_local(),
+            &self.session_keys,
         ))
     }
 
@@ -49,30 +46,21 @@ impl Codec {
             )
         })?;
 
-        let server_pub_key = self.session_keys.ecdh.public_key.to_bytes();
+        // ВАЖНО: TlsBridge сам проверит Auth Tag в Session ID клиента
+        // и вызовет update_keys для генерации общего секрета.
         let server_hello_record = TlsBridge::wrap_server_hello(
             &client_msg,
-            &server_pub_key,
-            self.session_keys.salt.get_local(),
+            &mut self.session_keys,
+            &ServerProfile::MODERN,
         )?;
 
-        let (w_key, w_iv, r_key, r_iv) = self
-            .session_keys
-            .update_keys(client_msg.random(), client_msg.extensions(), true)
-            .map_err(|e| {
-                netrunner_logger::error!(error = %e, "Server failed to update keys from ClientHello");
-                TlsError::new(
-                    ErrorStage::Handshake("Key Err"),
-                    ErrorAction::Drop,
-                    Bytes::new(),
-                )
-            })?;
-
+        // Ключи уже обновлены внутри session_keys.
+        // Просто забираем их и устанавливаем в AEAD шифратор.
+        let (w_key, w_iv, r_key, r_iv) = self.session_keys.get_aead_parameters();
         self.crypto.set_keys(w_key, w_iv, r_key, r_iv);
 
         Ok(server_hello_record)
     }
-
     pub fn process_handshake(&mut self, buffer: &mut BytesMut) -> Result<(), TlsError> {
         let mes_opt = TlsBridge::unpack_handshake(buffer)?;
         let mes = mes_opt.ok_or_else(|| {

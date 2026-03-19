@@ -55,6 +55,8 @@ pub struct SessionKeys {
     pub salt: SaltPair,
     pub ecdh: ECDH,
     pub auth_key: [u8; 32],
+    pub current_aead: Option<([u8; 32], [u8; 12], [u8; 32], [u8; 12])>,
+    is_initiator: bool, // Сохраним роль для правильного возврата параметров
 }
 
 impl SessionKeys {
@@ -63,7 +65,14 @@ impl SessionKeys {
             salt: SaltPair::new(is_initiator),
             ecdh: ECDH::new(),
             auth_key: [0u8; 32],
+            current_aead: None,
+            is_initiator,
         }
+    }
+
+    pub fn get_aead_parameters(&self) -> ([u8; 32], [u8; 12], [u8; 32], [u8; 12]) {
+        self.current_aead
+            .expect("Keys not generated yet. Call update_keys first.")
     }
 
     pub fn update_keys(
@@ -141,11 +150,6 @@ impl SessionKeys {
             .get_shared(public_key)
             .ok_or_else(|| "No shared secret".to_string())?;
 
-        netrunner_logger::debug!(
-            shared_prefix = %hex::encode(&shared_key[..8]),
-            "DH Shared secret derived"
-        );
-
         let hkdf = HKDF::extract_key(&self.salt.get_total(), &shared_key);
 
         let c_key = HKDF::expand_key::<32>(&hkdf, b"client_aead").map_err(|e| e.to_string())?;
@@ -153,19 +157,17 @@ impl SessionKeys {
         let s_key = HKDF::expand_key::<32>(&hkdf, b"server_aead").map_err(|e| e.to_string())?;
         let s_iv = HKDF::expand_key::<12>(&hkdf, b"server_iv").map_err(|e| e.to_string())?;
 
-        let auth_secret = HKDF::expand_key::<32>(&hkdf, b"auth_key").map_err(|e| e.to_string())?;
-        self.auth_key = auth_secret;
-        netrunner_logger::info!(
-            client_key_short = %hex::encode(&c_key[..4]),
-            server_key_short = %hex::encode(&s_key[..4]),
-            "HKDF expansion complete"
-        );
+        self.auth_key = HKDF::expand_key::<32>(&hkdf, b"auth_key").map_err(|e| e.to_string())?;
 
-        if is_server {
-            Ok((s_key, s_iv, c_key, c_iv))
+        // Определяем порядок: (Write Key, Write IV, Read Key, Read IV)
+        let keys = if is_server {
+            (s_key, s_iv, c_key, c_iv)
         } else {
-            Ok((c_key, c_iv, s_key, s_iv))
-        }
+            (c_key, c_iv, s_key, s_iv)
+        };
+
+        self.current_aead = Some(keys);
+        Ok(keys)
     }
 
     fn compute_tag(secret: &[u8], step: u64) -> [u8; 16] {

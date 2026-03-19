@@ -1,8 +1,9 @@
+use crate::crypto::session::SessionKeys;
 use crate::protocol::errors::{ErrorAction, ErrorStage, TlsError};
 use crate::protocol::parser::parser::Parser;
 use crate::tlseng::extension::ExtensionStack;
 use crate::tlseng::handshake::{ClientHello, HelloHeader, ServerHello};
-use crate::tlseng::profile::BrowserProfile;
+use crate::tlseng::profile::{BrowserProfile, ServerProfile};
 use crate::tlseng::tls_record::TlsRecord;
 use crate::tlseng::types::{ContentType, HelloType};
 use crate::tlseng::ApplicationData;
@@ -133,31 +134,66 @@ impl TlsBridge {
         ApplicationData::start_process(buffer)
     }
 
-    pub fn wrap_client_hello(
-        profile: &BrowserProfile,
-        host: &str,
-        public_key: &[u8; 32],
-        salt: [u8; 32],
-    ) -> Bytes {
-        ClientHello::make_client_hello(profile, host, public_key, salt)
+    pub fn wrap_client_hello(profile: &BrowserProfile, host: &str, keys: &SessionKeys) -> Bytes {
+        ClientHello::make_client_hello(profile, host, keys)
     }
 
     pub fn wrap_server_hello(
         client_msg: &HandshakeMessage,
-        server_pub_key: &[u8],
-        salt: [u8; 32],
+        keys: &mut SessionKeys,
+        profile: &ServerProfile,
     ) -> Result<Bytes, TlsError> {
-        if let HandshakeMessage::Client { base, .. } = client_msg {
-            Ok(ServerHello::make_server_hello(base, server_pub_key, salt))
+        if let HandshakeMessage::Client { base, extensions } = client_msg {
+            // 1. Проверка Auth Tag в Session ID (последние 16 байт)
+            if base.session_id.len() != 32 {
+                return Err(TlsError::new(
+                    ErrorStage::Handshake("Invalid SessionID len"),
+                    ErrorAction::Drop,
+                    Bytes::new(),
+                ));
+            }
+
+            let mut received_tag = [0u8; 16];
+            received_tag.copy_from_slice(&base.session_id[16..32]);
+
+            if !keys.verify_auth_tag(&received_tag) {
+                netrunner_logger::warn!("Unauthorized ClientHello: Auth Tag mismatch");
+                return Err(TlsError::new(
+                    ErrorStage::Handshake("Auth Failed"),
+                    ErrorAction::Drop,
+                    Bytes::new(),
+                ));
+            }
+
+            // 2. Выполняем Key Exchange (находим KeyShare клиента и считаем Shared Secret)
+            // Это обновит внутреннее состояние keys (auth_key и AEAD ключи)
+            keys.update_keys(base.random, extensions, true)
+                .map_err(|e| {
+                    netrunner_logger::error!(error = %e, "Server failed key update");
+                    TlsError::new(
+                        ErrorStage::Handshake("Key Exchange Failed"),
+                        ErrorAction::Drop,
+                        Bytes::new(),
+                    )
+                })?;
+
+            // 3. Генерируем ServerHello, используя наш свежий публичный ключ и локальную соль
+            let server_pub_key = keys.ecdh.public_key.to_bytes();
+
+            Ok(ServerHello::make_server_hello(
+                base,
+                &server_pub_key,
+                keys.salt.get_local(),
+                profile,
+            ))
         } else {
             Err(TlsError::new(
-                ErrorStage::Handshake("Wrong message type for ServerHello generation"),
+                ErrorStage::Handshake("Expected ClientHello for SH generation"),
                 ErrorAction::Drop,
                 Bytes::new(),
             ))
         }
     }
-
     pub fn pack_app_data(buffer: Bytes) -> Bytes {
         TlsRecord::build_application_data(buffer)
     }

@@ -1,12 +1,14 @@
+use aead::{rand_core::RngCore, OsRng};
 use bytes::{BufMut, Bytes, BytesMut};
 
 use crate::{
+    crypto::session::SessionKeys,
     tlseng::{
         consts::{HANDSHAKE_TYPE_CLIENT_HELLO, HANDSHAKE_TYPE_SERVER_HELLO},
         extension::ExtensionBuilder,
-        profile::BrowserProfile,
+        profile::{BrowserProfile, ServerProfile},
         tls_record::TlsRecord,
-        types::{ContentType, HelloType, ProtocolVersion},
+        types::{ContentType, HelloType, ProtocolVersion, TlsVersions},
     },
     utils::u24::U24,
 };
@@ -34,71 +36,75 @@ impl ClientHello {
 
         buf.put_u8(HANDSHAKE_TYPE_CLIENT_HELLO);
 
+        // Резервируем 3 байта под длину Handshake (U24)
         let length_pos = buf.len();
         buf.put_bytes(0, 3);
 
-        buf.put_u16(0x0303);
+        buf.put_u16(0x0303); // Legacy Version
         buf.put_slice(&self.random);
 
+        // Session ID
         buf.put_u8(self.session_id.len() as u8);
         buf.put_slice(&self.session_id);
 
+        // Cipher Suites
         buf.put_u16((self.cipher_suites.len() * 2) as u16);
         for &suite in &self.cipher_suites {
             buf.put_u16(suite);
         }
 
+        // Compression Methods (всегда 0x01 0x00 для маскировки)
         buf.put_u8(1);
         buf.put_u8(0x00);
 
+        // Extensions
         buf.put_u16(self.extensions.len() as u16);
         buf.put_slice(&self.extensions);
 
+        // ПРАВИЛЬНЫЙ РАСЧЕТ ДЛИНЫ:
+        // Длина сообщения Handshake не включает сам тип (1 байт) и поле длины (3 байта)
         let total_len = (buf.len() - length_pos - 3) as u32;
         let len_bytes = total_len.to_be_bytes();
-
+        // Записываем 3 байта длины (Big Endian)
         buf[length_pos..length_pos + 3].copy_from_slice(&len_bytes[1..4]);
 
-        let ext_len = self.extensions.len();
-        let total_handshake_len = (buf.len() - length_pos - 3) as u32;
-
-        netrunner_logger::debug!(
-            handshake_type = "ClientHello",
-            body_len = total_handshake_len,
-            extensions_len = ext_len,
-            total_bytes = buf.len(),
-            "Serialized Handshake message"
-        );
         buf.freeze()
     }
 
-    pub fn make_client_hello(
-        profile: &BrowserProfile,
-        host: &str,
-        public_key: &[u8; 32],
-        salt: [u8; 32],
-    ) -> Bytes {
-        let tls_random = salt;
+    pub fn make_client_hello(profile: &BrowserProfile, host: &str, keys: &SessionKeys) -> Bytes {
+        let tls_random = keys.salt.get_local();
+        let mut session_id_bytes = [0u8; 32];
+        OsRng.fill_bytes(&mut session_id_bytes[..16]);
+        session_id_bytes[16..].copy_from_slice(&keys.generate_auth_tag());
+
+        let record_header = 5;
+        let handshake_header = 4;
+        let client_hello_fixed = 2 + 32 + 1 + 32 + 2 + (profile.cipher_suites.len() * 2) + 2 + 2;
+
+        let total_overhead = record_header + handshake_header + client_hello_fixed;
 
         let mut ext_builder = ExtensionBuilder::new();
 
-        ext_builder.apply_profile(profile, host, public_key);
-        let extensions_bytes = ext_builder.build();
+        ext_builder.apply_profile(
+            profile,
+            host,
+            &keys.ecdh.public_key.to_bytes(),
+            total_overhead,
+        );
 
-        let mut session_id = BytesMut::with_capacity(32);
-        session_id.put_slice(&[0u8; 32]);
+        let extensions_bytes = ext_builder.build();
 
         let client_hello = ClientHello {
             version: ProtocolVersion::Tls12,
             random: tls_random,
-            session_id: session_id.freeze(),
-            cipher_suites: vec![0x1301, 0x1302, 0x1303],
+            session_id: Bytes::copy_from_slice(&session_id_bytes),
+            cipher_suites: profile.cipher_suites.to_vec(),
             extensions: extensions_bytes,
         };
 
         let record = TlsRecord::new(
             ContentType::Handshake,
-            ProtocolVersion::Tls10,
+            profile.record_layer_version,
             client_hello.serialize(),
         );
 
@@ -114,55 +120,78 @@ pub struct ServerHello {
     pub extensions: BytesMut,
 }
 impl ServerHello {
-    pub fn from_client_hello(
-        client_hello: &ClientHello,
-        server_public_key: &[u8],
-        salt: [u8; 32],
-    ) -> Self {
-        let server_random = salt;
-
-        let selected_suite = client_hello
-            .cipher_suites
-            .first()
-            .cloned()
-            .unwrap_or(0x1301);
-
-        let mut extensions = BytesMut::new();
-
-        extensions.put_u16(0x002b);
-        extensions.put_u16(2);
-        extensions.put_u16(0x0304);
-
-        extensions.put_u16(0x0033);
-        extensions.put_u16(36);
-        extensions.put_u16(0x001d);
-        extensions.put_u16(32);
-        extensions.put_slice(server_public_key);
-
-        Self {
-            version: ProtocolVersion::Tls12,
-            random: server_random,
-            session_id: client_hello.session_id.clone(),
-            cipher_suite: selected_suite,
-            extensions,
-        }
-    }
-
     pub fn make_server_hello(
         client_hello: &ClientHello,
         server_public_key: &[u8],
         salt: [u8; 32],
+        profile: &ServerProfile,
     ) -> Bytes {
-        let server_hello = Self::from_client_hello(client_hello, server_public_key, salt);
-        let handshake_payload = server_hello.serialize();
+        // Создаем инстанс ServerHello
+        let server_hello = Self::from_client_hello(client_hello, server_public_key, salt, profile);
 
+        // Оборачиваем в Record Layer
         let record = TlsRecord::new(
             ContentType::Handshake,
-            ProtocolVersion::Tls12,
-            handshake_payload,
+            profile.record_layer_version, // 0x0303 обычно
+            server_hello.serialize(),     // Сериализация самого SH
         );
 
         record.serialize()
+    }
+
+    pub fn from_client_hello(
+        client_hello: &ClientHello,
+        server_public_key: &[u8],
+        salt: [u8; 32],
+        profile: &ServerProfile,
+    ) -> Self {
+        // 1. Используем соль как рандом сервера
+        let server_random = salt;
+
+        // 2. Выбор Cipher Suite (твой код здесь хорош, оставляем)
+        let selected_suite = if profile.honor_cipher_order {
+            profile
+                .cipher_suites
+                .iter()
+                .find(|&&suite| client_hello.cipher_suites.contains(&suite))
+                .cloned()
+                .unwrap_or(0x1301)
+        } else {
+            client_hello
+                .cipher_suites
+                .iter()
+                .find(|&&suite| profile.cipher_suites.contains(&suite))
+                .cloned()
+                .unwrap_or(0x1301)
+        };
+
+        let mut extensions = BytesMut::new();
+
+        // 3. Работа с версией.
+        // Выбираем макс. версию из профиля (например, TLS 1.3)
+        let selected_version = profile.versions.max();
+
+        // Добавляем расширение Supported Versions (обязательно для TLS 1.3)
+        extensions.put_u16(0x002b);
+        extensions.put_u16(2);
+        extensions.put_u16(selected_version as u16);
+
+        // 4. Key Share (исправляем расчет длины, чтобы не было как в прошлый раз)
+        let key_len = server_public_key.len() as u16;
+        extensions.put_u16(0x0033);
+        extensions.put_u16(key_len + 4); // Группа(2) + Длина(2) + Ключ
+        extensions.put_u16(0x001d); // x25519
+        extensions.put_u16(key_len);
+        extensions.put_slice(server_public_key);
+
+        Self {
+            // Это поле будет использоваться как legacy_version (0x0303)
+            version: ProtocolVersion::Tls12,
+            random: server_random, // ИСПОЛЬЗУЕМ переменную
+            session_id: client_hello.session_id.clone(),
+            cipher_suite: selected_suite,
+            extensions,
+        }
     }
 
     pub fn serialize(&self) -> Bytes {
@@ -170,36 +199,37 @@ impl ServerHello {
 
         buf.put_u8(HANDSHAKE_TYPE_SERVER_HELLO);
 
+        // Резервируем место под длину Handshake (3 байта)
         let length_pos = buf.len();
-        buf.put_bytes(0, 3);
+        buf.put_slice(&[0, 0, 0]);
 
-        buf.put_u16(0x0303);
+        // Используем версию из структуры (Legacy Version)
+        buf.put_u16(self.version as u16);
+
+        // Используем рандом из структуры
         buf.put_slice(&self.random);
 
+        // Session ID (Echo)
         buf.put_u8(self.session_id.len() as u8);
         buf.put_slice(&self.session_id);
 
         buf.put_u16(self.cipher_suite);
 
+        // Compression (0x00)
         buf.put_u8(0x00);
 
-        buf.put_u16(self.extensions.len() as u16);
-        buf.put_slice(&self.extensions);
+        // Extensions
+        if !self.extensions.is_empty() {
+            buf.put_u16(self.extensions.len() as u16);
+            buf.put_slice(&self.extensions);
+        } else {
+            buf.put_u16(0);
+        }
 
-        let total_len = (buf.len() - length_pos - 3) as u32;
-        let len_bytes = total_len.to_be_bytes();
+        // Заполняем длину handshake-сообщения
+        let total_handshake_body_len = (buf.len() - length_pos - 3) as u32;
+        let len_bytes = total_handshake_body_len.to_be_bytes();
         buf[length_pos..length_pos + 3].copy_from_slice(&len_bytes[1..4]);
-
-        let total_handshake_len = (buf.len() - length_pos - 3) as u32;
-        let ext_len = self.extensions.len();
-
-        netrunner_logger::debug!(
-            handshake_type = "ServerHello",
-            body_len = total_handshake_len,
-            extensions_len = ext_len,
-            total_bytes = buf.len(),
-            "Serialized Handshake message"
-        );
 
         buf.freeze()
     }
