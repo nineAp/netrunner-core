@@ -120,6 +120,13 @@ impl Engine {
                     break;
                 }
 
+                if n >= 20 && buf[0] >> 4 == 4 {
+                    let dest_ip = &buf[16..20];
+                    if dest_ip[0] >= 224 && dest_ip[0] <= 239 {
+                        continue;
+                    }
+                }
+
                 let mut token = TokenBuffer::with_capacity(n);
                 token.extend_from_slice(&buf[..n]);
 

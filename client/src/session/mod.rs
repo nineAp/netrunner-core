@@ -7,18 +7,14 @@ pub mod mobile;
 use crate::{
     RUNTIME, Session,
     connections::dns::DnsHandler,
-    tun::{
-        engine::Engine,
-        routing::{reset_platform_routing, setup_platform_routing},
-        tun::Tun,
-    },
+    tun::{engine::Engine, routing::setup_platform_routing, tun::Tun},
 };
 use netrunner_core::proxy::{connection::connection::ConnectionRole, network::Network};
 use netrunner_logger::{error, info};
 use smoltcp::{iface::Config, phy::DeviceCapabilities};
 use std::net::Ipv4Addr;
 use std::sync::Arc;
-use tokio::{runtime::Runtime, signal};
+use tokio::runtime::Runtime;
 use tokio_util::sync::CancellationToken;
 
 fn get_runtime() -> &'static Runtime {
@@ -91,7 +87,7 @@ impl SessionManager {
                             .tun_name("netr0")
                             .address((10, 0, 0, 1))
                             .netmask((255, 255, 255, 0))
-                            .mtu(1200)
+                            .mtu(1280)
                             .up();
                     })
                     .expect("Failed to init TUN")
@@ -105,7 +101,7 @@ impl SessionManager {
                 }
             };
 
-            setup_platform_routing(&remote_address);
+            let _ = setup_platform_routing(&remote_address);
 
             let config = Config::new(smoltcp::wire::HardwareAddress::Ip);
             let mut caps = DeviceCapabilities::default();
@@ -131,24 +127,20 @@ impl SessionManager {
             engine.activate();
 
             let cancel_token_for_engine = cancel_token.clone();
-            std::thread::spawn(move || {
-                info!("Dedicated OS thread started for Engine");
 
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .unwrap();
+            tokio::spawn(async move {
+                info!("Engine async task started");
 
-                rt.block_on(async {
-                    tokio::select! {
-                        res = engine.run(tun_device) => {
-                            error!("Engine loop error: {:?}", res);
-                        },
-                        _ = cancel_token_for_engine.cancelled() => {
-                            info!("Engine thread shutting down via token");
-                        }
+                tokio::select! {
+                    // Добавляем обработку результата прямо здесь
+                    res = engine.run(tun_device) => {
+                        // Теперь эта ветка возвращает (), так как мы обработали результат
+                        info!("Engine loop finished: {:?}", res);
+                    },
+                    _ = cancel_token_for_engine.cancelled() => {
+                        info!("Engine task shutting down via token");
                     }
-                });
+                }
             });
         });
 
