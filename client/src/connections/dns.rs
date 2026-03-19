@@ -22,7 +22,6 @@ impl DnsHandler {
             cache_path: format!("{}/hosts_cache.txt", cache_dir),
         }
     }
-
     pub async fn init(&mut self) -> anyhow::Result<()> {
         let path = std::path::PathBuf::from(&self.cache_path);
 
@@ -41,60 +40,41 @@ impl DnsHandler {
 
         if needs_update {
             let p_clone = self.cache_path.clone();
+            // Просто спавним асинхронную задачу
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_secs(10)).await;
-                Self::download_blocklist(p_clone);
+                // Теперь вызываем асинхронно через .await
+                if let Err(e) = Self::download_blocklist_async(p_clone).await {
+                    netrunner_logger::error!("DNS: Background update failed: {}", e);
+                }
             });
         }
 
         Ok(())
     }
 
-    fn download_blocklist(cache_path: String) {
-        let runtime = crate::RUNTIME.get_or_init(|| {
-            tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .expect("Failed to create Tokio runtime")
-        });
+    // Делаем функцию асинхронной и убираем block_on
+    async fn download_blocklist_async(cache_path: String) -> anyhow::Result<()> {
+        info!("DNS: Starting background download to {}", cache_path);
 
-        runtime.block_on(async move {
-            info!("DNS: Starting background download to {}", cache_path);
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()?;
 
-            let client = reqwest::Client::builder()
-                .timeout(Duration::from_secs(30))
-                .build();
+        let resp = client
+            .get("https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts")
+            .send()
+            .await?;
 
-            let client = match client {
-                Ok(c) => c,
-                Err(e) => {
-                    netrunner_logger::error!("DNS: Failed to create client: {}", e);
-                    return;
-                }
-            };
+        if resp.status().is_success() {
+            let bytes = resp.bytes().await?;
+            tokio::fs::write(&cache_path, bytes).await?;
+            info!("DNS: Blocklist downloaded successfully to {}", cache_path);
+        } else {
+            error!("DNS: Download failed with status {}", resp.status());
+        }
 
-            match client
-                .get("https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts")
-                .send()
-                .await
-            {
-                Ok(resp) if resp.status().is_success() => {
-                    if let Ok(bytes) = resp.bytes().await {
-                        if let Err(e) = tokio::fs::write(&cache_path, bytes).await {
-                            netrunner_logger::error!("DNS: File write error: {}", e);
-                        } else {
-                            info!("DNS: Blocklist downloaded successfully to {}", cache_path);
-                        }
-                    }
-                }
-                Ok(resp) => {
-                    netrunner_logger::error!("DNS: Download failed with status {}", resp.status())
-                }
-                Err(e) => {
-                    netrunner_logger::error!("DNS: Request error (check internet/TLS): {}", e)
-                }
-            }
-        });
+        Ok(())
     }
 
     async fn load_from_file(&mut self) -> anyhow::Result<()> {

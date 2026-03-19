@@ -120,9 +120,20 @@ impl Engine {
                     break;
                 }
 
-                if n >= 20 && buf[0] >> 4 == 4 {
-                    let dest_ip = &buf[16..20];
-                    if dest_ip[0] >= 224 && dest_ip[0] <= 239 {
+                let first_byte = buf[0];
+                let version = first_byte >> 4;
+
+                if version == 4 {
+                    // IPv4 Multicast: 224.0.0.0 - 239.255.255.255
+                    if buf[12..16] == [0, 0, 0, 0] {
+                        continue;
+                    } // Маршрутизация
+                    if buf[16] >= 224 && buf[16] <= 239 {
+                        continue;
+                    }
+                } else if version == 6 {
+                    // IPv6 Multicast: ff00::/8 (первый байт 0xff)
+                    if first_byte == 0xff {
                         continue;
                     }
                 }
