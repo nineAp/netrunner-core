@@ -175,7 +175,7 @@ impl ConnectionManager {
     }
 
     fn create_tcp_socket<'a>() -> tcp::Socket<'a> {
-        const BUF_SIZE: usize = 128 * 1024; // Увеличил до 128KB для стабильного потока
+        const BUF_SIZE: usize = 512 * 1024;
         let mut socket = tcp::Socket::new(
             tcp::SocketBuffer::new(vec![0; BUF_SIZE]),
             tcp::SocketBuffer::new(vec![0; BUF_SIZE]),
@@ -188,7 +188,7 @@ impl ConnectionManager {
     }
 
     fn create_udp_socket<'a>() -> udp::Socket<'a> {
-        const BUF_SIZE: usize = 65536;
+        const BUF_SIZE: usize = 1024 * 64;
         const PACKET_COUNT: usize = 128;
 
         udp::Socket::new(
