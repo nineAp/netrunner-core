@@ -112,27 +112,8 @@ pub fn setup_platform_routing(remote_address: &str) -> io::Result<()> {
     }
     #[cfg(target_os = "windows")]
     {
-        let gateway = get_default_gateway().unwrap_or_else(|| "192.168.110.1".to_string());
-        info!("Detected gateway: {}", gateway);
+        let gateway = get_default_gateway().unwrap_or_else(|| "192.168.1.1".to_string());
 
-        let wintun = unsafe { wintun::load_from_path("wintun.dll") }.map_err(|e| {
-            io::Error::new(io::ErrorKind::Other, format!("Wintun load error: {}", e))
-        })?;
-
-        let adapter = wintun::Adapter::open(&wintun, "netr0")
-            .or_else(|_| wintun::Adapter::create(&wintun, "netr0", "Wintun Tunnel", None))?;
-
-        let if_idx = adapter.get_adapter_index().unwrap_or(49);
-
-        // 2. Настройка IP адаптера
-        let addr_cmd = format!(
-            "netsh interface ipv4 set address name=\"netr0\" static 10.0.0.1 255.255.255.0"
-        );
-        let _ = run_cmd_ext(&addr_cmd, true);
-
-        // 3. Маршрут к прокси (через реальный шлюз)
-        let proxy_ip = "62.60.244.156";
-        let _ = run_cmd_ext(&format!("route delete {}", proxy_ip), false);
         let _ = run_cmd_ext(
             &format!(
                 "route add {} mask 255.255.255.255 {} metric 1",
@@ -141,18 +122,29 @@ pub fn setup_platform_routing(remote_address: &str) -> io::Result<()> {
             true,
         );
 
-        // 4. МАРШРУТ В TUN: Направляем подсеть smoltcp в адаптер 49
-        // Используем метрику 5 (меньше 25, чтобы трафик шел в VPN приоритетно)
-        let tun_route_cmd = format!(
-            "route add 100.64.0.0 mask 255.192.0.0 0.0.0.0 if {} metric 5",
-            if_idx
+        let _ = run_cmd_ext(
+            &format!(
+                "route add 0.0.0.0 mask 128.0.0.0 10.0.0.2 if {} metric 5",
+                if_idx
+            ),
+            true,
         );
-        let _ = run_cmd_ext(&format!("route delete 100.64.0.0"), false);
-        let _ = run_cmd_ext(&tun_route_cmd, true);
+        let _ = run_cmd_ext(
+            &format!(
+                "route add 128.0.0.0 mask 128.0.0.0 10.0.0.2 if {} metric 5",
+                if_idx
+            ),
+            true,
+        );
+
+        let _ = run_cmd_ext(
+            &format!("netsh interface ipv4 set dnsservers name=\"netr0\" static 10.0.0.2 primary"),
+            true,
+        );
 
         info!(
-            "Routing configured: Proxy via {}, Tunnel via netr0 (if {})",
-            gateway, if_idx
+            "Full tunneling configured: Internet via netr0, Proxy Exception via {}",
+            gateway
         );
     }
 
