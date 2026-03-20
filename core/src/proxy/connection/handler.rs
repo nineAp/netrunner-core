@@ -36,7 +36,7 @@ impl StreamHandler {
             let muxer = self.muxer.clone();
 
             // Канал для передачи данных из мультиплексора в мост (bridge)
-            let (v_tx, v_rx) = tokio::sync::mpsc::channel(2048);
+            let (v_tx, v_rx) = tokio::sync::mpsc::channel(512);
             muxer.register_stream(stream_id, v_tx).await;
 
             tokio::spawn(async move {

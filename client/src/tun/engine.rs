@@ -7,7 +7,6 @@ use smoltcp::{
 };
 use std::sync::atomic::Ordering;
 use std::{
-    mem,
     sync::{Arc, LazyLock, atomic::AtomicBool},
     time::Instant as StdInstant,
 };
@@ -18,19 +17,25 @@ use tun::{DeviceReader, DeviceWriter};
 
 use netrunner_logger::{debug, info, warn};
 
-use crate::connections::dns::{self, DnsHandler};
+use crate::connections::dns::DnsHandler;
 use crate::tun::connection_manager::ConnectionManager;
 use crate::tun::device::{TokenBuffer, VirtTunDevice};
 use crate::tun::tun::Tun;
 
 pub static START_TIME: LazyLock<StdInstant> = LazyLock::new(StdInstant::now);
+
 pub struct Engine {
     interface: Interface,
     socket_set: SocketSet<'static>,
     manager: ConnectionManager,
     device: VirtTunDevice,
-    bridge_rx: UnboundedReceiver<TokenBuffer>,
-    bridge_tx: UnboundedSender<TokenBuffer>,
+
+    // Канал для инъекции пакетов в smoltcp
+    to_smoltcp_tx: UnboundedSender<TokenBuffer>,
+
+    // Временное хранилище канала выхода из smoltcp (отдадим воркеру в run)
+    from_smoltcp_rx: Option<UnboundedReceiver<TokenBuffer>>,
+
     avail: Arc<AtomicBool>,
 }
 
@@ -42,17 +47,19 @@ impl Engine {
         dns_handler: DnsHandler,
     ) -> Self {
         let now = Engine::current_time();
-        let (mut device, bridge_rx, bridge_tx, avail) = VirtTunDevice::new(caps);
+        // Смотри, как чисто мы получаем компоненты:
+        let (mut device, to_smoltcp_tx, from_smoltcp_rx, avail) = VirtTunDevice::new(caps);
         let interface = Interface::new(config, &mut device, now);
 
-        let socket_set = ConnectionManager::setup_sockets(128, 128, 4);
+        let socket_set = ConnectionManager::setup_sockets(64, 4);
         let manager = ConnectionManager::new(ip, dns_handler);
+
         Self {
             interface,
             socket_set,
             device,
-            bridge_tx,
-            bridge_rx,
+            to_smoltcp_tx,
+            from_smoltcp_rx: Some(from_smoltcp_rx),
             avail,
             manager,
         }
@@ -60,17 +67,33 @@ impl Engine {
 
     pub async fn run(&mut self, tun: Tun) {
         info!("Current routes: {:?}", self.interface.routes());
-
         let (writer, reader) = tun.split().expect("Failed to split TUN");
 
-        let from_engine = mem::replace(&mut self.bridge_rx, mpsc::unbounded_channel().1);
+        // 1. Создаем трубу для ВХОДЯЩЕГО трафика: TUN -> Engine
+        let (tun_to_engine_tx, mut tun_to_engine_rx) = mpsc::unbounded_channel();
+        Self::spawn_tun_reader(reader, tun_to_engine_tx, self.avail.clone());
 
-        Self::spawn_tun_to_engine(reader, self.bridge_tx.clone(), self.avail.clone());
-        Self::spawn_engine_to_tun(writer, from_engine);
+        // 2. Запускаем трубу ИСХОДЯЩЕГО трафика: smoltcp -> TUN
+        let from_smoltcp_rx = self.from_smoltcp_rx.take().expect("Engine started twice");
+        Self::spawn_tun_writer(writer, from_smoltcp_rx);
+
         let mut last_log = StdInstant::now();
-        loop {
-            let result = self.poll();
 
+        // 3. Главный цикл (ДИСПЕТЧЕР)
+        loop {
+            // Читаем всё, что прилетело из операционной системы
+            while let Ok(token) = tun_to_engine_rx.try_recv() {
+                // АНАЛИЗ: Создаем сокет, если это новый SYN
+                self.manager
+                    .try_create_socket_from_packet(&token, &mut self.socket_set);
+
+                // ПЕРЕДАЧА: Закидываем пакет в виртуальную сетевую карту smoltcp
+                if self.to_smoltcp_tx.send(token).is_ok() {
+                    self.device.mark_rx_available();
+                }
+            }
+
+            let result = self.poll();
             self.manager.process_sockets(&mut self.socket_set);
 
             if last_log.elapsed() >= Duration::from_secs(5) {
@@ -82,11 +105,12 @@ impl Engine {
                 continue;
             }
 
-            if self.avail.load(Ordering::Acquire) {
+            if self.avail.swap(false, Ordering::Acquire) {
                 tokio::task::yield_now().await;
                 continue;
             }
 
+            self.manager.cleanup(&mut self.socket_set);
             self.poll_delay().await;
         }
     }
@@ -107,13 +131,14 @@ impl Engine {
         sleep(sleep_duration).await;
     }
 
-    fn spawn_tun_to_engine(
+    // Воркер: Читает ОС -> Шлет в Engine
+    fn spawn_tun_reader(
         mut reader: DeviceReader,
         to_engine: UnboundedSender<TokenBuffer>,
         is_avail: Arc<AtomicBool>,
     ) {
         tokio::spawn(async move {
-            debug!("TUN-to-Engine bridge task started");
+            debug!("TUN Reader task started");
             let mut buf = [0u8; 65536];
             while let Ok(n) = reader.read(&mut buf).await {
                 if n == 0 {
@@ -122,17 +147,14 @@ impl Engine {
 
                 let first_byte = buf[0];
                 let version = first_byte >> 4;
-
                 if version == 4 {
-                    // IPv4 Multicast: 224.0.0.0 - 239.255.255.255
                     if buf[12..16] == [0, 0, 0, 0] {
                         continue;
-                    } // Маршрутизация
+                    }
                     if buf[16] >= 224 && buf[16] <= 239 {
                         continue;
                     }
                 } else if version == 6 {
-                    // IPv6 Multicast: ff00::/8 (первый байт 0xff)
                     if first_byte == 0xff {
                         continue;
                     }
@@ -142,27 +164,28 @@ impl Engine {
                 token.extend_from_slice(&buf[..n]);
 
                 if to_engine.send(token).is_ok() {
-                    is_avail.store(true, std::sync::atomic::Ordering::Release);
+                    is_avail.store(true, Ordering::Release);
                 } else {
                     break;
                 }
             }
-            warn!("TUN-to-Engine bridge task stopped");
+            warn!("TUN Reader task stopped");
         });
     }
 
-    fn spawn_engine_to_tun(
+    // Воркер: Читает smoltcp -> Шлет в ОС
+    fn spawn_tun_writer(
         mut writer: DeviceWriter,
-        mut from_engine: UnboundedReceiver<TokenBuffer>,
+        mut from_smoltcp: UnboundedReceiver<TokenBuffer>,
     ) {
         tokio::spawn(async move {
-            debug!("Engine-to-TUN bridge task started");
-            while let Some(token) = from_engine.recv().await {
+            debug!("TUN Writer task started");
+            while let Some(token) = from_smoltcp.recv().await {
                 if writer.write_all(&token).await.is_err() {
                     break;
                 }
             }
-            warn!("Engine-to-TUN bridge task stopped");
+            warn!("TUN Writer task stopped");
         });
     }
 
@@ -171,19 +194,17 @@ impl Engine {
         Instant::from_micros(duration.as_micros() as i64)
     }
 
-    pub fn set_any_ip(&mut self, state: bool) -> () {
+    pub fn set_any_ip(&mut self, state: bool) {
         self.interface.set_any_ip(state)
     }
 
     pub fn set_transparent_mode(&mut self) {
         self.interface.update_ip_addrs(|addrs| {
             addrs.clear();
-
             addrs
                 .push(IpCidr::new(IpAddress::v4(10, 0, 0, 2), 24))
                 .unwrap();
         });
-
         self.interface.routes_mut().remove_default_ipv4_route();
     }
 

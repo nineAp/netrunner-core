@@ -3,7 +3,7 @@ use netrunner_logger::{debug, error, info, warn};
 use smoltcp::{
     iface::{SocketHandle, SocketSet},
     socket::{AnySocket, icmp, tcp, udp},
-    wire::IpListenEndpoint,
+    wire::{IpListenEndpoint, IpProtocol, Ipv4Packet, TcpPacket},
 };
 use std::{
     collections::HashMap,
@@ -22,6 +22,7 @@ pub struct ConnectionManager {
     fake_ip_store: FakeIpStore,
     proxy_ip: String,
     failed_until: HashMap<SocketHandle, StdInstant>,
+    sockets_to_remove: Vec<SocketHandle>,
 }
 
 impl ConnectionManager {
@@ -33,7 +34,8 @@ impl ConnectionManager {
             proxy_ip: ip,
             fake_ip_store: FakeIpStore::new(),
             failed_until: HashMap::new(),
-            dns_handler, // Просто сохраняем готовый объект
+            dns_handler,
+            sockets_to_remove: Vec::new(),
         }
     }
     pub fn start_listening(&mut self, socket_set: &mut SocketSet) {
@@ -112,19 +114,22 @@ impl ConnectionManager {
     fn handle_tcp(&mut self, handle: SocketHandle, socket: &mut tcp::Socket) {
         use tcp::State;
 
+        // 1. Очистка закрытых сокетов
         if socket.state() == State::Closed {
-            if let Some(until) = self.failed_until.get(&handle) {
-                if StdInstant::now() < *until {
-                    return;
-                }
+            // Если сокет закрыт, удаляем его сессию и помечаем на удаление из сета
+            if self.active_tcp_sessions.contains_key(&handle) {
+                debug!(%handle, "TCP session closed, removing from active sessions");
+                self.active_tcp_sessions.remove(&handle);
             }
 
-            self.active_tcp_sessions.remove(&handle);
-            socket.abort();
-            let _ = socket.listen(443);
+            // Добавляем в очередь на удаление из SocketSet (чтобы освободить память)
+            if !self.sockets_to_remove.contains(&handle) {
+                self.sockets_to_remove.push(handle);
+            }
             return;
         }
 
+        // 2. Инициализация сессии при установке соединения
         if socket.state() == State::Established && !self.active_tcp_sessions.contains_key(&handle) {
             let target = self.resolve_target(socket);
 
@@ -135,22 +140,18 @@ impl ConnectionManager {
                 }
             }
 
+            info!(%handle, "New TCP session established for target: {:?}", target);
             let conn = TcpConnection::new(handle, self.proxy_ip.clone(), target);
             self.active_tcp_sessions.insert(handle, conn);
         }
 
+        // 3. Тик активной сессии (проброс данных в прокси)
         if let Some(conn) = self.active_tcp_sessions.get_mut(&handle) {
             if !conn.tick(socket) {
-                debug!(%handle, "Connection handshake failed or closed, aborting socket.");
-                self.active_tcp_sessions.remove(&handle);
+                debug!(%handle, "Connection tick failed, aborting.");
                 socket.abort();
-                self.failed_until
-                    .insert(handle, StdInstant::now() + Duration::from_secs(5));
+                // Сессия удалится на следующем проходе, когда стейт станет Closed
             }
-        } else if socket.state() == State::Established {
-            self.failed_until
-                .insert(handle, StdInstant::now() + Duration::from_secs(5));
-            socket.abort();
         }
 
         if socket.state() == State::CloseWait {
@@ -187,6 +188,56 @@ impl ConnectionManager {
         socket
     }
 
+    fn create_dynamic_tcp_socket<'a>(port: u16) -> tcp::Socket<'a> {
+        let buf_size = match port {
+            443 | 80 => 256 * 1024,     // 256 KB для веба
+            22 | 53 | 123 => 16 * 1024, // 16 KB для мелких протоколов (SSH, DNS over TCP, NTP)
+            _ => 64 * 1024,             // Дефолт
+        };
+
+        let mut socket = tcp::Socket::new(
+            tcp::SocketBuffer::new(vec![0; buf_size]),
+            tcp::SocketBuffer::new(vec![0; buf_size]),
+        );
+
+        socket.set_nagle_enabled(false); // Для отзывчивости (особенно в играх типа Silent Hill, если через VPN)
+        socket.set_ack_delay(None);
+        socket
+    }
+
+    pub fn try_create_socket_from_packet(&mut self, packet: &[u8], socket_set: &mut SocketSet) {
+        let Ok(ip_packet) = Ipv4Packet::new_checked(packet) else {
+            return;
+        };
+        if ip_packet.next_header() != IpProtocol::Tcp {
+            return;
+        };
+        let Ok(tcp_packet) = TcpPacket::new_checked(ip_packet.payload()) else {
+            return;
+        };
+
+        // Ищем только SYN (начало соединения)
+        if tcp_packet.syn() && !tcp_packet.ack() {
+            let dst_port = tcp_packet.dst_port();
+            let dst_addr = ip_packet.dst_addr();
+
+            // Проверяем, не создали ли мы уже такой сокет на предыдущем шаге
+            if !self.has_active_session(socket_set, dst_addr.into(), dst_port) {
+                debug!(target: "netrunner", "Dynamic TCP: Creating socket for {}:{}", dst_addr, dst_port);
+
+                let mut socket = Self::create_dynamic_tcp_socket(dst_port);
+                let endpoint = IpListenEndpoint {
+                    addr: Some(dst_addr.into()),
+                    port: dst_port,
+                };
+
+                if let Ok(_) = socket.listen(endpoint) {
+                    socket_set.add(socket);
+                }
+            }
+        }
+    }
+
     fn create_udp_socket<'a>() -> udp::Socket<'a> {
         const BUF_SIZE: usize = 1024 * 64;
         const PACKET_COUNT: usize = 128;
@@ -211,12 +262,34 @@ impl ConnectionManager {
         icmp::Socket::new(icmp_rx_buffer, icmp_tx_buffer)
     }
 
-    pub fn setup_sockets(n_tcp: usize, n_udp: usize, n_icmp: usize) -> SocketSet<'static> {
-        let mut sockets = SocketSet::new(Vec::with_capacity(n_tcp + n_udp + n_icmp));
-
-        for _ in 0..n_tcp {
-            sockets.add(Self::create_tcp_socket());
+    fn has_active_session(
+        &self,
+        socket_set: &SocketSet,
+        dst_addr: smoltcp::wire::IpAddress,
+        dst_port: u16,
+    ) -> bool {
+        for (_, socket) in socket_set.iter() {
+            if let Some(tcp) = tcp::Socket::downcast(socket) {
+                if let Some(endpoint) = tcp.local_endpoint() {
+                    if endpoint.addr == dst_addr && endpoint.port == dst_port {
+                        return true;
+                    }
+                }
+            }
         }
+        false
+    }
+
+    pub fn cleanup(&mut self, socket_set: &mut SocketSet) {
+        for handle in self.sockets_to_remove.drain(..) {
+            debug!(%handle, "Memory free: removing socket from set");
+            socket_set.remove(handle);
+            self.last_activity.remove(&handle);
+            self.failed_until.remove(&handle);
+        }
+    }
+    pub fn setup_sockets(n_udp: usize, n_icmp: usize) -> SocketSet<'static> {
+        let mut sockets = SocketSet::new(Vec::with_capacity(n_udp + n_icmp + 10));
 
         for _ in 0..n_udp {
             sockets.add(Self::create_udp_socket());
@@ -228,7 +301,6 @@ impl ConnectionManager {
 
         sockets
     }
-
     pub fn log_status(&self, socket_set: &SocketSet) {
         let mut established = 0;
         let mut total_tcp = 0;
