@@ -163,6 +163,7 @@ pub fn setup_platform_routing(remote_address: &str) -> io::Result<()> {
 pub fn reset_platform_routing(proxy_ip: Option<&str>) -> io::Result<()> {
     #[cfg(target_os = "linux")]
     {
+        let _ = run_cmd_ext("ip link delete netr0", true);
         let _ = run_cmd_ext("ip rule del fwmark 0x1 table 100", true);
         let _ = run_cmd_ext("ip route flush table 100", true);
         let _ = run_cmd_ext("nft delete table ip netrunner", true);
