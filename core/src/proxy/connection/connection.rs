@@ -28,7 +28,8 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-pub const BUF_SIZE: usize = 16384;
+pub const BUF_SIZE: usize = 65536;
+pub const CHANNEL_SIZE: usize = 256;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ConnectionRole {
@@ -139,7 +140,7 @@ impl ClientHandler {
             }
         }
 
-        let (mux_tx, mux_rx) = mpsc::channel(BUF_SIZE);
+        let (mux_tx, mux_rx) = mpsc::channel(CHANNEL_SIZE);
         let muxer = Muxer::new(mux_tx, true);
 
         let handler =
@@ -281,7 +282,7 @@ impl ServerHandler {
 impl TunnelHandler for ServerHandler {
     async fn run(mut self) -> Result<(), String> {
         info!("Acting as TLS Server");
-        let (mux_tx, mux_rx) = mpsc::channel(BUF_SIZE);
+        let (mux_tx, mux_rx) = mpsc::channel(CHANNEL_SIZE);
         let muxer = Muxer::new(mux_tx, false);
 
         // Тайм-аут для защиты от "сканеров-молчунов" (Active Probing)

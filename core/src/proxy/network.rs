@@ -3,6 +3,7 @@ use crate::{
     proxy::connection::{
         connection::{
             ClientHandler, Connection, ConnectionRole, ServerHandler, TunnelHandler, BUF_SIZE,
+            CHANNEL_SIZE,
         },
         engine::TunnelEngine,
         muxer::Muxer,
@@ -132,7 +133,7 @@ impl Network {
             }
         }
 
-        let (mux_tx, mux_rx) = tokio::sync::mpsc::channel(BUF_SIZE);
+        let (mux_tx, mux_rx) = tokio::sync::mpsc::channel(CHANNEL_SIZE);
         let muxer = Muxer::new(mux_tx, true);
 
         let handler = std::sync::Arc::new(crate::proxy::connection::handler::StreamHandler::new(
