@@ -212,9 +212,10 @@ impl ConnectionManager {
 
     fn create_dynamic_tcp_socket<'a>(port: u16) -> tcp::Socket<'a> {
         let buf_size = match port {
-            443 | 80 => 2048 * 1024,
-            22 | 53 | 123 => 16 * 1024,
-            _ => 64 * 1024,
+            443 | 80 => 512 * 1024,
+            22 => 32 * 1024,
+            53 => 16 * 1024,
+            _ => 128 * 1024,
         };
 
         let mut socket = tcp::Socket::new(
@@ -222,11 +223,11 @@ impl ConnectionManager {
             tcp::SocketBuffer::new(vec![0; buf_size]),
         );
 
+        // Nagle отключен - это правильно для уменьшения задержек
         socket.set_nagle_enabled(false);
         socket.set_ack_delay(None);
         socket
     }
-
     pub fn try_create_socket_from_packet(&mut self, packet: &[u8], socket_set: &mut SocketSet) {
         let Ok(ip_packet) = Ipv4Packet::new_checked(packet) else {
             return;
@@ -288,8 +289,9 @@ impl ConnectionManager {
 
     fn create_dynamic_udp_socket<'a>(port: u16) -> udp::Socket<'a> {
         let (buf_size, packet_count) = match port {
-            443 => (1024 * 1024, 512),
-            _ => (128 * 1024, 128),
+            443 => (512 * 1024, 380), // Большой буфер для QUIC (YouTube)
+            53 => (16 * 1024, 32),    // DNS
+            _ => (128 * 1024, 100),
         };
 
         udp::Socket::new(
