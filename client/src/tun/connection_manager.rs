@@ -358,7 +358,7 @@ impl ConnectionManager {
         }
     }
     pub fn setup_sockets(n_icmp: usize) -> SocketSet<'static> {
-        let mut sockets = SocketSet::new(Vec::with_capacity(256));
+        let mut sockets = SocketSet::new(Vec::with_capacity(1024));
 
         for _ in 0..n_icmp {
             sockets.add(Self::create_icmp_socket());

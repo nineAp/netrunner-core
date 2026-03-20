@@ -18,24 +18,33 @@ pub enum ConnectionState {
 pub struct TcpConnection {
     handle: SocketHandle,
     state: ConnectionState,
-    tx: mpsc::UnboundedSender<Vec<u8>>,
+    // UPLOAD: Ограниченный канал (Bounded) для Backpressure (128)
+    tx: mpsc::Sender<Vec<u8>>,
+    // DOWNLOAD: Безлимитный канал (Unbounded), чтобы Муксер НИКОГДА не зависал
     rx: mpsc::UnboundedReceiver<Vec<u8>>,
     pending_data: Vec<u8>,
     handshake_rx: Option<oneshot::Receiver<()>>,
 }
 
-const MAX_PENDING: usize = 2 * 1024 * 1024;
+// Подняли лимит буфера для загрузок до 32 Мегабайт.
+// Этого хватит для Спидтеста на скорости ~200-300 Мбит/с без разрыва соединения.
+const MAX_PENDING: usize = 32 * 1024 * 1024;
 
 impl TcpConnection {
     pub fn new(handle: SocketHandle, target_addr: TargetAddress, muxer: Muxer) -> Self {
-        let (tx_to_mux, mut rx_from_smol) = mpsc::unbounded_channel::<Vec<u8>>();
+        // UPLOAD: Ограничиваем очередь
+        let (tx_to_mux, mut rx_from_smol) = mpsc::channel::<Vec<u8>>(128);
+
+        // DOWNLOAD: Безлимитный канал до синхронного tick()
         let (tx_to_smol, rx_from_proxy) = mpsc::unbounded_channel::<Vec<u8>>();
         let (handshake_tx, handshake_rx) = oneshot::channel();
 
         let stream_id = muxer.next_id();
 
         tokio::spawn(async move {
-            let (v_tx, mut v_rx) = mpsc::channel(64);
+            // ИСПРАВЛЕНИЕ: Даем Муксеру ограниченный канал, как он и просит (тип mpsc::Sender)
+            // Делаем его достаточно вместительным (1024)
+            let (v_tx, mut v_rx) = mpsc::channel::<Bytes>(1024);
             muxer.register_stream(stream_id, v_tx).await;
 
             let connect_payload = target_addr.to_string();
@@ -83,6 +92,9 @@ impl TcpConnection {
                 }
             };
 
+            // МАГИЯ ЗДЕСЬ: Мы мгновенно читаем из ограниченного v_rx и переливаем
+            // в безлимитный tx_to_smol. send() у безлимитного канала никогда не блокируется.
+            // Поэтому v_rx всегда пустой, и Муксер никогда не зависнет!
             let from_proxy = async {
                 while let Some(data) = v_rx.recv().await {
                     if data.is_empty() {
@@ -113,7 +125,7 @@ impl TcpConnection {
             handle,
             state: ConnectionState::Handshaking,
             tx: tx_to_mux,
-            rx: rx_from_proxy,
+            rx: rx_from_proxy, // Это UnboundedReceiver, здесь ничего менять не надо
             pending_data: vec![],
             handshake_rx: Some(handshake_rx),
         }
@@ -156,19 +168,17 @@ impl TcpConnection {
                     return false;
                 }
             }
-
             ConnectionState::Closed => {
                 return false;
             }
-
             _ => {}
         }
 
         true
     }
+
     pub fn is_finished(&self, socket: &tcp::Socket) -> bool {
         use tcp::State;
-
         matches!(socket.state(), State::Closed | State::TimeWait)
     }
 
@@ -177,45 +187,75 @@ impl TcpConnection {
     }
 
     fn poll_and_process(&mut self, socket: &mut tcp::Socket) {
+        // 1. UPLOAD: Чанкинг и Backpressure (Защита от краша сервера)
         if socket.can_recv() {
-            let mut total_read = 0;
-            let _ = socket.recv(|data| {
-                if !data.is_empty() {
-                    if self.tx.send(data.to_vec()).is_ok() {
-                        total_read = data.len();
+            while socket.can_recv() {
+                let mut channel_full = false;
+                let mut channel_closed = false;
+
+                let _ = socket.recv(|data| {
+                    if data.is_empty() {
+                        return (0, ());
                     }
-                }
-                (total_read, ())
-            });
-        }
 
-        if self.pending_data.len() > MAX_PENDING {
-            netrunner_logger::error!(%self.handle, "TCP Buffer overflow ({} bytes). Dropping connection.", self.pending_data.len());
-            socket.abort();
-            self.state = ConnectionState::Closed;
-            return;
-        }
+                    let chunk_size = std::cmp::min(data.len(), 16000);
+                    let chunk = &data[..chunk_size];
 
-        if !self.pending_data.is_empty() && socket.can_send() {
-            match socket.send_slice(&self.pending_data) {
-                Ok(n) => {
-                    self.pending_data.drain(..n);
+                    match self.tx.try_send(chunk.to_vec()) {
+                        Ok(_) => (chunk_size, ()),
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            channel_full = true;
+                            (0, ()) // Оставляем данные в smoltcp
+                        }
+                        Err(_) => {
+                            channel_closed = true;
+                            (0, ())
+                        }
+                    }
+                });
+
+                if channel_full || channel_closed {
+                    break;
                 }
-                Err(_) => {}
             }
         }
 
-        if self.pending_data.is_empty() && socket.can_send() {
-            if let Ok(data) = self.rx.try_recv() {
+        // 2. DOWNLOAD: Сброс безлимитного канала в буфер
+        while let Ok(data) = self.rx.try_recv() {
+            if self.pending_data.is_empty() && socket.can_send() {
                 match socket.send_slice(&data) {
                     Ok(n) if n < data.len() => {
                         self.pending_data.extend_from_slice(&data[n..]);
                     }
                     Ok(_) => {}
                     Err(_) => {
-                        self.pending_data = data;
+                        self.pending_data.extend_from_slice(&data);
                     }
                 }
+            } else {
+                self.pending_data.extend_from_slice(&data);
+            }
+
+            // Защита от OOM. 32MB более чем достаточно.
+            if self.pending_data.len() > MAX_PENDING {
+                netrunner_logger::error!(
+                    %self.handle,
+                    "TCP Buffer overflow ({} bytes). Dropping connection.",
+                    self.pending_data.len()
+                );
+                socket.abort();
+                self.state = ConnectionState::Closed;
+                return;
+            }
+        }
+
+        // 3. DOWNLOAD: Отправка буфера в smoltcp
+        if !self.pending_data.is_empty() && socket.can_send() {
+            match socket.send_slice(&self.pending_data) {
+                Ok(n) => {
+                    self.pending_data.drain(..n);
+                }
+                Err(_) => {}
             }
         }
     }

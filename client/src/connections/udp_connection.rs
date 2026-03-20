@@ -11,19 +11,19 @@ use netrunner_core::{
     proxy::connection::muxer::{MuxMessage, Muxer},
 };
 
+use crate::connections::CHANNEL_CAPACITY;
+
 pub struct UdpConnection {
     pub handle: SocketHandle,
     stream_id: u32,
     tx_to_net: mpsc::Sender<MuxMessage>,
-    rx_from_net: mpsc::Receiver<Bytes>,
+    rx_from_net: mpsc::UnboundedReceiver<Bytes>, // <-- ТУТ
     client_endpoint: Option<IpEndpoint>,
     last_activity: Instant,
     token: CancellationToken,
 }
 
 const UDP_TIMEOUT: Duration = Duration::from_secs(60);
-
-const CHANNEL_CAPACITY: usize = 128;
 
 impl UdpConnection {
     pub fn new(handle: SocketHandle, target_addr: TargetAddress, muxer: Muxer) -> Self {
@@ -33,11 +33,14 @@ impl UdpConnection {
 
         let (tx_to_net, mut rx_from_smol) = mpsc::channel::<MuxMessage>(CHANNEL_CAPACITY);
 
-        let (v_tx, v_rx) = mpsc::channel::<Bytes>(CHANNEL_CAPACITY);
+        // ИСПРАВЛЕНИЕ: Внутренний безлимитный канал
+        let (internal_tx, internal_rx) = mpsc::unbounded_channel::<Bytes>();
 
         let m_clone = muxer.clone();
 
         tokio::spawn(async move {
+            // Даем Муксеру ограниченный канал (тип Sender), чтобы компилятор пропустил
+            let (v_tx, mut v_rx) = mpsc::channel::<Bytes>(1024);
             m_clone.register_stream(stream_id, v_tx).await;
 
             let _ = m_clone
@@ -56,8 +59,18 @@ impl UdpConnection {
                 }
             };
 
+            // Мгновенно выкачиваем данные из Муксера в безлимитный внутренний канал
+            let from_proxy = async {
+                while let Some(data) = v_rx.recv().await {
+                    if internal_tx.send(data).is_err() {
+                        break;
+                    }
+                }
+            };
+
             tokio::select! {
                 _ = to_proxy => {}
+                _ = from_proxy => {} // Не забудь добавить этот блок в select!
                 _ = task_token.cancelled() => {}
             }
 
@@ -75,7 +88,7 @@ impl UdpConnection {
             handle,
             stream_id,
             tx_to_net,
-            rx_from_net: v_rx,
+            rx_from_net: internal_rx, // Сохраняем безлимитный ресивер
             client_endpoint: None,
             last_activity: Instant::now(),
             token,
