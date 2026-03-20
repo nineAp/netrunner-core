@@ -146,7 +146,7 @@ impl TlsExtensions {
         if (id & 0x0f0f) != 0x0a0a {
             return false;
         }
-        // Убеждаемся, что оба байта идентичны (0x1A1A, а не 0x1A2A)
+
         (id & 0xff) == (id >> 8)
     }
 }

@@ -115,29 +115,25 @@ impl Parser for ClientHello {
     fn can_parse(bytes: &BytesMut) -> bool {
         let mut reader = &bytes[..];
 
-        // 1. Version (2) + Random (32) + SessionID Len (1) = 35
         if reader.len() < 35 {
             return false;
         }
         reader.advance(34);
 
-        // 2. Session ID
         let sid_len = reader[0] as usize;
         reader.advance(1);
         if reader.len() < sid_len + 2 {
             return false;
-        } // +2 для Cipher Suites Len
+        }
         reader.advance(sid_len);
 
-        // 3. Cipher Suites
         let ciphers_len = u16::from_be_bytes([reader[0], reader[1]]) as usize;
         reader.advance(2);
         if reader.len() < ciphers_len + 1 {
             return false;
-        } // +1 для Compression Len
+        }
         reader.advance(ciphers_len);
 
-        // 4. Compression Methods
         let comp_len = reader[0] as usize;
         reader.advance(1);
         if reader.len() < comp_len {
@@ -145,7 +141,6 @@ impl Parser for ClientHello {
         }
         reader.advance(comp_len);
 
-        // 5. Extensions (опционально в TLS, но обычно есть)
         if reader.len() >= 2 {
             let ext_len = u16::from_be_bytes([reader[0], reader[1]]) as usize;
             reader.advance(2);
@@ -158,8 +153,6 @@ impl Parser for ClientHello {
     }
 
     fn parse(bytes: &mut BytesMut) -> Result<Option<Self>, Self::Error> {
-        // Мы уже проверили всё в can_parse, поэтому здесь просто
-        // последовательно забираем данные через get_*
         if !Self::can_parse(bytes) {
             return Ok(None);
         }

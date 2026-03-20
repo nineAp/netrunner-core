@@ -35,7 +35,6 @@ impl StreamHandler {
             let target_str = String::from_utf8_lossy(&payload).to_string();
             let muxer = self.muxer.clone();
 
-            // Канал для передачи данных из мультиплексора в мост (bridge)
             let (v_tx, v_rx) = tokio::sync::mpsc::channel(512);
             muxer.register_stream(stream_id, v_tx).await;
 
@@ -43,7 +42,6 @@ impl StreamHandler {
                 let start = std::time::Instant::now();
                 info!(stream_id, target = %target_str, "Attempting remote connection");
 
-                // Обертываем коннект в таймаут, чтобы не плодить зомби-таски
                 let connect_timeout = tokio::time::timeout(
                     std::time::Duration::from_secs(5),
                     tokio::net::TcpStream::connect(&target_str),
@@ -62,7 +60,7 @@ impl StreamHandler {
 
                         let mut reply_buf = BytesMut::with_capacity(10);
                         let reply = SocksReply::ConnectResult {
-                            reply_code: 0x00, // Success
+                            reply_code: 0x00,
                             atyp: 0x01,
                             addr: [0, 0, 0, 0],
                             port: 0,
@@ -78,11 +76,11 @@ impl StreamHandler {
                     }
                     Ok(Err(e)) => {
                         error!(stream_id, target = %target_str, error = %e, "TCP connection failed");
-                        Self::send_error_reply(&muxer, stream_id, 0x01).await; // 0x01 = General failure
+                        Self::send_error_reply(&muxer, stream_id, 0x01).await;
                     }
                     Err(_) => {
                         error!(stream_id, target = %target_str, "Connection timed out (DNS/TCP)");
-                        Self::send_error_reply(&muxer, stream_id, 0x04).await; // 0x04 = Host unreachable
+                        Self::send_error_reply(&muxer, stream_id, 0x04).await;
                     }
                 }
             });

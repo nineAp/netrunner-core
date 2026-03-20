@@ -46,16 +46,12 @@ impl Codec {
             )
         })?;
 
-        // ВАЖНО: TlsBridge сам проверит Auth Tag в Session ID клиента
-        // и вызовет update_keys для генерации общего секрета.
         let server_hello_record = TlsBridge::wrap_server_hello(
             &client_msg,
             &mut self.session_keys,
             &ServerProfile::MODERN,
         )?;
 
-        // Ключи уже обновлены внутри session_keys.
-        // Просто забираем их и устанавливаем в AEAD шифратор.
         let (w_key, w_iv, r_key, r_iv) = self.session_keys.get_aead_parameters();
         self.crypto.set_keys(w_key, w_iv, r_key, r_iv);
 

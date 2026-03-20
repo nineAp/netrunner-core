@@ -40,10 +40,10 @@ impl DnsHandler {
 
         if needs_update {
             let p_clone = self.cache_path.clone();
-            // Просто спавним асинхронную задачу
+
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_secs(10)).await;
-                // Теперь вызываем асинхронно через .await
+
                 if let Err(e) = Self::download_blocklist_async(p_clone).await {
                     netrunner_logger::error!("DNS: Background update failed: {}", e);
                 }
@@ -53,7 +53,6 @@ impl DnsHandler {
         Ok(())
     }
 
-    // Делаем функцию асинхронной и убираем block_on
     async fn download_blocklist_async(cache_path: String) -> anyhow::Result<()> {
         info!("DNS: Starting background download to {}", cache_path);
 
@@ -112,7 +111,6 @@ impl DnsHandler {
             .set_recursion_available(true)
             .add_query(query.clone());
 
-        // Проверка блокировок
         if self.forbidden_suffixes.iter().any(|s| name.ends_with(s))
             || self.block_list.contains(&name)
         {

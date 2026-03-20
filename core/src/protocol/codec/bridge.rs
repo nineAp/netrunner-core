@@ -144,7 +144,6 @@ impl TlsBridge {
         profile: &ServerProfile,
     ) -> Result<Bytes, TlsError> {
         if let HandshakeMessage::Client { base, extensions } = client_msg {
-            // 1. Проверка Auth Tag в Session ID (последние 16 байт)
             if base.session_id.len() != 32 {
                 return Err(TlsError::new(
                     ErrorStage::Handshake("Invalid SessionID len"),
@@ -165,8 +164,6 @@ impl TlsBridge {
                 ));
             }
 
-            // 2. Выполняем Key Exchange (находим KeyShare клиента и считаем Shared Secret)
-            // Это обновит внутреннее состояние keys (auth_key и AEAD ключи)
             keys.update_keys(base.random, extensions, true)
                 .map_err(|e| {
                     netrunner_logger::error!(error = %e, "Server failed key update");
@@ -177,7 +174,6 @@ impl TlsBridge {
                     )
                 })?;
 
-            // 3. Генерируем ServerHello, используя наш свежий публичный ключ и локальную соль
             let server_pub_key = keys.ecdh.public_key.to_bytes();
 
             Ok(ServerHello::make_server_hello(

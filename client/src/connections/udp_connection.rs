@@ -1,4 +1,4 @@
-use crate::connections::dns::DnsHandler; // проверь путь
+use crate::connections::dns::DnsHandler;
 use crate::connections::ip_store::FakeIpStore;
 use smoltcp::socket::udp;
 

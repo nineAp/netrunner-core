@@ -114,22 +114,18 @@ impl ConnectionManager {
     fn handle_tcp(&mut self, handle: SocketHandle, socket: &mut tcp::Socket) {
         use tcp::State;
 
-        // 1. Очистка закрытых сокетов
         if socket.state() == State::Closed {
-            // Если сокет закрыт, удаляем его сессию и помечаем на удаление из сета
             if self.active_tcp_sessions.contains_key(&handle) {
                 debug!(%handle, "TCP session closed, removing from active sessions");
                 self.active_tcp_sessions.remove(&handle);
             }
 
-            // Добавляем в очередь на удаление из SocketSet (чтобы освободить память)
             if !self.sockets_to_remove.contains(&handle) {
                 self.sockets_to_remove.push(handle);
             }
             return;
         }
 
-        // 2. Инициализация сессии при установке соединения
         if socket.state() == State::Established && !self.active_tcp_sessions.contains_key(&handle) {
             let target = self.resolve_target(socket);
 
@@ -145,12 +141,10 @@ impl ConnectionManager {
             self.active_tcp_sessions.insert(handle, conn);
         }
 
-        // 3. Тик активной сессии (проброс данных в прокси)
         if let Some(conn) = self.active_tcp_sessions.get_mut(&handle) {
             if !conn.tick(socket) {
                 debug!(%handle, "Connection tick failed, aborting.");
                 socket.abort();
-                // Сессия удалится на следующем проходе, когда стейт станет Closed
             }
         }
 
@@ -190,9 +184,9 @@ impl ConnectionManager {
 
     fn create_dynamic_tcp_socket<'a>(port: u16) -> tcp::Socket<'a> {
         let buf_size = match port {
-            443 | 80 => 256 * 1024,     // 256 KB для веба
-            22 | 53 | 123 => 16 * 1024, // 16 KB для мелких протоколов (SSH, DNS over TCP, NTP)
-            _ => 64 * 1024,             // Дефолт
+            443 | 80 => 256 * 1024,
+            22 | 53 | 123 => 16 * 1024,
+            _ => 64 * 1024,
         };
 
         let mut socket = tcp::Socket::new(
@@ -200,7 +194,7 @@ impl ConnectionManager {
             tcp::SocketBuffer::new(vec![0; buf_size]),
         );
 
-        socket.set_nagle_enabled(false); // Для отзывчивости (особенно в играх типа Silent Hill, если через VPN)
+        socket.set_nagle_enabled(false);
         socket.set_ack_delay(None);
         socket
     }
@@ -216,12 +210,10 @@ impl ConnectionManager {
             return;
         };
 
-        // Ищем только SYN (начало соединения)
         if tcp_packet.syn() && !tcp_packet.ack() {
             let dst_port = tcp_packet.dst_port();
             let dst_addr = ip_packet.dst_addr();
 
-            // Проверяем, не создали ли мы уже такой сокет на предыдущем шаге
             if !self.has_active_session(socket_set, dst_addr.into(), dst_port) {
                 debug!(target: "netrunner", "Dynamic TCP: Creating socket for {}:{}", dst_addr, dst_port);
 

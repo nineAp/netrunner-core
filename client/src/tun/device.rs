@@ -15,7 +15,6 @@ use smoltcp::{
 };
 use tokio::sync::mpsc;
 
-// --- TokenBuffer (без изменений, он у тебя отличный) ---
 const TOKEN_BUFFER_LIST_MAX_SIZE: usize = 64;
 static TOKEN_BUFFER_LIST: LazyLock<Mutex<Vec<BytesMut>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 
@@ -61,11 +60,10 @@ impl DerefMut for TokenBuffer {
     }
 }
 
-// --- VirtTunDevice ---
 pub struct VirtTunDevice {
     capabilities: DeviceCapabilities,
-    rx_queue: mpsc::UnboundedReceiver<TokenBuffer>, // smoltcp читает отсюда
-    tx_queue: mpsc::UnboundedSender<TokenBuffer>,   // smoltcp пишет сюда
+    rx_queue: mpsc::UnboundedReceiver<TokenBuffer>,
+    tx_queue: mpsc::UnboundedSender<TokenBuffer>,
     rx_avail: Arc<AtomicBool>,
 }
 
@@ -74,8 +72,8 @@ impl VirtTunDevice {
         capabilities: DeviceCapabilities,
     ) -> (
         Self,
-        mpsc::UnboundedSender<TokenBuffer>, // Канал, чтобы закидывать пакеты в smoltcp
-        mpsc::UnboundedReceiver<TokenBuffer>, // Канал, чтобы забирать готовые пакеты из smoltcp
+        mpsc::UnboundedSender<TokenBuffer>,
+        mpsc::UnboundedReceiver<TokenBuffer>,
         Arc<AtomicBool>,
     ) {
         let (to_smoltcp_tx, to_smoltcp_rx) = mpsc::unbounded_channel();

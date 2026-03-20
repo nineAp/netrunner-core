@@ -36,36 +36,29 @@ impl ClientHello {
 
         buf.put_u8(HANDSHAKE_TYPE_CLIENT_HELLO);
 
-        // Резервируем 3 байта под длину Handshake (U24)
         let length_pos = buf.len();
         buf.put_bytes(0, 3);
 
-        buf.put_u16(0x0303); // Legacy Version
+        buf.put_u16(0x0303);
         buf.put_slice(&self.random);
 
-        // Session ID
         buf.put_u8(self.session_id.len() as u8);
         buf.put_slice(&self.session_id);
 
-        // Cipher Suites
         buf.put_u16((self.cipher_suites.len() * 2) as u16);
         for &suite in &self.cipher_suites {
             buf.put_u16(suite);
         }
 
-        // Compression Methods (всегда 0x01 0x00 для маскировки)
         buf.put_u8(1);
         buf.put_u8(0x00);
 
-        // Extensions
         buf.put_u16(self.extensions.len() as u16);
         buf.put_slice(&self.extensions);
 
-        // ПРАВИЛЬНЫЙ РАСЧЕТ ДЛИНЫ:
-        // Длина сообщения Handshake не включает сам тип (1 байт) и поле длины (3 байта)
         let total_len = (buf.len() - length_pos - 3) as u32;
         let len_bytes = total_len.to_be_bytes();
-        // Записываем 3 байта длины (Big Endian)
+
         buf[length_pos..length_pos + 3].copy_from_slice(&len_bytes[1..4]);
 
         buf.freeze()
@@ -126,14 +119,12 @@ impl ServerHello {
         salt: [u8; 32],
         profile: &ServerProfile,
     ) -> Bytes {
-        // Создаем инстанс ServerHello
         let server_hello = Self::from_client_hello(client_hello, server_public_key, salt, profile);
 
-        // Оборачиваем в Record Layer
         let record = TlsRecord::new(
             ContentType::Handshake,
-            profile.record_layer_version, // 0x0303 обычно
-            server_hello.serialize(),     // Сериализация самого SH
+            profile.record_layer_version,
+            server_hello.serialize(),
         );
 
         record.serialize()
@@ -145,10 +136,8 @@ impl ServerHello {
         salt: [u8; 32],
         profile: &ServerProfile,
     ) -> Self {
-        // 1. Используем соль как рандом сервера
         let server_random = salt;
 
-        // 2. Выбор Cipher Suite (твой код здесь хорош, оставляем)
         let selected_suite = if profile.honor_cipher_order {
             profile
                 .cipher_suites
@@ -167,27 +156,22 @@ impl ServerHello {
 
         let mut extensions = BytesMut::new();
 
-        // 3. Работа с версией.
-        // Выбираем макс. версию из профиля (например, TLS 1.3)
         let selected_version = profile.versions.max();
 
-        // Добавляем расширение Supported Versions (обязательно для TLS 1.3)
         extensions.put_u16(0x002b);
         extensions.put_u16(2);
         extensions.put_u16(selected_version as u16);
 
-        // 4. Key Share (исправляем расчет длины, чтобы не было как в прошлый раз)
         let key_len = server_public_key.len() as u16;
         extensions.put_u16(0x0033);
-        extensions.put_u16(key_len + 4); // Группа(2) + Длина(2) + Ключ
-        extensions.put_u16(0x001d); // x25519
+        extensions.put_u16(key_len + 4);
+        extensions.put_u16(0x001d);
         extensions.put_u16(key_len);
         extensions.put_slice(server_public_key);
 
         Self {
-            // Это поле будет использоваться как legacy_version (0x0303)
             version: ProtocolVersion::Tls12,
-            random: server_random, // ИСПОЛЬЗУЕМ переменную
+            random: server_random,
             session_id: client_hello.session_id.clone(),
             cipher_suite: selected_suite,
             extensions,
@@ -199,26 +183,20 @@ impl ServerHello {
 
         buf.put_u8(HANDSHAKE_TYPE_SERVER_HELLO);
 
-        // Резервируем место под длину Handshake (3 байта)
         let length_pos = buf.len();
         buf.put_slice(&[0, 0, 0]);
 
-        // Используем версию из структуры (Legacy Version)
         buf.put_u16(self.version as u16);
 
-        // Используем рандом из структуры
         buf.put_slice(&self.random);
 
-        // Session ID (Echo)
         buf.put_u8(self.session_id.len() as u8);
         buf.put_slice(&self.session_id);
 
         buf.put_u16(self.cipher_suite);
 
-        // Compression (0x00)
         buf.put_u8(0x00);
 
-        // Extensions
         if !self.extensions.is_empty() {
             buf.put_u16(self.extensions.len() as u16);
             buf.put_slice(&self.extensions);
@@ -226,7 +204,6 @@ impl ServerHello {
             buf.put_u16(0);
         }
 
-        // Заполняем длину handshake-сообщения
         let total_handshake_body_len = (buf.len() - length_pos - 3) as u32;
         let len_bytes = total_handshake_body_len.to_be_bytes();
         buf[length_pos..length_pos + 3].copy_from_slice(&len_bytes[1..4]);

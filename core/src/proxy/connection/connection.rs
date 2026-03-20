@@ -64,7 +64,7 @@ impl Connection {
 
     pub fn new_raw(inbound: OwnedReadHalf, outbound: OwnedWriteHalf) -> Self {
         Self {
-            addr: "0.0.0.0:0".parse().unwrap(), // заглушка, если адрес не важен
+            addr: "0.0.0.0:0".parse().unwrap(),
             inbound,
             outbound,
             read_buf: BytesMut::with_capacity(BUF_SIZE),
@@ -105,7 +105,6 @@ pub struct ClientHandler {
     pub muxer: Muxer,
 }
 
-// Внутри connection.rs или где у тебя ClientHandler
 impl ClientHandler {
     pub async fn connect(
         remote_proxy_addr: &str,
@@ -118,7 +117,6 @@ impl ClientHandler {
 
         let mut conn = Connection::new_raw(inbound, outbound);
 
-        // TLS Handshake
         let ch = conn
             .codec
             .make_client_handshake(&BrowserProfile::CHROME_131, "google.com")
@@ -177,7 +175,6 @@ impl ClientHandler {
 
         let mut buf = [0u8; 1024];
         loop {
-            // Просто ждем, пока клиент не разорвет TCP-соединение
             if self
                 .conn
                 .inbound
@@ -198,17 +195,14 @@ impl TunnelHandler for ClientHandler {
     async fn run(mut self) -> Result<(), String> {
         info!("Starting SOCKS multiplexed handling");
 
-        // 1. Приветствие (Handshake)
         self.conn.read_socks_request().await?;
         self.conn
             .send_socks_reply(SocksReply::HandshakeSelect { method: 0x00 })
             .await?;
 
-        // 2. Получаем основной запрос (Connect или UDP Associate)
         let req = self.conn.read_socks_request().await?;
 
         match req {
-            // Ветка TCP CONNECT
             SocksRequest::Connect {
                 command: 0x01,
                 target,
@@ -253,13 +247,11 @@ impl TunnelHandler for ClientHandler {
                 Ok(())
             }
 
-            // Ветка UDP ASSOCIATE
             SocksRequest::Connect { command: 0x03, .. } => {
                 info!("Handling UDP Associate request");
                 self.handle_udp_associate().await
             }
 
-            // Всё остальное (BIND и т.д.)
             _ => Err("Unsupported SOCKS command".into()),
         }
     }

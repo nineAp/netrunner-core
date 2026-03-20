@@ -56,7 +56,7 @@ pub struct SessionKeys {
     pub ecdh: ECDH,
     pub auth_key: [u8; 32],
     pub current_aead: Option<([u8; 32], [u8; 12], [u8; 32], [u8; 12])>,
-    is_initiator: bool, // Сохраним роль для правильного возврата параметров
+    is_initiator: bool,
 }
 
 impl SessionKeys {
@@ -159,7 +159,6 @@ impl SessionKeys {
 
         self.auth_key = HKDF::expand_key::<32>(&hkdf, b"auth_key").map_err(|e| e.to_string())?;
 
-        // Определяем порядок: (Write Key, Write IV, Read Key, Read IV)
         let keys = if is_server {
             (s_key, s_iv, c_key, c_iv)
         } else {

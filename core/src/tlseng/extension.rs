@@ -260,14 +260,13 @@ impl ExtensionBuilder {
                 TlsExtensions::RENEGOTIATION_INFO => self.renegotiation_info(),
                 TlsExtensions::PADDING => {
                     if profile.target_padding_len > 0 {
-                        // Передаем накопленный оверхед всего пакета
                         self.padding(profile.target_padding_len as usize, overhead);
                     }
                 }
 
                 id if TlsExtensions::is_grease(id) => {
                     if profile.has_grease {
-                        self.grease_with_id(id); // Используем конкретный ID из ExtensionOrder
+                        self.grease_with_id(id);
                     }
                 }
                 _ => self.apply_generic_extension(ext_id, profile),

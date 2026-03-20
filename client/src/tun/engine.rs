@@ -29,11 +29,7 @@ pub struct Engine {
     socket_set: SocketSet<'static>,
     manager: ConnectionManager,
     device: VirtTunDevice,
-
-    // Канал для инъекции пакетов в smoltcp
     to_smoltcp_tx: UnboundedSender<TokenBuffer>,
-
-    // Временное хранилище канала выхода из smoltcp (отдадим воркеру в run)
     from_smoltcp_rx: Option<UnboundedReceiver<TokenBuffer>>,
 
     avail: Arc<AtomicBool>,
@@ -47,7 +43,7 @@ impl Engine {
         dns_handler: DnsHandler,
     ) -> Self {
         let now = Engine::current_time();
-        // Смотри, как чисто мы получаем компоненты:
+
         let (mut device, to_smoltcp_tx, from_smoltcp_rx, avail) = VirtTunDevice::new(caps);
         let interface = Interface::new(config, &mut device, now);
 
@@ -69,25 +65,19 @@ impl Engine {
         info!("Current routes: {:?}", self.interface.routes());
         let (writer, reader) = tun.split().expect("Failed to split TUN");
 
-        // 1. Создаем трубу для ВХОДЯЩЕГО трафика: TUN -> Engine
         let (tun_to_engine_tx, mut tun_to_engine_rx) = mpsc::unbounded_channel();
         Self::spawn_tun_reader(reader, tun_to_engine_tx, self.avail.clone());
 
-        // 2. Запускаем трубу ИСХОДЯЩЕГО трафика: smoltcp -> TUN
         let from_smoltcp_rx = self.from_smoltcp_rx.take().expect("Engine started twice");
         Self::spawn_tun_writer(writer, from_smoltcp_rx);
 
         let mut last_log = StdInstant::now();
 
-        // 3. Главный цикл (ДИСПЕТЧЕР)
         loop {
-            // Читаем всё, что прилетело из операционной системы
             while let Ok(token) = tun_to_engine_rx.try_recv() {
-                // АНАЛИЗ: Создаем сокет, если это новый SYN
                 self.manager
                     .try_create_socket_from_packet(&token, &mut self.socket_set);
 
-                // ПЕРЕДАЧА: Закидываем пакет в виртуальную сетевую карту smoltcp
                 if self.to_smoltcp_tx.send(token).is_ok() {
                     self.device.mark_rx_available();
                 }
@@ -131,7 +121,6 @@ impl Engine {
         sleep(sleep_duration).await;
     }
 
-    // Воркер: Читает ОС -> Шлет в Engine
     fn spawn_tun_reader(
         mut reader: DeviceReader,
         to_engine: UnboundedSender<TokenBuffer>,
@@ -173,7 +162,6 @@ impl Engine {
         });
     }
 
-    // Воркер: Читает smoltcp -> Шлет в ОС
     fn spawn_tun_writer(
         mut writer: DeviceWriter,
         mut from_smoltcp: UnboundedReceiver<TokenBuffer>,

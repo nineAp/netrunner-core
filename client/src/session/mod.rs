@@ -43,8 +43,7 @@ impl SessionManager {
     pub(crate) fn spawn_session(
         &self,
         remote_address: String,
-        #[cfg(any(target_os = "android", target_os = "ios"))] // Путь обязателен для мобилок
-        tun_fd: Option<i32>,
+        #[cfg(any(target_os = "android", target_os = "ios"))] tun_fd: Option<i32>,
         #[cfg(any(target_os = "android", target_os = "ios"))] cache_dir: String,
     ) -> Arc<Session> {
         let runtime = get_runtime();
@@ -62,11 +61,11 @@ impl SessionManager {
                 #[cfg(any(target_os = "android", target_os = "ios"))]
                 {
                     cache_dir
-                } // Используем путь из мобильного приложения
+                }
                 #[cfg(any(target_os = "linux", target_os = "windows"))]
                 {
                     ".".to_string()
-                } // На ПК пишем в локальную папку
+                }
             };
 
             let mut dns_handler = DnsHandler::new(&cache_path);
@@ -132,9 +131,9 @@ impl SessionManager {
                 info!("Engine async task started");
 
                 tokio::select! {
-                    // Добавляем обработку результата прямо здесь
+
                     res = engine.run(tun_device) => {
-                        // Теперь эта ветка возвращает (), так как мы обработали результат
+
                         info!("Engine loop finished: {:?}", res);
                     },
                     _ = cancel_token_for_engine.cancelled() => {

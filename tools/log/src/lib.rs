@@ -37,7 +37,6 @@ impl Logger {
                 registry.with(fmt_layer)
             };
 
-            // 4. Инициализируем подписчик
             registry.init();
 
             let _ = LOGGER.set(Logger {
