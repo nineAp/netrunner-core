@@ -39,26 +39,35 @@ async fn main() -> anyhow::Result<()> {
 
     let config = Config::new(smoltcp::wire::HardwareAddress::Ip);
     let mut caps = DeviceCapabilities::default();
-    caps.max_transmission_unit = 1280;
+    caps.max_transmission_unit = 1350;
     caps.medium = smoltcp::phy::Medium::Ip;
 
     let network = Network::new(
-        "0.0.0.0".into(),
+        "127.0.0.1".into(),
         8080,
         ConnectionRole::Client,
         Some(remote_address.clone()),
     );
 
-    let proxy_ip = network.get_self_local_address();
-
     let network_token = CancellationToken::new();
     let net_token_for_spawn = network_token.clone();
-    tokio::spawn(async move {
-        info!("Network thread started");
-        network.run(net_token_for_spawn).await;
-    });
 
-    let mut engine = Engine::new(config, caps, proxy_ip, dns_handler);
+    info!("Establishing secure tunnel to proxy server...");
+    let muxer = match network.initialize_client_tunnel(net_token_for_spawn).await {
+        Ok(m) => m,
+        Err(e) => {
+            error!("Failed to establish secure tunnel: {}", e);
+            // Восстанавливаем роутинг перед выходом
+            let _ = reset_platform_routing(Some(
+                &remote_address.split(':').next().unwrap().to_string(),
+            ));
+            return Err(anyhow::anyhow!("Tunnel initialization failed: {}", e));
+        }
+    };
+    info!("Secure tunnel established, Muxer is ready.");
+
+    // Передаем Muxer в Engine
+    let mut engine = Engine::new(config, caps, dns_handler, muxer);
     engine.set_any_ip(true);
     engine.set_transparent_mode();
     engine.set_default_gateway(Ipv4Addr::new(10, 0, 0, 2));
@@ -69,6 +78,7 @@ async fn main() -> anyhow::Result<()> {
 
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::select! {
+        // Запускаем главный цикл обработки пакетов
         res = engine.run(tun_device) => {
             error!("Engine loop error: {:?}", res);
         },
@@ -77,7 +87,9 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Отменяем токен, что завершит фоновые задачи мультиплексора (TunnelEngine)
     network_token.cancel();
+
     info!("Restoring system routing...");
     let addr: std::net::SocketAddr = remote_address.parse().expect("Invalid address format");
     let p_ip = addr.ip().to_string();

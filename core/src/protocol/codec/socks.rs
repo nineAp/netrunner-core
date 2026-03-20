@@ -1,3 +1,5 @@
+use std::fmt;
+
 use bytes::{BufMut, BytesMut};
 
 use crate::protocol::parser::parser::Parser;
@@ -166,6 +168,16 @@ pub enum TargetAddress {
     Ipv4(std::net::Ipv4Addr, u16),
     Domain(String, u16),
     Ipv6(std::net::Ipv6Addr, u16),
+}
+
+impl fmt::Display for TargetAddress {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TargetAddress::Ipv4(addr, port) => write!(f, "{}:{}", addr, port),
+            TargetAddress::Domain(domain, port) => write!(f, "{}:{}", domain, port),
+            TargetAddress::Ipv6(addr, port) => write!(f, "[{}]:{}", addr, port),
+        }
+    }
 }
 
 #[derive(Debug)]

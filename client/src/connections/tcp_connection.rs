@@ -1,10 +1,12 @@
-use netrunner_core::protocol::codec::socks::{SocksRequest, TargetAddress};
+use std::time::Duration;
+
+use bytes::Bytes;
+use netrunner_core::protocol::codec::frame::FrameType;
+use netrunner_core::protocol::codec::socks::TargetAddress;
+use netrunner_core::proxy::connection::muxer::{MuxMessage, Muxer};
 use smoltcp::iface::SocketHandle;
 use smoltcp::socket::tcp;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
-use tokio_util::sync::CancellationToken;
 
 pub enum ConnectionState {
     Established,
@@ -19,63 +21,79 @@ pub struct TcpConnection {
     tx: mpsc::UnboundedSender<Vec<u8>>,
     rx: mpsc::UnboundedReceiver<Vec<u8>>,
     pending_data: Vec<u8>,
-    token: CancellationToken,
     handshake_rx: Option<oneshot::Receiver<()>>,
 }
 
-const MAX_PENDING: usize = 256 * 1024;
+const MAX_PENDING: usize = 2 * 1024 * 1024;
 
 impl TcpConnection {
-    pub fn new(handle: SocketHandle, proxy_addr: String, target_addr: TargetAddress) -> Self {
-        let (tx_to_proxy, mut rx_from_smol) = mpsc::unbounded_channel::<Vec<u8>>();
+    pub fn new(handle: SocketHandle, target_addr: TargetAddress, muxer: Muxer) -> Self {
+        let (tx_to_mux, mut rx_from_smol) = mpsc::unbounded_channel::<Vec<u8>>();
         let (tx_to_smol, rx_from_proxy) = mpsc::unbounded_channel::<Vec<u8>>();
         let (handshake_tx, handshake_rx) = oneshot::channel();
 
-        let token = CancellationToken::new();
-        let task_token = token.clone();
+        let stream_id = muxer.next_id();
 
         tokio::spawn(async move {
-            let mut stream = match TcpStream::connect(&proxy_addr).await {
-                Ok(s) => {
-                    netrunner_logger::debug!(%handle, "Connected to proxy successfully");
-                    s
-                }
-                Err(e) => {
-                    netrunner_logger::debug!(%handle, error = %e, "Failed to connect to proxy");
-                    return;
-                }
-            };
+            // 1. Регистрируем виртуальный стрим
+            let (v_tx, mut v_rx) = mpsc::channel(1024);
+            muxer.register_stream(stream_id, v_tx).await;
 
-            if let Err(e) = SocksRequest::perform_client_handshake(&mut stream, &target_addr).await
+            // 2. Отправляем запрос на соединение на удаленный сервер
+            let connect_payload = target_addr.to_string();
+            if muxer
+                .send_to_netwrok(MuxMessage {
+                    stream_id,
+                    frame_type: FrameType::Connect,
+                    data: Bytes::from(connect_payload),
+                })
+                .await
+                .is_err()
             {
-                netrunner_logger::debug!(%handle, error = %e, "SOCKS handshake failed");
+                muxer.remove_stream(stream_id).await;
                 return;
             }
 
-            let _ = handshake_tx.send(());
+            let first_payload = tokio::time::timeout(Duration::from_secs(10), v_rx.recv()).await;
+            match first_payload {
+                Ok(Some(data)) => {
+                    // Успешный SOCKS-ответ сервера имеет код 0x00 во втором байте
+                    if data.len() >= 2 && data[1] == 0x00 {
+                        let _ = handshake_tx.send(()); // Даем отмашку smoltcp, что можно слать данные
+                    } else {
+                        netrunner_logger::warn!(stream_id, "Server rejected TCP connection");
+                        muxer.remove_stream(stream_id).await;
+                        return;
+                    }
+                }
+                _ => {
+                    netrunner_logger::error!(stream_id, "Timeout waiting for proxy response");
+                    muxer.remove_stream(stream_id).await;
+                    return;
+                }
+            }
 
-            netrunner_logger::debug!(%handle, "SOCKS handshake successful, starting data bridge");
-
-            let (mut reader, mut writer) = stream.into_split();
-
+            // 4. Запускаем мост данных
             let to_proxy = async {
                 while let Some(data) = rx_from_smol.recv().await {
-                    if writer.write_all(&data).await.is_err() {
+                    let msg = MuxMessage {
+                        stream_id,
+                        frame_type: FrameType::Data, // Для TCP используем обычный Data
+                        data: Bytes::from(data),
+                    };
+                    if muxer.send_to_netwrok(msg).await.is_err() {
                         break;
                     }
                 }
             };
 
             let from_proxy = async {
-                let mut buf = [0u8; 65536];
-                loop {
-                    match reader.read(&mut buf).await {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => {
-                            if tx_to_smol.send(buf[..n].to_vec()).is_err() {
-                                break;
-                            }
-                        }
+                while let Some(data) = v_rx.recv().await {
+                    if data.is_empty() {
+                        break;
+                    } // EOF
+                    if tx_to_smol.send(data.to_vec()).is_err() {
+                        break;
                     }
                 }
             };
@@ -83,21 +101,28 @@ impl TcpConnection {
             tokio::select! {
                 _ = to_proxy => {}
                 _ = from_proxy => {}
-                _ = task_token.cancelled() => { netrunner_logger::debug!(%handle, "Task cancelled by Manager"); }
             }
+
+            // 5. Корректно закрываем стрим на сервере
+            let _ = muxer
+                .send_to_netwrok(MuxMessage {
+                    stream_id,
+                    frame_type: FrameType::Close,
+                    data: Bytes::new(),
+                })
+                .await;
+            muxer.remove_stream(stream_id).await;
         });
 
         Self {
             handle,
-            state: ConnectionState::Active,
-            tx: tx_to_proxy,
+            state: ConnectionState::Handshaking, // Начинаем с ожидания handshake_tx
+            tx: tx_to_mux,
             rx: rx_from_proxy,
             pending_data: vec![],
-            token,
             handshake_rx: Some(handshake_rx),
         }
     }
-
     pub fn tick(&mut self, socket: &mut tcp::Socket) -> bool {
         let state = socket.state();
 
@@ -157,43 +182,48 @@ impl TcpConnection {
     }
 
     fn poll_and_process(&mut self, socket: &mut tcp::Socket) {
+        // 1. Читаем ИЗ виртуального сокета -> В прокси-сервер
         if socket.can_recv() {
+            let mut total_read = 0;
             let _ = socket.recv(|data| {
-                let len = data.len();
-                if len > 0 {
-                    let _ = self.tx.send(data.to_vec());
+                if !data.is_empty() {
+                    if self.tx.send(data.to_vec()).is_ok() {
+                        total_read = data.len();
+                    }
                 }
-                (len, ())
+                (total_read, ())
             });
         }
 
-        if !self.pending_data.is_empty() {
-            if self.pending_data.len() > MAX_PENDING {
-                netrunner_logger::warn!(%self.handle, "Buffer overflow! Aborting connection.");
-                socket.abort();
-                self.token.cancel();
-                return;
-            }
+        // 2. Проверка лимита буфера перед тем, как брать новые данные
+        if self.pending_data.len() > MAX_PENDING {
+            netrunner_logger::error!(%self.handle, "TCP Buffer overflow ({} bytes). Dropping connection.", self.pending_data.len());
+            socket.abort();
+            self.state = ConnectionState::Closed;
+            return;
+        }
 
+        // 3. Сбрасываем то, что накопилось в pending_data
+        if !self.pending_data.is_empty() && socket.can_send() {
             match socket.send_slice(&self.pending_data) {
                 Ok(n) => {
-                    self.pending_data.drain(0..n);
+                    self.pending_data.drain(..n);
                 }
                 Err(_) => {}
             }
         }
 
-        if socket.can_send() {
-            while let Ok(data) = self.rx.try_recv() {
+        // 4. Читаем новые данные из прокси, ТОЛЬКО если старые ушли
+        if self.pending_data.is_empty() && socket.can_send() {
+            if let Ok(data) = self.rx.try_recv() {
                 match socket.send_slice(&data) {
                     Ok(n) if n < data.len() => {
-                        self.pending_data = data[n..].to_vec();
-                        break;
+                        self.pending_data.extend_from_slice(&data[n..]);
                     }
                     Ok(_) => {}
                     Err(_) => {
+                        // Если сокет внезапно отказал, сохраняем всё в буфер
                         self.pending_data = data;
-                        break;
                     }
                 }
             }

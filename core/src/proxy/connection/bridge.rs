@@ -3,6 +3,7 @@ use crate::proxy::connection::connection::BUF_SIZE;
 use crate::proxy::connection::muxer::{MuxMessage, Muxer};
 use bytes::{Bytes, BytesMut};
 use netrunner_logger::{debug, error};
+use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 pub async fn run_proxy_bridge<R, W>(
     stream_id: u32,
@@ -50,6 +51,65 @@ pub async fn run_proxy_bridge<R, W>(
                     }
                     None => {
                         debug!(stream_id, "Virtual channel closed");
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    let _ = muxer
+        .send_to_netwrok(MuxMessage {
+            stream_id,
+            frame_type: FrameType::Close,
+            data: Bytes::new(),
+        })
+        .await;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    muxer.remove_stream(stream_id).await;
+}
+
+pub async fn run_udp_bridge(
+    stream_id: u32,
+    socket: UdpSocket,
+    muxer: Muxer,
+    mut v_rx: mpsc::Receiver<Bytes>,
+) {
+    let mut buf = [0u8; 65536]; // Максимальный размер UDP пакета
+
+    loop {
+        tokio::select! {
+            // Читаем из реального интернета и шлем в туннель
+            res = socket.recv(&mut buf) => {
+                match res {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let msg = MuxMessage {
+                            stream_id,
+                            frame_type: FrameType::UdpData,
+                            data: Bytes::copy_from_slice(&buf[..n]),
+                        };
+                        if muxer.send_to_netwrok(msg).await.is_err() { break; }
+                    }
+                    Err(e) => {
+                        error!(stream_id, error = %e, "UDP socket read error");
+                        break;
+                    }
+                }
+            }
+
+            // Читаем из туннеля и шлем в реальный интернет
+            maybe_data = v_rx.recv() => {
+                match maybe_data {
+                    Some(data) => {
+                        if data.is_empty() { break; } // Сигнал закрытия
+                        if let Err(e) = socket.send(&data).await {
+                            error!(stream_id, error = %e, "UDP socket write error");
+                            break;
+                        }
+                    }
+                    None => {
+                        debug!(stream_id, "Virtual channel closed (UDP)");
                         break;
                     }
                 }

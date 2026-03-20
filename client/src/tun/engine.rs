@@ -1,3 +1,4 @@
+use netrunner_core::proxy::connection::muxer::Muxer;
 use smoltcp::iface::PollResult;
 use smoltcp::time::Instant;
 use smoltcp::wire::{IpAddress, IpCidr};
@@ -31,7 +32,6 @@ pub struct Engine {
     device: VirtTunDevice,
     to_smoltcp_tx: UnboundedSender<TokenBuffer>,
     from_smoltcp_rx: Option<UnboundedReceiver<TokenBuffer>>,
-
     avail: Arc<AtomicBool>,
 }
 
@@ -39,16 +39,16 @@ impl Engine {
     pub fn new(
         config: Config,
         caps: DeviceCapabilities,
-        ip: String,
         dns_handler: DnsHandler,
+        muxer: Muxer,
     ) -> Self {
         let now = Engine::current_time();
 
         let (mut device, to_smoltcp_tx, from_smoltcp_rx, avail) = VirtTunDevice::new(caps);
         let interface = Interface::new(config, &mut device, now);
 
-        let socket_set = ConnectionManager::setup_sockets(64, 4);
-        let manager = ConnectionManager::new(ip, dns_handler);
+        let socket_set = ConnectionManager::setup_sockets(4);
+        let manager = ConnectionManager::new(dns_handler, muxer);
 
         Self {
             interface,

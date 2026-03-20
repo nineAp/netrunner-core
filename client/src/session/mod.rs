@@ -86,7 +86,7 @@ impl SessionManager {
                             .tun_name("netr0")
                             .address((10, 0, 0, 1))
                             .netmask((255, 255, 255, 0))
-                            .mtu(1280)
+                            .mtu(1350)
                             .up();
                     })
                     .expect("Failed to init TUN")
@@ -104,7 +104,7 @@ impl SessionManager {
 
             let config = Config::new(smoltcp::wire::HardwareAddress::Ip);
             let mut caps = DeviceCapabilities::default();
-            caps.max_transmission_unit = 1280;
+            caps.max_transmission_unit = 1350;
             caps.medium = smoltcp::phy::Medium::Ip;
 
             let network = Network::new(
@@ -113,18 +113,22 @@ impl SessionManager {
                 ConnectionRole::Client,
                 Some(remote_address.clone()),
             );
-            let proxy_ip = network.get_self_local_address();
 
-            tokio::spawn(async move {
-                network.run(net_token).await;
-            });
+            let muxer = match network.initialize_client_tunnel(net_token).await {
+                Ok(m) => m,
+                Err(e) => {
+                    error!("Failed to establish secure tunnel to server: {}", e);
+                    return;
+                }
+            };
 
-            let mut engine = Engine::new(config, caps, proxy_ip, dns_handler);
+            info!("Secure tunnel established, Muxer is ready.");
+
+            let mut engine = Engine::new(config, caps, dns_handler, muxer);
             engine.set_any_ip(true);
             engine.set_transparent_mode();
             engine.set_default_gateway(Ipv4Addr::new(10, 0, 0, 2));
             engine.activate();
-
             let cancel_token_for_engine = cancel_token.clone();
 
             tokio::spawn(async move {

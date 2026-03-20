@@ -6,7 +6,11 @@ use crate::{
         frame::{Frame, FrameType},
         socks::SocksReply,
     },
-    proxy::connection::{bridge::run_proxy_bridge, connection::ConnectionRole, muxer::Muxer},
+    proxy::connection::{
+        bridge::{run_proxy_bridge, run_udp_bridge},
+        connection::ConnectionRole,
+        muxer::Muxer,
+    },
 };
 
 pub struct StreamHandler {
@@ -24,7 +28,9 @@ impl StreamHandler {
 
         match frame.header.frame_type {
             FrameType::Connect => self.on_connect(stream_id, frame.payload).await,
+            FrameType::UdpConnect => self.on_udp_connect(stream_id, frame.payload).await, // НОВОЕ
             FrameType::Data => self.on_data(stream_id, frame.payload).await,
+            FrameType::UdpData => self.on_udp_data(stream_id, frame.payload).await, // НОВОЕ
             FrameType::Close => self.on_close(stream_id).await,
             _ => debug!(stream_id, "Unhandled frame type"),
         }
@@ -40,7 +46,7 @@ impl StreamHandler {
 
             tokio::spawn(async move {
                 let start = std::time::Instant::now();
-                info!(stream_id, target = %target_str, "Attempting remote connection");
+                info!(stream_id, target = %target_str, "Attempting remote TCP connection");
 
                 let connect_timeout = tokio::time::timeout(
                     std::time::Duration::from_secs(5),
@@ -51,12 +57,7 @@ impl StreamHandler {
                 match connect_timeout {
                     Ok(Ok(stream)) => {
                         let elapsed = start.elapsed();
-                        info!(
-                            stream_id,
-                            target = %target_str,
-                            latency_ms = elapsed.as_millis(),
-                            "Remote connection established"
-                        );
+                        info!(stream_id, target = %target_str, latency_ms = elapsed.as_millis(), "Remote TCP connection established");
 
                         let mut reply_buf = BytesMut::with_capacity(10);
                         let reply = SocksReply::ConnectResult {
@@ -76,11 +77,11 @@ impl StreamHandler {
                     }
                     Ok(Err(e)) => {
                         error!(stream_id, target = %target_str, error = %e, "TCP connection failed");
-                        Self::send_error_reply(&muxer, stream_id, 0x01).await;
+                        Self::send_error_reply(&muxer, stream_id, 0x01, FrameType::Connect).await;
                     }
                     Err(_) => {
                         error!(stream_id, target = %target_str, "Connection timed out (DNS/TCP)");
-                        Self::send_error_reply(&muxer, stream_id, 0x04).await;
+                        Self::send_error_reply(&muxer, stream_id, 0x04, FrameType::Connect).await;
                     }
                 }
             });
@@ -88,7 +89,65 @@ impl StreamHandler {
             self.muxer.dispatch_to_local(stream_id, payload).await;
         }
     }
-    async fn send_error_reply(muxer: &Muxer, stream_id: u32, code: u8) {
+
+    // --- НОВЫЙ БЛОК ДЛЯ UDP ---
+    async fn on_udp_connect(&self, stream_id: u32, payload: Bytes) {
+        if self.role == ConnectionRole::Server {
+            let target_str = String::from_utf8_lossy(&payload).to_string();
+            let muxer = self.muxer.clone();
+
+            let (v_tx, v_rx) = tokio::sync::mpsc::channel(512);
+            muxer.register_stream(stream_id, v_tx).await;
+
+            tokio::spawn(async move {
+                info!(stream_id, target = %target_str, "Attempting remote UDP connection");
+
+                // Для UDP мы просто биндим сокет на любой свободный порт и "коннектим" к цели
+                match tokio::net::UdpSocket::bind("0.0.0.0:0").await {
+                    Ok(socket) => {
+                        if let Err(e) = socket.connect(&target_str).await {
+                            error!(stream_id, target = %target_str, error = %e, "UDP connect failed");
+                            Self::send_error_reply(&muxer, stream_id, 0x01, FrameType::UdpConnect)
+                                .await;
+                            return;
+                        }
+
+                        let mut reply_buf = BytesMut::with_capacity(10);
+                        let reply = SocksReply::ConnectResult {
+                            reply_code: 0x00,
+                            atyp: 0x01,
+                            addr: [0, 0, 0, 0],
+                            port: 0,
+                        };
+                        reply.write_to(&mut reply_buf);
+
+                        let _ = muxer
+                            .send_control(stream_id, FrameType::UdpConnect, reply_buf.freeze())
+                            .await;
+
+                        // Запускаем бридж для перекачки UDP датаграмм
+                        run_udp_bridge(stream_id, socket, muxer, v_rx).await;
+                    }
+                    Err(e) => {
+                        error!(stream_id, target = %target_str, error = %e, "UDP bind failed");
+                        Self::send_error_reply(&muxer, stream_id, 0x01, FrameType::UdpConnect)
+                            .await;
+                    }
+                }
+            });
+        } else {
+            // Если это клиент, отдаем payload локальному обработчику
+            self.muxer.dispatch_to_local(stream_id, payload).await;
+        }
+    }
+
+    async fn on_udp_data(&self, stream_id: u32, payload: Bytes) {
+        // Логика идентична TCP: пробрасываем датаграмму в локальный v_rx
+        self.muxer.dispatch_to_local(stream_id, payload).await;
+    }
+    // --------------------------
+
+    async fn send_error_reply(muxer: &Muxer, stream_id: u32, code: u8, frame_type: FrameType) {
         muxer.remove_stream(stream_id).await;
         let mut reply_buf = BytesMut::with_capacity(10);
         let reply = SocksReply::ConnectResult {
@@ -99,7 +158,7 @@ impl StreamHandler {
         };
         reply.write_to(&mut reply_buf);
         let _ = muxer
-            .send_control(stream_id, FrameType::Connect, reply_buf.freeze())
+            .send_control(stream_id, frame_type, reply_buf.freeze())
             .await;
     }
 

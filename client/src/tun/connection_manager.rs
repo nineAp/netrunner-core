@@ -1,9 +1,9 @@
-use netrunner_core::protocol::codec::socks::TargetAddress;
+use netrunner_core::{protocol::codec::socks::TargetAddress, proxy::connection::muxer::Muxer};
 use netrunner_logger::{debug, info, warn};
 use smoltcp::{
     iface::{SocketHandle, SocketSet},
     socket::{AnySocket, icmp, tcp, udp},
-    wire::{IpListenEndpoint, IpProtocol, Ipv4Packet, TcpPacket},
+    wire::{IpListenEndpoint, IpProtocol, Ipv4Packet, TcpPacket, UdpPacket},
 };
 use std::{collections::HashMap, time::Instant as StdInstant};
 
@@ -14,25 +14,25 @@ use crate::connections::{
 pub struct ConnectionManager {
     last_activity: HashMap<SocketHandle, StdInstant>,
     active_tcp_sessions: HashMap<SocketHandle, TcpConnection>,
-    _active_udp_sessions: HashMap<SocketHandle, UdpConnection>,
+    active_udp_sessions: HashMap<SocketHandle, UdpConnection>,
     dns_handler: DnsHandler,
     fake_ip_store: FakeIpStore,
-    proxy_ip: String,
     failed_until: HashMap<SocketHandle, StdInstant>,
     sockets_to_remove: Vec<SocketHandle>,
+    muxer: Muxer,
 }
 
 impl ConnectionManager {
-    pub fn new(ip: String, dns_handler: DnsHandler) -> Self {
+    pub fn new(dns_handler: DnsHandler, muxer: Muxer) -> Self {
         Self {
             last_activity: HashMap::new(),
             active_tcp_sessions: HashMap::new(),
-            _active_udp_sessions: HashMap::new(),
-            proxy_ip: ip,
+            active_udp_sessions: HashMap::new(),
             fake_ip_store: FakeIpStore::new(),
             failed_until: HashMap::new(),
             dns_handler,
             sockets_to_remove: Vec::new(),
+            muxer,
         }
     }
     pub fn start_listening(&mut self, socket_set: &mut SocketSet) {
@@ -134,7 +134,7 @@ impl ConnectionManager {
             }
 
             info!(%handle, "New TCP session established for target: {:?}", target);
-            let conn = TcpConnection::new(handle, self.proxy_ip.clone(), target);
+            let conn = TcpConnection::new(handle, target, self.muxer.clone());
             self.active_tcp_sessions.insert(handle, conn);
         }
 
@@ -152,7 +152,54 @@ impl ConnectionManager {
     fn handle_udp(&mut self, handle: SocketHandle, socket: &mut udp::Socket) {
         self.last_activity.insert(handle, StdInstant::now());
 
-        UdpConnection::process_incoming(socket, &mut self.fake_ip_store, &self.dns_handler);
+        let local_port = socket.endpoint().port;
+
+        // 1. ЛОКАЛЬНЫЙ DNS РЕЗОЛВЕР (FakeIP)
+        if local_port == 53 {
+            while socket.can_recv() {
+                let (data, meta) = match socket.recv() {
+                    Ok(res) => res,
+                    Err(_) => break,
+                };
+
+                // Передаем запрос в наш Fake DNS
+                if let Some(response) = self.dns_handler.handle_query(data, &mut self.fake_ip_store)
+                {
+                    netrunner_logger::debug!(to = %meta.endpoint, "Sending DNS response (FakeIP/Filtered)");
+                    let _ = socket.send_slice(&response, meta);
+                }
+            }
+            return; // Дальше не идем, для DNS сессии не нужны
+        }
+
+        // 2. ПРОКСИРУЕМЫЙ UDP (Игры, звонки и т.д.)
+        if socket.is_open() && !self.active_udp_sessions.contains_key(&handle) {
+            let endpoint = socket.endpoint();
+            let target = match endpoint.addr {
+                Some(smoltcp::wire::IpAddress::Ipv4(ipv4_addr)) => {
+                    TargetAddress::Ipv4(std::net::Ipv4Addr::from(ipv4_addr), endpoint.port)
+                }
+                Some(smoltcp::wire::IpAddress::Ipv6(ipv6_addr)) => {
+                    TargetAddress::Ipv6(std::net::Ipv6Addr::from(ipv6_addr), endpoint.port)
+                }
+                None => {
+                    netrunner_logger::warn!(%handle, "UDP socket endpoint has no IP address bound");
+                    return;
+                }
+            };
+
+            netrunner_logger::info!(%handle, target = %target, "New UDP proxied session established");
+
+            let conn = UdpConnection::new(handle, target, self.muxer.clone());
+            self.active_udp_sessions.insert(handle, conn);
+        }
+
+        if let Some(conn) = self.active_udp_sessions.get_mut(&handle) {
+            if !conn.tick(socket) {
+                self.sockets_to_remove.push(handle);
+                self.active_udp_sessions.remove(&handle);
+            }
+        }
     }
 
     fn handle_icmp(&mut self, handle: SocketHandle, socket: &mut icmp::Socket) {
@@ -187,45 +234,77 @@ impl ConnectionManager {
         let Ok(ip_packet) = Ipv4Packet::new_checked(packet) else {
             return;
         };
-        if ip_packet.next_header() != IpProtocol::Tcp {
-            return;
-        };
-        let Ok(tcp_packet) = TcpPacket::new_checked(ip_packet.payload()) else {
-            return;
-        };
 
-        if tcp_packet.syn() && !tcp_packet.ack() {
-            let dst_port = tcp_packet.dst_port();
-            let dst_addr = ip_packet.dst_addr();
-
-            if !self.has_active_session(socket_set, dst_addr.into(), dst_port) {
-                debug!(target: "netrunner", "Dynamic TCP: Creating socket for {}:{}", dst_addr, dst_port);
-
-                let mut socket = Self::create_dynamic_tcp_socket(dst_port);
-                let endpoint = IpListenEndpoint {
-                    addr: Some(dst_addr.into()),
-                    port: dst_port,
+        match ip_packet.next_header() {
+            IpProtocol::Tcp => {
+                let Ok(tcp_packet) = TcpPacket::new_checked(ip_packet.payload()) else {
+                    return;
                 };
 
-                if let Ok(_) = socket.listen(endpoint) {
-                    socket_set.add(socket);
+                if tcp_packet.syn() && !tcp_packet.ack() {
+                    let dst_port = tcp_packet.dst_port();
+                    let dst_addr = ip_packet.dst_addr();
+
+                    if !self.has_active_tcp_session(socket_set, dst_addr.into(), dst_port) {
+                        debug!(target: "netrunner", "Dynamic TCP: Creating socket for {}:{}", dst_addr, dst_port);
+
+                        let mut socket = Self::create_dynamic_tcp_socket(dst_port);
+                        let endpoint = IpListenEndpoint {
+                            addr: Some(dst_addr.into()),
+                            port: dst_port,
+                        };
+
+                        if let Ok(_) = socket.listen(endpoint) {
+                            socket_set.add(socket);
+                        }
+                    }
                 }
             }
+            IpProtocol::Udp => {
+                let Ok(udp_packet) = UdpPacket::new_checked(ip_packet.payload()) else {
+                    return;
+                };
+                let dst_port = udp_packet.dst_port();
+                let dst_addr = ip_packet.dst_addr();
+
+                // Игнорируем широковещательный мусор
+                if dst_port == 0 || dst_port == 137 || dst_port == 138 {
+                    return;
+                }
+
+                if !self.has_active_udp_session(socket_set, dst_addr.into(), dst_port) {
+                    netrunner_logger::debug!(target: "netrunner", "Dynamic UDP: Creating socket for {}:{}", dst_addr, dst_port);
+
+                    let mut socket = Self::create_dynamic_udp_socket(dst_port);
+                    let endpoint = IpListenEndpoint {
+                        addr: Some(dst_addr.into()),
+                        port: dst_port,
+                    };
+
+                    if let Ok(_) = socket.bind(endpoint) {
+                        socket_set.add(socket);
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
-    fn create_udp_socket<'a>() -> udp::Socket<'a> {
-        const BUF_SIZE: usize = 1024 * 64;
-        const PACKET_COUNT: usize = 128;
+    fn create_dynamic_udp_socket<'a>(port: u16) -> udp::Socket<'a> {
+        // Для QUIC (443) выделяем жирный буфер, для остального - умеренный
+        let (buf_size, packet_count) = match port {
+            443 => (1024 * 1024, 512), // 1MB буфер, 512 метаданных для пакетов
+            _ => (128 * 1024, 128),    // 128KB для обычного трафика
+        };
 
         udp::Socket::new(
             udp::PacketBuffer::new(
-                vec![udp::PacketMetadata::EMPTY; PACKET_COUNT],
-                vec![0; BUF_SIZE],
+                vec![udp::PacketMetadata::EMPTY; packet_count],
+                vec![0; buf_size],
             ),
             udp::PacketBuffer::new(
-                vec![udp::PacketMetadata::EMPTY; PACKET_COUNT],
-                vec![0; BUF_SIZE],
+                vec![udp::PacketMetadata::EMPTY; packet_count],
+                vec![0; buf_size],
             ),
         )
     }
@@ -238,7 +317,7 @@ impl ConnectionManager {
         icmp::Socket::new(icmp_rx_buffer, icmp_tx_buffer)
     }
 
-    fn has_active_session(
+    fn has_active_tcp_session(
         &self,
         socket_set: &SocketSet,
         dst_addr: smoltcp::wire::IpAddress,
@@ -256,6 +335,23 @@ impl ConnectionManager {
         false
     }
 
+    fn has_active_udp_session(
+        &self,
+        socket_set: &SocketSet,
+        dst_addr: smoltcp::wire::IpAddress,
+        dst_port: u16,
+    ) -> bool {
+        for (_, socket) in socket_set.iter() {
+            if let Some(udp) = udp::Socket::downcast(socket) {
+                let endpoint = udp.endpoint();
+                if endpoint.addr == Some(dst_addr) && endpoint.port == dst_port {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     pub fn cleanup(&mut self, socket_set: &mut SocketSet) {
         for handle in self.sockets_to_remove.drain(..) {
             debug!(%handle, "Memory free: removing socket from set");
@@ -264,12 +360,8 @@ impl ConnectionManager {
             self.failed_until.remove(&handle);
         }
     }
-    pub fn setup_sockets(n_udp: usize, n_icmp: usize) -> SocketSet<'static> {
-        let mut sockets = SocketSet::new(Vec::with_capacity(n_udp + n_icmp + 10));
-
-        for _ in 0..n_udp {
-            sockets.add(Self::create_udp_socket());
-        }
+    pub fn setup_sockets(n_icmp: usize) -> SocketSet<'static> {
+        let mut sockets = SocketSet::new(Vec::with_capacity(256));
 
         for _ in 0..n_icmp {
             sockets.add(Self::create_icmp_socket());
