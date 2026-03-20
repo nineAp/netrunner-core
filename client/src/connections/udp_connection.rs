@@ -23,7 +23,7 @@ pub struct UdpConnection {
 
 const UDP_TIMEOUT: Duration = Duration::from_secs(60);
 
-const CHANNEL_CAPACITY: usize = 1024;
+const CHANNEL_CAPACITY: usize = 64;
 
 impl UdpConnection {
     pub fn new(handle: SocketHandle, target_addr: TargetAddress, muxer: Muxer) -> Self {

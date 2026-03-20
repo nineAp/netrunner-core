@@ -35,7 +35,7 @@ impl TcpConnection {
         let stream_id = muxer.next_id();
 
         tokio::spawn(async move {
-            let (v_tx, mut v_rx) = mpsc::channel(1024);
+            let (v_tx, mut v_rx) = mpsc::channel(64);
             muxer.register_stream(stream_id, v_tx).await;
 
             let connect_payload = target_addr.to_string();
