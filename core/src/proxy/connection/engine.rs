@@ -117,22 +117,45 @@ impl TunnelEngine {
         codec: &mut Codec,
         msg: MuxMessage,
     ) -> Result<(), String> {
-        match codec.encrypt_data(msg.stream_id, msg.frame_type, msg.data) {
-            Ok(pkt) => {
-                outbound
-                    .write_all(&pkt)
-                    .await
-                    .map_err(|e| {
-                        error!(stream_id = msg.stream_id, error = %e, "Failed to write encrypted data to network");
+        const MAX_CHUNK_SIZE: usize = 16000;
+
+        let mut data = msg.data;
+        let stream_id = msg.stream_id;
+        let frame_type = msg.frame_type;
+
+        if data.is_empty() {
+            match codec.encrypt_data(stream_id, frame_type.clone(), Bytes::new()) {
+                Ok(pkt) => {
+                    outbound.write_all(&pkt).await.map_err(|e| e.to_string())?;
+                }
+                Err(e) => {
+                    error!(stream_id, error = ?e, "Encryption failed for empty message");
+                    return Err(format!("Encryption error: {:?}", e));
+                }
+            }
+            return Ok(());
+        }
+
+        while !data.is_empty() {
+            let chunk_size = std::cmp::min(data.len(), MAX_CHUNK_SIZE);
+
+            let chunk = data.split_to(chunk_size);
+
+            match codec.encrypt_data(stream_id, frame_type.clone(), chunk) {
+                Ok(pkt) => {
+                    outbound.write_all(&pkt).await.map_err(|e| {
+                        error!(stream_id, error = %e, "Failed to write encrypted data to network");
                         e.to_string()
                     })?;
-                debug!(stream_id = msg.stream_id, "Outbound packet sent");
-                Ok(())
-            }
-            Err(e) => {
-                error!(stream_id = msg.stream_id, error = ?e, "Encryption failed for outbound message");
-                Err(format!("Encryption error: {:?}", e))
+                }
+                Err(e) => {
+                    error!(stream_id, error = ?e, "Encryption failed for chunked message");
+                    return Err(format!("Encryption error: {:?}", e));
+                }
             }
         }
+
+        debug!(stream_id, "Outbound packet sent successfully");
+        Ok(())
     }
 }
