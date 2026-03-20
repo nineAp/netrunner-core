@@ -184,7 +184,7 @@ impl ConnectionManager {
 
     fn create_dynamic_tcp_socket<'a>(port: u16) -> tcp::Socket<'a> {
         let buf_size = match port {
-            443 | 80 => 256 * 1024,
+            443 | 80 => 2048 * 1024,
             22 | 53 | 123 => 16 * 1024,
             _ => 64 * 1024,
         };
