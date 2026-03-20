@@ -57,7 +57,7 @@ async fn main() -> anyhow::Result<()> {
         Ok(m) => m,
         Err(e) => {
             error!("Failed to establish secure tunnel: {}", e);
-            // Восстанавливаем роутинг перед выходом
+
             let _ = reset_platform_routing(Some(
                 &remote_address.split(':').next().unwrap().to_string(),
             ));
@@ -66,7 +66,6 @@ async fn main() -> anyhow::Result<()> {
     };
     info!("Secure tunnel established, Muxer is ready.");
 
-    // Передаем Muxer в Engine
     let mut engine = Engine::new(config, caps, dns_handler, muxer);
     engine.set_any_ip(true);
     engine.set_transparent_mode();
@@ -78,7 +77,7 @@ async fn main() -> anyhow::Result<()> {
 
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::select! {
-        // Запускаем главный цикл обработки пакетов
+
         res = engine.run(tun_device) => {
             error!("Engine loop error: {:?}", res);
         },
@@ -87,7 +86,6 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Отменяем токен, что завершит фоновые задачи мультиплексора (TunnelEngine)
     network_token.cancel();
 
     info!("Restoring system routing...");

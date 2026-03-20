@@ -154,7 +154,6 @@ impl ConnectionManager {
 
         let local_port = socket.endpoint().port;
 
-        // 1. ЛОКАЛЬНЫЙ DNS РЕЗОЛВЕР (FakeIP)
         if local_port == 53 {
             while socket.can_recv() {
                 let (data, meta) = match socket.recv() {
@@ -162,17 +161,15 @@ impl ConnectionManager {
                     Err(_) => break,
                 };
 
-                // Передаем запрос в наш Fake DNS
                 if let Some(response) = self.dns_handler.handle_query(data, &mut self.fake_ip_store)
                 {
                     netrunner_logger::debug!(to = %meta.endpoint, "Sending DNS response (FakeIP/Filtered)");
                     let _ = socket.send_slice(&response, meta);
                 }
             }
-            return; // Дальше не идем, для DNS сессии не нужны
+            return;
         }
 
-        // 2. ПРОКСИРУЕМЫЙ UDP (Игры, звонки и т.д.)
         if socket.is_open() && !self.active_udp_sessions.contains_key(&handle) {
             let endpoint = socket.endpoint();
             let target = match endpoint.addr {
@@ -267,7 +264,6 @@ impl ConnectionManager {
                 let dst_port = udp_packet.dst_port();
                 let dst_addr = ip_packet.dst_addr();
 
-                // Игнорируем широковещательный мусор
                 if dst_port == 0 || dst_port == 137 || dst_port == 138 {
                     return;
                 }
@@ -291,10 +287,9 @@ impl ConnectionManager {
     }
 
     fn create_dynamic_udp_socket<'a>(port: u16) -> udp::Socket<'a> {
-        // Для QUIC (443) выделяем жирный буфер, для остального - умеренный
         let (buf_size, packet_count) = match port {
-            443 => (1024 * 1024, 512), // 1MB буфер, 512 метаданных для пакетов
-            _ => (128 * 1024, 128),    // 128KB для обычного трафика
+            443 => (1024 * 1024, 512),
+            _ => (128 * 1024, 128),
         };
 
         udp::Socket::new(

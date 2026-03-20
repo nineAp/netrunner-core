@@ -75,11 +75,11 @@ pub async fn run_udp_bridge(
     muxer: Muxer,
     mut v_rx: mpsc::Receiver<Bytes>,
 ) {
-    let mut buf = [0u8; 65536]; // Максимальный размер UDP пакета
+    let mut buf = [0u8; 65536];
 
     loop {
         tokio::select! {
-            // Читаем из реального интернета и шлем в туннель
+
             res = socket.recv(&mut buf) => {
                 match res {
                     Ok(0) => break,
@@ -98,11 +98,11 @@ pub async fn run_udp_bridge(
                 }
             }
 
-            // Читаем из туннеля и шлем в реальный интернет
+
             maybe_data = v_rx.recv() => {
                 match maybe_data {
                     Some(data) => {
-                        if data.is_empty() { break; } // Сигнал закрытия
+                        if data.is_empty() { break; }
                         if let Err(e) = socket.send(&data).await {
                             error!(stream_id, error = %e, "UDP socket write error");
                             break;

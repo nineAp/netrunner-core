@@ -14,15 +14,15 @@ use netrunner_core::{
 pub struct UdpConnection {
     pub handle: SocketHandle,
     stream_id: u32,
-    tx_to_net: mpsc::Sender<MuxMessage>, // Прямой канал кадров
-    rx_from_net: mpsc::Receiver<Bytes>,  // Прямое чтение из муксера
+    tx_to_net: mpsc::Sender<MuxMessage>,
+    rx_from_net: mpsc::Receiver<Bytes>,
     client_endpoint: Option<IpEndpoint>,
     last_activity: Instant,
     token: CancellationToken,
 }
 
 const UDP_TIMEOUT: Duration = Duration::from_secs(60);
-// Ограничиваем очередь: для UDP дроп пакета при перегрузке — это норма
+
 const CHANNEL_CAPACITY: usize = 1024;
 
 impl UdpConnection {
@@ -31,10 +31,8 @@ impl UdpConnection {
         let token = CancellationToken::new();
         let task_token = token.clone();
 
-        // Канал из tick в асинхронную таску (сразу в формате MuxMessage)
         let (tx_to_net, mut rx_from_smol) = mpsc::channel::<MuxMessage>(CHANNEL_CAPACITY);
 
-        // Канал из муксера напрямую в tick
         let (v_tx, v_rx) = mpsc::channel::<Bytes>(CHANNEL_CAPACITY);
 
         let m_clone = muxer.clone();
@@ -42,7 +40,6 @@ impl UdpConnection {
         tokio::spawn(async move {
             m_clone.register_stream(stream_id, v_tx).await;
 
-            // 1. Устанавливаем соединение
             let _ = m_clone
                 .send_to_netwrok(MuxMessage {
                     stream_id,
@@ -51,7 +48,6 @@ impl UdpConnection {
                 })
                 .await;
 
-            // 2. Слушаем только один канал (на отправку в сеть)
             let to_proxy = async {
                 while let Some(msg) = rx_from_smol.recv().await {
                     if m_clone.send_to_netwrok(msg).await.is_err() {
@@ -65,7 +61,6 @@ impl UdpConnection {
                 _ = task_token.cancelled() => {}
             }
 
-            // 3. Закрываем стрим
             let _ = m_clone
                 .send_to_netwrok(MuxMessage {
                     stream_id,
@@ -80,7 +75,7 @@ impl UdpConnection {
             handle,
             stream_id,
             tx_to_net,
-            rx_from_net: v_rx, // Сохраняем Receiver напрямую
+            rx_from_net: v_rx,
             client_endpoint: None,
             last_activity: Instant::now(),
             token,
@@ -95,33 +90,27 @@ impl UdpConnection {
             return false;
         }
 
-        // 1. Читаем из TUN (приложение -> прокси)
         if socket.can_recv() {
             while let Ok((data, metadata)) = socket.recv() {
                 self.client_endpoint = Some(metadata.endpoint);
 
-                // Избегаем двойной аллокации, сразу копируем в Bytes
                 let msg = MuxMessage {
                     stream_id: self.stream_id,
                     frame_type: FrameType::UdpData,
                     data: Bytes::copy_from_slice(data),
                 };
 
-                // try_send не блокирует цикл. Если буфер забит - пакет отбрасывается.
-                // QUIC мгновенно поймет потерю и адаптирует битрейт видео.
                 if self.tx_to_net.try_send(msg).is_ok() {
                     self.last_activity = Instant::now();
                 }
             }
         }
 
-        // 2. Пишем в TUN (прокси -> приложение)
         if socket.can_send() {
             if let Some(endpoint) = self.client_endpoint {
-                // Читаем напрямую из канала муксера, минуя промежуточные таски
                 while let Ok(data) = self.rx_from_net.try_recv() {
                     if data.is_empty() {
-                        self.token.cancel(); // Сервер прислал сигнал закрытия
+                        self.token.cancel();
                         break;
                     }
 
@@ -130,7 +119,6 @@ impl UdpConnection {
                             self.last_activity = Instant::now();
                         }
                         Err(_) => {
-                            // Буфер smoltcp переполнен
                             break;
                         }
                     }

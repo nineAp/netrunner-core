@@ -35,11 +35,9 @@ impl TcpConnection {
         let stream_id = muxer.next_id();
 
         tokio::spawn(async move {
-            // 1. Регистрируем виртуальный стрим
             let (v_tx, mut v_rx) = mpsc::channel(1024);
             muxer.register_stream(stream_id, v_tx).await;
 
-            // 2. Отправляем запрос на соединение на удаленный сервер
             let connect_payload = target_addr.to_string();
             if muxer
                 .send_to_netwrok(MuxMessage {
@@ -57,9 +55,8 @@ impl TcpConnection {
             let first_payload = tokio::time::timeout(Duration::from_secs(10), v_rx.recv()).await;
             match first_payload {
                 Ok(Some(data)) => {
-                    // Успешный SOCKS-ответ сервера имеет код 0x00 во втором байте
                     if data.len() >= 2 && data[1] == 0x00 {
-                        let _ = handshake_tx.send(()); // Даем отмашку smoltcp, что можно слать данные
+                        let _ = handshake_tx.send(());
                     } else {
                         netrunner_logger::warn!(stream_id, "Server rejected TCP connection");
                         muxer.remove_stream(stream_id).await;
@@ -73,12 +70,11 @@ impl TcpConnection {
                 }
             }
 
-            // 4. Запускаем мост данных
             let to_proxy = async {
                 while let Some(data) = rx_from_smol.recv().await {
                     let msg = MuxMessage {
                         stream_id,
-                        frame_type: FrameType::Data, // Для TCP используем обычный Data
+                        frame_type: FrameType::Data,
                         data: Bytes::from(data),
                     };
                     if muxer.send_to_netwrok(msg).await.is_err() {
@@ -91,7 +87,7 @@ impl TcpConnection {
                 while let Some(data) = v_rx.recv().await {
                     if data.is_empty() {
                         break;
-                    } // EOF
+                    }
                     if tx_to_smol.send(data.to_vec()).is_err() {
                         break;
                     }
@@ -103,7 +99,6 @@ impl TcpConnection {
                 _ = from_proxy => {}
             }
 
-            // 5. Корректно закрываем стрим на сервере
             let _ = muxer
                 .send_to_netwrok(MuxMessage {
                     stream_id,
@@ -116,7 +111,7 @@ impl TcpConnection {
 
         Self {
             handle,
-            state: ConnectionState::Handshaking, // Начинаем с ожидания handshake_tx
+            state: ConnectionState::Handshaking,
             tx: tx_to_mux,
             rx: rx_from_proxy,
             pending_data: vec![],
@@ -182,7 +177,6 @@ impl TcpConnection {
     }
 
     fn poll_and_process(&mut self, socket: &mut tcp::Socket) {
-        // 1. Читаем ИЗ виртуального сокета -> В прокси-сервер
         if socket.can_recv() {
             let mut total_read = 0;
             let _ = socket.recv(|data| {
@@ -195,7 +189,6 @@ impl TcpConnection {
             });
         }
 
-        // 2. Проверка лимита буфера перед тем, как брать новые данные
         if self.pending_data.len() > MAX_PENDING {
             netrunner_logger::error!(%self.handle, "TCP Buffer overflow ({} bytes). Dropping connection.", self.pending_data.len());
             socket.abort();
@@ -203,7 +196,6 @@ impl TcpConnection {
             return;
         }
 
-        // 3. Сбрасываем то, что накопилось в pending_data
         if !self.pending_data.is_empty() && socket.can_send() {
             match socket.send_slice(&self.pending_data) {
                 Ok(n) => {
@@ -213,7 +205,6 @@ impl TcpConnection {
             }
         }
 
-        // 4. Читаем новые данные из прокси, ТОЛЬКО если старые ушли
         if self.pending_data.is_empty() && socket.can_send() {
             if let Ok(data) = self.rx.try_recv() {
                 match socket.send_slice(&data) {
@@ -222,7 +213,6 @@ impl TcpConnection {
                     }
                     Ok(_) => {}
                     Err(_) => {
-                        // Если сокет внезапно отказал, сохраняем всё в буфер
                         self.pending_data = data;
                     }
                 }

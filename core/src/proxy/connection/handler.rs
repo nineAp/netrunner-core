@@ -28,9 +28,9 @@ impl StreamHandler {
 
         match frame.header.frame_type {
             FrameType::Connect => self.on_connect(stream_id, frame.payload).await,
-            FrameType::UdpConnect => self.on_udp_connect(stream_id, frame.payload).await, // НОВОЕ
+            FrameType::UdpConnect => self.on_udp_connect(stream_id, frame.payload).await,
             FrameType::Data => self.on_data(stream_id, frame.payload).await,
-            FrameType::UdpData => self.on_udp_data(stream_id, frame.payload).await, // НОВОЕ
+            FrameType::UdpData => self.on_udp_data(stream_id, frame.payload).await,
             FrameType::Close => self.on_close(stream_id).await,
             _ => debug!(stream_id, "Unhandled frame type"),
         }
@@ -90,7 +90,6 @@ impl StreamHandler {
         }
     }
 
-    // --- НОВЫЙ БЛОК ДЛЯ UDP ---
     async fn on_udp_connect(&self, stream_id: u32, payload: Bytes) {
         if self.role == ConnectionRole::Server {
             let target_str = String::from_utf8_lossy(&payload).to_string();
@@ -102,7 +101,6 @@ impl StreamHandler {
             tokio::spawn(async move {
                 info!(stream_id, target = %target_str, "Attempting remote UDP connection");
 
-                // Для UDP мы просто биндим сокет на любой свободный порт и "коннектим" к цели
                 match tokio::net::UdpSocket::bind("0.0.0.0:0").await {
                     Ok(socket) => {
                         if let Err(e) = socket.connect(&target_str).await {
@@ -125,7 +123,6 @@ impl StreamHandler {
                             .send_control(stream_id, FrameType::UdpConnect, reply_buf.freeze())
                             .await;
 
-                        // Запускаем бридж для перекачки UDP датаграмм
                         run_udp_bridge(stream_id, socket, muxer, v_rx).await;
                     }
                     Err(e) => {
@@ -136,16 +133,13 @@ impl StreamHandler {
                 }
             });
         } else {
-            // Если это клиент, отдаем payload локальному обработчику
             self.muxer.dispatch_to_local(stream_id, payload).await;
         }
     }
 
     async fn on_udp_data(&self, stream_id: u32, payload: Bytes) {
-        // Логика идентична TCP: пробрасываем датаграмму в локальный v_rx
         self.muxer.dispatch_to_local(stream_id, payload).await;
     }
-    // --------------------------
 
     async fn send_error_reply(muxer: &Muxer, stream_id: u32, code: u8, frame_type: FrameType) {
         muxer.remove_stream(stream_id).await;
