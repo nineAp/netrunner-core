@@ -3,4 +3,4 @@ pub mod ip_store;
 pub mod tcp_connection;
 pub mod udp_connection;
 
-pub const CHANNEL_CAPACITY: usize = 2048;
+pub const CHANNEL_CAPACITY: usize = 2048 * 4;
