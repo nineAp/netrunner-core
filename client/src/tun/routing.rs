@@ -1,4 +1,4 @@
-use netrunner_logger::{error, info, warn};
+use netrunner_logger::{error, info};
 use std::io;
 use std::process::Command;
 
@@ -150,7 +150,7 @@ pub fn setup_platform_routing(remote_address: &str) -> io::Result<()> {
     Ok(())
 }
 
-pub fn reset_platform_routing(proxy_ip: Option<&str>) -> io::Result<()> {
+pub fn reset_platform_routing(_proxy_ip: Option<&str>) -> io::Result<()> {
     #[cfg(target_os = "linux")]
     {
         let _ = run_cmd_ext("ip link delete netr0", true);
@@ -165,7 +165,7 @@ pub fn reset_platform_routing(proxy_ip: Option<&str>) -> io::Result<()> {
         let _ = run_cmd_ext("route delete 0.0.0.0 mask 128.0.0.0", true);
         let _ = run_cmd_ext("route delete 128.0.0.0 mask 128.0.0.0", true);
 
-        if let Some(ip) = proxy_ip {
+        if let Some(ip) = _proxy_ip {
             let _ = run_cmd_ext(&format!("route delete {}", ip), true);
         }
 

@@ -62,8 +62,8 @@ impl Network {
                     tokio::select! {
                         _ = token.cancelled() => break,
                         res = listener.accept() => {
-                            if let Ok((stream, client_addr)) = res {
-                                let conn = Connection::new(stream, client_addr, false);
+                            if let Ok((stream, _client_addr)) = res {
+                                let conn = Connection::new(stream, false);
                                 let handler = ClientHandler{ conn, muxer: muxer.clone() };
                                 tokio::spawn(async move {
                                     if let Err(e) = handler.run().await {
@@ -82,7 +82,7 @@ impl Network {
                         _ = token.cancelled() => break,
                         res = listener.accept() => {
                             if let Ok((stream, client_addr)) = res {
-                                let conn = Connection::new(stream, client_addr, true);
+                                let conn = Connection::new(stream, true);
                                 let handler = ServerHandler { conn, token: token.clone() };
                                 tokio::spawn(async move {
                                     if let Err(e) = handler.run().await {

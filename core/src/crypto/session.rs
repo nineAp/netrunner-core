@@ -56,7 +56,6 @@ pub struct SessionKeys {
     pub ecdh: ECDH,
     pub auth_key: [u8; 32],
     pub current_aead: Option<([u8; 32], [u8; 12], [u8; 32], [u8; 12])>,
-    is_initiator: bool,
 }
 
 impl SessionKeys {
@@ -66,7 +65,6 @@ impl SessionKeys {
             ecdh: ECDH::new(),
             auth_key: [0u8; 32],
             current_aead: None,
-            is_initiator,
         }
     }
 

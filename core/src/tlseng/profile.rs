@@ -64,31 +64,27 @@ impl BrowserProfile {
 }
 
 pub struct ServerProfile {
-    pub name: &'static str,
     pub versions: TlsVersions,
-
     pub record_layer_version: ProtocolVersion,
-
     pub cipher_suites: &'static [u16],
-    pub groups: TlsGroups,
-    pub signatures: TlsSignatures,
-    pub alpn: &'static [&'static str],
-    pub session_tickets: bool,
+    pub _groups: TlsGroups,
+    pub _signatures: TlsSignatures,
+    pub _alpn: &'static [&'static str],
+    pub _session_tickets: bool,
     pub honor_cipher_order: bool,
 }
 
 impl ServerProfile {
     pub const MODERN: Self = Self {
-        name: "Modern-Secure",
         versions: TlsVersions::MODERN,
 
         record_layer_version: ProtocolVersion::Tls12,
 
         cipher_suites: &[0x1301, 0x1302, 0x1303],
-        groups: TlsGroups::MODERN,
-        signatures: TlsSignatures::BROWSER_STANDARD,
-        alpn: &["h2", "http/1.1"],
-        session_tickets: true,
+        _groups: TlsGroups::MODERN,
+        _signatures: TlsSignatures::BROWSER_STANDARD,
+        _alpn: &["h2", "http/1.1"],
+        _session_tickets: true,
         honor_cipher_order: true,
     };
 }

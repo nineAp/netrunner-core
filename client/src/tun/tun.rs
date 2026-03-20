@@ -1,4 +1,4 @@
-use netrunner_logger::{error, info, warn};
+use netrunner_logger::error;
 use std::io;
 use tun::{AsyncDevice, Configuration, DeviceReader, DeviceWriter, create_as_async};
 

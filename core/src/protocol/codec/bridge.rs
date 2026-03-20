@@ -117,7 +117,7 @@ impl TlsInterceptor for ApplicationData {
             ));
         }
         Ok(Some(ApplicationData {
-            len: record.payload.len(),
+            _len: record.payload.len(),
             payload: record.payload,
         }))
     }

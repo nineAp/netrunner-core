@@ -71,12 +71,12 @@ impl Parser for ApplicationData {
     }
 
     fn parse(bytes: &mut BytesMut) -> Result<Option<Self>, Self::Error> {
-        let len = bytes.len();
-        if len == 0 {
+        let _len = bytes.len();
+        if _len == 0 {
             return Ok(None);
         }
-        let payload = bytes.split_to(len).freeze();
-        Ok(Some(Self { len, payload }))
+        let payload = bytes.split_to(_len).freeze();
+        Ok(Some(Self { _len, payload }))
     }
 }
 
@@ -104,7 +104,7 @@ impl Parser for HelloHeader {
 
         Ok(Some(Self {
             header_type,
-            len: U24::from_u32(len),
+            _len: U24::from_u32(len),
         }))
     }
 }
@@ -157,7 +157,7 @@ impl Parser for ClientHello {
             return Ok(None);
         }
 
-        let version = ProtocolVersion::try_from(bytes.get_u16())
+        let _version = ProtocolVersion::try_from(bytes.get_u16())
             .map_err(|e| TlsError::new(ErrorStage::Tls(e), ErrorAction::Drop, Bytes::new()))?;
 
         let mut random = [0u8; 32];
@@ -184,7 +184,7 @@ impl Parser for ClientHello {
         };
 
         Ok(Some(Self {
-            version,
+            _version,
             random,
             session_id,
             cipher_suites,

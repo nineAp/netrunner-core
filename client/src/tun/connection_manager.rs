@@ -1,14 +1,11 @@
 use netrunner_core::protocol::codec::socks::TargetAddress;
-use netrunner_logger::{debug, error, info, warn};
+use netrunner_logger::{debug, info, warn};
 use smoltcp::{
     iface::{SocketHandle, SocketSet},
     socket::{AnySocket, icmp, tcp, udp},
     wire::{IpListenEndpoint, IpProtocol, Ipv4Packet, TcpPacket},
 };
-use std::{
-    collections::HashMap,
-    time::{Duration, Instant as StdInstant},
-};
+use std::{collections::HashMap, time::Instant as StdInstant};
 
 use crate::connections::{
     dns::DnsHandler, ip_store::FakeIpStore, tcp_connection::TcpConnection,
@@ -17,7 +14,7 @@ use crate::connections::{
 pub struct ConnectionManager {
     last_activity: HashMap<SocketHandle, StdInstant>,
     active_tcp_sessions: HashMap<SocketHandle, TcpConnection>,
-    active_udp_sessions: HashMap<SocketHandle, UdpConnection>,
+    _active_udp_sessions: HashMap<SocketHandle, UdpConnection>,
     dns_handler: DnsHandler,
     fake_ip_store: FakeIpStore,
     proxy_ip: String,
@@ -30,7 +27,7 @@ impl ConnectionManager {
         Self {
             last_activity: HashMap::new(),
             active_tcp_sessions: HashMap::new(),
-            active_udp_sessions: HashMap::new(),
+            _active_udp_sessions: HashMap::new(),
             proxy_ip: ip,
             fake_ip_store: FakeIpStore::new(),
             failed_until: HashMap::new(),
@@ -167,19 +164,6 @@ impl ConnectionManager {
                 Err(_) => {}
             }
         }
-    }
-
-    fn create_tcp_socket<'a>() -> tcp::Socket<'a> {
-        const BUF_SIZE: usize = 512 * 1024;
-        let mut socket = tcp::Socket::new(
-            tcp::SocketBuffer::new(vec![0; BUF_SIZE]),
-            tcp::SocketBuffer::new(vec![0; BUF_SIZE]),
-        );
-        socket.set_nagle_enabled(false);
-        socket.set_ack_delay(None);
-        socket.set_keep_alive(Some(smoltcp::time::Duration::from_secs(30)));
-        socket.set_hop_limit(Some(64));
-        socket
     }
 
     fn create_dynamic_tcp_socket<'a>(port: u16) -> tcp::Socket<'a> {

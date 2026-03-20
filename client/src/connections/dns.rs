@@ -1,7 +1,7 @@
 use crate::connections::ip_store::FakeIpStore;
 use hickory_proto::op::{Message, MessageType, ResponseCode};
 use hickory_proto::rr::{RData, Record, RecordType};
-use netrunner_logger::{debug, error, info, warn};
+use netrunner_logger::{error, info};
 use std::collections::HashSet;
 use std::time::{Duration, SystemTime};
 use tokio::fs::{self, File};

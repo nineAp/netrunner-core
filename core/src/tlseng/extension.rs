@@ -1,11 +1,7 @@
 use bytes::{BufMut, Bytes, BytesMut};
-use rand::RngExt;
 
 use crate::tlseng::{
-    consts::{
-        CERT_COMPRESSION_BROTLI, GREASE_IDENTIFIERS, OCSP_STATUS_TYPE, PSK_DHE_KE_MODE,
-        TYPE_HOST_NAME,
-    },
+    consts::{CERT_COMPRESSION_BROTLI, OCSP_STATUS_TYPE, PSK_DHE_KE_MODE, TYPE_HOST_NAME},
     profile::BrowserProfile,
     types::{TlsExtensions, TlsGroups, TlsSignatures, TlsVersions},
 };
@@ -58,18 +54,11 @@ impl ExtensionBuilder {
         self.payload.put_slice(data);
     }
 
-    pub fn grease(&mut self) {
-        let mut rng = rand::rng();
-        let rnd = rng.random_range(0..GREASE_IDENTIFIERS.len());
-        let etype = GREASE_IDENTIFIERS[rnd];
-        self.add_extension(etype, &[]);
-    }
-
     pub fn grease_with_id(&mut self, etype: u16) {
         self.add_extension(etype, &[]);
     }
 
-    pub fn apply_generic_extension(&mut self, etype: u16, profile: &BrowserProfile) {
+    pub fn apply_generic_extension(&mut self, etype: u16, _profile: &BrowserProfile) {
         match etype {
             _ => {
                 netrunner_logger::trace!(etype, "Applying generic or unknown extension");

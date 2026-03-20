@@ -16,9 +16,8 @@ use crate::{
     },
     tlseng::profile::BrowserProfile,
 };
-use bytes::{Bytes, BytesMut};
-use netrunner_logger::{debug, error, info, trace, warn};
-use std::net::SocketAddr;
+use bytes::BytesMut;
+use netrunner_logger::info;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{
@@ -43,7 +42,6 @@ pub trait TunnelHandler {
 }
 
 pub struct Connection {
-    addr: SocketAddr,
     pub inbound: OwnedReadHalf,
     pub outbound: OwnedWriteHalf,
     pub read_buf: BytesMut,
@@ -51,10 +49,9 @@ pub struct Connection {
 }
 
 impl Connection {
-    pub fn new(stream: TcpStream, addr: SocketAddr, init: bool) -> Self {
+    pub fn new(stream: TcpStream, init: bool) -> Self {
         let (inbound, outbound) = stream.into_split();
         Self {
-            addr,
             inbound,
             outbound,
             read_buf: BytesMut::with_capacity(BUF_SIZE),
@@ -64,7 +61,6 @@ impl Connection {
 
     pub fn new_raw(inbound: OwnedReadHalf, outbound: OwnedWriteHalf) -> Self {
         Self {
-            addr: "0.0.0.0:0".parse().unwrap(),
             inbound,
             outbound,
             read_buf: BytesMut::with_capacity(BUF_SIZE),

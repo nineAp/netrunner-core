@@ -9,11 +9,11 @@ impl U24 {
         U24([b[1], b[2], b[3]])
     }
 
-    pub fn to_u32(&self) -> u32 {
+    pub fn _to_u32(&self) -> u32 {
         u32::from_be_bytes([0, self.0[0], self.0[1], self.0[2]])
     }
 
-    pub fn from_slice(slice: &[u8]) -> u32 {
+    pub fn _from_slice(slice: &[u8]) -> u32 {
         u32::from_be_bytes([0, slice[0], slice[1], slice[2]])
     }
 }

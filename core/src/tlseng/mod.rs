@@ -1,7 +1,7 @@
 use bytes::Bytes;
 
 pub struct ApplicationData {
-    pub len: usize,
+    pub _len: usize,
     pub payload: Bytes,
 }
 

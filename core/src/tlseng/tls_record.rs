@@ -8,7 +8,7 @@ pub struct TlsRecord {
 
     pub version: ProtocolVersion,
 
-    pub len: u16,
+    pub _len: u16,
 
     pub payload: Bytes,
 }
@@ -18,7 +18,7 @@ impl TlsRecord {
         Self {
             content_type,
             version,
-            len: payload.len() as u16,
+            _len: payload.len() as u16,
             payload,
         }
     }

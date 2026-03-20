@@ -8,18 +8,18 @@ use crate::{
         extension::ExtensionBuilder,
         profile::{BrowserProfile, ServerProfile},
         tls_record::TlsRecord,
-        types::{ContentType, HelloType, ProtocolVersion, TlsVersions},
+        types::{ContentType, HelloType, ProtocolVersion},
     },
     utils::u24::U24,
 };
 
 pub struct HelloHeader {
     pub header_type: HelloType,
-    pub len: U24,
+    pub _len: U24,
 }
 
 pub struct ClientHello {
-    pub version: ProtocolVersion,
+    pub _version: ProtocolVersion,
 
     pub random: [u8; 32],
 
@@ -88,7 +88,7 @@ impl ClientHello {
         let extensions_bytes = ext_builder.build();
 
         let client_hello = ClientHello {
-            version: ProtocolVersion::Tls12,
+            _version: ProtocolVersion::Tls12,
             random: tls_random,
             session_id: Bytes::copy_from_slice(&session_id_bytes),
             cipher_suites: profile.cipher_suites.to_vec(),

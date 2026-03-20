@@ -2,8 +2,8 @@ uniffi::setup_scaffolding!();
 pub mod connections;
 pub mod tun;
 use netrunner_logger::info;
-use std::{sync::OnceLock, time::Duration};
-use tokio::{fs::File, io::AsyncWriteExt, runtime::Runtime};
+use std::sync::OnceLock;
+use tokio::runtime::Runtime;
 use tokio_util::sync::CancellationToken;
 
 use crate::tun::routing::reset_platform_routing;
