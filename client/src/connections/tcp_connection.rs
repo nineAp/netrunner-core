@@ -8,6 +8,8 @@ use smoltcp::iface::SocketHandle;
 use smoltcp::socket::tcp;
 use tokio::sync::{mpsc, oneshot};
 
+use crate::connections::CHANNEL_CAPACITY;
+
 pub enum ConnectionState {
     Established,
     Handshaking,
@@ -26,14 +28,12 @@ pub struct TcpConnection {
     handshake_rx: Option<oneshot::Receiver<()>>,
 }
 
-// Подняли лимит буфера для загрузок до 32 Мегабайт.
-// Этого хватит для Спидтеста на скорости ~200-300 Мбит/с без разрыва соединения.
-const MAX_PENDING: usize = 32 * 1024 * 1024;
+const MAX_PENDING: usize = 4 * 1024 * 1024;
 
 impl TcpConnection {
     pub fn new(handle: SocketHandle, target_addr: TargetAddress, muxer: Muxer) -> Self {
         // UPLOAD: Ограничиваем очередь
-        let (tx_to_mux, mut rx_from_smol) = mpsc::channel::<Vec<u8>>(128);
+        let (tx_to_mux, mut rx_from_smol) = mpsc::channel::<Vec<u8>>(CHANNEL_CAPACITY);
 
         // DOWNLOAD: Безлимитный канал до синхронного tick()
         let (tx_to_smol, rx_from_proxy) = mpsc::unbounded_channel::<Vec<u8>>();

@@ -2,8 +2,7 @@ use crate::{
     protocol::errors::ErrorAction,
     proxy::connection::{
         connection::{
-            ClientHandler, Connection, ConnectionRole, ServerHandler, TunnelHandler, BUF_SIZE,
-            CHANNEL_SIZE,
+            ClientHandler, Connection, ConnectionRole, ServerHandler, TunnelHandler, CHANNEL_SIZE,
         },
         engine::TunnelEngine,
         muxer::Muxer,
