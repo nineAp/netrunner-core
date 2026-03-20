@@ -111,7 +111,7 @@ impl Network {
         let mut codec = crate::protocol::codec::codec::Codec::new(false);
 
         let ch = codec
-            .make_client_handshake(&BrowserProfile::CHROME_131, "google.com")
+            .make_client_handshake(&BrowserProfile::CHROME_131, "ubuntu.com")
             .map_err(|e| format!("{:?}", e))?;
         outbound.write_all(&ch).await.map_err(|e| e.to_string())?;
 

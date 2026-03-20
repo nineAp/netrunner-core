@@ -57,6 +57,7 @@ impl Codec {
 
         Ok(server_hello_record)
     }
+
     pub fn process_handshake(&mut self, buffer: &mut BytesMut) -> Result<(), TlsError> {
         let mes_opt = TlsBridge::unpack_handshake(buffer)?;
         let mes = mes_opt.ok_or_else(|| {
@@ -150,10 +151,14 @@ impl Codec {
             }
         }
 
-        while let Some(app_data) = TlsBridge::unpack_app_data(buffer)? {
+        while let Some(app_data) = TlsBridge::unpack_app_data(buffer).map_err(|e| {
+            self.staging.clear();
+            e
+        })? {
             let mut data_to_decrypt = BytesMut::from(app_data.payload);
 
             let decrypted = self.crypto.decrypt(&mut data_to_decrypt).map_err(|_| {
+                self.staging.clear();
                 TlsError::new(
                     ErrorStage::Tls("Decr error"),
                     ErrorAction::Drop,
@@ -162,6 +167,7 @@ impl Codec {
             })?;
 
             if decrypted.len() < 16 {
+                self.staging.clear();
                 return Err(TlsError::new(
                     ErrorStage::Tls("Packet too short for auth"),
                     ErrorAction::Drop,
@@ -178,6 +184,7 @@ impl Codec {
                     received = %hex::encode(&received_tag[..4]),
                     "AUTH MISMATCH: Potential replay or MITM attack. Dropping connection."
                 );
+                self.staging.clear();
                 return Err(TlsError::new(
                     ErrorStage::Tls("Auth tag mismatch"),
                     ErrorAction::Drop,
@@ -199,11 +206,14 @@ impl Codec {
         match Frame::parse(&mut self.staging) {
             Ok(Some(frame)) => Ok(Some(frame)),
             Ok(None) => Ok(None),
-            Err(_) => Err(TlsError::new(
-                ErrorStage::Tls("Parse error"),
-                ErrorAction::Drop,
-                Bytes::new(),
-            )),
+            Err(_) => {
+                self.staging.clear();
+                Err(TlsError::new(
+                    ErrorStage::Tls("Parse error"),
+                    ErrorAction::Drop,
+                    Bytes::new(),
+                ))
+            }
         }
     }
 }

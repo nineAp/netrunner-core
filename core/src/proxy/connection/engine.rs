@@ -50,8 +50,8 @@ impl TunnelEngine {
                 }
 
                 _ = heartbeat.tick() => {
-                let msg = MuxMessage { stream_id: 0, frame_type: FrameType::Heartbeat, data: Bytes::new() };
-                Self::handle_outbound(&mut outbound, &mut codec, msg).await?;
+                    let msg = MuxMessage { stream_id: 0, frame_type: FrameType::Heartbeat, data: Bytes::new() };
+                    Self::handle_outbound(&mut outbound, &mut codec, msg).await?;
                 }
 
                 msg_opt = mux_rx.recv() => {
@@ -78,7 +78,7 @@ impl TunnelEngine {
             .map_err(|e| e.to_string())?;
 
         if n == 0 && read_buf.is_empty() {
-            netrunner_logger::error!("Connection closed by peer (EOF detected)");
+            netrunner_logger::info!("Connection closed by peer (EOF detected)");
             return Err("EOF".into());
         }
 
@@ -93,6 +93,15 @@ impl TunnelEngine {
                 Err(e) => {
                     if e.action == ErrorAction::Wait {
                         break;
+                    }
+
+                    if e.action == ErrorAction::Drop {
+                        // ТСПУ подмешал мусор ИЛИ ключи не совпали.
+                        // Мгновенный выход с ошибкой приведет к обрыву TCP-соединения.
+                        netrunner_logger::error!(
+                            "CRITICAL: Crypto tampering or sync lost. Hard dropping tunnel!"
+                        );
+                        return Err("Crypto drop".into());
                     }
 
                     error!(error = ?e, "Codec inbound failed");

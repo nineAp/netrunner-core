@@ -115,7 +115,7 @@ impl ClientHandler {
 
         let ch = conn
             .codec
-            .make_client_handshake(&BrowserProfile::CHROME_131, "google.com")
+            .make_client_handshake(&BrowserProfile::CHROME_131, "ubuntu.com")
             .map_err(|e| format!("{:?}", e))?;
         conn.outbound
             .write_all(&ch)
@@ -257,12 +257,35 @@ pub struct ServerHandler {
     pub token: CancellationToken,
 }
 
+impl ServerHandler {
+    async fn handle_fallback(outbound: &mut OwnedWriteHalf) {
+        // Формируем правдоподобный HTTP-ответ.
+        // Заголовок "Server: nginx" помогает мимикрировать под обычный веб-сервер.
+        let fallback_response = "HTTP/1.1 302 Found\r\n\
+                             Server: nginx/1.18.0 (Ubuntu)\r\n\
+                             Location: https://www.ubuntu.com/\r\n\
+                             Content-Length: 0\r\n\
+                             Connection: close\r\n\
+                             \r\n";
+
+        // Пытаемся отправить ответ сканеру/цензору, игнорируя ошибки (если он уже отключился)
+        let _ = outbound.write_all(fallback_response.as_bytes()).await;
+        let _ = outbound.flush().await;
+
+        // Корректно закрываем соединение (отправляем FIN/RST)
+        let _ = outbound.shutdown().await;
+    }
+}
+
 #[async_trait::async_trait]
 impl TunnelHandler for ServerHandler {
     async fn run(mut self) -> Result<(), String> {
         info!("Acting as TLS Server");
         let (mux_tx, mux_rx) = mpsc::channel(BUF_SIZE);
         let muxer = Muxer::new(mux_tx, false);
+
+        // Тайм-аут для защиты от "сканеров-молчунов" (Active Probing)
+        let handshake_timeout = std::time::Duration::from_secs(5);
 
         let hello = loop {
             match self
@@ -272,21 +295,47 @@ impl TunnelHandler for ServerHandler {
             {
                 Ok(b) => break b,
                 Err(e) if e.action == ErrorAction::Wait => {
-                    if self
-                        .conn
-                        .inbound
-                        .read_buf(&mut self.conn.read_buf)
-                        .await
-                        .map_err(|e| e.to_string())?
-                        == 0
-                    {
-                        return Err("Closed".into());
+                    // Используем timeout: если за 5 сек не пришел полный handshake - рвем/фолбечим
+                    let read_res = tokio::time::timeout(
+                        handshake_timeout,
+                        self.conn.inbound.read_buf(&mut self.conn.read_buf),
+                    )
+                    .await;
+
+                    match read_res {
+                        Ok(Ok(n)) if n == 0 => {
+                            return Err("Client closed connection before handshake".into());
+                        }
+                        Ok(Ok(_)) => {
+                            // Прочитали кусок, идем на следующий круг проверять handshake
+                            continue;
+                        }
+                        Ok(Err(e)) => {
+                            return Err(format!("Socket read error: {}", e));
+                        }
+                        Err(_) => {
+                            // СРАБОТАЛ ТАЙМ-АУТ
+                            netrunner_logger::warn!(
+                                "Handshake timeout (Scanner detected). Triggering fallback."
+                            );
+                            ServerHandler::handle_fallback(&mut self.conn.outbound).await;
+                            return Ok(()); // Выходим без ошибки, чтобы не крашить сервер
+                        }
                     }
                 }
-                Err(e) => return Err(format!("{:?}", e)),
+                Err(e) => {
+                    // ПРИШЕЛ МУСОР ИЛИ НЕВЕРНЫЙ ФОРМАТ (HTTP сканер)
+                    netrunner_logger::warn!(
+                        error = ?e,
+                        "Invalid handshake format (Scanner detected). Triggering fallback."
+                    );
+                    ServerHandler::handle_fallback(&mut self.conn.outbound).await;
+                    return Ok(()); // Выходим без ошибки
+                }
             }
         };
 
+        // --- ЕСЛИ МЫ ЗДЕСЬ, ХЕНДШЕЙК ПРОШЕЛ УСПЕШНО ---
         self.conn
             .outbound
             .write_all(&hello)
@@ -294,6 +343,7 @@ impl TunnelHandler for ServerHandler {
             .map_err(|e| e.to_string())?;
 
         let handler = std::sync::Arc::new(StreamHandler::new(muxer, ConnectionRole::Server));
+
         TunnelEngine {
             inbound: self.conn.inbound,
             outbound: self.conn.outbound,
