@@ -4,5 +4,6 @@ pub mod engine;
 pub mod handler;
 pub mod muxer;
 
-pub const BUF_SIZE: usize = 65536;
-pub const CHANNEL_SIZE: usize = 16;
+pub const TCP_BUF_SIZE: usize = 1024 * 512;
+pub const UDP_BUF_SIZE: usize = 1024 * 64;
+pub const MESSAGE_CHANNEL_SIZE: usize = 1024 * 16;

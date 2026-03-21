@@ -13,7 +13,7 @@ use crate::{
         engine::TunnelEngine,
         handler::StreamHandler,
         muxer::{MuxMessage, Muxer},
-        BUF_SIZE, CHANNEL_SIZE,
+        MESSAGE_CHANNEL_SIZE, TCP_BUF_SIZE,
     },
     tlseng::profile::BrowserProfile,
 };
@@ -53,7 +53,7 @@ impl Connection {
         Self {
             inbound,
             outbound,
-            read_buf: BytesMut::with_capacity(BUF_SIZE),
+            read_buf: BytesMut::with_capacity(TCP_BUF_SIZE),
             codec: Codec::new(init),
         }
     }
@@ -62,7 +62,7 @@ impl Connection {
         Self {
             inbound,
             outbound,
-            read_buf: BytesMut::with_capacity(BUF_SIZE),
+            read_buf: BytesMut::with_capacity(TCP_BUF_SIZE),
             codec: Codec::new(false),
         }
     }
@@ -138,8 +138,11 @@ impl ClientHandler {
             }
         }
 
-        let (mux_tx, mux_rx) = mpsc::channel(CHANNEL_SIZE);
-        let muxer = Muxer::new(mux_tx, true);
+        // --- ИЗМЕНЕНИЕ ДЛЯ НОВОГО MUXER ---
+        let (control_tx, control_rx) = mpsc::channel(MESSAGE_CHANNEL_SIZE);
+        let (data_tx, data_rx) = mpsc::channel(MESSAGE_CHANNEL_SIZE);
+
+        let muxer = Muxer::new(control_tx, data_tx, true);
 
         let handler =
             std::sync::Arc::new(StreamHandler::new(muxer.clone(), ConnectionRole::Client));
@@ -149,7 +152,8 @@ impl ClientHandler {
             outbound: conn.outbound,
             codec: conn.codec,
             read_buf: conn.read_buf,
-            mux_rx,
+            control_rx, // Передаем оба ресивера в Engine
+            data_rx,    // Передаем оба ресивера в Engine
             handler,
             token: token.clone(),
         };
@@ -203,17 +207,17 @@ impl TunnelHandler for ClientHandler {
                 target,
             } => {
                 let stream_id = self.muxer.next_id();
-                let (v_tx, mut v_rx) = mpsc::channel::<bytes::Bytes>(BUF_SIZE);
+                let (v_tx, mut v_rx) = mpsc::channel::<bytes::Bytes>(TCP_BUF_SIZE);
                 self.muxer.register_stream(stream_id, v_tx);
 
+                // Используем send_control для отправки FrameType::Connect
                 self.muxer
-                    .send_to_netwrok(MuxMessage {
+                    .send_control(
                         stream_id,
-                        frame_type: FrameType::Connect,
-                        data: bytes::Bytes::from(target.to_string()),
-                    })
-                    .await
-                    .map_err(|e| e.to_string())?;
+                        FrameType::Connect,
+                        bytes::Bytes::from(target.to_string()),
+                    )
+                    .await?;
 
                 let first_payload =
                     tokio::time::timeout(std::time::Duration::from_secs(10), v_rx.recv())
@@ -251,6 +255,7 @@ impl TunnelHandler for ClientHandler {
         }
     }
 }
+
 pub struct ServerHandler {
     pub conn: Connection,
     pub token: CancellationToken,
@@ -258,8 +263,6 @@ pub struct ServerHandler {
 
 impl ServerHandler {
     async fn handle_fallback(outbound: &mut OwnedWriteHalf) {
-        // Формируем правдоподобный HTTP-ответ.
-        // Заголовок "Server: nginx" помогает мимикрировать под обычный веб-сервер.
         let fallback_response = "HTTP/1.1 302 Found\r\n\
                              Server: nginx/1.18.0 (Ubuntu)\r\n\
                              Location: https://www.ubuntu.com/\r\n\
@@ -267,11 +270,8 @@ impl ServerHandler {
                              Connection: close\r\n\
                              \r\n";
 
-        // Пытаемся отправить ответ сканеру/цензору, игнорируя ошибки (если он уже отключился)
         let _ = outbound.write_all(fallback_response.as_bytes()).await;
         let _ = outbound.flush().await;
-
-        // Корректно закрываем соединение (отправляем FIN/RST)
         let _ = outbound.shutdown().await;
     }
 }
@@ -280,10 +280,12 @@ impl ServerHandler {
 impl TunnelHandler for ServerHandler {
     async fn run(mut self) -> Result<(), String> {
         info!("Acting as TLS Server");
-        let (mux_tx, mux_rx) = mpsc::channel(CHANNEL_SIZE);
-        let muxer = Muxer::new(mux_tx, false);
 
-        // Тайм-аут для защиты от "сканеров-молчунов" (Active Probing)
+        // --- ИЗМЕНЕНИЕ ДЛЯ НОВОГО MUXER ---
+        let (control_tx, control_rx) = mpsc::channel(MESSAGE_CHANNEL_SIZE);
+        let (data_tx, data_rx) = mpsc::channel(MESSAGE_CHANNEL_SIZE);
+        let muxer = Muxer::new(control_tx, data_tx, false);
+
         let handshake_timeout = std::time::Duration::from_secs(5);
 
         let hello = loop {
@@ -294,7 +296,6 @@ impl TunnelHandler for ServerHandler {
             {
                 Ok(b) => break b,
                 Err(e) if e.action == ErrorAction::Wait => {
-                    // Используем timeout: если за 5 сек не пришел полный handshake - рвем/фолбечим
                     let read_res = tokio::time::timeout(
                         handshake_timeout,
                         self.conn.inbound.read_buf(&mut self.conn.read_buf),
@@ -306,35 +307,31 @@ impl TunnelHandler for ServerHandler {
                             return Err("Client closed connection before handshake".into());
                         }
                         Ok(Ok(_)) => {
-                            // Прочитали кусок, идем на следующий круг проверять handshake
                             continue;
                         }
                         Ok(Err(e)) => {
                             return Err(format!("Socket read error: {}", e));
                         }
                         Err(_) => {
-                            // СРАБОТАЛ ТАЙМ-АУТ
                             netrunner_logger::warn!(
                                 "Handshake timeout (Scanner detected). Triggering fallback."
                             );
                             ServerHandler::handle_fallback(&mut self.conn.outbound).await;
-                            return Ok(()); // Выходим без ошибки, чтобы не крашить сервер
+                            return Ok(());
                         }
                     }
                 }
                 Err(e) => {
-                    // ПРИШЕЛ МУСОР ИЛИ НЕВЕРНЫЙ ФОРМАТ (HTTP сканер)
                     netrunner_logger::warn!(
                         error = ?e,
                         "Invalid handshake format (Scanner detected). Triggering fallback."
                     );
                     ServerHandler::handle_fallback(&mut self.conn.outbound).await;
-                    return Ok(()); // Выходим без ошибки
+                    return Ok(());
                 }
             }
         };
 
-        // --- ЕСЛИ МЫ ЗДЕСЬ, ХЕНДШЕЙК ПРОШЕЛ УСПЕШНО ---
         self.conn
             .outbound
             .write_all(&hello)
@@ -348,7 +345,8 @@ impl TunnelHandler for ServerHandler {
             outbound: self.conn.outbound,
             codec: self.conn.codec,
             read_buf: self.conn.read_buf,
-            mux_rx,
+            control_rx, // Передаем оба ресивера в Engine
+            data_rx,    // Передаем оба ресивера в Engine
             handler,
             token: self.token,
         }

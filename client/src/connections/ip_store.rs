@@ -30,7 +30,7 @@ impl FakeIpStore {
         self.next_ip += 1;
         self.cache.put(host.to_string(), ip);
         self.rev_cache.put(ip, host.to_string());
-        info!(host = %host, ip = %ip, "Assigned new fake IP");
+        debug!(host = %host, ip = %ip, "Assigned new fake IP");
         ip
     }
 

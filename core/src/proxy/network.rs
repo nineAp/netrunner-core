@@ -4,7 +4,7 @@ use crate::{
         connection::{ClientHandler, Connection, ConnectionRole, ServerHandler, TunnelHandler},
         engine::TunnelEngine,
         muxer::Muxer,
-        CHANNEL_SIZE,
+        MESSAGE_CHANNEL_SIZE,
     },
     tlseng::profile::BrowserProfile,
 };
@@ -22,6 +22,7 @@ pub struct Network {
     role: ConnectionRole,
     remote_proxy_addr: Option<String>,
 }
+
 impl Network {
     pub fn new(
         host: String,
@@ -131,8 +132,12 @@ impl Network {
             }
         }
 
-        let (mux_tx, mux_rx) = tokio::sync::mpsc::channel(CHANNEL_SIZE * 48);
-        let muxer = Muxer::new(mux_tx, true);
+        // --- ИЗМЕНЕНИЯ ЗДЕСЬ: Создаем два канала ---
+        let (control_tx, control_rx) = tokio::sync::mpsc::channel(100_000);
+        let (data_tx, data_rx) = tokio::sync::mpsc::channel(100_000);
+
+        // Передаем оба трансмиттера в Muxer
+        let muxer = Muxer::new(control_tx, data_tx, true);
 
         let handler = std::sync::Arc::new(crate::proxy::connection::handler::StreamHandler::new(
             muxer.clone(),
@@ -144,13 +149,21 @@ impl Network {
             outbound,
             codec,
             read_buf: sh_buf,
-            mux_rx,
+            control_rx,
+            data_rx,
             handler,
             token,
         };
 
-        tokio::spawn(async move { engine.run().await });
-
+        tokio::spawn(async move {
+            if let Err(e) = engine.run().await {
+                netrunner_logger::error!(
+                    "CRITICAL: Tunnel Engine died: {}. Restarting process...",
+                    e
+                );
+                std::process::exit(1);
+            }
+        });
         Ok(muxer)
     }
 

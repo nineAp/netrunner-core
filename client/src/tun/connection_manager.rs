@@ -1,16 +1,25 @@
-use netrunner_core::{protocol::codec::socks::TargetAddress, proxy::connection::muxer::Muxer};
+use bytes::Bytes;
+use netrunner_core::{
+    protocol::codec::{frame::FrameType, socks::TargetAddress},
+    proxy::connection::{
+        TCP_BUF_SIZE,
+        muxer::{MuxMessage, Muxer},
+    },
+};
 use netrunner_logger::{debug, info, warn};
 use smoltcp::{
     iface::{SocketHandle, SocketSet},
     socket::{AnySocket, icmp, tcp, udp},
     wire::{IpListenEndpoint, IpProtocol, Ipv4Packet, TcpPacket, UdpPacket},
 };
-use std::{collections::HashMap, time::Instant as StdInstant};
+use std::{collections::HashMap, time::Duration, time::Instant as StdInstant};
+use tokio::sync::mpsc;
 
 use crate::connections::{
-    dns::DnsHandler, ip_store::FakeIpStore, tcp_connection::TcpConnection,
+    CHANNEL_CAPACITY, dns::DnsHandler, ip_store::FakeIpStore, tcp_connection::TcpConnection,
     udp_connection::UdpConnection,
 };
+
 pub struct ConnectionManager {
     last_activity: HashMap<SocketHandle, StdInstant>,
     active_tcp_sessions: HashMap<SocketHandle, TcpConnection>,
@@ -35,6 +44,7 @@ impl ConnectionManager {
             muxer,
         }
     }
+
     pub fn start_listening(&mut self, socket_set: &mut SocketSet) {
         for (_, socket) in socket_set.iter_mut() {
             if let Some(tcp) = tcp::Socket::downcast_mut(socket) {
@@ -65,7 +75,6 @@ impl ConnectionManager {
             Some(ep) => ep,
             None => {
                 warn!(handle=?socket, "Attempted to resolve target for an unconnected socket");
-
                 return TargetAddress::Domain("disconnected".to_string(), 0);
             }
         };
@@ -96,6 +105,7 @@ impl ConnectionManager {
             }
         }
     }
+
     pub fn process_sockets(&mut self, socket_set: &mut SocketSet) {
         for (handle, socket) in socket_set.iter_mut() {
             if let Some(tcp) = tcp::Socket::downcast_mut(socket) {
@@ -134,8 +144,90 @@ impl ConnectionManager {
             }
 
             info!(%handle, "New TCP session established for target: {:?}", target);
-            let conn = TcpConnection::new(handle, target, self.muxer.clone());
+
+            // 1. Создаем соединение и получаем каналы
+            let (conn, mut rx_from_smol, tx_to_smol, handshake_tx) = TcpConnection::new(handle);
             self.active_tcp_sessions.insert(handle, conn);
+
+            // 2. Выносим логику мультиплексирования в фоновую задачу
+            let muxer = self.muxer.clone();
+            let stream_id = muxer.next_id();
+            let connect_payload = target.to_string();
+
+            tokio::spawn(async move {
+                let (v_tx, mut v_rx) = mpsc::channel::<Bytes>(TCP_BUF_SIZE);
+                muxer.register_stream(stream_id, v_tx);
+
+                if muxer
+                    .send_to_netwrok(MuxMessage {
+                        stream_id,
+                        frame_type: FrameType::Connect,
+                        data: Bytes::from(connect_payload),
+                    })
+                    .await
+                    .is_err()
+                {
+                    muxer.remove_stream(stream_id);
+                    return;
+                }
+
+                let first_payload =
+                    tokio::time::timeout(Duration::from_secs(10), v_rx.recv()).await;
+                match first_payload {
+                    Ok(Some(data)) => {
+                        if data.len() >= 2 && data[1] == 0x00 {
+                            let _ = handshake_tx.send(());
+                        } else {
+                            netrunner_logger::warn!(stream_id, "Server rejected TCP connection");
+                            muxer.remove_stream(stream_id);
+                            return;
+                        }
+                    }
+                    _ => {
+                        netrunner_logger::error!(stream_id, "Timeout waiting for proxy response");
+                        muxer.remove_stream(stream_id);
+                        return;
+                    }
+                }
+
+                let to_proxy = async {
+                    while let Some(data) = rx_from_smol.recv().await {
+                        let msg = MuxMessage {
+                            stream_id,
+                            frame_type: FrameType::Data,
+                            data,
+                        };
+                        if muxer.send_to_netwrok(msg).await.is_err() {
+                            break;
+                        }
+                    }
+                };
+
+                let from_proxy = async {
+                    while let Some(data) = v_rx.recv().await {
+                        if data.is_empty() {
+                            break;
+                        }
+                        if tx_to_smol.send(data).await.is_err() {
+                            break;
+                        }
+                    }
+                };
+
+                tokio::select! {
+                    _ = to_proxy => {}
+                    _ = from_proxy => {}
+                }
+
+                let _ = muxer
+                    .send_to_netwrok(MuxMessage {
+                        stream_id,
+                        frame_type: FrameType::Close,
+                        data: Bytes::new(),
+                    })
+                    .await;
+                muxer.remove_stream(stream_id);
+            });
         }
 
         if let Some(conn) = self.active_tcp_sessions.get_mut(&handle) {
@@ -149,6 +241,7 @@ impl ConnectionManager {
             socket.close();
         }
     }
+
     fn handle_udp(&mut self, handle: SocketHandle, socket: &mut udp::Socket) {
         self.last_activity.insert(handle, StdInstant::now());
 
@@ -187,8 +280,65 @@ impl ConnectionManager {
 
             netrunner_logger::info!(%handle, target = %target, "New UDP proxied session established");
 
-            let conn = UdpConnection::new(handle, target, self.muxer.clone());
+            // 1. Создаем UDP соединение и получаем каналы
+            let (conn, mut rx_from_smol, tx_to_smol) = UdpConnection::new(handle);
             self.active_udp_sessions.insert(handle, conn);
+
+            // 2. Фоновая задача для Muxer'а
+            let muxer = self.muxer.clone();
+            let stream_id = muxer.next_id();
+            let connect_payload = target.to_string();
+
+            tokio::spawn(async move {
+                let (v_tx, mut v_rx) = mpsc::channel::<Bytes>(CHANNEL_CAPACITY);
+                muxer.register_stream(stream_id, v_tx);
+
+                let _ = muxer
+                    .send_to_netwrok(MuxMessage {
+                        stream_id,
+                        frame_type: FrameType::UdpConnect,
+                        data: Bytes::from(connect_payload),
+                    })
+                    .await;
+
+                let to_proxy = async {
+                    while let Some(data) = rx_from_smol.recv().await {
+                        let msg = MuxMessage {
+                            stream_id,
+                            frame_type: FrameType::UdpData,
+                            data,
+                        };
+                        if muxer.send_to_netwrok(msg).await.is_err() {
+                            break;
+                        }
+                    }
+                };
+
+                let from_proxy = async {
+                    while let Some(data) = v_rx.recv().await {
+                        if data.is_empty() {
+                            break;
+                        }
+                        if tx_to_smol.send(data).await.is_err() {
+                            break;
+                        }
+                    }
+                };
+
+                tokio::select! {
+                    _ = to_proxy => {}
+                    _ = from_proxy => {}
+                }
+
+                let _ = muxer
+                    .send_to_netwrok(MuxMessage {
+                        stream_id,
+                        frame_type: FrameType::Close,
+                        data: Bytes::new(),
+                    })
+                    .await;
+                muxer.remove_stream(stream_id);
+            });
         }
 
         if let Some(conn) = self.active_udp_sessions.get_mut(&handle) {
@@ -223,11 +373,11 @@ impl ConnectionManager {
             tcp::SocketBuffer::new(vec![0; buf_size]),
         );
 
-        // Nagle отключен - это правильно для уменьшения задержек
         socket.set_nagle_enabled(false);
         socket.set_ack_delay(None);
         socket
     }
+
     pub fn try_create_socket_from_packet(&mut self, packet: &[u8], socket_set: &mut SocketSet) {
         let Ok(ip_packet) = Ipv4Packet::new_checked(packet) else {
             return;
@@ -357,6 +507,7 @@ impl ConnectionManager {
             self.failed_until.remove(&handle);
         }
     }
+
     pub fn setup_sockets(n_icmp: usize) -> SocketSet<'static> {
         let mut sockets = SocketSet::new(Vec::with_capacity(48));
 
@@ -366,6 +517,7 @@ impl ConnectionManager {
 
         sockets
     }
+
     pub fn log_status(&self, socket_set: &SocketSet) {
         let mut established = 0;
         let mut total_tcp = 0;

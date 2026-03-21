@@ -5,7 +5,7 @@ use netrunner_logger::{debug, error, info};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::tcp::{OwnedReadHalf, OwnedWriteHalf},
-    sync::mpsc::Receiver,
+    sync::{mpsc::Receiver, Mutex},
 };
 use tokio_util::sync::CancellationToken;
 
@@ -22,99 +22,161 @@ pub struct TunnelEngine {
     pub outbound: OwnedWriteHalf,
     pub codec: Codec,
     pub read_buf: BytesMut,
-    pub mux_rx: Receiver<MuxMessage>,
+    pub control_rx: Receiver<MuxMessage>,
+    pub data_rx: Receiver<MuxMessage>,
     pub handler: Arc<StreamHandler>,
     pub token: CancellationToken,
 }
 
 impl TunnelEngine {
     pub async fn run(self) -> Result<(), String> {
-        let mut inbound = self.inbound;
-        let mut outbound = self.outbound;
-        let mut codec = self.codec;
-        let mut read_buf = self.read_buf;
-        let mut mux_rx = self.mux_rx;
+        let inbound = self.inbound;
+        let outbound = self.outbound;
+
+        // Оборачиваем кодек в потокобезопасный мьютекс
+        let codec = Arc::new(Mutex::new(self.codec));
+        let read_buf = self.read_buf;
+
+        let control_rx = self.control_rx;
+        let data_rx = self.data_rx;
         let handler = self.handler;
-
         let token = self.token;
-        let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(15));
-        loop {
-            tokio::select! {
-                _ = token.cancelled() => {
-                    info!("TunnelEngine: Shutdown signal received. Closing...");
-                    return Ok(());
-                }
 
-                res = Self::process_inbound(&mut inbound, &mut codec, &mut read_buf, &handler) => {
-                    res?
-                }
+        // Клонируем Arc для независимых тасок
+        let codec_reader = codec.clone();
+        let codec_writer = codec.clone();
 
-                _ = heartbeat.tick() => {
-                    let msg = MuxMessage { stream_id: 0, frame_type: FrameType::Heartbeat, data: Bytes::new() };
-                    Self::handle_outbound(&mut outbound, &mut codec, msg).await?;
-                }
+        let token_reader = token.clone();
+        let token_writer = token.clone();
 
-                msg_opt = mux_rx.recv() => {
-                    if let Some(msg) = msg_opt {
-                        Self::handle_outbound(&mut outbound, &mut codec, msg).await?;
-                    } else {
+        // ==========================================
+        // 1. READER TASK (Только чтение и расшифровка)
+        // ==========================================
+        let reader_handle = tokio::spawn(async move {
+            let mut read_buf = read_buf;
+            let mut inbound = inbound;
+
+            loop {
+                tokio::select! {
+                    _ = token_reader.cancelled() => {
+                        info!("Reader Task: Shutdown signal received.");
                         break;
+                    }
+                    res = inbound.read_buf(&mut read_buf) => {
+                        let n = res.map_err(|e| e.to_string())?;
+
+                        // --- ИСПРАВЛЕННАЯ ЛОГИКА EOF ---
+                        if n == 0 {
+                            if read_buf.is_empty() {
+                                info!("Connection closed by peer (Clean EOF)");
+                            } else {
+                                error!("Connection abruptly closed by peer (Incomplete frame: {} bytes left)", read_buf.len());
+                            }
+                            // ВЫХОДИМ В ЛЮБОМ СЛУЧАЕ, СОКЕТ МЕРТВ!
+                            return Err::<(), String>("EOF".into());
+                        }
+
+                        // Вектор для фреймов. Мы расшифруем всё быстро,
+                        // сложим сюда и отпустим лок Кодека.
+                        let mut frames = Vec::new();
+
+                        {
+                            // Блокируем кодек только на время математики (расшифровки)
+                            let mut c = codec_reader.lock().await;
+                            loop {
+                                match c.inbound(&mut read_buf) {
+                                    Ok(Some(frame)) => frames.push(frame),
+                                    Ok(None) => break,
+                                    Err(e) => {
+                                        if e.action == ErrorAction::Wait {
+                                            break;
+                                        }
+                                        if e.action == ErrorAction::Drop {
+                                            error!("CRITICAL: Crypto tampering or sync lost. Hard dropping tunnel!");
+                                            return Err("Crypto drop".into());
+                                        }
+                                        error!(error = ?e, "Codec inbound failed");
+                                        return Err(format!("Codec error: {:?}", e));
+                                    }
+                                }
+                            }
+                        } // Лок кодека отпущен!
+
+                        // Обрабатываем фреймы (I/O) без лока, не мешая Writer Task
+                        for frame in frames {
+                            handler.handle(frame).await;
+                        }
                     }
                 }
             }
-        }
-        Ok(())
-    }
+            Ok::<(), String>(())
+        });
 
-    async fn process_inbound(
-        inbound: &mut OwnedReadHalf,
-        codec: &mut Codec,
-        read_buf: &mut BytesMut,
-        handler: &Arc<StreamHandler>,
-    ) -> Result<(), String> {
-        let n = inbound
-            .read_buf(read_buf)
-            .await
-            .map_err(|e| e.to_string())?;
+        // ==========================================
+        // 2. WRITER TASK (Только шифрование и отправка)
+        // ==========================================
+        let writer_handle = tokio::spawn(async move {
+            let mut outbound = outbound;
+            let mut control_rx = control_rx;
+            let mut data_rx = data_rx;
+            let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(15));
 
-        if n == 0 && read_buf.is_empty() {
-            netrunner_logger::info!("Connection closed by peer (EOF detected)");
-            return Err("EOF".into());
-        }
+            loop {
+                tokio::select! {
+                    biased; // Приоритет сверху вниз
 
-        loop {
-            match codec.inbound(read_buf) {
-                Ok(Some(frame)) => {
-                    handler.handle(frame).await;
-                }
-
-                Ok(None) => break,
-
-                Err(e) => {
-                    if e.action == ErrorAction::Wait {
+                    _ = token_writer.cancelled() => {
+                        info!("Writer Task: Shutdown signal received.");
                         break;
                     }
 
-                    if e.action == ErrorAction::Drop {
-                        // ТСПУ подмешал мусор ИЛИ ключи не совпали.
-                        // Мгновенный выход с ошибкой приведет к обрыву TCP-соединения.
-                        netrunner_logger::error!(
-                            "CRITICAL: Crypto tampering or sync lost. Hard dropping tunnel!"
-                        );
-                        return Err("Crypto drop".into());
+                    // FAST TRACK: Управляющие команды
+                    msg_opt = control_rx.recv() => {
+                        if let Some(msg) = msg_opt {
+                            Self::handle_outbound(&mut outbound, &codec_writer, msg).await?;
+                        } else {
+                            break;
+                        }
                     }
 
-                    error!(error = ?e, "Codec inbound failed");
-                    return Err(format!("Codec error: {:?}", e));
+                    // Пинг
+                    _ = heartbeat.tick() => {
+                        let msg = MuxMessage { stream_id: 0, frame_type: FrameType::Heartbeat, data: Bytes::new() };
+                        Self::handle_outbound(&mut outbound, &codec_writer, msg).await?;
+                    }
+
+                    // SLOW TRACK: Данные
+                    msg_opt = data_rx.recv() => {
+                        if let Some(msg) = msg_opt {
+                            Self::handle_outbound(&mut outbound, &codec_writer, msg).await?;
+                        } else {
+                            break;
+                        }
+                    }
                 }
             }
+            Ok::<(), String>(())
+        });
+
+        // ==========================================
+        // Ожидаем завершения обеих тасок.
+        // Если одна падает с ошибкой, убиваем туннель.
+        // ==========================================
+        let res = tokio::select! {
+            res = reader_handle => res.unwrap_or_else(|e| Err(format!("Reader panic: {}", e))),
+            res = writer_handle => res.unwrap_or_else(|e| Err(format!("Writer panic: {}", e))),
+        };
+
+        if let Err(e) = &res {
+            error!("TunnelEngine critical failure: {}", e);
         }
-        Ok(())
+
+        res
     }
 
     async fn handle_outbound(
         outbound: &mut OwnedWriteHalf,
-        codec: &mut Codec,
+        codec: &Arc<Mutex<Codec>>,
         msg: MuxMessage,
     ) -> Result<(), String> {
         const MAX_CHUNK_SIZE: usize = 16000;
@@ -123,36 +185,44 @@ impl TunnelEngine {
         let stream_id = msg.stream_id;
         let frame_type = msg.frame_type;
 
-        if data.is_empty() {
-            match codec.encrypt_data(stream_id, frame_type.clone(), Bytes::new()) {
-                Ok(pkt) => {
-                    outbound.write_all(&pkt).await.map_err(|e| e.to_string())?;
+        // Вектор зашифрованных пакетов. Собираем их быстро под локом.
+        let mut packets = Vec::new();
+
+        {
+            // Берем лок кодека только для шифрования
+            let mut c = codec.lock().await;
+
+            if data.is_empty() {
+                match c.encrypt_data(stream_id, frame_type.clone(), Bytes::new()) {
+                    Ok(pkt) => packets.push(pkt),
+                    Err(e) => {
+                        error!(stream_id, error = ?e, "Encryption failed for empty message");
+                        return Err(format!("Encryption error: {:?}", e));
+                    }
                 }
-                Err(e) => {
-                    error!(stream_id, error = ?e, "Encryption failed for empty message");
-                    return Err(format!("Encryption error: {:?}", e));
+            } else {
+                while !data.is_empty() {
+                    let chunk_size = std::cmp::min(data.len(), MAX_CHUNK_SIZE);
+                    let chunk = data.split_to(chunk_size);
+
+                    match c.encrypt_data(stream_id, frame_type.clone(), chunk) {
+                        Ok(pkt) => packets.push(pkt),
+                        Err(e) => {
+                            error!(stream_id, error = ?e, "Encryption failed for chunked message");
+                            return Err(format!("Encryption error: {:?}", e));
+                        }
+                    }
                 }
             }
-            return Ok(());
-        }
+        } // Лок кодека отпущен!
 
-        while !data.is_empty() {
-            let chunk_size = std::cmp::min(data.len(), MAX_CHUNK_SIZE);
-
-            let chunk = data.split_to(chunk_size);
-
-            match codec.encrypt_data(stream_id, frame_type.clone(), chunk) {
-                Ok(pkt) => {
-                    outbound.write_all(&pkt).await.map_err(|e| {
-                        error!(stream_id, error = %e, "Failed to write encrypted data to network");
-                        e.to_string()
-                    })?;
-                }
-                Err(e) => {
-                    error!(stream_id, error = ?e, "Encryption failed for chunked message");
-                    return Err(format!("Encryption error: {:?}", e));
-                }
-            }
+        // Выполняем I/O операцию (которая может зависнуть при плохой сети) БЕЗ лока кодека.
+        // Это позволяет Reader Task продолжать читать сеть!
+        for pkt in packets {
+            outbound.write_all(&pkt).await.map_err(|e| {
+                error!(stream_id, error = %e, "Failed to write encrypted data to network");
+                e.to_string()
+            })?;
         }
 
         debug!(stream_id, "Outbound packet sent successfully");

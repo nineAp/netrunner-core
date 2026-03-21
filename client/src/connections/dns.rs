@@ -1,7 +1,7 @@
 use crate::connections::ip_store::FakeIpStore;
 use hickory_proto::op::{Message, MessageType, ResponseCode};
 use hickory_proto::rr::{RData, Record, RecordType};
-use netrunner_logger::{error, info};
+use netrunner_logger::{debug, error, info};
 use std::collections::HashSet;
 use std::time::{Duration, SystemTime};
 use tokio::fs::{self, File};
@@ -114,7 +114,7 @@ impl DnsHandler {
         if self.forbidden_suffixes.iter().any(|s| name.ends_with(s))
             || self.block_list.contains(&name)
         {
-            info!(domain = %name, "DNS: Blocked");
+            debug!(domain = %name, "DNS: Blocked");
             res.set_response_code(ResponseCode::NXDomain);
             return res.to_vec().ok();
         }
