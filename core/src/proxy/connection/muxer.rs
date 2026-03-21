@@ -1,11 +1,10 @@
 use crate::protocol::codec::frame::FrameType;
 use bytes::Bytes;
-use std::collections::HashMap;
+use dashmap::DashMap; // Добавь в Cargo.toml: dashmap = "6.0"
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc::error::SendError;
 use tokio::sync::mpsc::Sender;
-use tokio::sync::RwLock;
 
 pub struct IdGenerator {
     counter: AtomicU32,
@@ -33,7 +32,7 @@ pub struct MuxMessage {
 #[derive(Clone)]
 pub struct Muxer {
     to_network: Sender<MuxMessage>,
-    streams: Arc<RwLock<HashMap<u32, Sender<Bytes>>>>,
+    streams: Arc<DashMap<u32, Sender<Bytes>>>,
     id_gen: Arc<IdGenerator>,
 }
 
@@ -41,7 +40,7 @@ impl Muxer {
     pub fn new(to_network: Sender<MuxMessage>, is_client: bool) -> Self {
         Self {
             to_network,
-            streams: Arc::new(RwLock::new(HashMap::new())),
+            streams: Arc::new(DashMap::new()),
             id_gen: Arc::new(IdGenerator::new(is_client)),
         }
     }
@@ -54,19 +53,17 @@ impl Muxer {
         self.to_network.send(message).await
     }
 
-    pub async fn register_stream(&self, stream_id: u32, tx: Sender<Bytes>) {
-        let mut lock = self.streams.write().await;
-        lock.insert(stream_id, tx);
+    pub fn register_stream(&self, stream_id: u32, tx: Sender<Bytes>) {
+        self.streams.insert(stream_id, tx);
         netrunner_logger::debug!(
             stream_id,
-            total_active = lock.len(),
+            total_active = self.streams.len(),
             "MUXER: [REGISTER] Stream added"
         );
     }
 
-    pub async fn remove_stream(&self, stream_id: u32) {
-        let mut lock = self.streams.write().await;
-        lock.remove(&stream_id);
+    pub fn remove_stream(&self, stream_id: u32) {
+        self.streams.remove(&stream_id);
     }
 
     pub async fn send_control(
@@ -86,10 +83,8 @@ impl Muxer {
     }
 
     pub async fn dispatch_to_local(&self, stream_id: u32, data: Bytes) {
-        let tx = {
-            let lock = self.streams.read().await;
-            lock.get(&stream_id).cloned()
-        };
+        // DashMap позволяет получить доступ к элементу без явного RwLock
+        let tx = self.streams.get(&stream_id).map(|r| r.value().clone());
 
         if let Some(tx) = tx {
             if data.is_empty() {
@@ -107,7 +102,7 @@ impl Muxer {
                     stream_id,
                     "MUXER: [WARN] Local channel closed, dropping packet"
                 );
-                self.remove_stream(stream_id).await;
+                self.remove_stream(stream_id);
             }
         } else {
             netrunner_logger::trace!(

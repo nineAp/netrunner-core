@@ -206,7 +206,7 @@ impl TunnelHandler for ClientHandler {
             } => {
                 let stream_id = self.muxer.next_id();
                 let (v_tx, mut v_rx) = mpsc::channel::<bytes::Bytes>(1024);
-                self.muxer.register_stream(stream_id, v_tx).await;
+                self.muxer.register_stream(stream_id, v_tx);
 
                 self.muxer
                     .send_to_netwrok(MuxMessage {

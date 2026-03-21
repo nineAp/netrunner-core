@@ -42,7 +42,7 @@ impl StreamHandler {
             let muxer = self.muxer.clone();
 
             let (v_tx, v_rx) = tokio::sync::mpsc::channel(512);
-            muxer.register_stream(stream_id, v_tx).await;
+            muxer.register_stream(stream_id, v_tx);
 
             tokio::spawn(async move {
                 let start = std::time::Instant::now();
@@ -96,7 +96,7 @@ impl StreamHandler {
             let muxer = self.muxer.clone();
 
             let (v_tx, v_rx) = tokio::sync::mpsc::channel(512);
-            muxer.register_stream(stream_id, v_tx).await;
+            muxer.register_stream(stream_id, v_tx);
 
             tokio::spawn(async move {
                 info!(stream_id, target = %target_str, "Attempting remote UDP connection");
@@ -142,7 +142,7 @@ impl StreamHandler {
     }
 
     async fn send_error_reply(muxer: &Muxer, stream_id: u32, code: u8, frame_type: FrameType) {
-        muxer.remove_stream(stream_id).await;
+        muxer.remove_stream(stream_id);
         let mut reply_buf = BytesMut::with_capacity(10);
         let reply = SocksReply::ConnectResult {
             reply_code: code,
@@ -162,6 +162,6 @@ impl StreamHandler {
 
     async fn on_close(&self, stream_id: u32) {
         self.muxer.dispatch_to_local(stream_id, Bytes::new()).await;
-        self.muxer.remove_stream(stream_id).await;
+        self.muxer.remove_stream(stream_id);
     }
 }

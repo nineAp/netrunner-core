@@ -17,4 +17,5 @@ rand = "0.10.0"
 hex = "0.4.3"
 tokio-util = { version = "0.7", features = ["rt"] }
 async-trait = "0.1.89"
+dashmap = "6.1.0"
 netrunner-logger = { path = "../tools/log" }

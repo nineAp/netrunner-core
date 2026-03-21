@@ -45,7 +45,7 @@ impl TcpConnection {
             // ИСПРАВЛЕНИЕ: Даем Муксеру ограниченный канал, как он и просит (тип mpsc::Sender)
             // Делаем его достаточно вместительным (1024)
             let (v_tx, mut v_rx) = mpsc::channel::<Bytes>(1024);
-            muxer.register_stream(stream_id, v_tx).await;
+            muxer.register_stream(stream_id, v_tx);
 
             let connect_payload = target_addr.to_string();
             if muxer
@@ -57,7 +57,7 @@ impl TcpConnection {
                 .await
                 .is_err()
             {
-                muxer.remove_stream(stream_id).await;
+                muxer.remove_stream(stream_id);
                 return;
             }
 
@@ -68,13 +68,13 @@ impl TcpConnection {
                         let _ = handshake_tx.send(());
                     } else {
                         netrunner_logger::warn!(stream_id, "Server rejected TCP connection");
-                        muxer.remove_stream(stream_id).await;
+                        muxer.remove_stream(stream_id);
                         return;
                     }
                 }
                 _ => {
                     netrunner_logger::error!(stream_id, "Timeout waiting for proxy response");
-                    muxer.remove_stream(stream_id).await;
+                    muxer.remove_stream(stream_id);
                     return;
                 }
             }
@@ -118,7 +118,7 @@ impl TcpConnection {
                     data: Bytes::new(),
                 })
                 .await;
-            muxer.remove_stream(stream_id).await;
+            muxer.remove_stream(stream_id);
         });
 
         Self {

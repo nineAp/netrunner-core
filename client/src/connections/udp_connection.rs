@@ -41,7 +41,7 @@ impl UdpConnection {
         tokio::spawn(async move {
             // Даем Муксеру ограниченный канал (тип Sender), чтобы компилятор пропустил
             let (v_tx, mut v_rx) = mpsc::channel::<Bytes>(1024);
-            m_clone.register_stream(stream_id, v_tx).await;
+            m_clone.register_stream(stream_id, v_tx);
 
             let _ = m_clone
                 .send_to_netwrok(MuxMessage {
@@ -81,7 +81,7 @@ impl UdpConnection {
                     data: Bytes::new(),
                 })
                 .await;
-            m_clone.remove_stream(stream_id).await;
+            m_clone.remove_stream(stream_id);
         });
 
         Self {

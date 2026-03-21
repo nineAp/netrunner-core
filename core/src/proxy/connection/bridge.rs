@@ -5,6 +5,7 @@ use bytes::{Bytes, BytesMut};
 use netrunner_logger::{debug, error};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
+
 pub async fn run_proxy_bridge<R, W>(
     stream_id: u32,
     mut reader: R,
@@ -58,6 +59,7 @@ pub async fn run_proxy_bridge<R, W>(
         }
     }
 
+    // Отправляем Close фрейм перед выходом
     let _ = muxer
         .send_to_netwrok(MuxMessage {
             stream_id,
@@ -65,8 +67,12 @@ pub async fn run_proxy_bridge<R, W>(
             data: Bytes::new(),
         })
         .await;
+
+    // Небольшая пауза, чтобы Close фрейм успел уйти в сеть
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    muxer.remove_stream(stream_id).await;
+
+    // ИЗМЕНЕНИЕ: remove_stream теперь синхронный
+    muxer.remove_stream(stream_id);
 }
 
 pub async fn run_udp_bridge(
@@ -79,7 +85,6 @@ pub async fn run_udp_bridge(
 
     loop {
         tokio::select! {
-
             res = socket.recv(&mut buf) => {
                 match res {
                     Ok(0) => break,
@@ -97,7 +102,6 @@ pub async fn run_udp_bridge(
                     }
                 }
             }
-
 
             maybe_data = v_rx.recv() => {
                 match maybe_data {
@@ -124,6 +128,9 @@ pub async fn run_udp_bridge(
             data: Bytes::new(),
         })
         .await;
+
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    muxer.remove_stream(stream_id).await;
+
+    // ИЗМЕНЕНИЕ: remove_stream теперь синхронный
+    muxer.remove_stream(stream_id);
 }
