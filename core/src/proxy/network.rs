@@ -133,8 +133,8 @@ impl Network {
         }
 
         // --- ИЗМЕНЕНИЯ ЗДЕСЬ: Создаем два канала ---
-        let (control_tx, control_rx) = tokio::sync::mpsc::channel(100_000);
-        let (data_tx, data_rx) = tokio::sync::mpsc::channel(100_000);
+        let (control_tx, control_rx) = tokio::sync::mpsc::channel(MESSAGE_CHANNEL_SIZE * 4);
+        let (data_tx, data_rx) = tokio::sync::mpsc::channel(MESSAGE_CHANNEL_SIZE * 4);
 
         // Передаем оба трансмиттера в Muxer
         let muxer = Muxer::new(control_tx, data_tx, true);

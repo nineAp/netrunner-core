@@ -1,12 +1,9 @@
 use bytes::Bytes;
 use netrunner_core::{
     protocol::codec::{frame::FrameType, socks::TargetAddress},
-    proxy::connection::{
-        TCP_BUF_SIZE,
-        muxer::{MuxMessage, Muxer},
-    },
+    proxy::connection::muxer::{MuxMessage, Muxer},
 };
-use netrunner_logger::{debug, info, warn};
+use netrunner_logger::{debug, error, info, warn};
 use smoltcp::{
     iface::{SocketHandle, SocketSet},
     socket::{AnySocket, icmp, tcp, udp},
@@ -74,11 +71,10 @@ impl ConnectionManager {
         let local_endpoint = match socket.local_endpoint() {
             Some(ep) => ep,
             None => {
-                warn!(handle=?socket, "Attempted to resolve target for an unconnected socket");
+                warn!(handle=?socket, "Target resolution failed: socket disconnected or no local endpoint");
                 return TargetAddress::Domain("disconnected".to_string(), 0);
             }
         };
-        debug!(remote_addr = %local_endpoint.addr, remote_port = %local_endpoint.port, "SMOLTCP RAW REMOTE ENDPOINT");
 
         let port = local_endpoint.port;
         let ip = local_endpoint.addr;
@@ -86,27 +82,30 @@ impl ConnectionManager {
         match ip {
             smoltcp::wire::IpAddress::Ipv4(ipv4_addr) => {
                 let std_ip = std::net::Ipv4Addr::from(ipv4_addr);
+                let start = StdInstant::now();
 
-                debug!(ip=%std_ip, "Trying to resolve IP in FakeIpStore");
                 if let Some(domain) = self.fake_ip_store.lookup_by_ip(&std_ip) {
-                    debug!(target=%domain, port=%port, "Resolved fake IP to domain");
-                    return TargetAddress::Domain(domain, port);
+                    debug!(ip=%std_ip, domain=%domain, elapsed=?start.elapsed(), "FakeIP match found");
+                    TargetAddress::Domain(domain, port)
                 } else {
-                    warn!(ip=%std_ip, "IP not found in FakeIpStore! SOCKS request will fail.");
+                    warn!(ip=%std_ip, port=%port, "IP not found in FakeIpStore. Using raw IP (possible DNS lag)");
+                    TargetAddress::Ipv4(std_ip, port)
                 }
-
-                debug!(ip=%std_ip, port=%port, "Using raw IP target");
-                TargetAddress::Ipv4(std_ip, port)
             }
             smoltcp::wire::IpAddress::Ipv6(ipv6_addr) => {
                 let std_ip = std::net::Ipv6Addr::from(ipv6_addr);
-                debug!(ip=%std_ip, port=%port, "Using IPv6 target");
+                debug!(ip=%std_ip, port=%port, "Using raw IPv6 target");
                 TargetAddress::Ipv6(std_ip, port)
             }
         }
     }
 
     pub fn process_sockets(&mut self, socket_set: &mut SocketSet) {
+        // Добавим лог в начало цикла, если сессий много, чтобы видеть нагрузку
+        if !self.active_tcp_sessions.is_empty() || !self.active_udp_sessions.is_empty() {
+            // trace!("Processing sockets: TCP={}, UDP={}", self.active_tcp_sessions.len(), self.active_udp_sessions.len());
+        }
+
         for (handle, socket) in socket_set.iter_mut() {
             if let Some(tcp) = tcp::Socket::downcast_mut(socket) {
                 self.handle_tcp(handle, tcp);
@@ -122,11 +121,9 @@ impl ConnectionManager {
         use tcp::State;
 
         if socket.state() == State::Closed {
-            if self.active_tcp_sessions.contains_key(&handle) {
-                debug!(%handle, "TCP session closed, removing from active sessions");
-                self.active_tcp_sessions.remove(&handle);
+            if self.active_tcp_sessions.remove(&handle).is_some() {
+                info!(%handle, "TCP Session removed: local socket closed");
             }
-
             if !self.sockets_to_remove.contains(&handle) {
                 self.sockets_to_remove.push(handle);
             }
@@ -134,30 +131,31 @@ impl ConnectionManager {
         }
 
         if socket.state() == State::Established && !self.active_tcp_sessions.contains_key(&handle) {
+            let start_establish = StdInstant::now();
             let target = self.resolve_target(socket);
 
             if let TargetAddress::Domain(d, _) = &target {
                 if d == "disconnected" {
+                    warn!(%handle, "Aborting socket: target unresolved");
                     socket.abort();
                     return;
                 }
             }
 
-            info!(%handle, "New TCP session established for target: {:?}", target);
+            info!(%handle, target = %target, "New TCP session: Local established, starting Muxer handshake");
 
-            // 1. Создаем соединение и получаем каналы
             let (conn, mut rx_from_smol, tx_to_smol, handshake_tx) = TcpConnection::new(handle);
             self.active_tcp_sessions.insert(handle, conn);
 
-            // 2. Выносим логику мультиплексирования в фоновую задачу
             let muxer = self.muxer.clone();
             let stream_id = muxer.next_id();
             let connect_payload = target.to_string();
 
             tokio::spawn(async move {
-                let (v_tx, mut v_rx) = mpsc::channel::<Bytes>(TCP_BUF_SIZE);
+                let (v_tx, mut v_rx) = mpsc::channel::<Bytes>(CHANNEL_CAPACITY);
                 muxer.register_stream(stream_id, v_tx);
 
+                let send_start = StdInstant::now();
                 if muxer
                     .send_to_netwrok(MuxMessage {
                         stream_id,
@@ -167,24 +165,25 @@ impl ConnectionManager {
                     .await
                     .is_err()
                 {
+                    error!(stream_id, "Muxer: Failed to send Connect frame");
                     muxer.remove_stream(stream_id);
                     return;
                 }
 
-                let first_payload =
-                    tokio::time::timeout(Duration::from_secs(10), v_rx.recv()).await;
-                match first_payload {
+                // Ждем подтверждения от прокси (handshake)
+                match tokio::time::timeout(Duration::from_secs(10), v_rx.recv()).await {
                     Ok(Some(data)) => {
                         if data.len() >= 2 && data[1] == 0x00 {
+                            info!(stream_id, %handle, elapsed=?send_start.elapsed(), "Muxer: Handshake success");
                             let _ = handshake_tx.send(());
                         } else {
-                            netrunner_logger::warn!(stream_id, "Server rejected TCP connection");
+                            warn!(stream_id, "Muxer: Connection rejected by proxy server");
                             muxer.remove_stream(stream_id);
                             return;
                         }
                     }
                     _ => {
-                        netrunner_logger::error!(stream_id, "Timeout waiting for proxy response");
+                        error!(stream_id, "Muxer: Handshake timeout (10s)");
                         muxer.remove_stream(stream_id);
                         return;
                     }
@@ -192,12 +191,15 @@ impl ConnectionManager {
 
                 let to_proxy = async {
                     while let Some(data) = rx_from_smol.recv().await {
-                        let msg = MuxMessage {
-                            stream_id,
-                            frame_type: FrameType::Data,
-                            data,
-                        };
-                        if muxer.send_to_netwrok(msg).await.is_err() {
+                        if muxer
+                            .send_to_netwrok(MuxMessage {
+                                stream_id,
+                                frame_type: FrameType::Data,
+                                data,
+                            })
+                            .await
+                            .is_err()
+                        {
                             break;
                         }
                     }
@@ -205,18 +207,15 @@ impl ConnectionManager {
 
                 let from_proxy = async {
                     while let Some(data) = v_rx.recv().await {
-                        if data.is_empty() {
-                            break;
-                        }
-                        if tx_to_smol.send(data).await.is_err() {
+                        if data.is_empty() || tx_to_smol.send(data).await.is_err() {
                             break;
                         }
                     }
                 };
 
                 tokio::select! {
-                    _ = to_proxy => {}
-                    _ = from_proxy => {}
+                    _ = to_proxy => debug!(stream_id, "Stream direction: SMOL -> Proxy closed"),
+                    _ = from_proxy => debug!(stream_id, "Stream direction: Proxy -> SMOL closed"),
                 }
 
                 let _ = muxer
@@ -227,17 +226,19 @@ impl ConnectionManager {
                     })
                     .await;
                 muxer.remove_stream(stream_id);
+                debug!(stream_id, "Muxer stream fully removed");
             });
         }
 
         if let Some(conn) = self.active_tcp_sessions.get_mut(&handle) {
             if !conn.tick(socket) {
-                debug!(%handle, "Connection tick failed, aborting.");
+                debug!(%handle, "TCP Connection tick failed (buffer full or error), aborting");
                 socket.abort();
             }
         }
 
         if socket.state() == State::CloseWait {
+            debug!(%handle, "Socket in CloseWait, closing locally");
             socket.close();
         }
     }
@@ -362,7 +363,7 @@ impl ConnectionManager {
 
     fn create_dynamic_tcp_socket<'a>(port: u16) -> tcp::Socket<'a> {
         let buf_size = match port {
-            443 | 80 => 512 * 1024,
+            443 | 80 => 1024 * 1024 * 2,
             22 => 32 * 1024,
             53 => 16 * 1024,
             _ => 128 * 1024,
@@ -377,7 +378,6 @@ impl ConnectionManager {
         socket.set_ack_delay(None);
         socket
     }
-
     pub fn try_create_socket_from_packet(&mut self, packet: &[u8], socket_set: &mut SocketSet) {
         let Ok(ip_packet) = Ipv4Packet::new_checked(packet) else {
             return;
@@ -394,16 +394,18 @@ impl ConnectionManager {
                     let dst_addr = ip_packet.dst_addr();
 
                     if !self.has_active_tcp_session(socket_set, dst_addr.into(), dst_port) {
-                        debug!(target: "netrunner", "Dynamic TCP: Creating socket for {}:{}", dst_addr, dst_port);
-
+                        let start_create = StdInstant::now();
                         let mut socket = Self::create_dynamic_tcp_socket(dst_port);
                         let endpoint = IpListenEndpoint {
                             addr: Some(dst_addr.into()),
                             port: dst_port,
                         };
 
-                        if let Ok(_) = socket.listen(endpoint) {
-                            socket_set.add(socket);
+                        if socket.listen(endpoint).is_ok() {
+                            let handle = socket_set.add(socket);
+                            debug!(%handle, "Dynamic TCP: Created for {}:{} in {:?}", dst_addr, dst_port, start_create.elapsed());
+                        } else {
+                            warn!("Dynamic TCP: Failed to listen on {}:{}", dst_addr, dst_port);
                         }
                     }
                 }
@@ -420,16 +422,16 @@ impl ConnectionManager {
                 }
 
                 if !self.has_active_udp_session(socket_set, dst_addr.into(), dst_port) {
-                    netrunner_logger::debug!(target: "netrunner", "Dynamic UDP: Creating socket for {}:{}", dst_addr, dst_port);
-
+                    let start_create = StdInstant::now();
                     let mut socket = Self::create_dynamic_udp_socket(dst_port);
                     let endpoint = IpListenEndpoint {
                         addr: Some(dst_addr.into()),
                         port: dst_port,
                     };
 
-                    if let Ok(_) = socket.bind(endpoint) {
-                        socket_set.add(socket);
+                    if socket.bind(endpoint).is_ok() {
+                        let handle = socket_set.add(socket);
+                        debug!(%handle, "Dynamic UDP: Created for {}:{} in {:?}", dst_addr, dst_port, start_create.elapsed());
                     }
                 }
             }
@@ -439,8 +441,8 @@ impl ConnectionManager {
 
     fn create_dynamic_udp_socket<'a>(port: u16) -> udp::Socket<'a> {
         let (buf_size, packet_count) = match port {
-            443 => (512 * 1024, 380), // Большой буфер для QUIC (YouTube)
-            53 => (16 * 1024, 32),    // DNS
+            443 => (512 * 1024, 390), // Большой буфер для QUIC (YouTube)
+            53 => (64 * 1024, 32),    // DNS
             _ => (128 * 1024, 100),
         };
 
@@ -501,10 +503,12 @@ impl ConnectionManager {
 
     pub fn cleanup(&mut self, socket_set: &mut SocketSet) {
         for handle in self.sockets_to_remove.drain(..) {
-            debug!(%handle, "Memory free: removing socket from set");
+            debug!(%handle, "Cleanup: Removing socket from SocketSet and internal maps");
             socket_set.remove(handle);
             self.last_activity.remove(&handle);
             self.failed_until.remove(&handle);
+            self.active_tcp_sessions.remove(&handle);
+            self.active_udp_sessions.remove(&handle);
         }
     }
 

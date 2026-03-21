@@ -1,8 +1,9 @@
 use bytes::{Buf, Bytes, BytesMut};
-use netrunner_core::proxy::connection::TCP_BUF_SIZE;
 use smoltcp::iface::SocketHandle;
 use smoltcp::socket::tcp;
 use tokio::sync::{mpsc, oneshot};
+
+use crate::connections::CHANNEL_CAPACITY;
 
 pub enum ConnectionState {
     Established,
@@ -14,16 +15,14 @@ pub enum ConnectionState {
 pub struct TcpConnection {
     pub handle: SocketHandle,
     state: ConnectionState,
-    // UPLOAD: Ограниченный канал для передачи данных наружу
     tx: mpsc::Sender<Bytes>,
-    // DOWNLOAD: Канал для приема данных из сети
     rx: mpsc::Receiver<Bytes>,
     pending_data: BytesMut,
     handshake_rx: Option<oneshot::Receiver<()>>,
 }
 
-const MAX_PENDING: usize = 32 * 512 * 1024;
-const TCP_CHUNK_SIZE: usize = 65536;
+const MAX_PENDING: usize = 64 * 1024;
+const TCP_CHUNK_SIZE: usize = 1024 * 16;
 
 impl TcpConnection {
     pub fn new(
@@ -34,8 +33,8 @@ impl TcpConnection {
         mpsc::Sender<Bytes>,
         oneshot::Sender<()>,
     ) {
-        let (tx_to_net, rx_from_smol) = mpsc::channel::<Bytes>(TCP_BUF_SIZE);
-        let (tx_to_smol, rx_from_net) = mpsc::channel::<Bytes>(TCP_BUF_SIZE);
+        let (tx_to_net, rx_from_smol) = mpsc::channel::<Bytes>(CHANNEL_CAPACITY);
+        let (tx_to_smol, rx_from_net) = mpsc::channel::<Bytes>(CHANNEL_CAPACITY);
         let (handshake_tx, handshake_rx) = oneshot::channel();
 
         let conn = Self {
@@ -107,74 +106,92 @@ impl TcpConnection {
     }
 
     fn poll_and_process(&mut self, socket: &mut tcp::Socket) {
-        // 1. UPLOAD: Чанкинг и Backpressure
-        if socket.can_recv() {
-            while socket.can_recv() {
-                let mut channel_full = false;
-                let mut channel_closed = false;
+        while socket.can_recv() {
+            let mut full = false;
 
-                let _ = socket.recv(|data| {
-                    if data.is_empty() {
-                        return (0, ());
+            // Используем recv_slice для контроля размера чанка
+            let mut temp = [0u8; TCP_CHUNK_SIZE];
+
+            // Peek, чтобы проверить, сможем ли мы отправить данные, прежде чем извлечь их
+            if let Ok(n) = socket.peek_slice(&mut temp) {
+                if n == 0 {
+                    break;
+                }
+
+                let chunk = Bytes::copy_from_slice(&temp[..n]);
+                match self.tx.try_send(chunk) {
+                    Ok(_) => {
+                        // Только если успешно отправили в канал, удаляем данные из сокета
+                        socket.recv_slice(&mut temp[..n]).unwrap();
                     }
-
-                    let chunk_size = std::cmp::min(data.len(), TCP_CHUNK_SIZE);
-                    let chunk = &data[..chunk_size];
-
-                    match self.tx.try_send(Bytes::copy_from_slice(chunk)) {
-                        Ok(_) => (chunk_size, ()),
-                        Err(mpsc::error::TrySendError::Full(_)) => {
-                            channel_full = true;
-                            (0, ()) // Оставляем данные в smoltcp
-                        }
-                        Err(_) => {
-                            channel_closed = true;
-                            (0, ())
-                        }
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        full = true; // Канал забит, сработает Backpressure в smoltcp
                     }
-                });
+                    Err(_) => {
+                        self.state = ConnectionState::Closed;
+                        return;
+                    }
+                }
+            } else {
+                break;
+            }
 
-                if channel_full || channel_closed {
+            if full {
+                break;
+            }
+        }
+
+        let current_pending = self.pending_data.len();
+
+        // Считаем % заполненности для логирования
+        let fill_ratio = (current_pending as f32 / MAX_PENDING as f32) * 100.0;
+
+        if current_pending >= MAX_PENDING {
+            // Состояние активного Backpressure
+            netrunner_logger::warn!(
+                %self.handle,
+                "Backpressure ACTIVE: Buffer is FULL ({} bytes). Stalling RX channel.",
+                current_pending
+            );
+        } else if fill_ratio > 80.0 {
+            // Состояние Bufferbloat (буфер почти полон, пакеты задерживаются)
+            netrunner_logger::info!(
+                %self.handle,
+                "Bufferbloat Warning: Buffer {:.1}% full ({} bytes). Latency increasing.",
+                fill_ratio, current_pending
+            );
+
+            // Продолжаем читать, пока есть хоть какое-то место
+            while let Ok(data) = self.rx.try_recv() {
+                self.pending_data.extend_from_slice(&data);
+                if self.pending_data.len() >= MAX_PENDING {
+                    break;
+                }
+            }
+        } else {
+            // Обычный режим
+            while let Ok(data) = self.rx.try_recv() {
+                self.pending_data.extend_from_slice(&data);
+                if self.pending_data.len() >= MAX_PENDING {
                     break;
                 }
             }
         }
 
-        // 2. DOWNLOAD: Сброс ограниченного канала в буфер
-        while let Ok(data) = self.rx.try_recv() {
-            if self.pending_data.is_empty() && socket.can_send() {
-                match socket.send_slice(&data) {
-                    Ok(n) if n < data.len() => {
-                        self.pending_data.extend_from_slice(&data[n..]);
-                    }
-                    Ok(_) => {}
-                    Err(_) => {
-                        self.pending_data.extend_from_slice(&data);
-                    }
-                }
-            } else {
-                self.pending_data.extend_from_slice(&data);
-            }
-
-            if self.pending_data.len() > MAX_PENDING {
-                netrunner_logger::error!(
-                    %self.handle,
-                    "TCP Buffer overflow ({} bytes). Dropping connection.",
-                    self.pending_data.len()
-                );
-                socket.abort();
-                self.state = ConnectionState::Closed;
-                return;
-            }
-        }
-
-        // 3. DOWNLOAD: Отправка буфера в smoltcp
+        // 3. DOWNLOAD: Отправка накопленного буфера в smoltcp
         if !self.pending_data.is_empty() && socket.can_send() {
             match socket.send_slice(&self.pending_data) {
                 Ok(n) => {
                     self.pending_data.advance(n);
+
+                    // Лог освобождения (опционально, чтобы видеть, что пробка рассасывается)
+                    if n > 0 && self.pending_data.len() < (MAX_PENDING / 2) && fill_ratio > 90.0 {
+                        netrunner_logger::info!(%self.handle, "Backpressure RELIEVED: Buffer drained to {} bytes", self.pending_data.len());
+                    }
                 }
-                Err(_) => {}
+                Err(e) => {
+                    netrunner_logger::debug!(%self.handle, "Smoltcp socket send error: {:?}", e);
+                }
             }
         }
     }

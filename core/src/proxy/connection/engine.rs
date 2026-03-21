@@ -179,7 +179,7 @@ impl TunnelEngine {
         codec: &Arc<Mutex<Codec>>,
         msg: MuxMessage,
     ) -> Result<(), String> {
-        const MAX_CHUNK_SIZE: usize = 16000;
+        const MAX_CHUNK_SIZE: usize = 1024 * 4;
 
         let mut data = msg.data;
         let stream_id = msg.stream_id;
