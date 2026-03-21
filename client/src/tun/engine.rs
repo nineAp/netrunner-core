@@ -47,7 +47,7 @@ impl Engine {
         let (mut device, to_smoltcp_tx, from_smoltcp_rx, avail) = VirtTunDevice::new(caps);
         let interface = Interface::new(config, &mut device, now);
 
-        let socket_set = ConnectionManager::setup_sockets(4);
+        let socket_set = ConnectionManager::setup_sockets(2);
         let manager = ConnectionManager::new(dns_handler, muxer);
 
         Self {

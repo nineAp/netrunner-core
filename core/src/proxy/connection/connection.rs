@@ -13,6 +13,7 @@ use crate::{
         engine::TunnelEngine,
         handler::StreamHandler,
         muxer::{MuxMessage, Muxer},
+        BUF_SIZE, CHANNEL_SIZE,
     },
     tlseng::profile::BrowserProfile,
 };
@@ -27,9 +28,6 @@ use tokio::{
     sync::mpsc,
 };
 use tokio_util::sync::CancellationToken;
-
-pub const BUF_SIZE: usize = 65536;
-pub const CHANNEL_SIZE: usize = 256;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ConnectionRole {
@@ -205,7 +203,7 @@ impl TunnelHandler for ClientHandler {
                 target,
             } => {
                 let stream_id = self.muxer.next_id();
-                let (v_tx, mut v_rx) = mpsc::channel::<bytes::Bytes>(1024);
+                let (v_tx, mut v_rx) = mpsc::channel::<bytes::Bytes>(BUF_SIZE);
                 self.muxer.register_stream(stream_id, v_tx);
 
                 self.muxer

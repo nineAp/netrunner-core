@@ -3,6 +3,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use netrunner_core::protocol::codec::frame::FrameType;
 use netrunner_core::protocol::codec::socks::TargetAddress;
+use netrunner_core::proxy::connection::BUF_SIZE;
 use netrunner_core::proxy::connection::muxer::{MuxMessage, Muxer};
 use smoltcp::iface::SocketHandle;
 use smoltcp::socket::tcp;
@@ -44,7 +45,7 @@ impl TcpConnection {
         tokio::spawn(async move {
             // ИСПРАВЛЕНИЕ: Даем Муксеру ограниченный канал, как он и просит (тип mpsc::Sender)
             // Делаем его достаточно вместительным (1024)
-            let (v_tx, mut v_rx) = mpsc::channel::<Bytes>(1024);
+            let (v_tx, mut v_rx) = mpsc::channel::<Bytes>(BUF_SIZE);
             muxer.register_stream(stream_id, v_tx);
 
             let connect_payload = target_addr.to_string();

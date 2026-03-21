@@ -1,11 +1,10 @@
 use crate::{
     protocol::errors::ErrorAction,
     proxy::connection::{
-        connection::{
-            ClientHandler, Connection, ConnectionRole, ServerHandler, TunnelHandler, CHANNEL_SIZE,
-        },
+        connection::{ClientHandler, Connection, ConnectionRole, ServerHandler, TunnelHandler},
         engine::TunnelEngine,
         muxer::Muxer,
+        CHANNEL_SIZE,
     },
     tlseng::profile::BrowserProfile,
 };
@@ -132,7 +131,7 @@ impl Network {
             }
         }
 
-        let (mux_tx, mux_rx) = tokio::sync::mpsc::channel(CHANNEL_SIZE);
+        let (mux_tx, mux_rx) = tokio::sync::mpsc::channel(CHANNEL_SIZE * 48);
         let muxer = Muxer::new(mux_tx, true);
 
         let handler = std::sync::Arc::new(crate::proxy::connection::handler::StreamHandler::new(

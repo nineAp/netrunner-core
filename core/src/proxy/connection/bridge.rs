@@ -1,6 +1,6 @@
 use crate::protocol::codec::frame::FrameType;
-use crate::proxy::connection::connection::BUF_SIZE;
 use crate::proxy::connection::muxer::{MuxMessage, Muxer};
+use crate::proxy::connection::BUF_SIZE;
 use bytes::{Bytes, BytesMut};
 use netrunner_logger::{debug, error};
 use tokio::net::UdpSocket;
