@@ -17,8 +17,8 @@ use crate::{
     },
     tlseng::profile::BrowserProfile,
 };
-use bytes::BytesMut;
-use netrunner_logger::info;
+use bytes::{Bytes, BytesMut};
+use netrunner_logger::{info, warn};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{
@@ -260,35 +260,72 @@ pub struct ServerHandler {
     pub conn: Connection,
     pub token: CancellationToken,
 }
-
 impl ServerHandler {
-    async fn handle_fallback(outbound: &mut OwnedWriteHalf) {
-        let fallback_response = "HTTP/1.1 302 Found\r\n\
-                             Server: nginx/1.18.0 (Ubuntu)\r\n\
-                             Location: https://www.ubuntu.com/\r\n\
-                             Content-Length: 0\r\n\
-                             Connection: close\r\n\
-                             \r\n";
+    async fn handle_stealth_fallback(
+        mut client_inbound: OwnedReadHalf,
+        mut client_outbound: OwnedWriteHalf,
+        initial_data: bytes::Bytes,
+    ) {
+        let target_host = "ubuntu.com:443";
+        info!(target = %target_host, "Stealth fallback: bridging to Target");
 
-        let _ = outbound.write_all(fallback_response.as_bytes()).await;
-        let _ = outbound.flush().await;
-        let _ = outbound.shutdown().await;
+        // 1. Пытаемся подключиться с коротким таймаутом
+        let target_stream = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            TcpStream::connect(target_host),
+        )
+        .await;
+
+        match target_stream {
+            Ok(Ok(mut target_server)) => {
+                let (mut server_read, mut server_write) = target_server.into_split();
+
+                // 2. Скармливаем те байты, которые уже вычитали (Client Hello)
+                if !initial_data.is_empty() {
+                    if let Err(e) = server_write.write_all(&initial_data).await {
+                        warn!("Failed to push initial data to fallback: {}", e);
+                        return;
+                    }
+                }
+
+                // 3. Запускаем bidirectional copy
+                // Это создаст две задачи, которые будут перекачивать байты, пока одна сторона не закроется
+                let res = tokio::io::copy_bidirectional(
+                    &mut tokio::io::join(&mut client_inbound, &mut client_outbound),
+                    &mut tokio::io::join(&mut server_read, &mut server_write),
+                )
+                .await;
+
+                match res {
+                    Ok((from_client, from_server)) => {
+                        info!(
+                            "Fallback closed. Sent: {} bytes, Recv: {} bytes",
+                            from_client, from_server
+                        );
+                    }
+                    Err(e) => warn!("Fallback bridge error: {}", e),
+                }
+            }
+            Ok(Err(e)) => warn!("Fallback connect error: {}", e),
+            Err(_) => warn!("Fallback connection timed out (Target unreachable)"),
+        }
     }
 }
 
 #[async_trait::async_trait]
 impl TunnelHandler for ServerHandler {
     async fn run(mut self) -> Result<(), String> {
-        info!("Acting as TLS Server");
+        info!("Acting as TLS Server with Stealth Fallback");
 
-        // --- ИЗМЕНЕНИЕ ДЛЯ НОВОГО MUXER ---
         let (control_tx, control_rx) = mpsc::channel(MESSAGE_CHANNEL_SIZE);
         let (data_tx, data_rx) = mpsc::channel(MESSAGE_CHANNEL_SIZE);
         let muxer = Muxer::new(control_tx, data_tx, false);
 
-        let handshake_timeout = std::time::Duration::from_secs(5);
+        let handshake_timeout = std::time::Duration::from_secs(1);
 
         let hello = loop {
+            let buf_snapshot = self.conn.read_buf.clone().freeze();
+
             match self
                 .conn
                 .codec
@@ -303,35 +340,42 @@ impl TunnelHandler for ServerHandler {
                     .await;
 
                     match read_res {
-                        Ok(Ok(n)) if n == 0 => {
-                            return Err("Client closed connection before handshake".into());
-                        }
-                        Ok(Ok(_)) => {
-                            continue;
-                        }
-                        Ok(Err(e)) => {
-                            return Err(format!("Socket read error: {}", e));
-                        }
+                        Ok(Ok(n)) if n == 0 => return Err("Client closed".into()),
+                        Ok(Ok(_)) => continue,
+                        Ok(Err(e)) => return Err(e.to_string()),
                         Err(_) => {
-                            netrunner_logger::warn!(
-                                "Handshake timeout (Scanner detected). Triggering fallback."
-                            );
-                            ServerHandler::handle_fallback(&mut self.conn.outbound).await;
+                            warn!("Handshake timeout. Going stealth.");
+                            // Используем наш снимок, так как основной буфер мог быть частично съеден
+                            ServerHandler::handle_stealth_fallback(
+                                self.conn.inbound,
+                                self.conn.outbound,
+                                buf_snapshot,
+                            )
+                            .await;
                             return Ok(());
                         }
                     }
                 }
                 Err(e) => {
-                    netrunner_logger::warn!(
-                        error = ?e,
-                        "Invalid handshake format (Scanner detected). Triggering fallback."
+                    warn!("Auth/Format failed: {:?}. Going stealth.", e);
+                    // ВАЖНО: используем сохраненный buf_snapshot
+                    info!(
+                        "DEBUG: Restoring {} bytes from snapshot for fallback",
+                        buf_snapshot.len()
                     );
-                    ServerHandler::handle_fallback(&mut self.conn.outbound).await;
+
+                    ServerHandler::handle_stealth_fallback(
+                        self.conn.inbound,
+                        self.conn.outbound,
+                        buf_snapshot,
+                    )
+                    .await;
                     return Ok(());
                 }
             }
         };
 
+        // Если дошли сюда — значит это наш клиент, шлем Server Hello
         self.conn
             .outbound
             .write_all(&hello)
@@ -345,8 +389,8 @@ impl TunnelHandler for ServerHandler {
             outbound: self.conn.outbound,
             codec: self.conn.codec,
             read_buf: self.conn.read_buf,
-            control_rx, // Передаем оба ресивера в Engine
-            data_rx,    // Передаем оба ресивера в Engine
+            control_rx,
+            data_rx,
             handler,
             token: self.token,
         }

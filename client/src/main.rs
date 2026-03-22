@@ -32,7 +32,7 @@ async fn main() -> anyhow::Result<()> {
     })
     .expect("Failed to initialize TUN device");
 
-    let remote_address: String = "62.60.244.156:443".into();
+    let remote_address: String = "147.45.43.70:443".into();
     let _ = setup_platform_routing(&remote_address);
 
     info!("TUN interface is UP: 10.0.0.1/24");
