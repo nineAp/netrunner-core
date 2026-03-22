@@ -1,5 +1,5 @@
 # Настройки
-SERVER_IP = 62.60.244.156
+SERVER_IP = 147.45.43.70
 REMOTE_USER = root
 REMOTE_PATH = /root/netr-core
 SERVICE_NAME = netrunner-server
