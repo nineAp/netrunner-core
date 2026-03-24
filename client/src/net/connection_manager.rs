@@ -3,7 +3,7 @@ use netrunner_core::{
     protocol::codec::{frame::FrameType, socks::TargetAddress},
     proxy::connection::muxer::{MuxMessage, Muxer},
 };
-use netrunner_logger::{debug, error, info, warn};
+use netrunner_logger::{debug, info, warn};
 use smoltcp::{
     iface::{SocketHandle, SocketSet},
     socket::{AnySocket, icmp, tcp, udp},
@@ -12,9 +12,11 @@ use smoltcp::{
 use std::{collections::HashMap, time::Duration, time::Instant as StdInstant};
 use tokio::sync::mpsc;
 
-use crate::connections::{
-    CHANNEL_CAPACITY, dns::DnsHandler, ip_store::FakeIpStore, tcp_connection::TcpConnection,
-    udp_connection::UdpConnection,
+use crate::net::{
+    CHANNEL_CAPACITY,
+    connection::{TcpConnection, UdpConnection},
+    dns::DnsHandler,
+    ip_store::FakeIpStore,
 };
 
 // ============================================================================

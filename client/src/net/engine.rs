@@ -20,8 +20,8 @@ use tun::{DeviceReader, DeviceWriter};
 
 use netrunner_logger::{debug, error, info, warn};
 
-use crate::connections::dns::DnsHandler;
-use crate::tun::connection_manager::ConnectionManager;
+use crate::net::connection_manager::ConnectionManager;
+use crate::net::dns::DnsHandler;
 use crate::tun::device::{TokenBuffer, VirtTunDevice};
 use crate::tun::routing::setup_platform_routing;
 use crate::tun::tun::Tun;
@@ -216,18 +216,31 @@ impl Engine {
     }
 }
 
-pub struct EngineBuilder {
-    remote_address: String,
-    cache_path: String,
-    tun_device: Option<Tun>,
+// ============================================================================
+// КОНФИГУРАЦИЯ ДВИЖКА
+// ============================================================================
+
+#[derive(Clone, Debug)]
+pub struct EngineConfig {
+    pub remote_address: String,
+    pub cache_path: String,
+    pub mtu: usize,
+    pub setup_routing: bool,
+    pub any_ip: bool,
+    pub transparent_mode: bool,
+    pub default_gateway: Ipv4Addr,
 }
 
-impl EngineBuilder {
+impl EngineConfig {
     pub fn new(remote_address: impl Into<String>) -> Self {
         Self {
             remote_address: remote_address.into(),
             cache_path: ".".to_string(),
-            tun_device: None,
+            mtu: 1350,
+            setup_routing: true,
+            any_ip: true,
+            transparent_mode: true,
+            default_gateway: Ipv4Addr::new(10, 0, 0, 2),
         }
     }
 
@@ -236,6 +249,36 @@ impl EngineBuilder {
         self
     }
 
+    pub fn with_mtu(mut self, mtu: usize) -> Self {
+        self.mtu = mtu;
+        self
+    }
+
+    pub fn _disable_routing(mut self) -> Self {
+        self.setup_routing = false;
+        self
+    }
+}
+
+// ============================================================================
+// БИЛДЕР ДВИЖКА
+// ============================================================================
+
+pub struct EngineBuilder {
+    config: EngineConfig,
+    tun_device: Option<Tun>,
+}
+
+impl EngineBuilder {
+    /// Инициализируем билдер на основе готового конфига
+    pub fn new(config: EngineConfig) -> Self {
+        Self {
+            config,
+            tun_device: None,
+        }
+    }
+
+    /// Передаем TUN интерфейс (зависит от платформы, поэтому не в конфиге)
     pub fn with_tun(mut self, tun: Tun) -> Self {
         self.tun_device = Some(tun);
         self
@@ -244,35 +287,53 @@ impl EngineBuilder {
     pub async fn build(self) -> Result<(Engine, Tun), String> {
         let tun = self.tun_device.ok_or("TUN device is required")?;
 
-        info!("Initializing Engine components...");
+        info!(
+            "Initializing Engine components with config: {:?}",
+            self.config
+        );
 
-        let mut dns_handler = DnsHandler::new(&self.cache_path);
+        // 1. Инициализация DNS
+        let mut dns_handler = DnsHandler::new(&self.config.cache_path);
         if let Err(e) = dns_handler.init().await {
             error!("Failed to initialize DNS blocklist: {}", e);
         }
 
-        if let Err(e) = setup_platform_routing(&self.remote_address) {
-            return Err(format!("Routing setup failed: {}", e));
+        // 2. Настройка системного роутинга (Опционально)
+        if self.config.setup_routing {
+            info!("Applying platform routing rules...");
+            if let Err(e) = setup_platform_routing(&self.config.remote_address) {
+                return Err(format!("Routing setup failed: {}", e));
+            }
+        } else {
+            info!("Platform routing setup skipped via config.");
         }
 
-        let config = Config::new(smoltcp::wire::HardwareAddress::Ip);
+        // 3. Конфигурация интерфейса smoltcp
+        let smol_config = Config::new(smoltcp::wire::HardwareAddress::Ip);
         let mut caps = DeviceCapabilities::default();
-        caps.max_transmission_unit = 1350;
+        caps.max_transmission_unit = self.config.mtu; // Берем из конфига
         caps.medium = smoltcp::phy::Medium::Ip;
 
+        // 4. Подключение к серверу
         info!("Establishing secure tunnel to proxy server...");
-        let muxer = ClientHandler::connect(&self.remote_address)
+        let muxer = ClientHandler::connect(&self.config.remote_address)
             .await
             .map_err(|e| format!("Failed to establish secure tunnel: {}", e))?;
         info!("Secure tunnel established, Muxer is ready.");
 
-        let mut engine = Engine::new(config, caps, dns_handler, muxer);
-        engine.set_any_ip(true);
-        engine.set_transparent_mode();
-        engine.set_default_gateway(Ipv4Addr::new(10, 0, 0, 2));
+        // 5. Инициализация и настройка Engine
+        let mut engine = Engine::new(smol_config, caps, dns_handler, muxer);
+
+        engine.set_any_ip(self.config.any_ip);
+
+        if self.config.transparent_mode {
+            engine.set_transparent_mode();
+        }
+
+        engine.set_default_gateway(self.config.default_gateway);
         engine.activate();
 
-        info!("Stack IP initialized: 10.0.0.2");
+        info!("Stack IP initialized: {}", self.config.default_gateway);
 
         Ok((engine, tun))
     }

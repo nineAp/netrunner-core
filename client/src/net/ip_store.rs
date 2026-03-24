@@ -5,7 +5,7 @@ use std::num::NonZeroUsize;
 
 pub struct FakeIpStore {
     cache: LruCache<String, Ipv4Addr>,
-    pub rev_cache: LruCache<Ipv4Addr, String>,
+    rev_cache: LruCache<Ipv4Addr, String>,
     next_ip: u32,
 }
 

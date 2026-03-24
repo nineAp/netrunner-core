@@ -1,5 +1,10 @@
-use netrunner_client::tun::{engine::EngineBuilder, routing::reset_platform_routing, tun::Tun};
 use netrunner_logger::{error, info};
+mod net;
+mod tun;
+
+// Импортируем и Билдер, и Конфиг
+use crate::tun::{routing::reset_platform_routing, tun::Tun};
+use net::engine::{EngineBuilder, EngineConfig};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -8,27 +13,34 @@ async fn main() -> anyhow::Result<()> {
 
     let remote_address = "147.45.43.70:443";
 
-    // 1. Создаем TUN интерфейс (зависит от платформы, поэтому делаем тут)
-    let tun_device = Tun::create(|config| {
-        config
+    // 1. Создаем конфигурацию движка
+    // Здесь мы можем гибко настроить параметры, которые раньше были захардкожены
+    let config = EngineConfig::new(remote_address)
+        .with_cache_path(".")
+        .with_mtu(1350); // Указываем MTU здесь, чтобы использовать его и для TUN, и для стека
+
+    // 2. Создаем TUN интерфейс
+    // Используем значение MTU из конфига, чтобы данные были синхронизированы
+    let tun_device = Tun::create(|tun_cfg| {
+        tun_cfg
             .tun_name("netr0")
             .address((10, 0, 0, 1))
             .netmask((255, 255, 255, 0))
             .destination((10, 0, 0, 2))
+            .mtu(config.mtu as u16)
             .up();
     })
     .expect("Failed to initialize TUN device");
 
-    info!("TUN interface is UP: 10.0.0.1/24");
+    info!("TUN interface is UP: 10.0.0.1/24 (MTU: {})", config.mtu);
 
-    // 2. Собираем движок через наш новый Builder
-    let builder_result = EngineBuilder::new(remote_address)
-        .with_cache_path(".")
+    // 3. Собираем движок, передавая объект конфигурации
+    let builder_result = EngineBuilder::new(config)
         .with_tun(tun_device)
         .build()
         .await;
 
-    // 3. Обрабатываем результат и запускаем цикл
+    // 4. Обрабатываем результат и запускаем цикл
     match builder_result {
         Ok((mut engine, tun)) => {
             info!("Engine starting process loop...");
@@ -36,8 +48,8 @@ async fn main() -> anyhow::Result<()> {
             let ctrl_c = tokio::signal::ctrl_c();
 
             tokio::select! {
-                res = engine.run(tun) => {
-                    error!("Engine loop error: {:?}", res);
+                _res = engine.run(tun) => {
+                    info!("Engine loop finished");
                 },
                 _ = ctrl_c => {
                     info!("Ctrl+C received, shutting down...");
@@ -49,7 +61,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // 4. Очистка системных роутов при любом сценарии выхода (ошибка или Ctrl+C)
+    // 5. Очистка системных роутов
     info!("Restoring system routing...");
     let addr: std::net::SocketAddr = remote_address.parse().expect("Invalid address format");
     let p_ip = addr.ip().to_string();

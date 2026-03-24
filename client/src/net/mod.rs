@@ -1,6 +1,7 @@
+mod connection;
+pub mod connection_manager;
 pub mod dns;
+pub mod engine;
 pub mod ip_store;
-pub mod tcp_connection;
-pub mod udp_connection;
 
 pub const CHANNEL_CAPACITY: usize = 16;

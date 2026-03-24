@@ -7,10 +7,6 @@ pub struct Tun {
 }
 
 impl Tun {
-    pub fn build() -> Configuration {
-        Configuration::default()
-    }
-
     pub fn new(config: &Configuration) -> io::Result<Self> {
         match create_as_async(config) {
             Ok(device) => Ok(Self { device }),
