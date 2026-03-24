@@ -15,7 +15,8 @@ static LOGGER: OnceLock<Logger> = OnceLock::new();
 impl Logger {
     pub fn init() {
         INIT.call_once(|| {
-            let filter = EnvFilter::new("info");
+            let filter =
+                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
             let (filter, handle) = tracing_subscriber::reload::Layer::new(filter);
 
             let registry = tracing_subscriber::registry().with(filter);

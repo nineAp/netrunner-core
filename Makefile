@@ -12,7 +12,7 @@ debug-client:
 	@echo "--- Применение прав ---"
 	sudo setcap cap_net_admin,cap_net_raw,cap_dac_override=eip ./target/debug/netrunner-client
 	@echo "--- Запуск клиента ---"
-	sudo ./target/debug/netrunner-client
+	sudo RUST_LOG=warn,netrunner_client=trace ./target/debug/netrunner-client
 
 debug-server:
 	@echo "--- Сборка сервера (Debug) ---"

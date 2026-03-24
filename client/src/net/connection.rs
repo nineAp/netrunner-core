@@ -10,6 +10,8 @@ use tokio::{
     sync::{mpsc, oneshot},
     time::Instant,
 };
+// Добавили trace для частых логов (попакетно) и debug для состояний
+use netrunner_logger::{debug, error, info, trace, warn};
 
 // ============================================================================
 // 1. БАЗОВАЯ СТРУКТУРА (ConnectionCore)
@@ -25,6 +27,7 @@ pub struct ConnectionCore {
 
 impl ConnectionCore {
     pub fn new(handle: SocketHandle) -> (Self, mpsc::Receiver<Bytes>, mpsc::Sender<Bytes>) {
+        trace!(%handle, "Creating ConnectionCore channels");
         let (tx_to_net, rx_from_smol) = mpsc::channel::<Bytes>(CHANNEL_CAPACITY);
         let (tx_to_smol, rx_from_net) = mpsc::channel::<Bytes>(CHANNEL_CAPACITY);
 
@@ -42,6 +45,7 @@ impl ConnectionCore {
 // 2. TCP СОЕДИНЕНИЕ (TcpConnection)
 // ============================================================================
 
+#[derive(Debug, PartialEq)]
 pub enum ConnectionState {
     Established,
     Handshaking,
@@ -68,6 +72,7 @@ impl TcpConnection {
         mpsc::Sender<Bytes>,
         oneshot::Sender<()>,
     ) {
+        debug!(%handle, "Initializing new TCP Connection (State -> Handshaking)");
         let (core, rx_from_smol, tx_to_smol) = ConnectionCore::new(handle);
         let (handshake_tx, handshake_rx) = oneshot::channel();
 
@@ -85,10 +90,6 @@ impl TcpConnection {
         matches!(socket.state(), tcp::State::Closed | tcp::State::TimeWait)
     }
 
-    pub fn _is_active(&self) -> bool {
-        matches!(self.state, ConnectionState::Active)
-    }
-
     pub fn tick(&mut self, socket: &mut tcp::Socket) -> bool {
         let state = socket.state();
 
@@ -97,12 +98,14 @@ impl TcpConnection {
                 if let Some(rx) = &mut self.handshake_rx {
                     match rx.try_recv() {
                         Ok(_) => {
+                            debug!(%self.core.handle, "TCP Handshake successful, State -> Active");
                             self.state = ConnectionState::Active;
                             self.handshake_rx = None;
                             return true;
                         }
-                        Err(oneshot::error::TryRecvError::Empty) => return true,
+                        Err(oneshot::error::TryRecvError::Empty) => return true, // Ждем
                         Err(oneshot::error::TryRecvError::Closed) => {
+                            debug!(%self.core.handle, "TCP Handshake channel dropped/aborted, State -> Closed");
                             self.state = ConnectionState::Closed;
                             return false;
                         }
@@ -116,12 +119,14 @@ impl TcpConnection {
                 self.poll_and_process(socket);
 
                 if state == tcp::State::CloseWait {
+                    debug!(%self.core.handle, "TCP Socket reached CloseWait state, closing");
                     socket.close();
                     self.state = ConnectionState::Closed;
                     return false;
                 }
 
                 if self.is_finished(socket) {
+                    debug!(%self.core.handle, "TCP Socket is finished (Closed/TimeWait), state -> Closed");
                     self.state = ConnectionState::Closed;
                     socket.close();
                     return false;
@@ -152,12 +157,15 @@ impl TcpConnection {
                 let chunk = Bytes::copy_from_slice(&temp[..n]);
                 match self.core.tx.try_send(chunk) {
                     Ok(_) => {
+                        trace!(%self.core.handle, "Forwarded {} bytes from smoltcp to Muxer", n);
                         socket.recv_slice(&mut temp[..n]).unwrap();
                     }
                     Err(mpsc::error::TrySendError::Full(_)) => {
+                        debug!(%self.core.handle, "Muxer TX channel full, backpressure applied to smoltcp read");
                         full = true;
                     }
                     Err(_) => {
+                        debug!(%self.core.handle, "Muxer TX channel closed unexpectedly, state -> Closed");
                         self.state = ConnectionState::Closed;
                         return;
                     }
@@ -176,19 +184,20 @@ impl TcpConnection {
         let fill_ratio = (current_pending as f32 / MAX_PENDING as f32) * 100.0;
 
         if current_pending >= MAX_PENDING {
-            netrunner_logger::warn!(
+            warn!(
                 %self.core.handle,
                 "Backpressure ACTIVE: Buffer is FULL ({} bytes). Stalling RX channel.",
                 current_pending
             );
         } else if fill_ratio > 80.0 {
-            netrunner_logger::info!(
+            info!(
                 %self.core.handle,
                 "Bufferbloat Warning: Buffer {:.1}% full ({} bytes). Latency increasing.",
                 fill_ratio, current_pending
             );
 
             while let Ok(data) = self.core.rx.try_recv() {
+                trace!(%self.core.handle, "Received {} bytes from Muxer (high buffer)", data.len());
                 self.pending_data.extend_from_slice(&data);
                 if self.pending_data.len() >= MAX_PENDING {
                     break;
@@ -196,6 +205,7 @@ impl TcpConnection {
             }
         } else {
             while let Ok(data) = self.core.rx.try_recv() {
+                trace!(%self.core.handle, "Received {} bytes from Muxer", data.len());
                 self.pending_data.extend_from_slice(&data);
                 if self.pending_data.len() >= MAX_PENDING {
                     break;
@@ -207,10 +217,11 @@ impl TcpConnection {
         if !self.pending_data.is_empty() && socket.can_send() {
             match socket.send_slice(&self.pending_data) {
                 Ok(n) => {
+                    trace!(%self.core.handle, "Wrote {} bytes from buffer to smoltcp", n);
                     self.pending_data.advance(n);
 
                     if n > 0 && self.pending_data.len() < (MAX_PENDING / 2) && fill_ratio > 90.0 {
-                        netrunner_logger::info!(
+                        info!(
                             %self.core.handle,
                             "Backpressure RELIEVED: Buffer drained to {} bytes",
                             self.pending_data.len()
@@ -218,7 +229,7 @@ impl TcpConnection {
                     }
                 }
                 Err(e) => {
-                    netrunner_logger::debug!(%self.core.handle, "Smoltcp socket send error: {:?}", e);
+                    debug!(%self.core.handle, "Smoltcp socket send error: {:?}", e);
                 }
             }
         }
@@ -239,6 +250,7 @@ pub struct UdpConnection {
 
 impl UdpConnection {
     pub fn new(handle: SocketHandle) -> (Self, mpsc::Receiver<Bytes>, mpsc::Sender<Bytes>) {
+        debug!(%handle, "Initializing new UDP Connection");
         let (core, rx_from_smol, tx_to_smol) = ConnectionCore::new(handle);
 
         let conn = Self {
@@ -253,35 +265,47 @@ impl UdpConnection {
     pub fn tick(&mut self, socket: &mut udp::Socket) -> bool {
         // Проверка таймаута
         if self.last_activity.elapsed() > UDP_TIMEOUT {
-            netrunner_logger::debug!(%self.core.handle, "UDP Session closed due to timeout");
+            debug!(%self.core.handle, "UDP Session closed due to {}s timeout", UDP_TIMEOUT.as_secs());
             socket.close();
             return false;
         }
 
-        // Читаем из smoltcp и шлем в сеть
+        // Читаем из smoltcp и шлем в сеть (через Muxer)
         if socket.can_recv() {
             while let Ok((data, metadata)) = socket.recv() {
+                if self.client_endpoint.is_none() {
+                    debug!(%self.core.handle, endpoint = %metadata.endpoint, "UDP Endpoint pinned");
+                }
                 self.client_endpoint = Some(metadata.endpoint);
 
+                trace!(%self.core.handle, "Forwarded UDP datagram ({} bytes) from smoltcp to Muxer", data.len());
                 if self.core.tx.try_send(Bytes::copy_from_slice(data)).is_ok() {
                     self.last_activity = Instant::now();
+                } else {
+                    debug!(%self.core.handle, "Muxer TX channel full or closed, dropping UDP datagram");
                 }
             }
         }
 
-        // Читаем из сети и шлем в smoltcp
+        // Читаем из сети (от Muxer) и шлем в smoltcp
         if socket.can_send() {
             if let Some(endpoint) = self.client_endpoint {
                 while let Ok(data) = self.core.rx.try_recv() {
                     if data.is_empty() {
+                        debug!(%self.core.handle, "Received empty datagram (Close signal) from Muxer, closing UDP socket");
                         socket.close();
                         return false;
                     }
 
-                    if socket.send_slice(&data, endpoint).is_ok() {
-                        self.last_activity = Instant::now();
-                    } else {
-                        break;
+                    match socket.send_slice(&data, endpoint) {
+                        Ok(_) => {
+                            trace!(%self.core.handle, "Wrote UDP datagram ({} bytes) to smoltcp", data.len());
+                            self.last_activity = Instant::now();
+                        }
+                        Err(e) => {
+                            debug!(%self.core.handle, "Failed to send UDP datagram to smoltcp: {:?}", e);
+                            break;
+                        }
                     }
                 }
             }

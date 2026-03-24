@@ -3,7 +3,7 @@ use netrunner_core::{
     protocol::codec::{frame::FrameType, socks::TargetAddress},
     proxy::connection::muxer::{MuxMessage, Muxer},
 };
-use netrunner_logger::{debug, info, warn};
+use netrunner_logger::{debug, error, info, trace, warn};
 use smoltcp::{
     iface::{SocketHandle, SocketSet},
     socket::{AnySocket, icmp, tcp, udp},
@@ -235,50 +235,87 @@ impl ConnectionManager {
 
     pub fn try_create_socket_from_packet(&mut self, packet: &[u8], socket_set: &mut SocketSet) {
         let Ok(ip_packet) = Ipv4Packet::new_checked(packet) else {
+            trace!("try_create_socket: Failed to parse IPv4 packet, ignoring");
             return;
         };
+
+        let dst_addr = ip_packet.dst_addr();
 
         match ip_packet.next_header() {
             IpProtocol::Tcp => {
                 if let Ok(tcp_packet) = TcpPacket::new_checked(ip_packet.payload()) {
+                    // Реагируем только на чистые SYN-пакеты (начало нового соединения)
                     if tcp_packet.syn() && !tcp_packet.ack() {
                         let dst_port = tcp_packet.dst_port();
-                        let dst_addr = ip_packet.dst_addr();
+                        trace!(%dst_addr, dst_port, "Received TCP SYN");
 
                         if !self.tracker.has_tcp(dst_addr.into(), dst_port, socket_set) {
+                            debug!(%dst_addr, dst_port, "No active TCP socket found, allocating new one");
+
                             let mut socket = SocketFactory::create_tcp(dst_port);
                             let endpoint = IpListenEndpoint {
                                 addr: Some(dst_addr.into()),
                                 port: dst_port,
                             };
-                            if socket.listen(endpoint).is_ok() {
-                                socket_set.add(socket);
+
+                            match socket.listen(endpoint) {
+                                Ok(_) => {
+                                    debug!(%dst_addr, dst_port, "TCP socket successfully listening");
+                                    socket_set.add(socket);
+                                }
+                                Err(e) => {
+                                    error!(%dst_addr, dst_port, "Failed to listen on TCP socket: {:?}", e);
+                                }
                             }
+                        } else {
+                            trace!(%dst_addr, dst_port, "TCP socket already exists, ignoring SYN");
                         }
                     }
+                } else {
+                    trace!("try_create_socket: Failed to parse TCP payload");
                 }
             }
             IpProtocol::Udp => {
                 if let Ok(udp_packet) = UdpPacket::new_checked(ip_packet.payload()) {
                     let dst_port = udp_packet.dst_port();
+
+                    // Блокируем порты локального вещания и NetBIOS
                     if dst_port == 0 || dst_port == 137 || dst_port == 138 {
+                        trace!(%dst_addr, dst_port, "Ignored blocked UDP port");
                         return;
                     }
 
-                    let dst_addr = ip_packet.dst_addr();
                     if !self.tracker.has_udp(dst_addr.into(), dst_port, socket_set) {
+                        debug!(%dst_addr, dst_port, "No active UDP socket found, allocating new one");
+
                         let mut socket = SocketFactory::create_udp(dst_port);
                         let endpoint = IpListenEndpoint {
                             addr: Some(dst_addr.into()),
                             port: dst_port,
                         };
-                        if socket.bind(endpoint).is_ok() {
-                            socket_set.add(socket);
+
+                        match socket.bind(endpoint) {
+                            Ok(_) => {
+                                debug!(%dst_addr, dst_port, "UDP socket successfully bound");
+                                socket_set.add(socket);
+                            }
+                            Err(e) => {
+                                error!(%dst_addr, dst_port, "Failed to bind UDP socket: {:?}", e);
+                            }
                         }
+                    } else {
+                        trace!(%dst_addr, dst_port, "UDP socket already exists, ignoring creation");
                     }
+                } else {
+                    trace!("try_create_socket: Failed to parse UDP payload");
                 }
             }
-            _ => {}
+            protocol => {
+                trace!(
+                    "try_create_socket: Ignored unsupported IP protocol: {:?}",
+                    protocol
+                );
+            }
         }
     }
 
