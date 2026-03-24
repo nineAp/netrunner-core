@@ -101,10 +101,7 @@ impl ConnectionManager {
     }
 
     pub fn process_sockets(&mut self, socket_set: &mut SocketSet) {
-        // Добавим лог в начало цикла, если сессий много, чтобы видеть нагрузку
-        if !self.active_tcp_sessions.is_empty() || !self.active_udp_sessions.is_empty() {
-            // trace!("Processing sockets: TCP={}, UDP={}", self.active_tcp_sessions.len(), self.active_udp_sessions.len());
-        }
+        if !self.active_tcp_sessions.is_empty() || !self.active_udp_sessions.is_empty() {}
 
         for (handle, socket) in socket_set.iter_mut() {
             if let Some(tcp) = tcp::Socket::downcast_mut(socket) {
@@ -170,7 +167,6 @@ impl ConnectionManager {
                     return;
                 }
 
-                // Ждем подтверждения от прокси (handshake)
                 match tokio::time::timeout(Duration::from_secs(10), v_rx.recv()).await {
                     Ok(Some(data)) => {
                         if data.len() >= 2 && data[1] == 0x00 {
@@ -281,11 +277,9 @@ impl ConnectionManager {
 
             netrunner_logger::info!(%handle, target = %target, "New UDP proxied session established");
 
-            // 1. Создаем UDP соединение и получаем каналы
             let (conn, mut rx_from_smol, tx_to_smol) = UdpConnection::new(handle);
             self.active_udp_sessions.insert(handle, conn);
 
-            // 2. Фоновая задача для Muxer'а
             let muxer = self.muxer.clone();
             let stream_id = muxer.next_id();
             let connect_payload = target.to_string();
@@ -441,8 +435,8 @@ impl ConnectionManager {
 
     fn create_dynamic_udp_socket<'a>(port: u16) -> udp::Socket<'a> {
         let (buf_size, packet_count) = match port {
-            443 => (512 * 1024, 390), // Большой буфер для QUIC (YouTube)
-            53 => (64 * 1024, 32),    // DNS
+            443 => (512 * 1024, 390),
+            53 => (64 * 1024, 32),
             _ => (128 * 1024, 100),
         };
 

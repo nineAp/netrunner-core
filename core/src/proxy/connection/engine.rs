@@ -25,7 +25,6 @@ pub struct TunnelEngine {
     pub control_rx: Receiver<MuxMessage>,
     pub data_rx: Receiver<MuxMessage>,
     pub handler: Arc<StreamHandler>,
-    pub token: CancellationToken,
 }
 
 impl TunnelEngine {
@@ -33,25 +32,20 @@ impl TunnelEngine {
         let inbound = self.inbound;
         let outbound = self.outbound;
 
-        // Оборачиваем кодек в потокобезопасный мьютекс
         let codec = Arc::new(Mutex::new(self.codec));
         let read_buf = self.read_buf;
 
         let control_rx = self.control_rx;
         let data_rx = self.data_rx;
         let handler = self.handler;
-        let token = self.token;
+        let token = CancellationToken::new();
 
-        // Клонируем Arc для независимых тасок
         let codec_reader = codec.clone();
         let codec_writer = codec.clone();
 
         let token_reader = token.clone();
         let token_writer = token.clone();
 
-        // ==========================================
-        // 1. READER TASK (Только чтение и расшифровка)
-        // ==========================================
         let reader_handle = tokio::spawn(async move {
             let mut read_buf = read_buf;
             let mut inbound = inbound;
@@ -65,23 +59,23 @@ impl TunnelEngine {
                     res = inbound.read_buf(&mut read_buf) => {
                         let n = res.map_err(|e| e.to_string())?;
 
-                        // --- ИСПРАВЛЕННАЯ ЛОГИКА EOF ---
+
                         if n == 0 {
                             if read_buf.is_empty() {
                                 info!("Connection closed by peer (Clean EOF)");
                             } else {
                                 error!("Connection abruptly closed by peer (Incomplete frame: {} bytes left)", read_buf.len());
                             }
-                            // ВЫХОДИМ В ЛЮБОМ СЛУЧАЕ, СОКЕТ МЕРТВ!
+
                             return Err::<(), String>("EOF".into());
                         }
 
-                        // Вектор для фреймов. Мы расшифруем всё быстро,
-                        // сложим сюда и отпустим лок Кодека.
+
+
                         let mut frames = Vec::new();
 
                         {
-                            // Блокируем кодек только на время математики (расшифровки)
+
                             let mut c = codec_reader.lock().await;
                             loop {
                                 match c.inbound(&mut read_buf) {
@@ -100,9 +94,9 @@ impl TunnelEngine {
                                     }
                                 }
                             }
-                        } // Лок кодека отпущен!
+                        }
 
-                        // Обрабатываем фреймы (I/O) без лока, не мешая Writer Task
+
                         for frame in frames {
                             handler.handle(frame).await;
                         }
@@ -112,9 +106,6 @@ impl TunnelEngine {
             Ok::<(), String>(())
         });
 
-        // ==========================================
-        // 2. WRITER TASK (Только шифрование и отправка)
-        // ==========================================
         let writer_handle = tokio::spawn(async move {
             let mut outbound = outbound;
             let mut control_rx = control_rx;
@@ -123,14 +114,14 @@ impl TunnelEngine {
 
             loop {
                 tokio::select! {
-                    biased; // Приоритет сверху вниз
+                    biased;
 
                     _ = token_writer.cancelled() => {
                         info!("Writer Task: Shutdown signal received.");
                         break;
                     }
 
-                    // FAST TRACK: Управляющие команды
+
                     msg_opt = control_rx.recv() => {
                         if let Some(msg) = msg_opt {
                             Self::handle_outbound(&mut outbound, &codec_writer, msg).await?;
@@ -139,13 +130,13 @@ impl TunnelEngine {
                         }
                     }
 
-                    // Пинг
+
                     _ = heartbeat.tick() => {
                         let msg = MuxMessage { stream_id: 0, frame_type: FrameType::Heartbeat, data: Bytes::new() };
                         Self::handle_outbound(&mut outbound, &codec_writer, msg).await?;
                     }
 
-                    // SLOW TRACK: Данные
+
                     msg_opt = data_rx.recv() => {
                         if let Some(msg) = msg_opt {
                             Self::handle_outbound(&mut outbound, &codec_writer, msg).await?;
@@ -158,10 +149,6 @@ impl TunnelEngine {
             Ok::<(), String>(())
         });
 
-        // ==========================================
-        // Ожидаем завершения обеих тасок.
-        // Если одна падает с ошибкой, убиваем туннель.
-        // ==========================================
         let res = tokio::select! {
             res = reader_handle => res.unwrap_or_else(|e| Err(format!("Reader panic: {}", e))),
             res = writer_handle => res.unwrap_or_else(|e| Err(format!("Writer panic: {}", e))),
@@ -185,11 +172,9 @@ impl TunnelEngine {
         let stream_id = msg.stream_id;
         let frame_type = msg.frame_type;
 
-        // Вектор зашифрованных пакетов. Собираем их быстро под локом.
         let mut packets = Vec::new();
 
         {
-            // Берем лок кодека только для шифрования
             let mut c = codec.lock().await;
 
             if data.is_empty() {
@@ -214,10 +199,8 @@ impl TunnelEngine {
                     }
                 }
             }
-        } // Лок кодека отпущен!
+        }
 
-        // Выполняем I/O операцию (которая может зависнуть при плохой сети) БЕЗ лока кодека.
-        // Это позволяет Reader Task продолжать читать сеть!
         for pkt in packets {
             outbound.write_all(&pkt).await.map_err(|e| {
                 error!(stream_id, error = %e, "Failed to write encrypted data to network");

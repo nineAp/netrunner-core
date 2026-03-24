@@ -6,11 +6,11 @@ use std::{
         Arc, LazyLock, Mutex,
         atomic::{AtomicBool, Ordering},
     },
-    time::Instant as StdInstant, // Добавлено для расчёта скорости
+    time::Instant as StdInstant,
 };
 
 use bytes::BytesMut;
-use netrunner_logger::info; // Предполагается, что у тебя есть этот логгер
+use netrunner_logger::info;
 use smoltcp::{
     phy::{self, Device, DeviceCapabilities},
     time::Instant,
@@ -20,7 +20,6 @@ use tokio::sync::mpsc;
 const TOKEN_BUFFER_LIST_MAX_SIZE: usize = 64;
 static TOKEN_BUFFER_LIST: LazyLock<Mutex<Vec<BytesMut>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 
-// Структура, которую мы будем возвращать пользователю
 #[derive(Debug, Clone, Copy)]
 pub struct TrafficStats {
     pub rx_bytes: u64,
@@ -79,20 +78,17 @@ pub struct VirtTunDevice {
     tx_queue: mpsc::UnboundedSender<TokenBuffer>,
     rx_avail: Arc<AtomicBool>,
 
-    // === Статистика трафика ===
     rx_bytes: u64,
     tx_bytes: u64,
     rx_packets: u64,
     tx_packets: u64,
 
-    // Внутренние переменные для расчёта скорости
     last_speed_calc: StdInstant,
     last_rx_bytes: u64,
     last_tx_bytes: u64,
     cached_rx_speed: f64,
     cached_tx_speed: f64,
 
-    // Для периодического логирования
     last_log_time: StdInstant,
 }
 
@@ -147,7 +143,6 @@ impl VirtTunDevice {
             let rx_diff = self.rx_bytes.saturating_sub(self.last_rx_bytes);
             let tx_diff = self.tx_bytes.saturating_sub(self.last_tx_bytes);
 
-            // Переводим в МегаБайты в секунду (MB/s)
             self.cached_rx_speed = (rx_diff as f64 / 1_048_576.0) / elapsed_speed;
             self.cached_tx_speed = (tx_diff as f64 / 1_048_576.0) / elapsed_speed;
 
@@ -166,12 +161,11 @@ impl VirtTunDevice {
         }
     }
 
-    /// Внутренний метод проверки таймера для вывода логов
     fn check_and_log_stats(&mut self) {
         let now = StdInstant::now();
-        // Логируем каждые 5 секунд
+
         if now.duration_since(self.last_log_time).as_secs() >= 5 {
-            let stats = self.get_stats(); // Заодно обновляем скорости
+            let stats = self.get_stats();
 
             info!(
                 "TunDevice Traffic: RX: {:.2} MB ({} pkts) | TX: {:.2} MB ({} pkts) | Speed: ↓{:.2} MB/s, ↑{:.2} MB/s",
@@ -193,12 +187,9 @@ impl Device for VirtTunDevice {
     type TxToken<'a> = VirtTxToken<'a>;
 
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        // Проверяем, не пора ли записать стату в лог. receive() вызывается очень часто,
-        // поэтому это отличное место для heartbeat таймера.
         self.check_and_log_stats();
 
         if let Ok(buffer) = self.rx_queue.try_recv() {
-            // Учет входящего трафика (DOWNLOAD)
             self.rx_bytes += buffer.len() as u64;
             self.rx_packets += 1;
 
@@ -250,7 +241,6 @@ impl phy::TxToken for VirtTxToken<'_> {
 
         let result = f(&mut buffer);
 
-        // Учет исходящего трафика (UPLOAD)
         self.0.tx_bytes += len as u64;
         self.0.tx_packets += 1;
 

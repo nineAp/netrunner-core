@@ -1,19 +1,8 @@
-use crate::{
-    protocol::errors::ErrorAction,
-    proxy::connection::{
-        connection::{ClientHandler, Connection, ConnectionRole, ServerHandler, TunnelHandler},
-        engine::TunnelEngine,
-        muxer::Muxer,
-        MESSAGE_CHANNEL_SIZE,
-    },
-    tlseng::profile::BrowserProfile,
+use crate::proxy::connection::connection::{
+    ClientHandler, Connection, ConnectionRole, ServerHandler, TunnelHandler,
 };
-use bytes::BytesMut;
 use netrunner_logger::{error, info};
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
-};
+use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
 pub struct Network {
@@ -49,7 +38,7 @@ impl Network {
                     .as_ref()
                     .ok_or("No proxy addr")
                     .unwrap();
-                let muxer = match ClientHandler::connect(server_addr, token.clone()).await {
+                let muxer = match ClientHandler::connect(server_addr).await {
                     Ok(m) => m,
                     Err(e) => {
                         error!(error = %e, "Global tunnel failed.");
@@ -95,79 +84,5 @@ impl Network {
                 }
             }
         }
-    }
-
-    pub async fn initialize_client_tunnel(
-        &self,
-        token: CancellationToken,
-    ) -> Result<Muxer, String> {
-        let server_addr = self.remote_proxy_addr.as_ref().ok_or("No proxy addr")?;
-
-        let stream = TcpStream::connect(server_addr)
-            .await
-            .map_err(|e| e.to_string())?;
-        let (mut inbound, mut outbound) = stream.into_split();
-
-        let mut codec = crate::protocol::codec::codec::Codec::new(false);
-
-        let ch = codec
-            .make_client_handshake(&BrowserProfile::CHROME_131, "ubuntu.com")
-            .map_err(|e| format!("{:?}", e))?;
-        outbound.write_all(&ch).await.map_err(|e| e.to_string())?;
-
-        let mut sh_buf = BytesMut::with_capacity(2048);
-        loop {
-            match codec.process_handshake(&mut sh_buf) {
-                Ok(_) => break,
-                Err(e) if e.action == ErrorAction::Wait => {
-                    let n = inbound
-                        .read_buf(&mut sh_buf)
-                        .await
-                        .map_err(|e| e.to_string())?;
-                    if n == 0 {
-                        return Err("EOF during handshake".into());
-                    }
-                }
-                Err(e) => return Err(format!("TLS error: {:?}", e)),
-            }
-        }
-
-        // --- ИЗМЕНЕНИЯ ЗДЕСЬ: Создаем два канала ---
-        let (control_tx, control_rx) = tokio::sync::mpsc::channel(MESSAGE_CHANNEL_SIZE * 4);
-        let (data_tx, data_rx) = tokio::sync::mpsc::channel(MESSAGE_CHANNEL_SIZE * 4);
-
-        // Передаем оба трансмиттера в Muxer
-        let muxer = Muxer::new(control_tx, data_tx, true);
-
-        let handler = std::sync::Arc::new(crate::proxy::connection::handler::StreamHandler::new(
-            muxer.clone(),
-            ConnectionRole::Client,
-        ));
-
-        let engine = TunnelEngine {
-            inbound,
-            outbound,
-            codec,
-            read_buf: sh_buf,
-            control_rx,
-            data_rx,
-            handler,
-            token,
-        };
-
-        tokio::spawn(async move {
-            if let Err(e) = engine.run().await {
-                netrunner_logger::error!(
-                    "CRITICAL: Tunnel Engine died: {}. Restarting process...",
-                    e
-                );
-                std::process::exit(1);
-            }
-        });
-        Ok(muxer)
-    }
-
-    pub fn get_self_local_address(&self) -> String {
-        format!("127.0.0.1:{}", self.port)
     }
 }

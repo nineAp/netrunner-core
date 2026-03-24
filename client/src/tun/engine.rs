@@ -1,3 +1,4 @@
+use netrunner_core::proxy::connection::connection::ClientHandler;
 use netrunner_core::proxy::connection::muxer::Muxer;
 use smoltcp::iface::PollResult;
 use smoltcp::time::Instant;
@@ -6,6 +7,7 @@ use smoltcp::{
     iface::{Config, Interface, SocketSet},
     phy::DeviceCapabilities,
 };
+use std::net::Ipv4Addr;
 use std::sync::atomic::Ordering;
 use std::{
     sync::{Arc, LazyLock, atomic::AtomicBool},
@@ -16,11 +18,12 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::time::{Duration, sleep};
 use tun::{DeviceReader, DeviceWriter};
 
-use netrunner_logger::{debug, info, warn};
+use netrunner_logger::{debug, error, info, warn};
 
 use crate::connections::dns::DnsHandler;
 use crate::tun::connection_manager::ConnectionManager;
 use crate::tun::device::{TokenBuffer, VirtTunDevice};
+use crate::tun::routing::setup_platform_routing;
 use crate::tun::tun::Tun;
 
 pub static START_TIME: LazyLock<StdInstant> = LazyLock::new(StdInstant::now);
@@ -210,5 +213,67 @@ impl Engine {
         self.interface
             .poll(now, &mut self.device, &mut self.socket_set);
         self.manager.start_listening(&mut self.socket_set);
+    }
+}
+
+pub struct EngineBuilder {
+    remote_address: String,
+    cache_path: String,
+    tun_device: Option<Tun>,
+}
+
+impl EngineBuilder {
+    pub fn new(remote_address: impl Into<String>) -> Self {
+        Self {
+            remote_address: remote_address.into(),
+            cache_path: ".".to_string(),
+            tun_device: None,
+        }
+    }
+
+    pub fn with_cache_path(mut self, path: impl Into<String>) -> Self {
+        self.cache_path = path.into();
+        self
+    }
+
+    pub fn with_tun(mut self, tun: Tun) -> Self {
+        self.tun_device = Some(tun);
+        self
+    }
+
+    pub async fn build(self) -> Result<(Engine, Tun), String> {
+        let tun = self.tun_device.ok_or("TUN device is required")?;
+
+        info!("Initializing Engine components...");
+
+        let mut dns_handler = DnsHandler::new(&self.cache_path);
+        if let Err(e) = dns_handler.init().await {
+            error!("Failed to initialize DNS blocklist: {}", e);
+        }
+
+        if let Err(e) = setup_platform_routing(&self.remote_address) {
+            return Err(format!("Routing setup failed: {}", e));
+        }
+
+        let config = Config::new(smoltcp::wire::HardwareAddress::Ip);
+        let mut caps = DeviceCapabilities::default();
+        caps.max_transmission_unit = 1350;
+        caps.medium = smoltcp::phy::Medium::Ip;
+
+        info!("Establishing secure tunnel to proxy server...");
+        let muxer = ClientHandler::connect(&self.remote_address)
+            .await
+            .map_err(|e| format!("Failed to establish secure tunnel: {}", e))?;
+        info!("Secure tunnel established, Muxer is ready.");
+
+        let mut engine = Engine::new(config, caps, dns_handler, muxer);
+        engine.set_any_ip(true);
+        engine.set_transparent_mode();
+        engine.set_default_gateway(Ipv4Addr::new(10, 0, 0, 2));
+        engine.activate();
+
+        info!("Stack IP initialized: 10.0.0.2");
+
+        Ok((engine, tun))
     }
 }

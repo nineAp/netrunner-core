@@ -59,7 +59,6 @@ pub async fn run_proxy_bridge<R, W>(
         }
     }
 
-    // Отправляем Close фрейм перед выходом
     let _ = muxer
         .send_to_netwrok(MuxMessage {
             stream_id,
@@ -68,10 +67,8 @@ pub async fn run_proxy_bridge<R, W>(
         })
         .await;
 
-    // Небольшая пауза, чтобы Close фрейм успел уйти в сеть
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-    // ИЗМЕНЕНИЕ: remove_stream теперь синхронный
     muxer.remove_stream(stream_id);
 }
 
@@ -131,6 +128,5 @@ pub async fn run_udp_bridge(
 
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-    // ИЗМЕНЕНИЕ: remove_stream теперь синхронный
     muxer.remove_stream(stream_id);
 }

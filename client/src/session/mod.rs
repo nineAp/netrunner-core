@@ -1,21 +1,17 @@
+use crate::{
+    RUNTIME,
+    tun::{engine::EngineBuilder, routing::reset_platform_routing, tun::Tun},
+};
+use netrunner_logger::{error, info};
+use std::sync::Arc;
+use tokio::runtime::Runtime;
+use tokio_util::sync::CancellationToken;
+
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 pub mod desktop;
 
 #[cfg(any(target_os = "android", target_os = "ios"))]
 pub mod mobile;
-
-use crate::{
-    RUNTIME, Session,
-    connections::dns::DnsHandler,
-    tun::{engine::Engine, routing::setup_platform_routing, tun::Tun},
-};
-use netrunner_core::proxy::{connection::connection::ConnectionRole, network::Network};
-use netrunner_logger::{error, info};
-use smoltcp::{iface::Config, phy::DeviceCapabilities};
-use std::net::Ipv4Addr;
-use std::sync::Arc;
-use tokio::runtime::Runtime;
-use tokio_util::sync::CancellationToken;
 
 fn get_runtime() -> &'static Runtime {
     RUNTIME.get_or_init(|| {
@@ -24,6 +20,29 @@ fn get_runtime() -> &'static Runtime {
             .build()
             .expect("Failed to create tokio runtime")
     })
+}
+
+#[derive(uniffi::Object)]
+pub struct Session {
+    pub(crate) cancel_token: CancellationToken,
+    pub(crate) proxy_ip: String,
+}
+
+#[uniffi::export]
+impl Session {
+    pub fn stop(&self) {
+        info!("Stopping session...");
+        self.cancel_token.cancel();
+        let _ = reset_platform_routing(Some(&self.proxy_ip));
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        info!("Session dropped, stopping all tasks...");
+        self.cancel_token.cancel();
+        let _ = reset_platform_routing(Some(&self.proxy_ip));
+    }
 }
 
 #[derive(uniffi::Object)]
@@ -48,8 +67,7 @@ impl SessionManager {
     ) -> Arc<Session> {
         let runtime = get_runtime();
         let cancel_token = CancellationToken::new();
-        let sesison_token = cancel_token.clone();
-        let net_token = cancel_token.clone();
+        let session_token = cancel_token.clone();
 
         let addr: std::net::SocketAddr = remote_address.parse().expect("Invalid address format");
         let remote_proxy_ip = addr.ip().to_string();
@@ -67,11 +85,6 @@ impl SessionManager {
                     ".".to_string()
                 }
             };
-
-            let mut dns_handler = DnsHandler::new(&cache_path);
-            if let Err(e) = dns_handler.init().await {
-                error!("Failed to initialize DNS blocklist: {}", e);
-            }
 
             let tun_device = {
                 #[cfg(any(target_os = "android", target_os = "ios"))]
@@ -100,55 +113,32 @@ impl SessionManager {
                 }
             };
 
-            let _ = setup_platform_routing(&remote_address);
+            let builder_result = EngineBuilder::new(&remote_address)
+                .with_cache_path(&cache_path)
+                .with_tun(tun_device)
+                .build()
+                .await;
 
-            let config = Config::new(smoltcp::wire::HardwareAddress::Ip);
-            let mut caps = DeviceCapabilities::default();
-            caps.max_transmission_unit = 1350;
-            caps.medium = smoltcp::phy::Medium::Ip;
-
-            let network = Network::new(
-                "0.0.0.0".into(),
-                8080,
-                ConnectionRole::Client,
-                Some(remote_address.clone()),
-            );
-
-            let muxer = match network.initialize_client_tunnel(net_token).await {
-                Ok(m) => m,
-                Err(e) => {
-                    error!("Failed to establish secure tunnel to server: {}", e);
-                    return;
-                }
-            };
-
-            info!("Secure tunnel established, Muxer is ready.");
-
-            let mut engine = Engine::new(config, caps, dns_handler, muxer);
-            engine.set_any_ip(true);
-            engine.set_transparent_mode();
-            engine.set_default_gateway(Ipv4Addr::new(10, 0, 0, 2));
-            engine.activate();
-            let cancel_token_for_engine = cancel_token.clone();
-
-            tokio::spawn(async move {
-                info!("Engine async task started");
-
-                tokio::select! {
-
-                    res = engine.run(tun_device) => {
-
-                        info!("Engine loop finished: {:?}", res);
-                    },
-                    _ = cancel_token_for_engine.cancelled() => {
-                        info!("Engine task shutting down via token");
+            match builder_result {
+                Ok((mut engine, tun)) => {
+                    info!("Engine async task started");
+                    tokio::select! {
+                        res = engine.run(tun) => {
+                            info!("Engine loop finished: {:?}", res);
+                        },
+                        _ = cancel_token.cancelled() => {
+                            info!("Engine task shutting down via token");
+                        }
                     }
                 }
-            });
+                Err(e) => {
+                    error!("Failed to build VPN Engine: {}", e);
+                }
+            }
         });
 
         Arc::new(Session {
-            cancel_token: sesison_token,
+            cancel_token: session_token,
             proxy_ip: remote_proxy_ip,
         })
     }

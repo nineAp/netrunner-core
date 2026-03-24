@@ -6,7 +6,7 @@ use netrunner_client::{
         tun::Tun,
     },
 };
-use netrunner_core::proxy::{connection::connection::ConnectionRole, network::Network};
+use netrunner_core::proxy::connection::connection::ClientHandler;
 use netrunner_logger::{error, info};
 use smoltcp::{iface::Config, phy::DeviceCapabilities};
 use std::net::Ipv4Addr;
@@ -42,26 +42,15 @@ async fn main() -> anyhow::Result<()> {
     caps.max_transmission_unit = 1350;
     caps.medium = smoltcp::phy::Medium::Ip;
 
-    let network = Network::new(
-        "127.0.0.1".into(),
-        8080,
-        ConnectionRole::Client,
-        Some(remote_address.clone()),
-    );
-
     let network_token = CancellationToken::new();
-    let net_token_for_spawn = network_token.clone();
 
     info!("Establishing secure tunnel to proxy server...");
-    let muxer = match network.initialize_client_tunnel(net_token_for_spawn).await {
+
+    let muxer = match ClientHandler::connect(&remote_address).await {
         Ok(m) => m,
         Err(e) => {
-            error!("Failed to establish secure tunnel: {}", e);
-
-            let _ = reset_platform_routing(Some(
-                &remote_address.split(':').next().unwrap().to_string(),
-            ));
-            return Err(anyhow::anyhow!("Tunnel initialization failed: {}", e));
+            error!("Failed to establish secure tunnel to server: {}", e);
+            return Err(anyhow::anyhow!("Failed to establish secure tunnel: {}", e));
         }
     };
     info!("Secure tunnel established, Muxer is ready.");
@@ -96,7 +85,7 @@ async fn main() -> anyhow::Result<()> {
         error!("Failed to restore routing: {}", e);
     } else {
         info!("System routing restored successfully.");
-    }
+    };
 
     Ok(())
 }

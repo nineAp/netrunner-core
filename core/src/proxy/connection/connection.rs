@@ -9,15 +9,12 @@ use crate::{
         parser::parser::Parser,
     },
     proxy::connection::{
-        bridge::run_proxy_bridge,
-        engine::TunnelEngine,
-        handler::StreamHandler,
-        muxer::{MuxMessage, Muxer},
+        bridge::run_proxy_bridge, engine::TunnelEngine, handler::StreamHandler, muxer::Muxer,
         MESSAGE_CHANNEL_SIZE, TCP_BUF_SIZE,
     },
     tlseng::profile::BrowserProfile,
 };
-use bytes::{Bytes, BytesMut};
+use bytes::BytesMut;
 use netrunner_logger::{info, warn};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -101,10 +98,7 @@ pub struct ClientHandler {
 }
 
 impl ClientHandler {
-    pub async fn connect(
-        remote_proxy_addr: &str,
-        token: CancellationToken,
-    ) -> Result<Muxer, String> {
+    pub async fn connect(remote_proxy_addr: &str) -> Result<Muxer, String> {
         let stream = TcpStream::connect(remote_proxy_addr)
             .await
             .map_err(|e| e.to_string())?;
@@ -138,9 +132,8 @@ impl ClientHandler {
             }
         }
 
-        // --- ИЗМЕНЕНИЕ ДЛЯ НОВОГО MUXER ---
-        let (control_tx, control_rx) = mpsc::channel(MESSAGE_CHANNEL_SIZE);
-        let (data_tx, data_rx) = mpsc::channel(MESSAGE_CHANNEL_SIZE);
+        let (control_tx, control_rx) = mpsc::channel(MESSAGE_CHANNEL_SIZE * 4);
+        let (data_tx, data_rx) = mpsc::channel(MESSAGE_CHANNEL_SIZE * 4);
 
         let muxer = Muxer::new(control_tx, data_tx, true);
 
@@ -152,10 +145,9 @@ impl ClientHandler {
             outbound: conn.outbound,
             codec: conn.codec,
             read_buf: conn.read_buf,
-            control_rx, // Передаем оба ресивера в Engine
-            data_rx,    // Передаем оба ресивера в Engine
+            control_rx,
+            data_rx,
             handler,
-            token: token.clone(),
         };
 
         tokio::spawn(async move { engine.run().await });
@@ -210,7 +202,6 @@ impl TunnelHandler for ClientHandler {
                 let (v_tx, mut v_rx) = mpsc::channel::<bytes::Bytes>(TCP_BUF_SIZE);
                 self.muxer.register_stream(stream_id, v_tx);
 
-                // Используем send_control для отправки FrameType::Connect
                 self.muxer
                     .send_control(
                         stream_id,
@@ -269,7 +260,6 @@ impl ServerHandler {
         let target_host = "ubuntu.com:443";
         info!(target = %target_host, "Stealth fallback: bridging to Target");
 
-        // 1. Пытаемся подключиться с коротким таймаутом
         let target_stream = tokio::time::timeout(
             std::time::Duration::from_secs(3),
             TcpStream::connect(target_host),
@@ -277,10 +267,9 @@ impl ServerHandler {
         .await;
 
         match target_stream {
-            Ok(Ok(mut target_server)) => {
+            Ok(Ok(target_server)) => {
                 let (mut server_read, mut server_write) = target_server.into_split();
 
-                // 2. Скармливаем те байты, которые уже вычитали (Client Hello)
                 if !initial_data.is_empty() {
                     if let Err(e) = server_write.write_all(&initial_data).await {
                         warn!("Failed to push initial data to fallback: {}", e);
@@ -288,8 +277,6 @@ impl ServerHandler {
                     }
                 }
 
-                // 3. Запускаем bidirectional copy
-                // Это создаст две задачи, которые будут перекачивать байты, пока одна сторона не закроется
                 let res = tokio::io::copy_bidirectional(
                     &mut tokio::io::join(&mut client_inbound, &mut client_outbound),
                     &mut tokio::io::join(&mut server_read, &mut server_write),
@@ -345,7 +332,7 @@ impl TunnelHandler for ServerHandler {
                         Ok(Err(e)) => return Err(e.to_string()),
                         Err(_) => {
                             warn!("Handshake timeout. Going stealth.");
-                            // Используем наш снимок, так как основной буфер мог быть частично съеден
+
                             ServerHandler::handle_stealth_fallback(
                                 self.conn.inbound,
                                 self.conn.outbound,
@@ -358,7 +345,7 @@ impl TunnelHandler for ServerHandler {
                 }
                 Err(e) => {
                     warn!("Auth/Format failed: {:?}. Going stealth.", e);
-                    // ВАЖНО: используем сохраненный buf_snapshot
+
                     info!(
                         "DEBUG: Restoring {} bytes from snapshot for fallback",
                         buf_snapshot.len()
@@ -375,7 +362,6 @@ impl TunnelHandler for ServerHandler {
             }
         };
 
-        // Если дошли сюда — значит это наш клиент, шлем Server Hello
         self.conn
             .outbound
             .write_all(&hello)
@@ -392,7 +378,6 @@ impl TunnelHandler for ServerHandler {
             control_rx,
             data_rx,
             handler,
-            token: self.token,
         }
         .run()
         .await

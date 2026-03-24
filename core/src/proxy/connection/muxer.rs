@@ -54,12 +54,10 @@ impl Muxer {
         self.id_gen.next()
     }
 
-    // Обычные данные летят в канал с низким приоритетом
     pub async fn send_to_netwrok(&self, message: MuxMessage) -> Result<(), SendError<MuxMessage>> {
         self.data_tx.send(message).await
     }
 
-    // Управляющие фреймы летят в VIP-канал
     pub async fn send_control(
         &self,
         stream_id: u32,
@@ -96,7 +94,6 @@ impl Muxer {
                 self.remove_stream(stream_id);
             }
         } else {
-            // Уменьшил уровень лога до TRACE, потому что это штатная ситуация при больших буферах!
             netrunner_logger::trace!(
                 stream_id,
                 len = data.len(),
