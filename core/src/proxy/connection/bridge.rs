@@ -6,7 +6,7 @@ use netrunner_logger::{debug, error};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
-pub async fn run_proxy_bridge<R, W>(
+pub async fn run_tcp_bridge<R, W>(
     stream_id: u32,
     mut reader: R,
     mut writer: W,

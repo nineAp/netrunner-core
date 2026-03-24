@@ -7,7 +7,7 @@ use crate::{
         socks::SocksReply,
     },
     proxy::connection::{
-        bridge::{run_proxy_bridge, run_udp_bridge},
+        bridge::{run_tcp_bridge, run_udp_bridge},
         connection::ConnectionRole,
         muxer::Muxer,
     },
@@ -73,7 +73,7 @@ impl StreamHandler {
                             .await;
 
                         let (r, w) = stream.into_split();
-                        run_proxy_bridge(stream_id, r, w, muxer, v_rx).await;
+                        run_tcp_bridge(stream_id, r, w, muxer, v_rx).await;
                     }
                     Ok(Err(e)) => {
                         error!(stream_id, target = %target_str, error = %e, "TCP connection failed");

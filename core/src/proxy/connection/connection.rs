@@ -9,7 +9,7 @@ use crate::{
         parser::parser::Parser,
     },
     proxy::connection::{
-        bridge::run_proxy_bridge, engine::TunnelEngine, handler::StreamHandler, muxer::Muxer,
+        bridge::run_tcp_bridge, engine::TunnelEngine, handler::StreamHandler, muxer::Muxer,
         MESSAGE_CHANNEL_SIZE, TCP_BUF_SIZE,
     },
     tlseng::profile::BrowserProfile,
@@ -232,7 +232,7 @@ impl TunnelHandler for ClientHandler {
                 let muxer = self.muxer;
 
                 tokio::spawn(async move {
-                    run_proxy_bridge(stream_id, browser_in, browser_out, muxer, v_rx).await;
+                    run_tcp_bridge(stream_id, browser_in, browser_out, muxer, v_rx).await;
                 });
                 Ok(())
             }
