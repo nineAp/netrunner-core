@@ -1,5 +1,8 @@
-use crate::proxy::connection::connection::{
-    ClientHandler, Connection, ConnectionRole, ServerHandler, TunnelHandler,
+use crate::{
+    protocol::codec::{frame::FRAME_HEADER_SIZE, MAX_PADDING_SIZE},
+    proxy::connection::connection::{
+        ClientHandler, Connection, ConnectionRole, ServerHandler, TunnelHandler,
+    },
 };
 use netrunner_logger::{error, info};
 use tokio::net::TcpListener;
@@ -83,6 +86,57 @@ impl Network {
                     }
                 }
             }
+        }
+    }
+}
+
+pub const IP_UDP_OVERHEAD: usize = 28;
+
+pub struct NetworkConfig {
+    pub mtu: usize,
+    pub max_wire_frame_size: usize,
+    pub safe_payload_size: usize,
+    pub tcp_rx_buffer_size: usize,
+    pub tcp_tx_buffer_size: usize,
+    pub udp_rx_buffer_size: usize,
+    pub udp_tx_buffer_size: usize,
+    pub channel_capacity: usize,
+}
+
+impl NetworkConfig {
+    pub fn new(system_mtu: usize) -> Self {
+        let transport_overhead = 28; // IPv4 + UDP
+
+        let max_wire_frame = system_mtu.saturating_sub(transport_overhead);
+
+        let safe_payload = max_wire_frame
+            .saturating_sub(FRAME_HEADER_SIZE as usize)
+            .saturating_sub((MAX_PADDING_SIZE - 1) as usize);
+
+        let tcp_chunks_count = 65536 / safe_payload;
+        let tcp_buffer = safe_payload * tcp_chunks_count;
+
+        let udp_chunks_count = 16384 / safe_payload;
+        let udp_buffer = safe_payload * udp_chunks_count;
+
+        let channel_cap = 1024;
+
+        netrunner_logger::info!(
+            mtu = system_mtu,
+            payload = safe_payload,
+            tcp_buf = tcp_buffer,
+            "Network Optimizer: Calculations complete for current MTU"
+        );
+
+        Self {
+            mtu: system_mtu,
+            max_wire_frame_size: max_wire_frame,
+            safe_payload_size: safe_payload,
+            tcp_rx_buffer_size: tcp_buffer,
+            tcp_tx_buffer_size: tcp_buffer,
+            udp_rx_buffer_size: udp_buffer,
+            udp_tx_buffer_size: udp_buffer,
+            channel_capacity: channel_cap,
         }
     }
 }

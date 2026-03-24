@@ -3,12 +3,14 @@ uniffi::setup_scaffolding!();
 
 mod net;
 mod tun;
-pub use crate::tun::{routing, tun::Tun}; //for desktop test in main.rs
+pub use crate::tun::{routing, tun::Tun};
 
 use crate::{
     net::engine::{EngineBuilder, EngineConfig},
     tun::routing::reset_platform_routing,
 };
+use netrunner_core::proxy::connection::connection::ConnectionRole;
+use netrunner_core::proxy::network::Network;
 use netrunner_logger::{error, info};
 use std::sync::{Arc, OnceLock};
 use tokio::runtime::Runtime;
@@ -16,7 +18,6 @@ use tokio_util::sync::CancellationToken;
 
 pub static RUNTIME: OnceLock<Runtime> = OnceLock::new();
 
-// Инициализация Tokio Runtime
 fn get_runtime() -> &'static Runtime {
     RUNTIME.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
@@ -54,7 +55,7 @@ impl Drop for Session {
 }
 
 // ==========================================
-// SESSION MANAGER (Публичный API UniFFI)
+// SESSION MANAGER
 // ==========================================
 
 #[derive(uniffi::Object)]
@@ -75,14 +76,10 @@ impl SessionManager {
         let addr: std::net::SocketAddr = remote_address.parse().expect("Invalid address format");
         let remote_proxy_ip = addr.ip().to_string();
 
-        // 1. Создаем базовый конфиг
         let mut config = EngineConfig::new(&remote_address).with_cache_path(&cache_dir);
 
-        // 2. Тонкая настройка под платформу
         #[cfg(any(target_os = "android", target_os = "ios"))]
         {
-            // На мобилках роутингом обычно управляет VpnService (Android) или NEPacketTunnelProvider (iOS)
-            // Поэтому отключаем попытки движка менять системные таблицы роутинга напрямую
             config = config.disable_routing().with_mtu(1280);
         }
 
@@ -91,10 +88,44 @@ impl SessionManager {
             config = config.with_mtu(1350);
         }
 
-        runtime.spawn(async move {
-            info!("Starting VPN session thread...");
+        // --- 1. ЗАПУСК ЛОКАЛЬНОГО ПРОКСИ (NETWORK) ---
+        let local_proxy_port = 8080;
+        let local_proxy_host = "127.0.0.1".to_string();
+        let proxy_token = cancel_token.clone();
+        let remote_addr_clone = remote_address.clone();
 
-            // 3. Инициализация TUN устройства (специфично для платформ)
+        runtime.spawn(async move {
+            info!(
+                "Starting Local Proxy (Network) on {}:{}",
+                local_proxy_host, local_proxy_port
+            );
+
+            let network = Network::new(
+                local_proxy_host,
+                local_proxy_port,
+                ConnectionRole::Client,
+                Some(remote_addr_clone),
+            );
+
+            // Оборачиваем в tokio::select! для жесткой отмены
+            tokio::select! {
+                _ = network.run(proxy_token.clone()) => {
+                    info!("Local Proxy (Network) task finished normally.");
+                }
+                _ = proxy_token.cancelled() => {
+                    info!("Local Proxy (Network) task forcefully stopped via CancellationToken.");
+                }
+            }
+        });
+
+        // Даем прокси немного времени на бинд порта
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        // --- 2. ЗАПУСК ENGINE И TUN ---
+        let engine_token = cancel_token.clone();
+        runtime.spawn(async move {
+            info!("Starting VPN Engine thread...");
+
             let tun_device = {
                 #[cfg(any(target_os = "android", target_os = "ios"))]
                 {
@@ -108,7 +139,7 @@ impl SessionManager {
                             .tun_name("netr0")
                             .address((10, 0, 0, 1))
                             .netmask((255, 255, 255, 0))
-                            .mtu(config.mtu as u16) // Используем MTU из нашего конфига
+                            .mtu(config.mtu as u16)
                             .up();
                     })
                     .expect("Failed to init TUN")
@@ -122,7 +153,6 @@ impl SessionManager {
                 }
             };
 
-            // 4. Используем обновленный билдер
             let builder_result = EngineBuilder::new(config)
                 .with_tun(tun_device)
                 .build()
@@ -135,7 +165,7 @@ impl SessionManager {
                         res = engine.run(tun) => {
                             info!("Engine loop finished: {:?}", res);
                         },
-                        _ = cancel_token.cancelled() => {
+                        _ = engine_token.cancelled() => {
                             info!("Engine task shutting down via token");
                         }
                     }

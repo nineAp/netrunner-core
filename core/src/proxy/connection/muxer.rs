@@ -54,8 +54,44 @@ impl Muxer {
         self.id_gen.next()
     }
 
-    pub async fn send_to_netwrok(&self, message: MuxMessage) -> Result<(), SendError<MuxMessage>> {
+    pub async fn send_to_network(&self, message: MuxMessage) -> Result<(), SendError<MuxMessage>> {
         self.data_tx.send(message).await
+    }
+
+    pub async fn send_data_safe(&self, stream_id: u32, mut data: Bytes) -> Result<(), String> {
+        // Лимит полезной нагрузки, чтобы вместе с заголовком и паддингом
+        // пакет оставался в пределах ~1400-1450 байт.
+        const MAX_PAYLOAD_CHUNK: usize = 1300;
+
+        if data.len() <= MAX_PAYLOAD_CHUNK {
+            return self
+                .send_to_network(MuxMessage {
+                    stream_id,
+                    frame_type: FrameType::Data,
+                    data,
+                })
+                .await
+                .map_err(|e| e.to_string());
+        }
+
+        // Если данных много (например, те самые 4096 байт), режем их на куски
+        while !data.is_empty() {
+            let chunk_size = std::cmp::min(data.len(), MAX_PAYLOAD_CHUNK);
+            let chunk = data.split_to(chunk_size);
+
+            self.send_to_network(MuxMessage {
+                stream_id,
+                frame_type: FrameType::Data,
+                data: chunk,
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+
+            // Небольшая уступка планировщику, чтобы не забить канал мгновенно
+            tokio::task::yield_now().await;
+        }
+
+        Ok(())
     }
 
     pub async fn send_control(

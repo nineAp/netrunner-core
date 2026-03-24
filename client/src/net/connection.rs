@@ -263,22 +263,35 @@ impl UdpConnection {
     }
 
     pub fn tick(&mut self, socket: &mut udp::Socket) -> bool {
-        // Проверка таймаута
         if self.last_activity.elapsed() > UDP_TIMEOUT {
             debug!(%self.core.handle, "UDP Session closed due to {}s timeout", UDP_TIMEOUT.as_secs());
             socket.close();
             return false;
         }
 
-        // Читаем из smoltcp и шлем в сеть (через Muxer)
         if socket.can_recv() {
+            let target_endpoint = socket.endpoint();
             while let Ok((data, metadata)) = socket.recv() {
-                if self.client_endpoint.is_none() {
-                    debug!(%self.core.handle, endpoint = %metadata.endpoint, "UDP Endpoint pinned");
-                }
-                self.client_endpoint = Some(metadata.endpoint);
+                let source_endpoint = metadata.endpoint;
 
-                trace!(%self.core.handle, "Forwarded UDP datagram ({} bytes) from smoltcp to Muxer", data.len());
+                if self.client_endpoint.is_none() {
+                    info!(
+                        %self.core.handle,
+                        source = %source_endpoint,
+                        target = %target_endpoint,
+                        "UDP Session Established. Pinning endpoint."
+                    );
+                }
+                self.client_endpoint = Some(source_endpoint);
+
+                trace!(
+                    %self.core.handle,
+                    source = %source_endpoint,
+                    target = %target_endpoint,
+                    bytes = data.len(),
+                    "Forwarded UDP datagram from smoltcp to Muxer"
+                );
+
                 if self.core.tx.try_send(Bytes::copy_from_slice(data)).is_ok() {
                     self.last_activity = Instant::now();
                 } else {
@@ -287,9 +300,8 @@ impl UdpConnection {
             }
         }
 
-        // Читаем из сети (от Muxer) и шлем в smoltcp
         if socket.can_send() {
-            if let Some(endpoint) = self.client_endpoint {
+            if let Some(client_endpoint) = self.client_endpoint {
                 while let Ok(data) = self.core.rx.try_recv() {
                     if data.is_empty() {
                         debug!(%self.core.handle, "Received empty datagram (Close signal) from Muxer, closing UDP socket");
@@ -297,9 +309,16 @@ impl UdpConnection {
                         return false;
                     }
 
-                    match socket.send_slice(&data, endpoint) {
+                    match socket.send_slice(&data, client_endpoint) {
                         Ok(_) => {
-                            trace!(%self.core.handle, "Wrote UDP datagram ({} bytes) to smoltcp", data.len());
+                            let proxy_endpoint = socket.endpoint();
+                            info!(
+                                %self.core.handle,
+                                source = %proxy_endpoint,
+                                target = %client_endpoint,
+                                bytes = data.len(),
+                                "Wrote UDP reply from Muxer back to smoltcp"
+                            );
                             self.last_activity = Instant::now();
                         }
                         Err(e) => {

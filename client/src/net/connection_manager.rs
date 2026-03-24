@@ -1,8 +1,5 @@
 use bytes::Bytes;
-use netrunner_core::{
-    protocol::codec::{frame::FrameType, socks::TargetAddress},
-    proxy::connection::muxer::{MuxMessage, Muxer},
-};
+use netrunner_core::protocol::codec::socks::TargetAddress;
 use netrunner_logger::{debug, error, info, trace, warn};
 use smoltcp::{
     iface::{SocketHandle, SocketSet},
@@ -10,10 +7,10 @@ use smoltcp::{
     wire::{IpListenEndpoint, IpProtocol, Ipv4Packet, TcpPacket, UdpPacket},
 };
 use std::{collections::HashMap, time::Duration, time::Instant as StdInstant};
-use tokio::sync::mpsc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpStream, UdpSocket};
 
 use crate::net::{
-    CHANNEL_CAPACITY,
     connection::{TcpConnection, UdpConnection},
     dns::DnsHandler,
     ip_store::FakeIpStore,
@@ -193,15 +190,13 @@ impl SocketFactory {
 pub struct ConnectionManager {
     tracker: SessionTracker,
     resolver: TargetResolver,
-    muxer: Muxer,
 }
 
 impl ConnectionManager {
-    pub fn new(dns_handler: DnsHandler, muxer: Muxer) -> Self {
+    pub fn new(dns_handler: DnsHandler) -> Self {
         Self {
             tracker: SessionTracker::new(),
             resolver: TargetResolver::new(dns_handler),
-            muxer,
         }
     }
 
@@ -244,7 +239,6 @@ impl ConnectionManager {
         match ip_packet.next_header() {
             IpProtocol::Tcp => {
                 if let Ok(tcp_packet) = TcpPacket::new_checked(ip_packet.payload()) {
-                    // Реагируем только на чистые SYN-пакеты (начало нового соединения)
                     if tcp_packet.syn() && !tcp_packet.ack() {
                         let dst_port = tcp_packet.dst_port();
                         trace!(%dst_addr, dst_port, "Received TCP SYN");
@@ -354,45 +348,45 @@ impl ConnectionManager {
             let (conn, mut rx_from_smol, tx_to_smol, handshake_tx) = TcpConnection::new(handle);
             self.tracker.active_tcp.insert(handle, conn);
 
-            let muxer = self.muxer.clone();
-            let stream_id = muxer.next_id();
-            let connect_payload = target.to_string();
+            // Конвертируем TargetAddress в строку, понятную для tokio::net
+            let target_str = match target {
+                TargetAddress::Domain(d, p) => format!("{}:{}", d, p),
+                TargetAddress::Ipv4(ip, p) => format!("{}:{}", ip, p),
+                TargetAddress::Ipv6(ip, p) => format!("{}:{}", ip, p),
+            };
 
             tokio::spawn(async move {
-                let (v_tx, mut v_rx) = mpsc::channel::<Bytes>(CHANNEL_CAPACITY);
-                muxer.register_stream(stream_id, v_tx);
-
-                if muxer
-                    .send_to_netwrok(MuxMessage {
-                        stream_id,
-                        frame_type: FrameType::Connect,
-                        data: Bytes::from(connect_payload),
-                    })
-                    .await
-                    .is_err()
-                {
-                    muxer.remove_stream(stream_id);
-                    return;
-                }
-
-                match tokio::time::timeout(Duration::from_secs(10), v_rx.recv()).await {
-                    Ok(Some(data)) if data.len() >= 2 && data[1] == 0x00 => {
-                        let _ = handshake_tx.send(());
-                    }
-                    _ => {
-                        muxer.remove_stream(stream_id);
+                let mut upstream = match TcpStream::connect(&target_str).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        error!("Failed to connect to upstream TCP {}: {}", target_str, e);
                         return;
                     }
-                }
+                };
 
-                let to_proxy = async {
+                // Сообщаем соединению smoltcp, что мы готовы (рукопожатие выполнено)
+                let _ = handshake_tx.send(());
+
+                let (mut r, mut w) = upstream.into_split();
+
+                // Читаем из tun (smoltcp) и пишем во внешнюю сеть
+                let to_upstream = async {
                     while let Some(data) = rx_from_smol.recv().await {
-                        if muxer
-                            .send_to_netwrok(MuxMessage {
-                                stream_id,
-                                frame_type: FrameType::Data,
-                                data,
-                            })
+                        if w.write_all(&data).await.is_err() {
+                            break;
+                        }
+                    }
+                };
+
+                // Читаем из внешней сети и пишем в tun (smoltcp)
+                let from_upstream = async {
+                    let mut buf = vec![0u8; 8192]; // Читаем чанками
+                    while let Ok(n) = r.read(&mut buf).await {
+                        if n == 0 {
+                            break;
+                        } // EOF
+                        if tx_to_smol
+                            .send(Bytes::copy_from_slice(&buf[..n]))
                             .await
                             .is_err()
                         {
@@ -401,24 +395,7 @@ impl ConnectionManager {
                     }
                 };
 
-                let from_proxy = async {
-                    while let Some(data) = v_rx.recv().await {
-                        if data.is_empty() || tx_to_smol.send(data).await.is_err() {
-                            break;
-                        }
-                    }
-                };
-
-                tokio::select! { _ = to_proxy => {}, _ = from_proxy => {} }
-
-                let _ = muxer
-                    .send_to_netwrok(MuxMessage {
-                        stream_id,
-                        frame_type: FrameType::Close,
-                        data: Bytes::new(),
-                    })
-                    .await;
-                muxer.remove_stream(stream_id);
+                tokio::select! { _ = to_upstream => {}, _ = from_upstream => {} }
             });
         }
 
@@ -464,30 +441,48 @@ impl ConnectionManager {
             let (conn, mut rx_from_smol, tx_to_smol) = UdpConnection::new(handle);
             self.tracker.active_udp.insert(handle, conn);
 
-            let muxer = self.muxer.clone();
-            let stream_id = muxer.next_id();
-            let connect_payload = target.to_string();
+            // Конвертируем для tokio::net::UdpSocket
+            let target_str = match target {
+                TargetAddress::Domain(d, p) => format!("{}:{}", d, p),
+                TargetAddress::Ipv4(ip, p) => format!("{}:{}", ip, p),
+                TargetAddress::Ipv6(ip, p) => format!("{}:{}", ip, p),
+            };
 
             tokio::spawn(async move {
-                let (v_tx, mut v_rx) = mpsc::channel::<Bytes>(CHANNEL_CAPACITY);
-                muxer.register_stream(stream_id, v_tx);
+                // Создаем локальный UDP сокет со случайным портом
+                let upstream = match UdpSocket::bind("0.0.0.0:0").await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        error!("Failed to bind local UDP socket: {}", e);
+                        return;
+                    }
+                };
 
-                let _ = muxer
-                    .send_to_netwrok(MuxMessage {
-                        stream_id,
-                        frame_type: FrameType::UdpConnect,
-                        data: Bytes::from(connect_payload),
-                    })
-                    .await;
+                // "Подключаем" UDP сокет к цели (включает фильтр пакетов и позволяет использовать обычные send/recv)
+                if let Err(e) = upstream.connect(&target_str).await {
+                    error!("Failed to connect UDP to {}: {}", target_str, e);
+                    return;
+                }
 
-                let to_proxy = async {
+                let upstream = std::sync::Arc::new(upstream);
+                let upstream_rx = upstream.clone();
+                let upstream_tx = upstream;
+
+                // Из smoltcp наружу
+                let to_upstream = async {
                     while let Some(data) = rx_from_smol.recv().await {
-                        if muxer
-                            .send_to_netwrok(MuxMessage {
-                                stream_id,
-                                frame_type: FrameType::UdpData,
-                                data,
-                            })
+                        if upstream_tx.send(&data).await.is_err() {
+                            break;
+                        }
+                    }
+                };
+
+                // Извне в smoltcp
+                let from_upstream = async {
+                    let mut buf = vec![0u8; 65536]; // Максимальный размер UDP датаграммы
+                    while let Ok(n) = upstream_rx.recv(&mut buf).await {
+                        if tx_to_smol
+                            .send(Bytes::copy_from_slice(&buf[..n]))
                             .await
                             .is_err()
                         {
@@ -496,24 +491,7 @@ impl ConnectionManager {
                     }
                 };
 
-                let from_proxy = async {
-                    while let Some(data) = v_rx.recv().await {
-                        if data.is_empty() || tx_to_smol.send(data).await.is_err() {
-                            break;
-                        }
-                    }
-                };
-
-                tokio::select! { _ = to_proxy => {}, _ = from_proxy => {} }
-
-                let _ = muxer
-                    .send_to_netwrok(MuxMessage {
-                        stream_id,
-                        frame_type: FrameType::Close,
-                        data: Bytes::new(),
-                    })
-                    .await;
-                muxer.remove_stream(stream_id);
+                tokio::select! { _ = to_upstream => {}, _ = from_upstream => {} }
             });
         }
 

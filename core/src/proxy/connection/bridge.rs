@@ -32,7 +32,7 @@ pub async fn run_tcp_bridge<R, W>(
                             frame_type: FrameType::Data,
                             data: buf.split().freeze(),
                         };
-                        if muxer.send_to_netwrok(msg).await.is_err() { break; }
+                        if muxer.send_to_network(msg).await.is_err() { break; }
                     }
                     Err(e) => {
                         error!(stream_id, error = %e, "Socket read error");
@@ -60,7 +60,7 @@ pub async fn run_tcp_bridge<R, W>(
     }
 
     let _ = muxer
-        .send_to_netwrok(MuxMessage {
+        .send_to_network(MuxMessage {
             stream_id,
             frame_type: FrameType::Close,
             data: Bytes::new(),
@@ -91,7 +91,7 @@ pub async fn run_udp_bridge(
                             frame_type: FrameType::UdpData,
                             data: Bytes::copy_from_slice(&buf[..n]),
                         };
-                        if muxer.send_to_netwrok(msg).await.is_err() { break; }
+                        if muxer.send_to_network(msg).await.is_err() { break; }
                     }
                     Err(e) => {
                         error!(stream_id, error = %e, "UDP socket read error");
@@ -119,7 +119,7 @@ pub async fn run_udp_bridge(
     }
 
     let _ = muxer
-        .send_to_netwrok(MuxMessage {
+        .send_to_network(MuxMessage {
             stream_id,
             frame_type: FrameType::Close,
             data: Bytes::new(),
