@@ -1,85 +1,371 @@
-# Netrunner TLS Engine (`tlseng`)
+--- 
 
-Модуль `tlseng` — это высокопроизводительное ядро для генерации, парсинга и манипуляции TLS-трафиком (TLS 1.2 / TLS 1.3). Основная задача движка — **обход систем глубокого анализа трафика (DPI)** и активных проб (Active Probing) путем идеальной мимикрии под легитимный трафик современных браузеров.
+# TLS Engine (Masking + Parsing)
 
-Движок не является полноценной реализацией криптографического стека TLS. Это "умный фасад", который формирует криптографически достоверные пакеты `ClientHello` и `ServerHello`, позволяя скрыто передавать авторизационные данные и устанавливать защищенные туннели, неотличимые от обычного HTTPS-трафика.
+## Обзор
 
-## 🌟 Ключевые возможности
+Этот модуль реализует:
 
-- **Perfect Fingerprint Mimicry (JA3 / JA4):** Полная имитация параметров расширений, порядка их следования, поддерживаемых групп и наборов шифров. Движок генерирует отпечатки, на 100% совпадающие с реальными браузерами (Chrome, Edge, Firefox, Safari).
-- **Stealth Authentication (Stateless):** Уникальный механизм скрытой авторизации. Токен доступа (Auth Tag) маскируется внутри поля `Session ID` (TLS 1.3 эхо), что позволяет серверу аутентифицировать клиента еще до начала обмена Application Data, не привлекая внимания DPI.
-- **Advanced GREASE Support:** Автоматическая и контекстно-зависимая генерация случайных идентификаторов (GREASE) согласно RFC 8701 для обхода сигнатурных фильтров, специфичных для Chromium-браузеров.
-- **Smart Padding:** Интеллектуальный расчет расширения `Padding` с учетом размера всех заголовков (overhead) для выравнивания пакета `ClientHello` до заданного размера (например, ровно 512 байт для Chrome), исключая эвристическое детектирование по длине пакета.
-- **Zero-Copy Parsing:** Использование крейта `bytes` (`Bytes`, `BytesMut`) для парсинга и сериализации пакетов без лишних аллокаций в памяти.
+- Генерацию TLS ClientHello / ServerHello с профилями браузеров
+- Гибкую сборку TLS Extensions (включая GREASE, padding, ALPS)
+- Парсинг TLS-records и handshake-сообщений
+- Маскировку под реальные браузеры (Chrome / Firefox)
+- Минимальный TLS-стек для кастомного протокола
 
-## 🏗 Архитектура модулей
+Фокус: **fingerprint mimicry**, а не полный TLS стек.
 
-Структура модуля разделена на логические компоненты для максимальной гибкости и расширяемости:
+---
 
-- **`profile/`**: База данных профилей браузеров и серверов (`BrowserProfile`, `ServerProfile`). Содержит константы для версий, шифров, наличия GREASE, ALPS и целевого размера паддинга.
-- **`extension/`**: Мощный и потокобезопасный `ExtensionBuilder` для сборки TLS-расширений (SNI, ALPN, KeyShare, ALPS, Supported Versions и т.д.) в строгом соответствии с профилем.
-- **`handshake/`**: Реализация структур `ClientHello` и `ServerHello`. Управляет генерацией рандома, встраиванием скрытых тегов и выбором шифров.
-- **`tls_record/`**: Низкоуровневая инкапсуляция данных в `TlsRecord` с правильным указанием версий (маскировка Record Layer Version под `0x0301`).
-- **`types/` и `consts/`**: Строго типизированные перечисления (Enums) и константы протокола TLS.
+## Архитектура
 
-## 🛠 Глубокое погружение: Как это работает
+```
+tlseng/
+├── consts.rs        # TLS константы
+├── extension.rs     # Extensions builder + parser
+├── handshake.rs     # ClientHello / ServerHello
+├── profile.rs       # Browser / Server profiles
+├── tls_record.rs    # TLS record layer
+├── types.rs         # enums + структуры
+```
 
-### 1. Профилирование трафика
+---
 
-Движок не хардкодит расширения. Вместо этого `ExtensionBuilder` принимает `BrowserProfile`. Профиль указывает, нужны ли GREASE-значения, какой должен быть `ExtensionOrder` (порядок следования) и до какого размера "надувать" пакет паддингом. Это позволяет в одну строчку переключать маскировку с Chrome 131 на Firefox 130.
+## Основные компоненты
 
-### 2. Скрытая авторизация (Session ID Auth)
+### 1. TLS Record Layer
 
-В TLS 1.3 поле `Session ID` сохранено для обратной совместимости (Middlebox Compatibility Mode).
-`tlseng` использует это 32-байтовое поле как контейнер:
+Файл: `tls_record.rs`
 
-1.  **Клиент:** Заполняет первые 16 байт случайными данными, а в последние 16 байт записывает HMAC (Auth Tag), сгенерированный на основе локального времени и мастер-ключа.
-2.  **DPI:** Видит стандартный 32-байтовый массив, неотличимый от обычного рандома.
-3.  **Сервер:** Извлекает последние 16 байт из `ClientHello` и верифицирует их. Если проверка не пройдена, соединение разрывается (защита от активного сканирования). Если пройдена — сервер возвращает этот же `Session ID` эхом в `ServerHello`.
-
-## 🚀 Примеры использования
-
-### Генерация `ClientHello` (на стороне клиента)
-
-Создание маскировочного пакета под Chrome 131 со встроенной авторизацией:
+Реализует базовый TLS record:
 
 ```rust
-use crate::tlseng::profile::BrowserProfile;
-use crate::tlseng::extension::ExtensionBuilder;
-use crate::tlseng::handshake::ClientHello;
-use crate::tlseng::tls_record::TlsRecord;
-use bytes::Bytes;
-
-pub fn make_client_hello(profile: &BrowserProfile, host: &str, keys: &SessionKeys) -> Bytes {
-    let tls_random = keys.salt.get_local();
-
-    // Расчет размера заголовков для точного Padding
-    let overhead = 5 + 4 + 2 + 32 + 1 + 32 + 2 + (profile.cipher_suites.len() * 2) + 2 + 2;
-
-    // Сборка расширений по профилю
-    let mut ext_builder = ExtensionBuilder::new();
-    ext_builder.apply_profile(profile, host, &keys.ecdh.public_key.to_bytes(), overhead);
-    let extensions_bytes = ext_builder.build();
-
-    // Генерация Session ID с Auth Tag
-    let mut session_id_bytes = [0u8; 32];
-    rand::fill(&mut session_id_bytes[..16]);
-    session_id_bytes[16..].copy_from_slice(&keys.generate_auth_tag());
-
-    let client_hello = ClientHello {
-        version: profile.versions.get_legacy(), // Всегда 0x0303 для TLS 1.3
-        random: tls_random,
-        session_id: Bytes::copy_from_slice(&session_id_bytes),
-        cipher_suites: profile.cipher_suites.to_vec(),
-        extensions: extensions_bytes,
-    };
-
-    let record = TlsRecord::new(
-        ContentType::Handshake,
-        profile.record_layer_version, // 0x0301 для маскировки
-        client_hello.serialize(),
-    );
-
-    record.serialize()
+struct TlsRecord {
+    content_type: ContentType,
+    version: ProtocolVersion,
+    payload: Bytes
 }
 ```
+
+Поддержка:
+
+- Handshake (0x16)
+- ApplicationData (0x17)
+- Alert (0x15)
+
+Особенности:
+
+- Минимальная валидация длины
+- Быстрая сериализация без аллокаций
+- ApplicationData требует минимум 17 байт (под AEAD)
+
+---
+
+### 2. Handshake Layer
+
+Файл: `handshake.rs`
+
+#### ClientHello
+
+Генерация:
+
+```rust
+ClientHello::make_client_hello(profile, host, keys)
+```
+
+Что делает:
+
+- Генерирует `random` (через session keys)
+- Формирует `session_id`:
+  - 16 байт random
+  - 16 байт auth tag
+
+- Вставляет cipher suites из профиля
+- Добавляет extensions через `ExtensionBuilder`
+- Оборачивает в TLS Record
+
+Особенности:
+
+- TLS 1.3 masked как TLS 1.2 (version = 0x0303)
+- Поддержка padding (для fingerprint совпадения)
+- Полный контроль порядка extensions
+
+---
+
+#### ServerHello
+
+```rust
+ServerHello::make_server_hello(...)
+```
+
+- Выбор cipher suite:
+  - либо server order
+  - либо client order
+
+- Всегда включает:
+  - supported_versions
+  - key_share
+
+Минимальный TLS 1.3 ServerHello
+
+---
+
+### 3. Extension System
+
+Файл: `extension.rs`
+
+#### ExtensionStack (Parser)
+
+- Парсит список extensions
+- Проверяет корректность длины
+- Позволяет искать extension по типу
+
+```rust
+find_by_type(etype) -> Option<Bytes>
+```
+
+---
+
+#### ExtensionBuilder
+
+Ключевой компонент маскировки.
+
+```rust
+ExtensionBuilder::apply_profile(profile, host, pub_key, overhead)
+```
+
+Поддерживает:
+
+| Extension             | Реализация |
+| --------------------- | ---------- |
+| SNI                   | ✔          |
+| ALPN                  | ✔          |
+| ALPS                  | ✔          |
+| Supported Groups      | ✔          |
+| Signature Algorithms  | ✔          |
+| KeyShare              | ✔          |
+| PSK Modes             | ✔          |
+| Padding               | ✔          |
+| GREASE                | ✔          |
+| Compress Certificate  | ✔          |
+| SCT                   | ✔          |
+| Delegated Credentials | ✔          |
+
+---
+
+#### Особенности
+
+##### GREASE
+
+```rust
+TlsExtensions::is_grease(id)
+```
+
+- Проверка по паттерну `0x?a?a`
+- Вставляется только если `profile.has_grease`
+
+---
+
+##### Padding
+
+```rust
+padding(target_size, overhead)
+```
+
+- Доводит ClientHello до нужного размера
+- Используется для bypass DPI / fingerprint
+
+---
+
+##### ALPS (Application Settings)
+
+```rust
+application_settings(["h2"])
+```
+
+- Chromium-only behavior
+- Добавляется только если есть в профиле
+
+---
+
+### 4. Profiles (Fingerprint Mimicry)
+
+Файл: `profile.rs`
+
+#### BrowserProfile
+
+Определяет fingerprint:
+
+```rust
+pub struct BrowserProfile {
+    groups
+    signatures
+    versions
+    cipher_suites
+    extension_order
+    alpn
+    grease
+    padding
+}
+```
+
+---
+
+#### Примеры
+
+##### Chrome 131
+
+- GREASE: включен
+- ALPS: включен
+- Padding: 512 bytes
+- TLS 1.3 only
+- Record version: TLS 1.0 (как в реальном Chrome)
+
+##### Firefox 130
+
+- GREASE: выключен
+- ALPS: нет
+- Padding: нет
+- TLS 1.2 + 1.3
+
+---
+
+#### Extension Order — критично
+
+```rust
+ExtensionOrder::CHROMIUM_131
+```
+
+Порядок полностью повторяет реальный браузер.
+
+Это ключ к обходу:
+
+- JA3 fingerprint
+- DPI
+- TLS fingerprinting
+
+---
+
+### 5. Типы и константы
+
+Файл: `types.rs`
+
+Содержит:
+
+- `ContentType`
+- `ProtocolVersion`
+- `HelloType`
+- `TlsGroups`
+- `TlsSignatures`
+- `TlsVersions`
+- `TlsExtensions`
+
+---
+
+#### Важно
+
+##### TLS Versions
+
+```rust
+TlsVersions::TLS_13_ONLY
+TlsVersions::MODERN
+```
+
+Метод:
+
+```rust
+max() -> ProtocolVersion
+```
+
+---
+
+##### Supported Groups
+
+```rust
+X25519 (0x001d) — основной
+```
+
+---
+
+##### Signature Algorithms
+
+Совместимы с браузерами:
+
+- ECDSA
+- RSA-PSS
+- RSA PKCS1
+
+---
+
+## Парсинг
+
+Все структуры реализуют трейт:
+
+```rust
+trait Parser {
+    fn can_parse(...)
+    fn parse(...)
+}
+```
+
+Подход:
+
+1. `can_parse` — быстрый pre-check без аллокаций
+2. `parse` — безопасный разбор
+
+---
+
+## Безопасность и ограничения
+
+### Что есть
+
+- Корректная структура TLS
+- Реалистичный fingerprint
+- Минимальная валидация
+
+### Чего нет
+
+- Полного TLS state machine
+- Certificate validation
+- Finished / handshake verify
+- AEAD шифрования (в этом модуле)
+
+---
+
+## Основной use-case
+
+Этот движок предназначен для:
+
+- TLS fingerprint spoofing
+- DPI bypass
+- Proxy / tunneling протоколов
+- Эмуляции браузера на уровне TLS
+
+---
+
+## Пример использования
+
+```rust
+let client_hello = ClientHello::make_client_hello(
+    &BrowserProfile::CHROME_131,
+    "example.com",
+    &session_keys
+);
+```
+
+---
+
+## Ключевые идеи
+
+1. TLS используется как транспорт маскировки
+2. Fingerprint важнее криптографии
+3. Поведение должно совпадать с браузером
+4. Порядок и длины критичны
+5. GREASE обязателен для Chromium
+
+---
+
+Если нужно — могу:
+
+- разобрать отличия от real Chrome packet capture
+- добавить JA3 генерацию
+- указать где fingerprint ещё палится (важно)
