@@ -1,5 +1,5 @@
 use crate::{
-    protocol::{
+    nrxp::{
         codec::{
             codec::Codec,
             frame::FrameType,
@@ -8,9 +8,11 @@ use crate::{
         errors::ErrorAction,
         parser::parser::Parser,
     },
-    proxy::connection::{
-        bridge::run_tcp_bridge, engine::TunnelEngine, handler::StreamHandler, muxer::Muxer,
-        MESSAGE_CHANNEL_SIZE, TCP_BUF_SIZE,
+    net::{
+        connection::{
+            bridge::run_tcp_bridge, engine::TunnelEngine, handler::StreamHandler, muxer::Muxer,
+        },
+        network::NetworkConfig,
     },
     tlseng::profile::BrowserProfile,
 };
@@ -50,7 +52,7 @@ impl Connection {
         Self {
             inbound,
             outbound,
-            read_buf: BytesMut::with_capacity(TCP_BUF_SIZE),
+            read_buf: BytesMut::with_capacity(NetworkConfig::global().tcp_buffer_size),
             codec: Codec::new(init),
         }
     }
@@ -59,7 +61,7 @@ impl Connection {
         Self {
             inbound,
             outbound,
-            read_buf: BytesMut::with_capacity(TCP_BUF_SIZE),
+            read_buf: BytesMut::with_capacity(NetworkConfig::global().tcp_buffer_size),
             codec: Codec::new(false),
         }
     }
@@ -132,8 +134,8 @@ impl ClientHandler {
             }
         }
 
-        let (control_tx, control_rx) = mpsc::channel(MESSAGE_CHANNEL_SIZE * 4);
-        let (data_tx, data_rx) = mpsc::channel(MESSAGE_CHANNEL_SIZE * 4);
+        let (control_tx, control_rx) = mpsc::channel(NetworkConfig::global().channel_capacity);
+        let (data_tx, data_rx) = mpsc::channel(NetworkConfig::global().channel_capacity);
 
         let muxer = Muxer::new(control_tx, data_tx, true);
 
@@ -199,7 +201,8 @@ impl TunnelHandler for ClientHandler {
                 target,
             } => {
                 let stream_id = self.muxer.next_id();
-                let (v_tx, mut v_rx) = mpsc::channel::<bytes::Bytes>(TCP_BUF_SIZE);
+                let (v_tx, mut v_rx) =
+                    mpsc::channel::<bytes::Bytes>(NetworkConfig::global().tcp_buffer_size);
                 self.muxer.register_stream(stream_id, v_tx);
 
                 self.muxer
@@ -304,8 +307,8 @@ impl TunnelHandler for ServerHandler {
     async fn run(mut self) -> Result<(), String> {
         info!("Acting as TLS Server with Stealth Fallback");
 
-        let (control_tx, control_rx) = mpsc::channel(MESSAGE_CHANNEL_SIZE);
-        let (data_tx, data_rx) = mpsc::channel(MESSAGE_CHANNEL_SIZE);
+        let (control_tx, control_rx) = mpsc::channel(NetworkConfig::global().channel_capacity);
+        let (data_tx, data_rx) = mpsc::channel(NetworkConfig::global().channel_capacity);
         let muxer = Muxer::new(control_tx, data_tx, false);
 
         let handshake_timeout = std::time::Duration::from_secs(1);

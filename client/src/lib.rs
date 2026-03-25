@@ -9,8 +9,8 @@ use crate::{
     net::engine::{EngineBuilder, EngineConfig},
     tun::routing::reset_platform_routing,
 };
-use netrunner_core::proxy::connection::connection::ConnectionRole;
-use netrunner_core::proxy::network::Network;
+use netrunner_core::net::connection::connection::ConnectionRole;
+use netrunner_core::net::network::Network;
 use netrunner_logger::{error, info};
 use std::sync::{Arc, OnceLock};
 use tokio::runtime::Runtime;

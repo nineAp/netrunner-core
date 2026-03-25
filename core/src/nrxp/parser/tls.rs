@@ -1,5 +1,5 @@
 use crate::{
-    protocol::{
+    nrxp::{
         errors::{ErrorAction, ErrorStage, TlsError},
         parser::Parser,
     },

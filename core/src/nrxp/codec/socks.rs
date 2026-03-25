@@ -2,7 +2,7 @@ use std::fmt;
 
 use bytes::{BufMut, BytesMut};
 
-use crate::protocol::parser::parser::Parser;
+use crate::nrxp::parser::parser::Parser;
 
 pub const SOCKS5_VERSION: u8 = 0x05;
 pub const REPLY_SUCCESS: u8 = 0x00;

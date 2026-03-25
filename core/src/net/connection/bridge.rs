@@ -1,6 +1,6 @@
-use crate::protocol::codec::frame::FrameType;
-use crate::proxy::connection::muxer::{MuxMessage, Muxer};
-use crate::proxy::connection::{TCP_BUF_SIZE, UDP_BUF_SIZE};
+use crate::nrxp::codec::frame::FrameType;
+use crate::net::connection::muxer::{MuxMessage, Muxer};
+use crate::net::network::NetworkConfig;
 use bytes::{Bytes, BytesMut};
 use netrunner_logger::{debug, error};
 use tokio::net::UdpSocket;
@@ -16,7 +16,7 @@ pub async fn run_tcp_bridge<R, W>(
     R: tokio::io::AsyncReadExt + Unpin,
     W: tokio::io::AsyncWriteExt + Unpin,
 {
-    let mut buf = BytesMut::with_capacity(TCP_BUF_SIZE);
+    let mut buf = BytesMut::with_capacity(NetworkConfig::global().tcp_buffer_size);
 
     loop {
         tokio::select! {
@@ -78,7 +78,7 @@ pub async fn run_udp_bridge(
     muxer: Muxer,
     mut v_rx: mpsc::Receiver<Bytes>,
 ) {
-    let mut buf = BytesMut::with_capacity(UDP_BUF_SIZE);
+    let mut buf = BytesMut::with_capacity(NetworkConfig::global().udp_buffer_size);
 
     loop {
         tokio::select! {

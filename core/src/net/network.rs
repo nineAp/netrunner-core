@@ -1,6 +1,8 @@
+use std::sync::OnceLock;
+
 use crate::{
-    protocol::codec::{frame::FRAME_HEADER_SIZE, MAX_PADDING_SIZE},
-    proxy::connection::connection::{
+    nrxp::codec::{frame::FRAME_HEADER_SIZE, MAX_PADDING_SIZE},
+    net::connection::connection::{
         ClientHandler, Connection, ConnectionRole, ServerHandler, TunnelHandler,
     },
 };
@@ -32,7 +34,7 @@ impl Network {
 
     pub async fn run(&self, token: CancellationToken) {
         let addr = format!("{}:{}", self.host, self.port);
-
+        NetworkConfig::init_global(1350);
         match self.role {
             ConnectionRole::Client => {
                 info!("Starting Client mode");
@@ -90,16 +92,14 @@ impl Network {
     }
 }
 
-pub const IP_UDP_OVERHEAD: usize = 28;
+pub static GLOBAL_NET_CONFIG: OnceLock<NetworkConfig> = OnceLock::new();
 
 pub struct NetworkConfig {
     pub mtu: usize,
     pub max_wire_frame_size: usize,
     pub safe_payload_size: usize,
-    pub tcp_rx_buffer_size: usize,
-    pub tcp_tx_buffer_size: usize,
-    pub udp_rx_buffer_size: usize,
-    pub udp_tx_buffer_size: usize,
+    pub tcp_buffer_size: usize,
+    pub udp_buffer_size: usize,
     pub channel_capacity: usize,
 }
 
@@ -132,11 +132,21 @@ impl NetworkConfig {
             mtu: system_mtu,
             max_wire_frame_size: max_wire_frame,
             safe_payload_size: safe_payload,
-            tcp_rx_buffer_size: tcp_buffer,
-            tcp_tx_buffer_size: tcp_buffer,
-            udp_rx_buffer_size: udp_buffer,
-            udp_tx_buffer_size: udp_buffer,
+            tcp_buffer_size: tcp_buffer,
+            udp_buffer_size: udp_buffer,
             channel_capacity: channel_cap,
         }
+    }
+
+    pub fn init_global(system_mtu: usize) {
+        let config = Self::new(system_mtu);
+        if GLOBAL_NET_CONFIG.set(config).is_err() {
+            netrunner_logger::warn!("Global network config was already initialized!");
+        }
+    }
+    pub fn global() -> &'static Self {
+        GLOBAL_NET_CONFIG
+            .get()
+            .expect("Global NetworkConfig is not initialized! Call init_global() first.")
     }
 }

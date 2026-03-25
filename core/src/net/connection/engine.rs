@@ -10,11 +10,11 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    protocol::{
+    net::connection::{handler::StreamHandler, muxer::MuxMessage},
+    nrxp::{
         codec::{codec::Codec, frame::FrameType},
         errors::ErrorAction,
     },
-    proxy::connection::{handler::StreamHandler, muxer::MuxMessage},
 };
 
 pub struct TunnelEngine {

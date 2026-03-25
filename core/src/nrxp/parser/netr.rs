@@ -1,6 +1,6 @@
 use bytes::{Buf, BytesMut};
 
-use crate::protocol::{
+use crate::nrxp::{
     codec::frame::{Frame, FrameHeader, FrameType, FRAME_HEADER_SIZE},
     parser::parser::Parser,
 };

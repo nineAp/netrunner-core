@@ -1,5 +1,5 @@
-use crate::net::CHANNEL_CAPACITY;
 use bytes::{Buf, Bytes, BytesMut};
+use netrunner_core::net::network::NetworkConfig;
 use smoltcp::{
     iface::SocketHandle,
     socket::{tcp, udp},
@@ -28,8 +28,10 @@ pub struct ConnectionCore {
 impl ConnectionCore {
     pub fn new(handle: SocketHandle) -> (Self, mpsc::Receiver<Bytes>, mpsc::Sender<Bytes>) {
         trace!(%handle, "Creating ConnectionCore channels");
-        let (tx_to_net, rx_from_smol) = mpsc::channel::<Bytes>(CHANNEL_CAPACITY);
-        let (tx_to_smol, rx_from_net) = mpsc::channel::<Bytes>(CHANNEL_CAPACITY);
+        let (tx_to_net, rx_from_smol) =
+            mpsc::channel::<Bytes>(NetworkConfig::global().channel_capacity);
+        let (tx_to_smol, rx_from_net) =
+            mpsc::channel::<Bytes>(NetworkConfig::global().channel_capacity);
 
         let core = Self {
             handle,

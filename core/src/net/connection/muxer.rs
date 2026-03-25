@@ -1,4 +1,4 @@
-use crate::protocol::codec::frame::FrameType;
+use crate::nrxp::codec::frame::FrameType;
 use bytes::Bytes;
 use dashmap::DashMap;
 use std::sync::atomic::{AtomicU32, Ordering};

@@ -1,6 +1,6 @@
 use bytes::{Buf, BytesMut};
 
-use crate::protocol::{codec::socks::*, parser::parser::Parser};
+use crate::nrxp::{codec::socks::*, parser::parser::Parser};
 
 impl Parser for SocksTarget {
     type Error = String;

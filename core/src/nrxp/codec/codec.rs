@@ -3,11 +3,10 @@ use bytes::{Bytes, BytesMut};
 use crate::crypto::aead::AeadPacker;
 use crate::crypto::chacha::ChaChaCipher;
 use crate::crypto::session::SessionKeys;
-use crate::protocol::codec::bridge::TlsBridge;
-use crate::protocol::codec::frame::{Frame, FrameHeader, FrameType};
-use crate::protocol::codec::padding::Padding;
-use crate::protocol::errors::{ErrorAction, ErrorStage, TlsError};
-use crate::protocol::parser::parser::Parser;
+use crate::nrxp::codec::bridge::TlsBridge;
+use crate::nrxp::codec::frame::{Frame, FrameHeader, FrameType, Padding};
+use crate::nrxp::errors::{ErrorAction, ErrorStage, TlsError};
+use crate::nrxp::parser::parser::Parser;
 use crate::tlseng::profile::{BrowserProfile, ServerProfile};
 
 pub struct Codec {

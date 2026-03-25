@@ -1,6 +1,6 @@
 use crate::crypto::session::SessionKeys;
-use crate::protocol::errors::{ErrorAction, ErrorStage, TlsError};
-use crate::protocol::parser::parser::Parser;
+use crate::nrxp::errors::{ErrorAction, ErrorStage, TlsError};
+use crate::nrxp::parser::parser::Parser;
 use crate::tlseng::extension::ExtensionStack;
 use crate::tlseng::handshake::{ClientHello, HelloHeader, ServerHello};
 use crate::tlseng::profile::{BrowserProfile, ServerProfile};

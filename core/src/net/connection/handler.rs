@@ -2,14 +2,17 @@ use bytes::{Bytes, BytesMut};
 use netrunner_logger::{debug, error, info};
 
 use crate::{
-    protocol::codec::{
+    net::{
+        connection::{
+            bridge::{run_tcp_bridge, run_udp_bridge},
+            connection::ConnectionRole,
+            muxer::Muxer,
+        },
+        network::NetworkConfig,
+    },
+    nrxp::codec::{
         frame::{Frame, FrameType},
         socks::SocksReply,
-    },
-    proxy::connection::{
-        bridge::{run_tcp_bridge, run_udp_bridge},
-        connection::ConnectionRole,
-        muxer::Muxer,
     },
 };
 
@@ -41,7 +44,7 @@ impl StreamHandler {
             let target_str = String::from_utf8_lossy(&payload).to_string();
             let muxer = self.muxer.clone();
 
-            let (v_tx, v_rx) = tokio::sync::mpsc::channel(512);
+            let (v_tx, v_rx) = tokio::sync::mpsc::channel(NetworkConfig::global().channel_capacity);
             muxer.register_stream(stream_id, v_tx);
 
             tokio::spawn(async move {
@@ -95,7 +98,7 @@ impl StreamHandler {
             let target_str = String::from_utf8_lossy(&payload).to_string();
             let muxer = self.muxer.clone();
 
-            let (v_tx, v_rx) = tokio::sync::mpsc::channel(512);
+            let (v_tx, v_rx) = tokio::sync::mpsc::channel(NetworkConfig::global().channel_capacity);
             muxer.register_stream(stream_id, v_tx);
 
             tokio::spawn(async move {
