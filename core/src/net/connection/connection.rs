@@ -1,4 +1,10 @@
 use crate::{
+    net::{
+        connection::{
+            bridge::run_tcp_bridge, engine::TunnelEngine, handler::StreamHandler, muxer::Muxer,
+        },
+        network::NetworkConfig,
+    },
     nrxp::{
         codec::{
             codec::Codec,
@@ -6,14 +12,8 @@ use crate::{
             socks::{SocksReply, SocksRequest},
         },
         errors::ErrorAction,
-        parser::parser::Parser,
     },
-    net::{
-        connection::{
-            bridge::run_tcp_bridge, engine::TunnelEngine, handler::StreamHandler, muxer::Muxer,
-        },
-        network::NetworkConfig,
-    },
+    parser::Parser,
     tlseng::profile::BrowserProfile,
 };
 use bytes::BytesMut;

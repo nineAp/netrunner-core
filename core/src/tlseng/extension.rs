@@ -1,9 +1,13 @@
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 
-use crate::tlseng::{
-    consts::{CERT_COMPRESSION_BROTLI, OCSP_STATUS_TYPE, PSK_DHE_KE_MODE, TYPE_HOST_NAME},
-    profile::BrowserProfile,
-    types::{TlsExtensions, TlsGroups, TlsSignatures, TlsVersions},
+use crate::{
+    nrxp::errors::{ErrorAction, ErrorStage, TlsError},
+    parser::Parser,
+    tlseng::{
+        consts::{CERT_COMPRESSION_BROTLI, OCSP_STATUS_TYPE, PSK_DHE_KE_MODE, TYPE_HOST_NAME},
+        profile::BrowserProfile,
+        types::{TlsExtensions, TlsGroups, TlsSignatures, TlsVersions},
+    },
 };
 
 #[derive(Debug)]
@@ -24,6 +28,54 @@ impl ExtensionStack {
             .iter()
             .find(|e| e.etype == etype)
             .map(|e| e.data.clone())
+    }
+}
+
+impl Parser for ExtensionStack {
+    type Error = TlsError;
+
+    fn can_parse(bytes: &BytesMut) -> bool {
+        let mut offset = 0;
+        let data_len = bytes.len();
+
+        while offset + 4 <= data_len {
+            let elen = u16::from_be_bytes([bytes[offset + 2], bytes[offset + 3]]) as usize;
+            offset += 4 + elen;
+        }
+
+        offset <= data_len
+    }
+
+    fn parse(bytes: &mut BytesMut) -> Result<Option<Self>, Self::Error> {
+        let mut offset = 0;
+        let data_len = bytes.len();
+
+        while offset + 4 <= data_len {
+            let elen = u16::from_be_bytes([bytes[offset + 2], bytes[offset + 3]]) as usize;
+            offset += 4 + elen;
+        }
+
+        if offset > data_len {
+            return Ok(None);
+        }
+
+        if offset != data_len {
+            return Err(TlsError::new(
+                ErrorStage::Tls("Malformed extension stack: trailing data"),
+                ErrorAction::Drop,
+                Bytes::new(),
+            ));
+        }
+
+        let mut extensions = Vec::new();
+        while bytes.remaining() >= 4 {
+            let etype = bytes.get_u16();
+            let elen = bytes.get_u16() as usize;
+            let data = bytes.split_to(elen).freeze();
+            extensions.push(Extension::new(etype, data));
+        }
+
+        Ok(Some(Self { extensions }))
     }
 }
 

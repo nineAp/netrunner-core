@@ -6,7 +6,7 @@ use crate::crypto::session::SessionKeys;
 use crate::nrxp::codec::bridge::TlsBridge;
 use crate::nrxp::codec::frame::{Frame, FrameHeader, FrameType, Padding};
 use crate::nrxp::errors::{ErrorAction, ErrorStage, TlsError};
-use crate::nrxp::parser::parser::Parser;
+use crate::parser::Parser;
 use crate::tlseng::profile::{BrowserProfile, ServerProfile};
 
 pub struct Codec {

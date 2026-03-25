@@ -1,5 +1,7 @@
 mod crypto;
-pub mod nrxp;
 pub mod net;
+pub mod nrxp;
+pub mod parser;
+pub mod rawcast;
 mod tlseng;
 mod utils;

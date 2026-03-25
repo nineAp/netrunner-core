@@ -1,12 +1,11 @@
 use crate::crypto::session::SessionKeys;
 use crate::nrxp::errors::{ErrorAction, ErrorStage, TlsError};
-use crate::nrxp::parser::parser::Parser;
+use crate::parser::Parser;
 use crate::tlseng::extension::ExtensionStack;
 use crate::tlseng::handshake::{ClientHello, HelloHeader, ServerHello};
 use crate::tlseng::profile::{BrowserProfile, ServerProfile};
-use crate::tlseng::tls_record::TlsRecord;
+use crate::tlseng::tls_record::{ApplicationData, TlsRecord};
 use crate::tlseng::types::{ContentType, HelloType};
-use crate::tlseng::ApplicationData;
 use bytes::{Bytes, BytesMut};
 
 pub trait TlsInterceptor {
