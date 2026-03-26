@@ -38,10 +38,10 @@ pub trait TunnelHandler {
 }
 
 pub struct Connection {
-    pub inbound: OwnedReadHalf,
-    pub outbound: OwnedWriteHalf,
-    pub read_buf: BytesMut,
-    pub codec: Codec,
+    pub(crate) inbound: OwnedReadHalf,
+    pub(crate) outbound: OwnedWriteHalf,
+    pub(crate) read_buf: BytesMut,
+    pub(crate) codec: Codec,
 }
 
 impl Connection {

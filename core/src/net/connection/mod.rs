@@ -1,5 +1,7 @@
-mod bridge;
-pub mod connection;
-pub mod engine;
-pub mod handler;
-pub mod muxer;
+mod bridge; // Все модули делаем приватными
+mod connection;
+mod engine;
+mod handler;
+mod muxer;
+
+pub use connection::{ClientHandler, Connection, ConnectionRole, ServerHandler, TunnelHandler};

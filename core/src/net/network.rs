@@ -1,9 +1,7 @@
 use std::sync::OnceLock;
 
 use crate::{
-    net::connection::connection::{
-        ClientHandler, Connection, ConnectionRole, ServerHandler, TunnelHandler,
-    },
+    net::connection::{ClientHandler, Connection, ConnectionRole, ServerHandler, TunnelHandler},
     nrxp::frame::{FRAME_HEADER_SIZE, MAX_PADDING_SIZE},
 };
 use netrunner_logger::{error, info};

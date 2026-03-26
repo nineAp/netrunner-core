@@ -14,7 +14,7 @@ use crate::{
     nrxp::{codec::Codec, errors::ErrorAction, frame::FrameType},
 };
 
-pub struct TunnelEngine {
+pub(crate) struct TunnelEngine {
     pub inbound: OwnedReadHalf,
     pub outbound: OwnedWriteHalf,
     pub codec: Codec,

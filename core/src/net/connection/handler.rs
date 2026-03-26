@@ -16,17 +16,17 @@ use crate::{
     },
 };
 
-pub struct StreamHandler {
+pub(crate) struct StreamHandler {
     muxer: Muxer,
     role: ConnectionRole,
 }
 
 impl StreamHandler {
-    pub fn new(muxer: Muxer, role: ConnectionRole) -> Self {
+    pub(crate) fn new(muxer: Muxer, role: ConnectionRole) -> Self {
         Self { muxer, role }
     }
 
-    pub async fn handle(&self, frame: Frame) {
+    pub(crate) async fn handle(&self, frame: Frame) {
         let stream_id = frame.header.stream_id;
 
         match frame.header.frame_type {

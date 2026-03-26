@@ -1,5 +1,4 @@
-use netrunner_core::net::connection::connection::ClientHandler;
-use netrunner_core::net::connection::muxer::Muxer;
+use netrunner_core::net::ClientHandler;
 use smoltcp::iface::PollResult;
 use smoltcp::time::Instant;
 use smoltcp::wire::{IpAddress, IpCidr};

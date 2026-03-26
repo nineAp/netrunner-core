@@ -7,7 +7,7 @@ use crate::tun::{routing::reset_platform_routing, tun::Tun};
 use net::engine::{EngineBuilder, EngineConfig};
 
 // Импортируем компоненты локального прокси
-use netrunner_core::net::connection::connection::ConnectionRole;
+use netrunner_core::net::ConnectionRole;
 use netrunner_core::net::network::Network;
 use tokio_util::sync::CancellationToken;
 

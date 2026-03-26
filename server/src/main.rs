@@ -1,5 +1,5 @@
 use clap::Parser;
-use netrunner_core::net::{connection::connection::ConnectionRole, network::Network};
+use netrunner_core::net::{network::Network, ConnectionRole};
 use netrunner_logger::Logger;
 use tokio_util::sync::CancellationToken;
 #[derive(Parser, Debug)]

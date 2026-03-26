@@ -6,7 +6,7 @@ use tokio::sync::mpsc::{error::SendError, Sender};
 
 use crate::nrxp::frame::FrameType;
 
-pub struct IdGenerator {
+struct IdGenerator {
     counter: AtomicU32,
 }
 

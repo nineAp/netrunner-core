@@ -6,7 +6,7 @@ use netrunner_logger::{debug, error};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
-pub async fn run_tcp_bridge<R, W>(
+pub(crate) async fn run_tcp_bridge<R, W>(
     stream_id: u32,
     mut reader: R,
     mut writer: W,
@@ -72,7 +72,7 @@ pub async fn run_tcp_bridge<R, W>(
     muxer.remove_stream(stream_id);
 }
 
-pub async fn run_udp_bridge(
+pub(crate) async fn run_udp_bridge(
     stream_id: u32,
     socket: UdpSocket,
     muxer: Muxer,
