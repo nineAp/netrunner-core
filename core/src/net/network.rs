@@ -34,7 +34,7 @@ impl Network {
         let addr = format!("{}:{}", self.host, self.port);
 
         // Инициализируем глобальный конфиг сети (MTU, размеры буферов)
-        NetworkConfig::init_global(1500);
+        NetworkConfig::init_global(1280);
 
         match self.role {
             ConnectionRole::Client => {
