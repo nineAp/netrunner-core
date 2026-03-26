@@ -193,22 +193,15 @@ impl ClientHandler {
 
                         tokio::spawn(async move {
                             while let Some(payload) = v_rx.recv().await {
-                                if payload.is_empty() {
-                                    let close_frame =
-                                        RawCastFrame::close(protocol, socket_id, dst_ip, dst_port);
-                                    let _ = tx_engine_clone.send(close_frame).await;
+                                let data_frame = RawCastFrame::data(
+                                    protocol,
+                                    socket_id,
+                                    dst_ip,
+                                    dst_port,
+                                    payload.to_vec(),
+                                );
+                                if tx_engine_clone.send(data_frame).await.is_err() {
                                     break;
-                                } else {
-                                    let data_frame = RawCastFrame::data(
-                                        protocol,
-                                        socket_id,
-                                        dst_ip,
-                                        dst_port,
-                                        payload.to_vec(),
-                                    );
-                                    if tx_engine_clone.send(data_frame).await.is_err() {
-                                        break;
-                                    }
                                 }
                             }
                             muxer_clone.remove_stream(stream_id);

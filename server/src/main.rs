@@ -14,6 +14,7 @@ struct Args {
 
 fn main() {
     Logger::init();
+    Logger::global().set_level("trace"); //set error in prod
     let args = Args::parse();
     let net = Network::new(args.host, args.port, ConnectionRole::Server, None);
 

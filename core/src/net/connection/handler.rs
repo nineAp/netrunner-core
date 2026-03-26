@@ -41,7 +41,8 @@ impl StreamHandler {
             let target_str = String::from_utf8_lossy(&payload).to_string();
             let muxer = self.muxer.clone();
 
-            let (v_tx, v_rx) = tokio::sync::mpsc::channel(NetworkConfig::global().stream_capacity);
+            let (v_tx, v_rx) =
+                tokio::sync::mpsc::channel(NetworkConfig::global().tcp_stream_capacity);
             muxer.register_stream(stream_id, v_tx);
 
             tokio::spawn(async move {
@@ -83,7 +84,8 @@ impl StreamHandler {
             let target_str = String::from_utf8_lossy(&payload).to_string();
             let muxer = self.muxer.clone();
 
-            let (v_tx, v_rx) = tokio::sync::mpsc::channel(NetworkConfig::global().stream_capacity);
+            let (v_tx, v_rx) =
+                tokio::sync::mpsc::channel(NetworkConfig::global().udp_stream_capacity);
             muxer.register_stream(stream_id, v_tx);
 
             tokio::spawn(async move {
@@ -128,7 +130,6 @@ impl StreamHandler {
     }
 
     async fn on_close(&self, stream_id: u32) {
-        self.muxer.dispatch_to_local(stream_id, Bytes::new()).await;
         self.muxer.remove_stream(stream_id);
     }
 }

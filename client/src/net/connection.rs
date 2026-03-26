@@ -3,13 +3,11 @@ use netrunner_core::net::network::NetworkConfig;
 use smoltcp::{
     iface::SocketHandle,
     socket::{tcp, udp},
+    time::Instant,
     wire::IpEndpoint,
 };
 use std::time::Duration;
-use tokio::{
-    sync::{mpsc, oneshot},
-    time::Instant,
-};
+use tokio::sync::{mpsc, oneshot};
 // Добавили trace для частых логов (попакетно) и debug для состояний
 use netrunner_logger::{debug, info, trace, warn};
 
@@ -29,9 +27,9 @@ impl ConnectionCore {
     pub fn new(handle: SocketHandle) -> (Self, mpsc::Receiver<Bytes>, mpsc::Sender<Bytes>) {
         trace!(%handle, "Creating ConnectionCore channels");
         let (tx_to_net, rx_from_smol) =
-            mpsc::channel::<Bytes>(NetworkConfig::global().stream_capacity);
+            mpsc::channel::<Bytes>(NetworkConfig::global().tcp_stream_capacity);
         let (tx_to_smol, rx_from_net) =
-            mpsc::channel::<Bytes>(NetworkConfig::global().stream_capacity);
+            mpsc::channel::<Bytes>(NetworkConfig::global().tcp_stream_capacity);
 
         let core = Self {
             handle,
@@ -247,8 +245,22 @@ impl UdpConnection {
     }
 
     pub fn tick(&mut self, socket: &mut udp::Socket) -> bool {
-        if self.last_activity.elapsed() > UDP_TIMEOUT {
-            debug!(%self.core.handle, "UDP Session closed due to {}s timeout", UDP_TIMEOUT.as_secs());
+        // 1. Получаем текущее время системы в миллисекундах
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+
+        // 2. Считаем разницу (сколько мс прошло с последней активности)
+        let elapsed_ms = now_ms - self.last_activity.total_millis();
+
+        // 3. Сравниваем с UDP_TIMEOUT (переводим его тоже в мс)
+        if elapsed_ms > UDP_TIMEOUT.as_millis() as i64 {
+            debug!(
+                %self.core.handle,
+                "UDP Session closed due to {}s timeout",
+                UDP_TIMEOUT.as_secs()
+            );
             socket.close();
             return false;
         }
@@ -286,34 +298,30 @@ impl UdpConnection {
 
         if socket.can_send() {
             if let Some(client_endpoint) = self.client_endpoint {
-                while let Ok(data) = self.core.rx.try_recv() {
-                    if data.is_empty() {
-                        debug!(%self.core.handle, "Received empty datagram (Close signal) from Muxer, closing UDP socket");
-                        socket.close();
-                        return false;
-                    }
-
-                    match socket.send_slice(&data, client_endpoint) {
-                        Ok(_) => {
-                            let proxy_endpoint = socket.endpoint();
-                            info!(
-                                %self.core.handle,
-                                source = %proxy_endpoint,
-                                target = %client_endpoint,
-                                bytes = data.len(),
-                                "Wrote UDP reply from Muxer back to smoltcp"
-                            );
-                            self.last_activity = Instant::now();
-                        }
-                        Err(e) => {
-                            debug!(%self.core.handle, "Failed to send UDP datagram to smoltcp: {:?}", e);
+                loop {
+                    match self.core.rx.try_recv() {
+                        Ok(data) => match socket.send_slice(&data, client_endpoint) {
+                            Ok(_) => {
+                                self.last_activity = smoltcp::time::Instant::now();
+                            }
+                            Err(e) => {
+                                debug!(%self.core.handle, "Failed to send UDP datagram: {:?}", e);
+                                break;
+                            }
+                        },
+                        Err(mpsc::error::TryRecvError::Empty) => {
                             break;
+                        }
+                        Err(mpsc::error::TryRecvError::Disconnected) => {
+                            // Сервер разорвал соединение!
+                            debug!(%self.core.handle, "Muxer channel disconnected, closing UDP socket");
+                            socket.close();
+                            return false;
                         }
                     }
                 }
             }
         }
-
         true
     }
 }

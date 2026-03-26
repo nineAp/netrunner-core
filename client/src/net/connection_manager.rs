@@ -168,7 +168,7 @@ impl SocketFactory {
         let (buf_size, packet_count) = match port {
             443 => (max_buf, max_buf / payload_size), // QUIC/HTTP3 трафик
             53 => (64 * 1024, (64 * 1024) / payload_size), // DNS
-            _ => (max_buf / 2, (max_buf / 2) / payload_size),
+            _ => (max_buf, max_buf / payload_size),
         };
 
         // Гарантируем, что метаданных хватит хотя бы на 10 пакетов

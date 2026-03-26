@@ -34,7 +34,7 @@ impl Network {
         let addr = format!("{}:{}", self.host, self.port);
 
         // Инициализируем глобальный конфиг сети (MTU, размеры буферов)
-        NetworkConfig::init_global(1350);
+        NetworkConfig::init_global(1500);
 
         match self.role {
             ConnectionRole::Client => {
@@ -86,8 +86,9 @@ pub struct NetworkConfig {
     // --- ИЗМЕНЕНИЯ ЗДЕСЬ ---
     pub tcp_buffer_size: usize, // Размер буфера для системного tokio::TcpStream
     pub udp_buffer_size: usize,
-    pub muxer_capacity: usize,  // Глобальные каналы (Muxer <-> Engine)
-    pub stream_capacity: usize, // Локальные каналы 1 сокета (Engine <-> Muxer)
+    pub muxer_capacity: usize,      // Глобальные каналы (Muxer <-> Engine)
+    pub tcp_stream_capacity: usize, // Локальные каналы 1 сокета (Engine <-> Muxer)
+    pub udp_stream_capacity: usize, // Локальные каналы 1 сокета (Engine <-> Muxer)
 
     pub smoltcp_socket_buf: usize,
     pub tcp_max_pending: usize,
@@ -101,7 +102,8 @@ impl NetworkConfig {
         let safe_payload = max_wire_frame.saturating_sub(10).saturating_sub(255);
 
         let muxer_capacity = 64;
-        let stream_capacity = 4;
+        let tcp_stream_capacity = 4; // Жесткий лимит для загрузок
+        let udp_stream_capacity = 8;
 
         Self {
             mtu: system_mtu,
@@ -113,7 +115,8 @@ impl NetworkConfig {
             udp_buffer_size: 16 * 1024,
 
             muxer_capacity,
-            stream_capacity,
+            tcp_stream_capacity,
+            udp_stream_capacity,
             smoltcp_socket_buf: 64 * 1024,
             tcp_max_pending: 16 * 1024,
             tcp_chunk_size: 8 * 1024,

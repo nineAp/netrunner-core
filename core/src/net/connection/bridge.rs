@@ -44,7 +44,7 @@ pub(crate) async fn run_tcp_bridge<R, W>(
             maybe_data = v_rx.recv() => {
                 match maybe_data {
                     Some(data) => {
-                        if data.is_empty() { break; }
+                        if data.is_empty() { continue; }
                         if let Err(e) = writer.write_all(&data).await {
                             error!(stream_id, error = %e, "Socket write error");
                             break;
@@ -103,7 +103,6 @@ pub(crate) async fn run_udp_bridge(
             maybe_data = v_rx.recv() => {
                 match maybe_data {
                     Some(data) => {
-                        if data.is_empty() { break; }
                         if let Err(e) = socket.send(&data).await {
                             error!(stream_id, error = %e, "UDP socket write error");
                             break;

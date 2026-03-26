@@ -13,6 +13,7 @@ use tokio_util::sync::CancellationToken;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     netrunner_logger::Logger::init();
+    netrunner_logger::Logger::global().set_level("debug");
     info!("Initializing NetRunner Stack...");
 
     let remote_address = "147.45.43.70:443".to_string();
@@ -23,7 +24,7 @@ async fn main() -> anyhow::Result<()> {
     // ==================================================
     let config = EngineConfig::new(&remote_address)
         .with_cache_path(".")
-        .with_mtu(1350);
+        .with_mtu(1500);
 
     // ВАЖНО: Инициализируем глобальные настройки сети (MTU, размеры буферов Muxer'а)
     NetworkConfig::init_global(config.mtu);

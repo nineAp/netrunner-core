@@ -89,7 +89,7 @@ impl SessionManager {
 
         #[cfg(target_os = "linux")]
         {
-            config = config.with_mtu(1350);
+            config = config.with_mtu(1500);
         }
 
         NetworkConfig::init_global(config.mtu);
