@@ -24,7 +24,7 @@ async fn main() -> anyhow::Result<()> {
     // ==================================================
     let config = EngineConfig::new(&remote_address)
         .with_cache_path(".")
-        .with_mtu(1280);
+        .with_mtu(1500);
 
     // ВАЖНО: Инициализируем глобальные настройки сети (MTU, размеры буферов Muxer'а)
     NetworkConfig::init_global(config.mtu);
