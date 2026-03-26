@@ -161,7 +161,7 @@ impl SocketFactory {
 
     fn create_udp<'a>(port: u16) -> udp::Socket<'a> {
         let config = NetworkConfig::global();
-        let max_buf = config.udp_buffer_size;
+        let max_buf = config.smoltcp_socket_buf;
         let payload_size = config.safe_payload_size.max(1); // Защита от деления на 0
 
         // Вычисляем размер буфера и количество пакетов
@@ -170,9 +170,7 @@ impl SocketFactory {
             53 => (64 * 1024, (64 * 1024) / payload_size), // DNS
             _ => (max_buf, max_buf / payload_size),
         };
-
-        // Гарантируем, что метаданных хватит хотя бы на 10 пакетов
-        let packet_count = packet_count.max(10);
+        let packet_count = packet_count.max(32);
 
         udp::Socket::new(
             udp::PacketBuffer::new(
@@ -226,13 +224,25 @@ impl ConnectionManager {
             match tx.try_send(frame.payload.clone()) {
                 Ok(_) => Ok(()),
                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                    Err(frame) // Возвращаем кадр, чтобы Engine затормозил чтение туннеля
+                    error!(
+                        "🟡 WARNING: Inbound channel FULL for stream {}",
+                        frame.socket_id
+                    );
+                    Err(frame)
                 }
                 Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                    Ok(()) // Сокет уже закрыт браузером, дропаем пакет
+                    error!(
+                        "🔴 WARNING: Inbound channel CLOSED for stream {}",
+                        frame.socket_id
+                    );
+                    Ok(())
                 }
             }
         } else {
+            error!(
+                "👻 ORPHAN PACKET: No local socket for stream {}",
+                frame.socket_id
+            );
             Ok(())
         }
     }

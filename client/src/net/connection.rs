@@ -9,7 +9,7 @@ use smoltcp::{
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 // Добавили trace для частых логов (попакетно) и debug для состояний
-use netrunner_logger::{debug, info, trace, warn};
+use netrunner_logger::{debug, error, info, trace, warn};
 
 // ============================================================================
 // 1. БАЗОВАЯ СТРУКТУРА (ConnectionCore)
@@ -302,10 +302,16 @@ impl UdpConnection {
                     match self.core.rx.try_recv() {
                         Ok(data) => match socket.send_slice(&data, client_endpoint) {
                             Ok(_) => {
+                                info!(
+                                    %self.core.handle,
+                                    bytes = data.len(),
+                                    target = %client_endpoint,
+                                    "🟢 SUCCESS: Received UDP from tunnel, pushed to smoltcp!"
+                                );
                                 self.last_activity = smoltcp::time::Instant::now();
                             }
                             Err(e) => {
-                                debug!(%self.core.handle, "Failed to send UDP datagram: {:?}", e);
+                                error!(%self.core.handle, "Failed to send UDP datagram: {:?}", e);
                                 break;
                             }
                         },
