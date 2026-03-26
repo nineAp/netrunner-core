@@ -300,7 +300,7 @@ impl EngineConfig {
         self
     }
 
-    pub fn _disable_routing(mut self) -> Self {
+    pub fn disable_routing(mut self) -> Self {
         self.setup_routing = false;
         self
     }
