@@ -2,12 +2,14 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 use rand::Rng;
 
-use crate::{nrxp::codec::MAX_PADDING_SIZE, parser::Parser};
+use crate::parser::Parser;
 
 pub struct Padding {
     pub len: u16,
     pub data: Bytes,
 }
+
+pub const MAX_PADDING_SIZE: u32 = 255;
 
 impl Padding {
     pub fn generate_padding() -> Padding {

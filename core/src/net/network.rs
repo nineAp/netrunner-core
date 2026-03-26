@@ -1,10 +1,10 @@
 use std::sync::OnceLock;
 
 use crate::{
-    nrxp::codec::{frame::FRAME_HEADER_SIZE, MAX_PADDING_SIZE},
     net::connection::connection::{
         ClientHandler, Connection, ConnectionRole, ServerHandler, TunnelHandler,
     },
+    nrxp::frame::{FRAME_HEADER_SIZE, MAX_PADDING_SIZE},
 };
 use netrunner_logger::{error, info};
 use tokio::net::TcpListener;

@@ -3,9 +3,9 @@ use bytes::{Bytes, BytesMut};
 use crate::crypto::aead::AeadPacker;
 use crate::crypto::chacha::ChaChaCipher;
 use crate::crypto::session::SessionKeys;
-use crate::nrxp::codec::bridge::TlsBridge;
-use crate::nrxp::codec::frame::{Frame, FrameHeader, FrameType, Padding};
+use crate::nrxp::bridge::TlsBridge;
 use crate::nrxp::errors::{ErrorAction, ErrorStage, TlsError};
+use crate::nrxp::frame::{Frame, FrameHeader, FrameType, Padding};
 use crate::parser::Parser;
 use crate::tlseng::profile::{BrowserProfile, ServerProfile};
 

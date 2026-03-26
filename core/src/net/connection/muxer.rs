@@ -1,9 +1,10 @@
-use crate::nrxp::codec::frame::FrameType;
 use bytes::Bytes;
 use dashmap::DashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc::{error::SendError, Sender};
+
+use crate::nrxp::frame::FrameType;
 
 pub struct IdGenerator {
     counter: AtomicU32,

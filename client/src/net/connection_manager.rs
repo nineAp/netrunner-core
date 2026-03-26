@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use netrunner_core::nrxp::codec::socks::TargetAddress;
+use netrunner_core::nrxp::socks::TargetAddress;
 use netrunner_logger::{debug, error, info, trace, warn};
 use smoltcp::{
     iface::{SocketHandle, SocketSet},

@@ -6,12 +6,10 @@ use crate::{
         network::NetworkConfig,
     },
     nrxp::{
-        codec::{
-            codec::Codec,
-            frame::FrameType,
-            socks::{SocksReply, SocksRequest},
-        },
+        codec::Codec,
         errors::ErrorAction,
+        frame::FrameType,
+        socks::{SocksReply, SocksRequest},
     },
     parser::Parser,
     tlseng::profile::BrowserProfile,

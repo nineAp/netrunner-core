@@ -10,7 +10,7 @@ use crate::{
         },
         network::NetworkConfig,
     },
-    nrxp::codec::{
+    nrxp::{
         frame::{Frame, FrameType},
         socks::SocksReply,
     },
