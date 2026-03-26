@@ -1,7 +1,7 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 use crate::{
-    nrxp::errors::{ErrorAction, ErrorStage, TlsError},
+    nrxp::{ErrorAction, ErrorStage, TlsError},
     parser::Parser,
     tlseng::types::{ContentType, ProtocolVersion},
 };

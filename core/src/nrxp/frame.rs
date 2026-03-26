@@ -4,7 +4,7 @@ use rand::Rng;
 
 use crate::parser::Parser;
 
-pub struct Padding {
+struct Padding {
     pub len: u16,
     pub data: Bytes,
 }
@@ -26,7 +26,7 @@ impl Padding {
 }
 
 #[derive(Copy, Clone, Debug)]
-pub enum FrameType {
+pub(crate) enum FrameType {
     Connect = 0x00,
     Data = 0x01,
     Close = 0x02,
@@ -35,18 +35,18 @@ pub enum FrameType {
     UdpData = 0x05,
 }
 #[derive(Copy, Clone)]
-pub struct FrameHeader {
-    pub auth_tag: [u8; 16],
-    pub stream_id: u32,
-    pub frame_type: FrameType,
-    pub payload_len: u16,
-    pub padding_len: u16,
+pub(crate) struct FrameHeader {
+    pub(crate) _auth_tag: [u8; 16],
+    pub(crate) stream_id: u32,
+    pub(crate) frame_type: FrameType,
+    pub(crate) payload_len: u16,
+    pub(crate) padding_len: u16,
 }
 
-pub struct Frame {
-    pub header: FrameHeader,
-    pub payload: Bytes,
-    pub padding: Bytes,
+pub(crate) struct Frame {
+    pub(crate) header: FrameHeader,
+    pub(crate) payload: Bytes,
+    pub(crate) _padding: Bytes,
 }
 
 const AUTH_TAG_SIZE: u16 = 16;
@@ -59,25 +59,44 @@ pub const FRAME_HEADER_SIZE: u16 =
     AUTH_TAG_SIZE + STREAM_ID_SIZE + FRAME_TYPE_SIZE + PAYLOAD_LEN_SIZE + PADDING_LEN_SIZE;
 
 impl Frame {
-    pub fn into_bytes(self, auth_key: &[u8; 16]) -> BytesMut {
-        let updated_padding = Padding::generate_padding();
-        let total_size = FRAME_HEADER_SIZE as usize + self.payload.len() + self.padding.len();
+    pub(crate) fn new(stream_id: u32, frame_type: FrameType, payload: Bytes) -> Self {
+        Self {
+            header: FrameHeader {
+                _auth_tag: [0u8; 16],
+                stream_id,
+                frame_type,
+                payload_len: payload.len() as u16,
+                padding_len: 0,
+            },
+            payload,
+            _padding: Bytes::new(),
+        }
+    }
+
+    // 3. БЕЗОПАСНАЯ СЕРИАЛИЗАЦИЯ С ИСПРАВЛЕННЫМ БАГОМ РАЗМЕРА
+    pub(crate) fn into_bytes(mut self, auth_key: &[u8; 16]) -> BytesMut {
+        let generated_padding = Padding::generate_padding();
+
+        // Обновляем заголовок реальной длиной сгенерированного паддинга
+        self.header.padding_len = generated_padding.len;
+
+        // Теперь размер считается правильно!
+        let total_size =
+            FRAME_HEADER_SIZE as usize + self.payload.len() + generated_padding.len as usize;
         let mut buf = BytesMut::with_capacity(total_size);
 
         buf.put_slice(auth_key);
         buf.put_u32(self.header.stream_id);
         buf.put_u8(self.header.frame_type as u8);
         buf.put_u16(self.header.payload_len);
-        buf.put_u16(updated_padding.len);
+        buf.put_u16(self.header.padding_len);
 
         buf.put(self.payload);
-
-        buf.put(updated_padding.data);
+        buf.put(generated_padding.data);
 
         buf
     }
 }
-
 impl Parser for FrameHeader {
     type Error = String;
 
@@ -92,8 +111,8 @@ impl Parser for FrameHeader {
 
         let mut header_chunk = bytes.split_to(FRAME_HEADER_SIZE as usize);
 
-        let mut auth_tag = [0u8; 16];
-        header_chunk.copy_to_slice(&mut auth_tag);
+        let mut _auth_tag = [0u8; 16];
+        header_chunk.copy_to_slice(&mut _auth_tag);
 
         let stream_id = header_chunk.get_u32();
 
@@ -110,7 +129,7 @@ impl Parser for FrameHeader {
         let padding_len = header_chunk.get_u16();
 
         Ok(Some(Self {
-            auth_tag,
+            _auth_tag,
             stream_id,
             frame_type,
             payload_len,
@@ -156,12 +175,12 @@ impl Parser for Frame {
         }
 
         let payload = bytes.split_to(p_len).freeze();
-        let padding = bytes.split_to(pad_len).freeze();
+        let _padding = bytes.split_to(pad_len).freeze();
 
         Ok(Some(Self {
             header,
             payload,
-            padding,
+            _padding,
         }))
     }
 }

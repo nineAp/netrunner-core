@@ -2,8 +2,8 @@ use aead::{rand_core::RngCore, OsRng};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 use crate::{
-    crypto::session::SessionKeys,
-    nrxp::errors::{ErrorAction, ErrorStage, TlsError},
+    crypto::SessionKeys,
+    nrxp::{ErrorAction, ErrorStage, TlsError},
     parser::Parser,
     tlseng::{
         consts::{HANDSHAKE_TYPE_CLIENT_HELLO, HANDSHAKE_TYPE_SERVER_HELLO},
@@ -15,7 +15,7 @@ use crate::{
     utils::u24::{BufExt, U24},
 };
 
-pub struct HelloHeader {
+pub(crate) struct HelloHeader {
     pub header_type: HelloType,
     pub _len: U24,
 }
@@ -49,7 +49,7 @@ impl Parser for HelloHeader {
     }
 }
 
-pub struct ClientHello {
+pub(crate) struct ClientHello {
     pub _version: ProtocolVersion,
 
     pub random: [u8; 32],
@@ -96,7 +96,7 @@ impl ClientHello {
     }
 
     pub fn make_client_hello(profile: &BrowserProfile, host: &str, keys: &SessionKeys) -> Bytes {
-        let tls_random = keys.salt.get_local();
+        let tls_random = keys.local_salt();
         let mut session_id_bytes = [0u8; 32];
         OsRng.fill_bytes(&mut session_id_bytes[..16]);
         session_id_bytes[16..].copy_from_slice(&keys.generate_auth_tag());
@@ -109,12 +109,7 @@ impl ClientHello {
 
         let mut ext_builder = ExtensionBuilder::new();
 
-        ext_builder.apply_profile(
-            profile,
-            host,
-            &keys.ecdh.public_key.to_bytes(),
-            total_overhead,
-        );
+        ext_builder.apply_profile(profile, host, &keys.public_key_bytes(), total_overhead);
 
         let extensions_bytes = ext_builder.build();
 
@@ -220,7 +215,7 @@ impl Parser for ClientHello {
     }
 }
 
-pub struct ServerHello {
+pub(crate) struct ServerHello {
     pub version: ProtocolVersion,
     pub random: [u8; 32],
     pub session_id: Bytes,

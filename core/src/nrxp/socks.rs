@@ -4,19 +4,19 @@ use bytes::{Buf, BufMut, BytesMut};
 
 use crate::parser::Parser;
 
-pub const SOCKS5_VERSION: u8 = 0x05;
-pub const REPLY_SUCCESS: u8 = 0x00;
-pub const REPLY_AUTH_FAILURE: u8 = 0xFF;
-pub const SOCKS5_MIN_HEADER: usize = 4;
-pub const ATYP_IPV4: u8 = 0x01;
-pub const ATYP_DOMAIN: u8 = 0x03;
-pub const ATYP_IPV6: u8 = 0x04;
-pub const IPV4_SIZE: usize = 4;
-pub const IPV6_SIZE: usize = 16;
-pub const PORT_SIZE: usize = 2;
+const SOCKS5_VERSION: u8 = 0x05;
+const REPLY_SUCCESS: u8 = 0x00;
+const REPLY_AUTH_FAILURE: u8 = 0xFF;
+const SOCKS5_MIN_HEADER: usize = 4;
+const ATYP_IPV4: u8 = 0x01;
+const ATYP_DOMAIN: u8 = 0x03;
+const ATYP_IPV6: u8 = 0x04;
+const IPV4_SIZE: usize = 4;
+const IPV6_SIZE: usize = 16;
+const PORT_SIZE: usize = 2;
 
 #[derive(Debug)]
-pub enum SocksRequest {
+pub(crate) enum SocksRequest {
     Handshake { methods: Vec<u8> },
     Connect { command: u8, target: SocksTarget },
     Unknown,
@@ -151,7 +151,7 @@ impl SocksRequest {
 }
 
 #[derive(Debug)]
-pub enum SocksReply {
+pub(crate) enum SocksReply {
     HandshakeSelect {
         method: u8,
     },
@@ -181,7 +181,7 @@ impl fmt::Display for TargetAddress {
 }
 
 #[derive(Debug)]
-pub struct SocksTarget {
+pub(crate) struct SocksTarget {
     pub addr: TargetAddress,
 }
 

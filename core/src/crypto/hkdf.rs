@@ -1,15 +1,15 @@
 use hkdf::Hkdf;
 use sha2::Sha256;
 
-pub struct HKDF;
+pub(crate) struct HKDF;
 
 impl HKDF {
-    pub fn extract_key(salt: &[u8], ikm: &[u8]) -> Hkdf<Sha256> {
+    pub(crate) fn extract_key(salt: &[u8], ikm: &[u8]) -> Hkdf<Sha256> {
         let extracted_key = Hkdf::<Sha256>::new(Some(salt), ikm);
         extracted_key
     }
 
-    pub fn expand_key<const N: usize>(
+    pub(crate) fn expand_key<const N: usize>(
         extracted_key: &Hkdf<Sha256>,
         mark: &[u8],
     ) -> Result<[u8; N], String> {

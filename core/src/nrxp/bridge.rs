@@ -1,14 +1,14 @@
-use crate::crypto::session::SessionKeys;
+use crate::crypto::SessionKeys;
 use crate::nrxp::errors::{ErrorAction, ErrorStage, TlsError};
 use crate::parser::Parser;
-use crate::tlseng::extension::ExtensionStack;
-use crate::tlseng::handshake::{ClientHello, HelloHeader, ServerHello};
-use crate::tlseng::profile::{BrowserProfile, ServerProfile};
-use crate::tlseng::tls_record::{ApplicationData, TlsRecord};
-use crate::tlseng::types::{ContentType, HelloType};
+use crate::tlseng::ExtensionStack;
+use crate::tlseng::{ApplicationData, TlsRecord};
+use crate::tlseng::{BrowserProfile, ServerProfile};
+use crate::tlseng::{ClientHello, HelloHeader, ServerHello};
+use crate::tlseng::{ContentType, HelloType};
 use bytes::{Bytes, BytesMut};
 
-pub trait TlsInterceptor {
+trait TlsInterceptor {
     type Output;
 
     fn start_process(buffer: &mut BytesMut) -> Result<Option<Self::Output>, TlsError> {
@@ -22,7 +22,7 @@ pub trait TlsInterceptor {
     fn handle_record(record: TlsRecord) -> Result<Option<Self::Output>, TlsError>;
 }
 
-pub enum HandshakeMessage {
+pub(crate) enum HandshakeMessage {
     Client {
         base: ClientHello,
         extensions: ExtensionStack,
@@ -122,7 +122,7 @@ impl TlsInterceptor for ApplicationData {
     }
 }
 
-pub struct TlsBridge;
+pub(crate) struct TlsBridge;
 
 impl TlsBridge {
     pub fn unpack_handshake(buffer: &mut BytesMut) -> Result<Option<HandshakeMessage>, TlsError> {
@@ -173,12 +173,12 @@ impl TlsBridge {
                     )
                 })?;
 
-            let server_pub_key = keys.ecdh.public_key.to_bytes();
+            let server_pub_key = keys.public_key_bytes();
 
             Ok(ServerHello::make_server_hello(
                 base,
                 &server_pub_key,
-                keys.salt.get_local(),
+                keys.local_salt(),
                 profile,
             ))
         } else {

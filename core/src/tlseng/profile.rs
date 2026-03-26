@@ -1,7 +1,7 @@
 use crate::tlseng::types::{
     ExtensionOrder, ProtocolVersion, TlsGroups, TlsSignatures, TlsVersions,
 };
-pub struct BrowserProfile {
+pub(crate) struct BrowserProfile {
     pub name: &'static str,
     pub groups: TlsGroups,
     pub signatures: TlsSignatures,
@@ -63,7 +63,7 @@ impl BrowserProfile {
     };
 }
 
-pub struct ServerProfile {
+pub(crate) struct ServerProfile {
     pub versions: TlsVersions,
     pub record_layer_version: ProtocolVersion,
     pub cipher_suites: &'static [u16],

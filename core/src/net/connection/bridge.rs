@@ -1,6 +1,6 @@
 use crate::net::connection::muxer::{MuxMessage, Muxer};
 use crate::net::network::NetworkConfig;
-use crate::nrxp::frame::FrameType;
+use crate::nrxp::FrameType;
 use bytes::{Bytes, BytesMut};
 use netrunner_logger::{debug, error};
 use tokio::net::UdpSocket;

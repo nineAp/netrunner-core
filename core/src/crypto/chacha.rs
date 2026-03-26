@@ -3,8 +3,7 @@ use chacha20poly1305::aead::generic_array::GenericArray;
 use chacha20poly1305::{AeadInPlace, ChaCha20Poly1305, Key, KeyInit, Nonce};
 
 use crate::crypto::aead::AeadPacker;
-
-pub struct NonceState {
+struct NonceState {
     counter: u64,
     base_iv: [u8; 12],
 }
@@ -32,10 +31,10 @@ impl NonceState {
 }
 
 pub struct ChaChaCipher {
-    pub encrypt_cipher: ChaCha20Poly1305,
-    pub decrypt_cipher: ChaCha20Poly1305,
-    pub encrypt_state: NonceState,
-    pub decrypt_state: NonceState,
+    encrypt_cipher: ChaCha20Poly1305,
+    decrypt_cipher: ChaCha20Poly1305,
+    encrypt_state: NonceState,
+    decrypt_state: NonceState,
 }
 
 impl ChaChaCipher {

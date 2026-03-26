@@ -2,7 +2,7 @@ use x25519_dalek::PublicKey;
 
 use crate::{
     crypto::{ecdh::ECDH, hkdf::HKDF},
-    tlseng::extension::ExtensionStack,
+    tlseng::ExtensionStack,
 };
 
 use hmac::{Hmac, Mac};
@@ -12,14 +12,14 @@ type HmacSha256 = Hmac<Sha256>;
 
 use aead::{rand_core::RngCore, OsRng};
 
-pub struct SaltPair {
+pub(crate) struct SaltPair {
     local_salt: [u8; 32],
     remote_salt: [u8; 32],
     is_initiator: bool,
 }
 
 impl SaltPair {
-    pub fn new(is_initiator: bool) -> Self {
+    pub(crate) fn new(is_initiator: bool) -> Self {
         let mut local_salt = [0u8; 32];
         OsRng.fill_bytes(&mut local_salt);
         Self {
@@ -29,15 +29,15 @@ impl SaltPair {
         }
     }
 
-    pub fn get_local(&self) -> [u8; 32] {
+    pub(crate) fn get_local(&self) -> [u8; 32] {
         self.local_salt
     }
 
-    pub fn set_remote_salt(&mut self, salt: [u8; 32]) {
+    pub(crate) fn set_remote_salt(&mut self, salt: [u8; 32]) {
         self.remote_salt = salt
     }
 
-    pub fn get_total(&self) -> [u8; 64] {
+    pub(crate) fn get_total(&self) -> [u8; 64] {
         let mut salt = [0u8; 64];
         if self.is_initiator {
             salt[..32].copy_from_slice(&self.local_salt);
@@ -52,14 +52,14 @@ impl SaltPair {
 }
 
 pub struct SessionKeys {
-    pub salt: SaltPair,
-    pub ecdh: ECDH,
-    pub auth_key: [u8; 32],
-    pub current_aead: Option<([u8; 32], [u8; 12], [u8; 32], [u8; 12])>,
+    salt: SaltPair,
+    ecdh: ECDH,
+    auth_key: [u8; 32],
+    current_aead: Option<([u8; 32], [u8; 12], [u8; 32], [u8; 12])>,
 }
 
 impl SessionKeys {
-    pub fn new(is_initiator: bool) -> Self {
+    pub(crate) fn new(is_initiator: bool) -> Self {
         Self {
             salt: SaltPair::new(is_initiator),
             ecdh: ECDH::new(),
@@ -68,12 +68,12 @@ impl SessionKeys {
         }
     }
 
-    pub fn get_aead_parameters(&self) -> ([u8; 32], [u8; 12], [u8; 32], [u8; 12]) {
+    pub(crate) fn get_aead_parameters(&self) -> ([u8; 32], [u8; 12], [u8; 32], [u8; 12]) {
         self.current_aead
             .expect("Keys not generated yet. Call update_keys first.")
     }
 
-    pub fn update_keys(
+    pub(crate) fn update_keys(
         &mut self,
         salt: [u8; 32],
         extensions: &ExtensionStack,
@@ -176,7 +176,7 @@ impl SessionKeys {
         tag
     }
 
-    pub fn generate_auth_tag(&self) -> [u8; 16] {
+    pub(crate) fn generate_auth_tag(&self) -> [u8; 16] {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -185,7 +185,7 @@ impl SessionKeys {
         Self::compute_tag(&self.auth_key, now / 60)
     }
 
-    pub fn verify_auth_tag(&self, received_tag: &[u8; 16]) -> bool {
+    pub(crate) fn verify_auth_tag(&self, received_tag: &[u8; 16]) -> bool {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("Time went backwards")
@@ -207,5 +207,17 @@ impl SessionKeys {
             "AUTH MISMATCH: All tags rejected for current window"
         );
         false
+    }
+
+    pub(crate) fn local_salt(&self) -> [u8; 32] {
+        self.salt.get_local()
+    }
+
+    pub(crate) fn public_key_bytes(&self) -> [u8; 32] {
+        self.ecdh.public_key.to_bytes()
+    }
+
+    pub(crate) fn auth_key_fingerprint(&self) -> String {
+        hex::encode(&self.auth_key[..4])
     }
 }

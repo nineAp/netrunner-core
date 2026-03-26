@@ -1,6 +1,6 @@
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ContentType {
+pub(crate) enum ContentType {
     Handshake = 0x16,
 
     ApplicationData = 0x17,
@@ -23,7 +23,7 @@ impl TryFrom<u8> for ContentType {
 
 #[repr(u16)]
 #[derive(Copy, Clone, Debug)]
-pub enum ProtocolVersion {
+pub(crate) enum ProtocolVersion {
     Tls10 = 0x0301,
     Tls12 = 0x0303,
     Tls13 = 0x0304,
@@ -45,7 +45,7 @@ impl TryFrom<u16> for ProtocolVersion {
 }
 
 #[derive(Copy, Clone, Debug, PartialEq)]
-pub enum HelloType {
+pub(crate) enum HelloType {
     Client = 0x01,
 
     Server = 0x02,
@@ -64,7 +64,7 @@ impl TryFrom<u8> for HelloType {
 }
 
 #[derive(Clone, Copy)]
-pub struct TlsGroups(pub &'static [u16]);
+pub(crate) struct TlsGroups(pub &'static [u16]);
 
 impl TlsGroups {
     pub const X25519: u16 = 0x001d;
@@ -77,7 +77,7 @@ impl TlsGroups {
 }
 
 #[derive(Clone, Copy)]
-pub struct TlsSignatures(pub &'static [u16]);
+pub(crate) struct TlsSignatures(pub &'static [u16]);
 
 impl TlsSignatures {
     pub const ECDSA_SECP256R1_SHA256: u16 = 0x0403;

@@ -2,7 +2,7 @@ use std::sync::OnceLock;
 
 use crate::{
     net::connection::{ClientHandler, Connection, ConnectionRole, ServerHandler, TunnelHandler},
-    nrxp::frame::{FRAME_HEADER_SIZE, MAX_PADDING_SIZE},
+    nrxp::{FRAME_HEADER_SIZE, MAX_PADDING_SIZE},
 };
 use netrunner_logger::{error, info};
 use tokio::net::TcpListener;
@@ -75,7 +75,7 @@ impl Network {
                         res = listener.accept() => {
                             if let Ok((stream, client_addr)) = res {
                                 let conn = Connection::new(stream, true);
-                                let handler = ServerHandler { conn, token: token.clone() };
+                                let handler = ServerHandler { conn };
                                 tokio::spawn(async move {
                                     if let Err(e) = handler.run().await {
                                         error!(client = %client_addr, error = %e, "Server handler error");

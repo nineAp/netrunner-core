@@ -1,7 +1,7 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 use crate::{
-    nrxp::errors::{ErrorAction, ErrorStage, TlsError},
+    nrxp::{ErrorAction, ErrorStage, TlsError},
     parser::Parser,
     tlseng::{
         consts::{CERT_COMPRESSION_BROTLI, OCSP_STATUS_TYPE, PSK_DHE_KE_MODE, TYPE_HOST_NAME},
@@ -11,14 +11,14 @@ use crate::{
 };
 
 #[derive(Debug)]
-pub struct Extension {
+pub(crate) struct Extension {
     pub etype: u16,
-    pub elen: u16,
+    pub _elen: u16,
     pub data: Bytes,
 }
 
 #[derive(Debug)]
-pub struct ExtensionStack {
+pub(crate) struct ExtensionStack {
     pub extensions: Vec<Extension>,
 }
 
@@ -83,13 +83,13 @@ impl Extension {
     pub fn new(etype: u16, data: Bytes) -> Self {
         Self {
             etype,
-            elen: data.len() as u16,
+            _elen: data.len() as u16,
             data,
         }
     }
 }
 
-pub struct ExtensionBuilder {
+pub(crate) struct ExtensionBuilder {
     payload: BytesMut,
 }
 

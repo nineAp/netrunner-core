@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc::{error::SendError, Sender};
 
-use crate::nrxp::frame::FrameType;
+use crate::nrxp::FrameType;
 
 struct IdGenerator {
     counter: AtomicU32,

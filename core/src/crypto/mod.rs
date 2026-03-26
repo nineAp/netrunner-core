@@ -1,5 +1,9 @@
-pub mod aead;
-pub mod chacha;
+mod aead;
+mod chacha;
 mod ecdh;
 mod hkdf;
-pub mod session;
+mod session;
+
+pub(crate) use aead::AeadPacker;
+pub(crate) use chacha::ChaChaCipher;
+pub(crate) use session::SessionKeys;

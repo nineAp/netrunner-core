@@ -1,22 +1,22 @@
 use bytes::{Bytes, BytesMut};
 
-use crate::crypto::aead::AeadPacker;
-use crate::crypto::chacha::ChaChaCipher;
-use crate::crypto::session::SessionKeys;
+use crate::crypto::AeadPacker;
+use crate::crypto::ChaChaCipher;
+use crate::crypto::SessionKeys;
 use crate::nrxp::bridge::TlsBridge;
 use crate::nrxp::errors::{ErrorAction, ErrorStage, TlsError};
-use crate::nrxp::frame::{Frame, FrameHeader, FrameType, Padding};
+use crate::nrxp::frame::{Frame, FrameType};
 use crate::parser::Parser;
-use crate::tlseng::profile::{BrowserProfile, ServerProfile};
+use crate::tlseng::{BrowserProfile, ServerProfile};
 
 pub struct Codec {
     crypto: ChaChaCipher,
-    pub session_keys: SessionKeys,
+    session_keys: SessionKeys,
     staging: BytesMut,
 }
 
 impl Codec {
-    pub fn new(is_initiator: bool) -> Self {
+    pub(crate) fn new(is_initiator: bool) -> Self {
         Self {
             crypto: ChaChaCipher::new(),
             session_keys: SessionKeys::new(is_initiator),
@@ -24,7 +24,7 @@ impl Codec {
         }
     }
 
-    pub fn make_client_handshake(
+    pub(crate) fn make_client_handshake(
         &mut self,
         profile: &BrowserProfile,
         host: &str,
@@ -36,7 +36,10 @@ impl Codec {
         ))
     }
 
-    pub fn make_server_handshake(&mut self, buffer: &mut BytesMut) -> Result<Bytes, TlsError> {
+    pub(crate) fn make_server_handshake(
+        &mut self,
+        buffer: &mut BytesMut,
+    ) -> Result<Bytes, TlsError> {
         let client_msg = TlsBridge::unpack_handshake(buffer)?.ok_or_else(|| {
             TlsError::new(
                 ErrorStage::Handshake("No CH"),
@@ -57,7 +60,7 @@ impl Codec {
         Ok(server_hello_record)
     }
 
-    pub fn process_handshake(&mut self, buffer: &mut BytesMut) -> Result<(), TlsError> {
+    pub(crate) fn process_handshake(&mut self, buffer: &mut BytesMut) -> Result<(), TlsError> {
         let mes_opt = TlsBridge::unpack_handshake(buffer)?;
         let mes = mes_opt.ok_or_else(|| {
             TlsError::new(
@@ -83,43 +86,21 @@ impl Codec {
         Ok(())
     }
 
-    pub async fn try_handshake(&mut self, buffer: &mut BytesMut) -> Result<bool, TlsError> {
-        match self.process_handshake(buffer) {
-            Ok(_) => Ok(true),
-            Err(e) if e.action == ErrorAction::Wait => Ok(false),
-            Err(e) => Err(e),
-        }
-    }
-
     fn outbound(
         &mut self,
         stream_id: u32,
         frame_type: FrameType,
         payload: Bytes,
     ) -> Result<Bytes, TlsError> {
-        let padding = Padding::generate_padding();
-
         let tag = self.session_keys.generate_auth_tag();
         netrunner_logger::debug!(
             step = %(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() / 60),
-            auth_key_hash = %hex::encode(&self.session_keys.auth_key[..4]),
+            auth_key_hash = %hex::encode(&self.session_keys.auth_key_fingerprint()),
             generated_tag = %hex::encode(&tag[..4]),
             "OUTBOUND: Generated auth tag"
         );
 
-        let header = FrameHeader {
-            auth_tag: [0u8; 16],
-            stream_id,
-            frame_type,
-            payload_len: payload.len() as u16,
-            padding_len: padding.len as u16,
-        };
-
-        let frame = Frame {
-            header,
-            payload,
-            padding: padding.data,
-        };
+        let frame = Frame::new(stream_id, frame_type, payload);
         let mut frame_bytes = frame.into_bytes(&tag);
 
         let encrypted_payload = self.crypto.encrypt(&mut frame_bytes).map_err(|e| {
@@ -179,7 +160,7 @@ impl Codec {
 
             if !self.session_keys.verify_auth_tag(&received_tag) {
                 netrunner_logger::error!(
-                    expected_hash = %hex::encode(&self.session_keys.auth_key[..4]),
+                    expected_hash = %hex::encode(&self.session_keys.auth_key_fingerprint()),
                     received = %hex::encode(&received_tag[..4]),
                     "AUTH MISMATCH: Potential replay or MITM attack. Dropping connection."
                 );

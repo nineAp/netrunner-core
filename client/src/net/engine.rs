@@ -310,7 +310,7 @@ impl EngineBuilder {
 
         // 4. Подключение к серверу
         info!("Establishing secure tunnel to proxy server...");
-        let muxer = ClientHandler::connect(&self.config.remote_address)
+        ClientHandler::connect(&self.config.remote_address)
             .await
             .map_err(|e| format!("Failed to establish secure tunnel: {}", e))?;
         info!("Secure tunnel established, Muxer is ready.");

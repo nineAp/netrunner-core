@@ -6,13 +6,10 @@ use crate::{
         network::NetworkConfig,
     },
     nrxp::{
-        codec::Codec,
-        errors::ErrorAction,
-        frame::FrameType,
-        socks::{SocksReply, SocksRequest},
+        Codec, ErrorAction, FrameType, {SocksReply, SocksRequest},
     },
     parser::Parser,
-    tlseng::profile::BrowserProfile,
+    tlseng::BrowserProfile,
 };
 use bytes::BytesMut;
 use netrunner_logger::{info, warn};
@@ -93,8 +90,8 @@ impl Connection {
 }
 
 pub struct ClientHandler {
-    pub conn: Connection,
-    pub muxer: Muxer,
+    pub(crate) conn: Connection,
+    pub(crate) muxer: Muxer,
 }
 
 impl ClientHandler {
@@ -249,8 +246,7 @@ impl TunnelHandler for ClientHandler {
 }
 
 pub struct ServerHandler {
-    pub conn: Connection,
-    pub token: CancellationToken,
+    pub(crate) conn: Connection,
 }
 impl ServerHandler {
     async fn handle_stealth_fallback(

@@ -1,12 +1,12 @@
 use bytes::Bytes;
-use netrunner_core::nrxp::socks::TargetAddress;
+use netrunner_core::nrxp::TargetAddress;
 use netrunner_logger::{debug, error, info, trace, warn};
 use smoltcp::{
     iface::{SocketHandle, SocketSet},
     socket::{AnySocket, icmp, tcp, udp},
     wire::{IpListenEndpoint, IpProtocol, Ipv4Packet, TcpPacket, UdpPacket},
 };
-use std::{collections::HashMap, time::Duration, time::Instant as StdInstant};
+use std::{collections::HashMap, time::Instant as StdInstant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 

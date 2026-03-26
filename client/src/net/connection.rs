@@ -11,7 +11,7 @@ use tokio::{
     time::Instant,
 };
 // Добавили trace для частых логов (попакетно) и debug для состояний
-use netrunner_logger::{debug, error, info, trace, warn};
+use netrunner_logger::{debug, info, trace, warn};
 
 // ============================================================================
 // 1. БАЗОВАЯ СТРУКТУРА (ConnectionCore)

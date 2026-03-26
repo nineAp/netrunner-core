@@ -11,8 +11,7 @@ use crate::{
         network::NetworkConfig,
     },
     nrxp::{
-        frame::{Frame, FrameType},
-        socks::SocksReply,
+        SocksReply, {Frame, FrameType},
     },
 };
 

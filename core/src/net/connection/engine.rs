@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     net::connection::{handler::StreamHandler, muxer::MuxMessage},
-    nrxp::{codec::Codec, errors::ErrorAction, frame::FrameType},
+    nrxp::{Codec, ErrorAction, FrameType},
 };
 
 pub(crate) struct TunnelEngine {
