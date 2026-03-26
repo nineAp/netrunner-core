@@ -109,14 +109,14 @@ impl NetworkConfig {
             safe_payload_size: safe_payload,
 
             // Заменяем громоздкие вычисления на стандартные 64KB чанки для системных сокетов
-            tcp_buffer_size: 64 * 1024,
-            udp_buffer_size: 64 * 1024,
+            tcp_buffer_size: 16 * 1024,
+            udp_buffer_size: 16 * 1024,
 
             muxer_capacity,
             stream_capacity,
             smoltcp_socket_buf: 64 * 1024,
-            tcp_max_pending: 64 * 1024,
-            tcp_chunk_size: 16 * 1024,
+            tcp_max_pending: 16 * 1024,
+            tcp_chunk_size: 8 * 1024,
         }
     }
 
