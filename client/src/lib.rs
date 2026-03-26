@@ -1,3 +1,4 @@
+use netrunner_core::net::network::NetworkConfig;
 use uniffi;
 uniffi::setup_scaffolding!();
 
@@ -9,8 +10,6 @@ use crate::{
     net::engine::{EngineBuilder, EngineConfig},
     tun::routing::reset_platform_routing,
 };
-use netrunner_core::net::ConnectionRole;
-use netrunner_core::net::network::Network;
 use netrunner_logger::{error, info};
 use std::sync::{Arc, OnceLock};
 use tokio::runtime::Runtime;
@@ -88,40 +87,9 @@ impl SessionManager {
             config = config.with_mtu(1350);
         }
 
-        // --- 1. ЗАПУСК ЛОКАЛЬНОГО ПРОКСИ (NETWORK) ---
-        let local_proxy_port = 8080;
-        let local_proxy_host = "127.0.0.1".to_string();
-        let proxy_token = cancel_token.clone();
-        let remote_addr_clone = remote_address.clone();
+        NetworkConfig::init_global(config.mtu);
 
-        runtime.spawn(async move {
-            info!(
-                "Starting Local Proxy (Network) on {}:{}",
-                local_proxy_host, local_proxy_port
-            );
-
-            let network = Network::new(
-                local_proxy_host,
-                local_proxy_port,
-                ConnectionRole::Client,
-                Some(remote_addr_clone),
-            );
-
-            // Оборачиваем в tokio::select! для жесткой отмены
-            tokio::select! {
-                _ = network.run(proxy_token.clone()) => {
-                    info!("Local Proxy (Network) task finished normally.");
-                }
-                _ = proxy_token.cancelled() => {
-                    info!("Local Proxy (Network) task forcefully stopped via CancellationToken.");
-                }
-            }
-        });
-
-        // Даем прокси немного времени на бинд порта
-        std::thread::sleep(std::time::Duration::from_millis(100));
-
-        // --- 2. ЗАПУСК ENGINE И TUN ---
+        // --- ЗАПУСК ENGINE И TUN ---
         let engine_token = cancel_token.clone();
         runtime.spawn(async move {
             info!("Starting VPN Engine thread...");
@@ -160,10 +128,13 @@ impl SessionManager {
 
             match builder_result {
                 Ok((mut engine, tun)) => {
-                    info!("Engine async task started");
+                    info!("Engine built successfully, starting loop...");
+
+                    // tokio::select! позволяет моментально прервать бесконечный цикл
+                    // engine.run() при вызове session.stop()
                     tokio::select! {
-                        res = engine.run(tun) => {
-                            info!("Engine loop finished: {:?}", res);
+                        _ = engine.run(tun) => {
+                            info!("Engine loop finished normally.");
                         },
                         _ = engine_token.cancelled() => {
                             info!("Engine task shutting down via token");

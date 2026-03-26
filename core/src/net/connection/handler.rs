@@ -1,4 +1,4 @@
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use netrunner_logger::{debug, error, info};
 
 use crate::{
@@ -10,9 +10,7 @@ use crate::{
         },
         network::NetworkConfig,
     },
-    nrxp::{
-        SocksReply, {Frame, FrameType},
-    },
+    nrxp::{Frame, FrameType},
 };
 
 pub(crate) struct StreamHandler {
@@ -43,7 +41,7 @@ impl StreamHandler {
             let target_str = String::from_utf8_lossy(&payload).to_string();
             let muxer = self.muxer.clone();
 
-            let (v_tx, v_rx) = tokio::sync::mpsc::channel(NetworkConfig::global().channel_capacity);
+            let (v_tx, v_rx) = tokio::sync::mpsc::channel(NetworkConfig::global().stream_capacity);
             muxer.register_stream(stream_id, v_tx);
 
             tokio::spawn(async move {
@@ -61,29 +59,17 @@ impl StreamHandler {
                         let elapsed = start.elapsed();
                         info!(stream_id, target = %target_str, latency_ms = elapsed.as_millis(), "Remote TCP connection established");
 
-                        let mut reply_buf = BytesMut::with_capacity(10);
-                        let reply = SocksReply::ConnectResult {
-                            reply_code: 0x00,
-                            atyp: 0x01,
-                            addr: [0, 0, 0, 0],
-                            port: 0,
-                        };
-                        reply.write_to(&mut reply_buf);
-
-                        let _ = muxer
-                            .send_control(stream_id, FrameType::Connect, reply_buf.freeze())
-                            .await;
-
+                        // Больше никаких ответов (Reply), просто прокидываем байты!
                         let (r, w) = stream.into_split();
                         run_tcp_bridge(stream_id, r, w, muxer, v_rx).await;
                     }
                     Ok(Err(e)) => {
                         error!(stream_id, target = %target_str, error = %e, "TCP connection failed");
-                        Self::send_error_reply(&muxer, stream_id, 0x01, FrameType::Connect).await;
+                        Self::close_stream(&muxer, stream_id).await;
                     }
                     Err(_) => {
                         error!(stream_id, target = %target_str, "Connection timed out (DNS/TCP)");
-                        Self::send_error_reply(&muxer, stream_id, 0x04, FrameType::Connect).await;
+                        Self::close_stream(&muxer, stream_id).await;
                     }
                 }
             });
@@ -97,7 +83,7 @@ impl StreamHandler {
             let target_str = String::from_utf8_lossy(&payload).to_string();
             let muxer = self.muxer.clone();
 
-            let (v_tx, v_rx) = tokio::sync::mpsc::channel(NetworkConfig::global().channel_capacity);
+            let (v_tx, v_rx) = tokio::sync::mpsc::channel(NetworkConfig::global().stream_capacity);
             muxer.register_stream(stream_id, v_tx);
 
             tokio::spawn(async move {
@@ -107,30 +93,16 @@ impl StreamHandler {
                     Ok(socket) => {
                         if let Err(e) = socket.connect(&target_str).await {
                             error!(stream_id, target = %target_str, error = %e, "UDP connect failed");
-                            Self::send_error_reply(&muxer, stream_id, 0x01, FrameType::UdpConnect)
-                                .await;
+                            Self::close_stream(&muxer, stream_id).await;
                             return;
                         }
 
-                        let mut reply_buf = BytesMut::with_capacity(10);
-                        let reply = SocksReply::ConnectResult {
-                            reply_code: 0x00,
-                            atyp: 0x01,
-                            addr: [0, 0, 0, 0],
-                            port: 0,
-                        };
-                        reply.write_to(&mut reply_buf);
-
-                        let _ = muxer
-                            .send_control(stream_id, FrameType::UdpConnect, reply_buf.freeze())
-                            .await;
-
+                        // Успех - просто начинаем слушать UDP и слать в туннель
                         run_udp_bridge(stream_id, socket, muxer, v_rx).await;
                     }
                     Err(e) => {
                         error!(stream_id, target = %target_str, error = %e, "UDP bind failed");
-                        Self::send_error_reply(&muxer, stream_id, 0x01, FrameType::UdpConnect)
-                            .await;
+                        Self::close_stream(&muxer, stream_id).await;
                     }
                 }
             });
@@ -143,19 +115,12 @@ impl StreamHandler {
         self.muxer.dispatch_to_local(stream_id, payload).await;
     }
 
-    async fn send_error_reply(muxer: &Muxer, stream_id: u32, code: u8, frame_type: FrameType) {
-        muxer.remove_stream(stream_id);
-        let mut reply_buf = BytesMut::with_capacity(10);
-        let reply = SocksReply::ConnectResult {
-            reply_code: code,
-            atyp: 0x01,
-            addr: [0, 0, 0, 0],
-            port: 0,
-        };
-        reply.write_to(&mut reply_buf);
+    // Вспомогательная функция вместо send_error_reply
+    async fn close_stream(muxer: &Muxer, stream_id: u32) {
         let _ = muxer
-            .send_control(stream_id, frame_type, reply_buf.freeze())
+            .send_control(stream_id, FrameType::Close, Bytes::new())
             .await;
+        muxer.remove_stream(stream_id);
     }
 
     async fn on_data(&self, stream_id: u32, payload: Bytes) {

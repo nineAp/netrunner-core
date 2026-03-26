@@ -1,14 +1,16 @@
 use bytes::Bytes;
-use netrunner_core::nrxp::TargetAddress;
-use netrunner_logger::{debug, error, info, trace, warn};
+use netrunner_core::{
+    net::network::NetworkConfig,
+    rawcast::{LocalProtocol, RawCastEvent, RawCastFrame},
+};
+use netrunner_logger::{debug, error, info, trace};
 use smoltcp::{
     iface::{SocketHandle, SocketSet},
     socket::{AnySocket, icmp, tcp, udp},
     wire::{IpListenEndpoint, IpProtocol, Ipv4Packet, TcpPacket, UdpPacket},
 };
 use std::{collections::HashMap, time::Instant as StdInstant};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpStream, UdpSocket};
+use tokio::sync::mpsc;
 
 use crate::net::{
     connection::{TcpConnection, UdpConnection},
@@ -19,13 +21,15 @@ use crate::net::{
 // ============================================================================
 // 1. УПРАВЛЕНИЕ СОСТОЯНИЕМ СЕССИЙ (SessionTracker)
 // ============================================================================
-
 struct SessionTracker {
     last_activity: HashMap<SocketHandle, StdInstant>,
     active_tcp: HashMap<SocketHandle, TcpConnection>,
     active_udp: HashMap<SocketHandle, UdpConnection>,
+    inbound_tx: HashMap<u64, mpsc::Sender<Bytes>>,
     failed_until: HashMap<SocketHandle, StdInstant>,
     to_remove: Vec<SocketHandle>,
+    next_socket_id: u64,
+    handle_to_id: HashMap<SocketHandle, u64>,
 }
 
 impl SessionTracker {
@@ -34,9 +38,18 @@ impl SessionTracker {
             last_activity: HashMap::new(),
             active_tcp: HashMap::new(),
             active_udp: HashMap::new(),
+            inbound_tx: HashMap::new(),
             failed_until: HashMap::new(),
             to_remove: Vec::new(),
+            next_socket_id: 1,
+            handle_to_id: HashMap::new(),
         }
+    }
+
+    fn generate_socket_id(&mut self) -> u64 {
+        let id = self.next_socket_id;
+        self.next_socket_id = self.next_socket_id.wrapping_add(1);
+        id
     }
 
     fn queue_removal(&mut self, handle: SocketHandle) {
@@ -53,19 +66,28 @@ impl SessionTracker {
             self.failed_until.remove(&handle);
             self.active_tcp.remove(&handle);
             self.active_udp.remove(&handle);
+
+            // ВОТ ТУТ ГЛАВНОЕ ИСПРАВЛЕНИЕ:
+            // Достаем НАШ socket_id, который мы выдали этому handle при старте сессии
+            if let Some(socket_id) = self.handle_to_id.remove(&handle) {
+                self.inbound_tx.remove(&socket_id);
+            }
         }
     }
 
-    fn has_tcp(
+    fn has_connection_from(
         &self,
-        dst_addr: smoltcp::wire::IpAddress,
-        dst_port: u16,
+        src_addr: smoltcp::wire::IpAddress,
+        src_port: u16,
         socket_set: &SocketSet,
     ) -> bool {
         socket_set.iter().any(|(_, s)| {
             if let Some(tcp) = tcp::Socket::downcast(s) {
-                if let Some(ep) = tcp.local_endpoint() {
-                    return ep.addr == dst_addr && ep.port == dst_port;
+                // Если сокет уже привязался к клиенту, проверяем его исходные данные
+                if let Some(remote) = tcp.remote_endpoint() {
+                    if remote.addr == src_addr && remote.port == src_port {
+                        return true;
+                    }
                 }
             }
             false
@@ -105,30 +127,6 @@ impl TargetResolver {
         }
     }
 
-    fn resolve_tcp(&self, socket: &tcp::Socket) -> TargetAddress {
-        let ep = match socket.local_endpoint() {
-            Some(ep) => ep,
-            None => {
-                warn!(handle=?socket, "Target resolution failed: no local endpoint");
-                return TargetAddress::Domain("disconnected".to_string(), 0);
-            }
-        };
-
-        match ep.addr {
-            smoltcp::wire::IpAddress::Ipv4(ip) => {
-                let std_ip = std::net::Ipv4Addr::from(ip);
-                if let Some(domain) = self.fake_ip_store.lookup_by_ip(&std_ip) {
-                    TargetAddress::Domain(domain, ep.port)
-                } else {
-                    TargetAddress::Ipv4(std_ip, ep.port)
-                }
-            }
-            smoltcp::wire::IpAddress::Ipv6(ip) => {
-                TargetAddress::Ipv6(std::net::Ipv6Addr::from(ip), ep.port)
-            }
-        }
-    }
-
     fn process_dns_query(&mut self, data: &[u8]) -> Option<Vec<u8>> {
         self.dns_handler.handle_query(data, &mut self.fake_ip_store)
     }
@@ -137,17 +135,21 @@ impl TargetResolver {
 // ============================================================================
 // 3. ФАБРИКА СОКЕТОВ (SocketFactory)
 // ============================================================================
-
 struct SocketFactory;
 
 impl SocketFactory {
     fn create_tcp<'a>(port: u16) -> tcp::Socket<'a> {
+        let max_buf = NetworkConfig::global().smoltcp_socket_buf;
+
+        // Для Web-трафика используем максимум из конфига (например, 2 МБ)
+        // Для остальных урезаем в 4 раза, чтобы сэкономить RAM на фоновых соединениях
         let buf_size = match port {
-            443 | 80 => 1024 * 1024 * 2,
+            443 | 80 | 8080 => max_buf,
             22 => 32 * 1024,
             53 => 16 * 1024,
-            _ => 128 * 1024,
+            _ => max_buf / 4,
         };
+
         let mut socket = tcp::Socket::new(
             tcp::SocketBuffer::new(vec![0; buf_size]),
             tcp::SocketBuffer::new(vec![0; buf_size]),
@@ -158,11 +160,20 @@ impl SocketFactory {
     }
 
     fn create_udp<'a>(port: u16) -> udp::Socket<'a> {
+        let config = NetworkConfig::global();
+        let max_buf = config.udp_buffer_size;
+        let payload_size = config.safe_payload_size.max(1); // Защита от деления на 0
+
+        // Вычисляем размер буфера и количество пакетов
         let (buf_size, packet_count) = match port {
-            443 => (512 * 1024, 390),
-            53 => (64 * 1024, 32),
-            _ => (128 * 1024, 100),
+            443 => (max_buf, max_buf / payload_size), // QUIC/HTTP3 трафик
+            53 => (64 * 1024, (64 * 1024) / payload_size), // DNS
+            _ => (max_buf / 2, (max_buf / 2) / payload_size),
         };
+
+        // Гарантируем, что метаданных хватит хотя бы на 10 пакетов
+        let packet_count = packet_count.max(10);
+
         udp::Socket::new(
             udp::PacketBuffer::new(
                 vec![udp::PacketMetadata::EMPTY; packet_count],
@@ -186,20 +197,45 @@ impl SocketFactory {
 // ============================================================================
 // 4. ГЛАВНЫЙ КООРДИНАТОР (ConnectionManager)
 // ============================================================================
-
 pub struct ConnectionManager {
     tracker: SessionTracker,
     resolver: TargetResolver,
+    tx_to_tunnel: mpsc::Sender<RawCastFrame>,
 }
 
 impl ConnectionManager {
-    pub fn new(dns_handler: DnsHandler) -> Self {
+    pub fn new(dns_handler: DnsHandler, tx_to_tunnel: mpsc::Sender<RawCastFrame>) -> Self {
         Self {
             tracker: SessionTracker::new(),
             resolver: TargetResolver::new(dns_handler),
+            tx_to_tunnel,
         }
     }
 
+    // ВАЖНО: Метод для получения данных из сети (от VPN) и инъекции их в smoltcp
+    // Пытается внедрить пакет. Если канал переполнен — возвращает пакет обратно!
+    pub fn try_inject_inbound(&mut self, frame: RawCastFrame) -> Result<(), RawCastFrame> {
+        if frame.event != RawCastEvent::Data {
+            if frame.event == RawCastEvent::Close {
+                self.tracker.inbound_tx.remove(&frame.socket_id);
+            }
+            return Ok(());
+        }
+
+        if let Some(tx) = self.tracker.inbound_tx.get(&frame.socket_id) {
+            match tx.try_send(frame.payload.clone()) {
+                Ok(_) => Ok(()),
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    Err(frame) // Возвращаем кадр, чтобы Engine затормозил чтение туннеля
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    Ok(()) // Сокет уже закрыт браузером, дропаем пакет
+                }
+            }
+        } else {
+            Ok(())
+        }
+    }
     pub fn setup_sockets(n_icmp: usize) -> SocketSet<'static> {
         let mut sockets = SocketSet::new(Vec::with_capacity(48));
         for _ in 0..n_icmp {
@@ -238,13 +274,23 @@ impl ConnectionManager {
 
         match ip_packet.next_header() {
             IpProtocol::Tcp => {
-                if let Ok(tcp_packet) = TcpPacket::new_checked(ip_packet.payload()) {
-                    if tcp_packet.syn() && !tcp_packet.ack() {
-                        let dst_port = tcp_packet.dst_port();
-                        trace!(%dst_addr, dst_port, "Received TCP SYN");
+                let src_addr = ip_packet.src_addr();
+                let dst_addr = ip_packet.dst_addr();
 
-                        if !self.tracker.has_tcp(dst_addr.into(), dst_port, socket_set) {
-                            debug!(%dst_addr, dst_port, "No active TCP socket found, allocating new one");
+                if let Ok(tcp_packet) = TcpPacket::new_checked(ip_packet.payload()) {
+                    // 2. Проверяем, что это пакет инициализации соединения (SYN)
+                    if tcp_packet.syn() && !tcp_packet.ack() {
+                        let src_port = tcp_packet.src_port();
+                        let dst_port = tcp_packet.dst_port();
+
+                        trace!(%dst_addr, dst_port, src_port, "Received TCP SYN");
+
+                        // 3. Теперь src_addr доступен в этой области видимости
+                        if !self
+                            .tracker
+                            .has_connection_from(src_addr.into(), src_port, socket_set)
+                        {
+                            debug!(%dst_addr, dst_port, src_port, "Allocating new TCP socket");
 
                             let mut socket = SocketFactory::create_tcp(dst_port);
                             let endpoint = IpListenEndpoint {
@@ -254,19 +300,16 @@ impl ConnectionManager {
 
                             match socket.listen(endpoint) {
                                 Ok(_) => {
-                                    debug!(%dst_addr, dst_port, "TCP socket successfully listening");
                                     socket_set.add(socket);
                                 }
                                 Err(e) => {
-                                    error!(%dst_addr, dst_port, "Failed to listen on TCP socket: {:?}", e);
+                                    error!(%dst_addr, dst_port, "Failed to listen: {:?}", e);
                                 }
                             }
                         } else {
-                            trace!(%dst_addr, dst_port, "TCP socket already exists, ignoring SYN");
+                            trace!(%dst_addr, dst_port, src_port, "Socket already exists, ignoring SYN");
                         }
                     }
-                } else {
-                    trace!("try_create_socket: Failed to parse TCP payload");
                 }
             }
             IpProtocol::Udp => {
@@ -324,7 +367,6 @@ impl ConnectionManager {
             }
         }
     }
-
     fn handle_tcp(&mut self, handle: SocketHandle, socket: &mut tcp::Socket) {
         if socket.state() == tcp::State::Closed {
             self.tracker.active_tcp.remove(&handle);
@@ -335,67 +377,63 @@ impl ConnectionManager {
         if socket.state() == tcp::State::Established
             && !self.tracker.active_tcp.contains_key(&handle)
         {
-            let target = self.resolver.resolve_tcp(socket);
-            if let TargetAddress::Domain(ref d, _) = target {
-                if d == "disconnected" {
-                    socket.abort();
-                    return;
-                }
-            }
-
-            info!(%handle, target = %target, "New TCP session established");
-
-            let (conn, mut rx_from_smol, tx_to_smol, handshake_tx) = TcpConnection::new(handle);
-            self.tracker.active_tcp.insert(handle, conn);
-
-            // Конвертируем TargetAddress в строку, понятную для tokio::net
-            let target_str = match target {
-                TargetAddress::Domain(d, p) => format!("{}:{}", d, p),
-                TargetAddress::Ipv4(ip, p) => format!("{}:{}", ip, p),
-                TargetAddress::Ipv6(ip, p) => format!("{}:{}", ip, p),
+            let (dst_ip, dst_port) = match socket.local_endpoint() {
+                Some(ep) => match ep.addr {
+                    smoltcp::wire::IpAddress::Ipv4(ip) => (std::net::Ipv4Addr::from(ip), ep.port),
+                    _ => return,
+                },
+                None => return,
             };
 
-            tokio::spawn(async move {
-                let mut upstream = match TcpStream::connect(&target_str).await {
-                    Ok(s) => s,
-                    Err(e) => {
-                        error!("Failed to connect to upstream TCP {}: {}", target_str, e);
-                        return;
-                    }
-                };
+            info!(%handle, ip = %dst_ip, port = dst_port, "New TCP session intercepted");
 
-                // Сообщаем соединению smoltcp, что мы готовы (рукопожатие выполнено)
+            let socket_id = self.tracker.generate_socket_id();
+            self.tracker.handle_to_id.insert(handle, socket_id);
+
+            let (conn, mut rx_from_smol, tx_to_smol, handshake_tx) = TcpConnection::new(handle);
+
+            self.tracker.active_tcp.insert(handle, conn);
+            self.tracker.inbound_tx.insert(socket_id, tx_to_smol);
+
+            // ИСПРАВЛЕНИЕ ЗДЕСЬ: Переводим IP обратно в домен
+            let target_str = if let Some(domain) = self.resolver.fake_ip_store.lookup_by_ip(&dst_ip)
+            {
+                format!("{}:{}", domain, dst_port)
+            } else {
+                format!("{}:{}", dst_ip, dst_port)
+            };
+
+            let tx_tunnel = self.tx_to_tunnel.clone();
+
+            tokio::spawn(async move {
+                // Создаем кадр коннекта
+                let mut connect_frame =
+                    RawCastFrame::connect(LocalProtocol::Tcp, socket_id, dst_ip, dst_port);
+                // Кладем доменное имя в payload, чтобы ClientHandler его прочитал
+                connect_frame.payload = bytes::Bytes::from(target_str);
+
+                if tx_tunnel.send(connect_frame).await.is_err() {
+                    return;
+                }
+
                 let _ = handshake_tx.send(());
 
-                let (mut r, mut w) = upstream.into_split();
-
-                // Читаем из tun (smoltcp) и пишем во внешнюю сеть
-                let to_upstream = async {
-                    while let Some(data) = rx_from_smol.recv().await {
-                        if w.write_all(&data).await.is_err() {
-                            break;
-                        }
+                while let Some(data) = rx_from_smol.recv().await {
+                    let data_frame = RawCastFrame::data(
+                        LocalProtocol::Tcp,
+                        socket_id,
+                        dst_ip,
+                        dst_port,
+                        data.to_vec(),
+                    );
+                    if tx_tunnel.send(data_frame).await.is_err() {
+                        break;
                     }
-                };
+                }
 
-                // Читаем из внешней сети и пишем в tun (smoltcp)
-                let from_upstream = async {
-                    let mut buf = vec![0u8; 8192]; // Читаем чанками
-                    while let Ok(n) = r.read(&mut buf).await {
-                        if n == 0 {
-                            break;
-                        } // EOF
-                        if tx_to_smol
-                            .send(Bytes::copy_from_slice(&buf[..n]))
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                };
-
-                tokio::select! { _ = to_upstream => {}, _ = from_upstream => {} }
+                let close_frame =
+                    RawCastFrame::close(LocalProtocol::Tcp, socket_id, dst_ip, dst_port);
+                let _ = tx_tunnel.send(close_frame).await;
             });
         }
 
@@ -404,12 +442,7 @@ impl ConnectionManager {
                 socket.abort();
             }
         }
-
-        if socket.state() == tcp::State::CloseWait {
-            socket.close();
-        }
     }
-
     fn handle_udp(&mut self, handle: SocketHandle, socket: &mut udp::Socket) {
         self.tracker.last_activity.insert(handle, StdInstant::now());
 
@@ -427,71 +460,54 @@ impl ConnectionManager {
         }
 
         if socket.is_open() && !self.tracker.active_udp.contains_key(&handle) {
-            let ep = socket.endpoint();
-            let target = match ep.addr {
+            let (dst_ip, dst_port) = match socket.endpoint().addr {
                 Some(smoltcp::wire::IpAddress::Ipv4(ip)) => {
-                    TargetAddress::Ipv4(std::net::Ipv4Addr::from(ip), ep.port)
+                    (std::net::Ipv4Addr::from(ip), socket.endpoint().port)
                 }
-                Some(smoltcp::wire::IpAddress::Ipv6(ip)) => {
-                    TargetAddress::Ipv6(std::net::Ipv6Addr::from(ip), ep.port)
-                }
-                None => return,
+                _ => return,
             };
+
+            // 1. Генерируем уникальный ID
+            let socket_id = self.tracker.generate_socket_id();
+
+            // 2. Сохраняем привязку для будущего cleanup
+            self.tracker.handle_to_id.insert(handle, socket_id);
 
             let (conn, mut rx_from_smol, tx_to_smol) = UdpConnection::new(handle);
-            self.tracker.active_udp.insert(handle, conn);
 
-            // Конвертируем для tokio::net::UdpSocket
-            let target_str = match target {
-                TargetAddress::Domain(d, p) => format!("{}:{}", d, p),
-                TargetAddress::Ipv4(ip, p) => format!("{}:{}", ip, p),
-                TargetAddress::Ipv6(ip, p) => format!("{}:{}", ip, p),
+            self.tracker.active_udp.insert(handle, conn);
+            self.tracker.inbound_tx.insert(socket_id, tx_to_smol);
+            let target_str = if let Some(domain) = self.resolver.fake_ip_store.lookup_by_ip(&dst_ip)
+            {
+                format!("{}:{}", domain, dst_port)
+            } else {
+                format!("{}:{}", dst_ip, dst_port)
             };
 
-            tokio::spawn(async move {
-                // Создаем локальный UDP сокет со случайным портом
-                let upstream = match UdpSocket::bind("0.0.0.0:0").await {
-                    Ok(s) => s,
-                    Err(e) => {
-                        error!("Failed to bind local UDP socket: {}", e);
-                        return;
-                    }
-                };
+            let tx_tunnel = self.tx_to_tunnel.clone();
 
-                // "Подключаем" UDP сокет к цели (включает фильтр пакетов и позволяет использовать обычные send/recv)
-                if let Err(e) = upstream.connect(&target_str).await {
-                    error!("Failed to connect UDP to {}: {}", target_str, e);
-                    return;
+            tokio::spawn(async move {
+                let mut connect_frame =
+                    RawCastFrame::connect(LocalProtocol::Udp, socket_id, dst_ip, dst_port);
+                connect_frame.payload = bytes::Bytes::from(target_str); // Кладем домен
+                let _ = tx_tunnel.send(connect_frame).await;
+
+                while let Some(data) = rx_from_smol.recv().await {
+                    let data_frame = RawCastFrame::data(
+                        LocalProtocol::Udp,
+                        socket_id,
+                        dst_ip,
+                        dst_port,
+                        data.to_vec(),
+                    );
+                    if tx_tunnel.send(data_frame).await.is_err() {
+                        break;
+                    }
                 }
 
-                let upstream = std::sync::Arc::new(upstream);
-                let upstream_rx = upstream.clone();
-                let upstream_tx = upstream;
-
-                // Из smoltcp наружу
-                let to_upstream = async {
-                    while let Some(data) = rx_from_smol.recv().await {
-                        if upstream_tx.send(&data).await.is_err() {
-                            break;
-                        }
-                    }
-                };
-
-                // Извне в smoltcp
-                let from_upstream = async {
-                    let mut buf = vec![0u8; 65536]; // Максимальный размер UDP датаграммы
-                    while let Ok(n) = upstream_rx.recv(&mut buf).await {
-                        if tx_to_smol
-                            .send(Bytes::copy_from_slice(&buf[..n]))
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                };
-
-                tokio::select! { _ = to_upstream => {}, _ = from_upstream => {} }
+                let close_frame =
+                    RawCastFrame::close(LocalProtocol::Udp, socket_id, dst_ip, dst_port);
+                let _ = tx_tunnel.send(close_frame).await;
             });
         }
 

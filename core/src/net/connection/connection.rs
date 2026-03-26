@@ -1,18 +1,14 @@
 use crate::{
     net::{
-        connection::{
-            bridge::run_tcp_bridge, engine::TunnelEngine, handler::StreamHandler, muxer::Muxer,
-        },
+        connection::{engine::TunnelEngine, handler::StreamHandler, muxer::Muxer},
         network::NetworkConfig,
     },
-    nrxp::{
-        Codec, ErrorAction, FrameType, {SocksReply, SocksRequest},
-    },
-    parser::Parser,
+    nrxp::{Codec, ErrorAction, FrameType},
+    rawcast::{LocalProtocol, RawCastEvent, RawCastFrame},
     tlseng::BrowserProfile,
 };
-use bytes::BytesMut;
-use netrunner_logger::{info, warn};
+use bytes::{Bytes, BytesMut};
+use netrunner_logger::{error, info, warn};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{
@@ -21,7 +17,6 @@ use tokio::{
     },
     sync::mpsc,
 };
-use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ConnectionRole {
@@ -60,53 +55,34 @@ impl Connection {
             codec: Codec::new(false),
         }
     }
-
-    pub async fn read_socks_request(&mut self) -> Result<SocksRequest, String> {
-        loop {
-            match SocksRequest::parse(&mut self.read_buf) {
-                Ok(Some(req)) => return Ok(req),
-                Ok(None) => {}
-                Err(e) => return Err(format!("Socks parse error: {}", e)),
-            }
-            let n = self
-                .inbound
-                .read_buf(&mut self.read_buf)
-                .await
-                .map_err(|e| e.to_string())?;
-            if n == 0 {
-                return Err("Client closed connection".into());
-            }
-        }
-    }
-
-    pub async fn send_socks_reply(&mut self, reply: SocksReply) -> Result<(), String> {
-        let mut buf = BytesMut::with_capacity(24);
-        reply.write_to(&mut buf);
-        self.outbound
-            .write_all(&buf)
-            .await
-            .map_err(|e| e.to_string())
-    }
 }
 
-pub struct ClientHandler {
-    pub(crate) conn: Connection,
-    pub(crate) muxer: Muxer,
-}
+pub struct ClientHandler;
 
 impl ClientHandler {
-    pub async fn connect(remote_proxy_addr: &str) -> Result<Muxer, String> {
+    /// Вспомогательная функция: устанавливает одно физическое TLS-соединение
+    /// и возвращает готовый Muxer для работы с ним.
+    async fn establish_leg(remote_proxy_addr: &str, leg_name: &str) -> Result<Muxer, String> {
+        info!(
+            "Establishing dedicated {} tunnel to {}...",
+            leg_name, remote_proxy_addr
+        );
+
         let stream = TcpStream::connect(remote_proxy_addr)
             .await
-            .map_err(|e| e.to_string())?;
-        let (inbound, outbound) = stream.into_split();
+            .map_err(|e| format!("Failed to connect: {}", e))?;
 
+        if let Err(e) = stream.set_nodelay(true) {
+            warn!("Failed to set TCP_NODELAY on {} leg: {}", leg_name, e);
+        }
+        let (inbound, outbound) = stream.into_split();
         let mut conn = Connection::new_raw(inbound, outbound);
 
         let ch = conn
             .codec
             .make_client_handshake(&BrowserProfile::CHROME_131, "ubuntu.com")
-            .map_err(|e| format!("{:?}", e))?;
+            .map_err(|e| format!("Handshake generation failed: {:?}", e))?;
+
         conn.outbound
             .write_all(&ch)
             .await
@@ -122,18 +98,19 @@ impl ClientHandler {
                         .await
                         .map_err(|e| e.to_string())?;
                     if n == 0 {
-                        return Err("EOF during handshake".into());
+                        return Err(format!("EOF during handshake on {} leg", leg_name));
                     }
                 }
-                Err(e) => return Err(format!("TLS error: {:?}", e)),
+                Err(e) => return Err(format!("TLS error on {} leg: {:?}", leg_name, e)),
             }
         }
 
-        let (control_tx, control_rx) = mpsc::channel(NetworkConfig::global().channel_capacity);
-        let (data_tx, data_rx) = mpsc::channel(NetworkConfig::global().channel_capacity);
+        info!("{} TLS Handshake complete. Starting Engine.", leg_name);
+
+        let (control_tx, control_rx) = mpsc::channel(NetworkConfig::global().muxer_capacity);
+        let (data_tx, data_rx) = mpsc::channel(NetworkConfig::global().muxer_capacity);
 
         let muxer = Muxer::new(control_tx, data_tx, true);
-
         let handler =
             std::sync::Arc::new(StreamHandler::new(muxer.clone(), ConnectionRole::Client));
 
@@ -152,102 +129,125 @@ impl ClientHandler {
         Ok(muxer)
     }
 
-    async fn handle_udp_associate(&mut self) -> Result<(), String> {
-        let reply = SocksReply::ConnectResult {
-            reply_code: 0x00,
-            atyp: 0x01,
-            addr: [0, 0, 0, 0],
-            port: 0,
-        };
-        self.conn.send_socks_reply(reply).await?;
+    /// Главная функция запуска клиента
+    pub async fn connect(
+        remote_proxy_addr: &str,
+        mut rx_from_engine: mpsc::Receiver<RawCastFrame>,
+        tx_to_engine: mpsc::Sender<RawCastFrame>,
+    ) -> Result<(), String> {
+        // 1. Устанавливаем ДВА независимых соединения
+        // Мы можем сделать это параллельно через tokio::try_join! для скорости
+        let (tcp_muxer, udp_muxer) = tokio::try_join!(
+            Self::establish_leg(remote_proxy_addr, "TCP"),
+            Self::establish_leg(remote_proxy_addr, "UDP"),
+        )?;
 
-        let mut buf = [0u8; 1024];
-        loop {
-            if self
-                .conn
-                .inbound
-                .read(&mut buf)
-                .await
-                .map_err(|e| e.to_string())?
-                == 0
-            {
-                break;
+        info!("Dual-tunnel architecture established successfully!");
+
+        // 2. ЗАПУСКАЕМ МОСТ-РОУТЕР
+        tokio::spawn(async move {
+            while let Some(raw_frame) = rx_from_engine.recv().await {
+                let stream_id = raw_frame.socket_id as u32;
+                let is_udp = raw_frame.protocol == LocalProtocol::Udp;
+
+                // РОУТИНГ: Выбираем нужный физический канал
+                let muxer = if is_udp {
+                    udp_muxer.clone()
+                } else {
+                    tcp_muxer.clone()
+                };
+
+                match raw_frame.event {
+                    RawCastEvent::Connect => {
+                        let (v_tx, mut v_rx) =
+                            mpsc::channel(NetworkConfig::global().tcp_buffer_size);
+                        muxer.register_stream(stream_id, v_tx);
+
+                        // Читаем домен, который мы прокинули в предыдущем шаге
+                        let target = if !raw_frame.payload.is_empty() {
+                            String::from_utf8_lossy(&raw_frame.payload).to_string()
+                        } else {
+                            format!("{}:{}", raw_frame.dst_ip, raw_frame.dst_port)
+                        };
+
+                        let frame_type = if is_udp {
+                            FrameType::UdpConnect
+                        } else {
+                            FrameType::Connect
+                        };
+
+                        if let Err(e) = muxer
+                            .send_control(stream_id, frame_type, Bytes::from(target))
+                            .await
+                        {
+                            error!("Failed to send connect control frame: {}", e);
+                            continue;
+                        }
+
+                        let tx_engine_clone = tx_to_engine.clone();
+                        let mut muxer_clone = muxer.clone();
+                        let dst_ip = raw_frame.dst_ip;
+                        let dst_port = raw_frame.dst_port;
+                        let protocol = raw_frame.protocol;
+                        let socket_id = raw_frame.socket_id;
+
+                        tokio::spawn(async move {
+                            while let Some(payload) = v_rx.recv().await {
+                                if payload.is_empty() {
+                                    let close_frame =
+                                        RawCastFrame::close(protocol, socket_id, dst_ip, dst_port);
+                                    let _ = tx_engine_clone.send(close_frame).await;
+                                    break;
+                                } else {
+                                    let data_frame = RawCastFrame::data(
+                                        protocol,
+                                        socket_id,
+                                        dst_ip,
+                                        dst_port,
+                                        payload.to_vec(),
+                                    );
+                                    if tx_engine_clone.send(data_frame).await.is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                            muxer_clone.remove_stream(stream_id);
+                        });
+                    }
+
+                    RawCastEvent::Data => {
+                        let frame_type = if is_udp {
+                            FrameType::UdpData
+                        } else {
+                            FrameType::Data
+                        };
+
+                        if let Err(e) = muxer
+                            .send_control(stream_id, frame_type, raw_frame.payload)
+                            .await
+                        {
+                            error!("Failed to send data frame: {}", e);
+                        }
+                    }
+
+                    RawCastEvent::Close => {
+                        let _ = muxer
+                            .send_control(stream_id, FrameType::Close, Bytes::new())
+                            .await;
+                        muxer.remove_stream(stream_id);
+                    }
+                }
             }
-        }
+            info!("ClientHandler bridge task terminated.");
+        });
+
         Ok(())
     }
 }
-
-#[async_trait::async_trait]
-impl TunnelHandler for ClientHandler {
-    async fn run(mut self) -> Result<(), String> {
-        info!("Starting SOCKS multiplexed handling");
-
-        self.conn.read_socks_request().await?;
-        self.conn
-            .send_socks_reply(SocksReply::HandshakeSelect { method: 0x00 })
-            .await?;
-
-        let req = self.conn.read_socks_request().await?;
-
-        match req {
-            SocksRequest::Connect {
-                command: 0x01,
-                target,
-            } => {
-                let stream_id = self.muxer.next_id();
-                let (v_tx, mut v_rx) =
-                    mpsc::channel::<bytes::Bytes>(NetworkConfig::global().tcp_buffer_size);
-                self.muxer.register_stream(stream_id, v_tx);
-
-                self.muxer
-                    .send_control(
-                        stream_id,
-                        FrameType::Connect,
-                        bytes::Bytes::from(target.to_string()),
-                    )
-                    .await?;
-
-                let first_payload =
-                    tokio::time::timeout(std::time::Duration::from_secs(10), v_rx.recv())
-                        .await
-                        .map_err(|_| "Timeout waiting for proxy response")?
-                        .ok_or("No data from proxy")?;
-
-                if first_payload.len() >= 2 && first_payload[1] == 0x00 {
-                    self.conn
-                        .outbound
-                        .write_all(&first_payload)
-                        .await
-                        .map_err(|e| e.to_string())?;
-                } else {
-                    self.conn.outbound.write_all(&first_payload).await.ok();
-                    return Err("Proxy rejected connection".into());
-                }
-
-                let browser_in = self.conn.inbound;
-                let browser_out = self.conn.outbound;
-                let muxer = self.muxer;
-
-                tokio::spawn(async move {
-                    run_tcp_bridge(stream_id, browser_in, browser_out, muxer, v_rx).await;
-                });
-                Ok(())
-            }
-
-            SocksRequest::Connect { command: 0x03, .. } => {
-                info!("Handling UDP Associate request");
-                self.handle_udp_associate().await
-            }
-
-            _ => Err("Unsupported SOCKS command".into()),
-        }
-    }
-}
-
 pub struct ServerHandler {
     pub(crate) conn: Connection,
 }
+
 impl ServerHandler {
     async fn handle_stealth_fallback(
         mut client_inbound: OwnedReadHalf,
@@ -295,14 +295,13 @@ impl ServerHandler {
         }
     }
 }
-
 #[async_trait::async_trait]
 impl TunnelHandler for ServerHandler {
     async fn run(mut self) -> Result<(), String> {
         info!("Acting as TLS Server with Stealth Fallback");
 
-        let (control_tx, control_rx) = mpsc::channel(NetworkConfig::global().channel_capacity);
-        let (data_tx, data_rx) = mpsc::channel(NetworkConfig::global().channel_capacity);
+        let (control_tx, control_rx) = mpsc::channel(NetworkConfig::global().muxer_capacity);
+        let (data_tx, data_rx) = mpsc::channel(NetworkConfig::global().muxer_capacity);
         let muxer = Muxer::new(control_tx, data_tx, false);
 
         let handshake_timeout = std::time::Duration::from_secs(1);

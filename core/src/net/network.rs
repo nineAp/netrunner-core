@@ -1,10 +1,10 @@
 use std::sync::OnceLock;
 
 use crate::{
-    net::connection::{ClientHandler, Connection, ConnectionRole, ServerHandler, TunnelHandler},
+    net::connection::{Connection, ConnectionRole, ServerHandler, TunnelHandler},
     nrxp::{FRAME_HEADER_SIZE, MAX_PADDING_SIZE},
 };
-use netrunner_logger::{error, info};
+use netrunner_logger::{error, info, warn};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
@@ -32,50 +32,36 @@ impl Network {
 
     pub async fn run(&self, token: CancellationToken) {
         let addr = format!("{}:{}", self.host, self.port);
+
+        // Инициализируем глобальный конфиг сети (MTU, размеры буферов)
         NetworkConfig::init_global(1350);
+
         match self.role {
             ConnectionRole::Client => {
-                info!("Starting Client mode");
-                let server_addr = self
-                    .remote_proxy_addr
-                    .as_ref()
-                    .ok_or("No proxy addr")
-                    .unwrap();
-                let muxer = match ClientHandler::connect(server_addr).await {
-                    Ok(m) => m,
-                    Err(e) => {
-                        error!(error = %e, "Global tunnel failed.");
-                        return;
-                    }
-                };
-
-                let listener = TcpListener::bind(&addr).await.expect("SOCKS bind failed");
-                loop {
-                    tokio::select! {
-                        _ = token.cancelled() => break,
-                        res = listener.accept() => {
-                            if let Ok((stream, _client_addr)) = res {
-                                let conn = Connection::new(stream, false);
-                                let handler = ClientHandler{ conn, muxer: muxer.clone() };
-                                tokio::spawn(async move {
-                                    if let Err(e) = handler.run().await {
-                                        error!(error = %e, "Client handler error");
-                                    }
-                                });
-                            }
-                        }
-                    }
-                }
+                // В новой архитектуре клиент запускается через EngineBuilder + TUN.
+                // Структура Network теперь используется только для запуска Сервера.
+                error!("Client mode cannot be run via Network::run anymore.");
+                error!("Please use EngineBuilder to initialize the TUN client.");
+                panic!("Legacy SOCKS5 client mode has been removed.");
             }
             ConnectionRole::Server => {
+                info!("Starting Server mode on {}", addr);
                 let listener = TcpListener::bind(&addr).await.expect("Server bind failed");
+
                 loop {
                     tokio::select! {
-                        _ = token.cancelled() => break,
+                        _ = token.cancelled() => {
+                            info!("Shutdown signal received, stopping server.");
+                            break;
+                        }
                         res = listener.accept() => {
                             if let Ok((stream, client_addr)) = res {
+                                info!("New connection from {}", client_addr);
+
+                                // Создаем соединение (init = true для сервера)
                                 let conn = Connection::new(stream, true);
                                 let handler = ServerHandler { conn };
+
                                 tokio::spawn(async move {
                                     if let Err(e) = handler.run().await {
                                         error!(client = %client_addr, error = %e, "Server handler error");
@@ -96,52 +82,51 @@ pub struct NetworkConfig {
     pub mtu: usize,
     pub max_wire_frame_size: usize,
     pub safe_payload_size: usize,
-    pub tcp_buffer_size: usize,
+
+    // --- ИЗМЕНЕНИЯ ЗДЕСЬ ---
+    pub tcp_buffer_size: usize, // Размер буфера для системного tokio::TcpStream
     pub udp_buffer_size: usize,
-    pub channel_capacity: usize,
+    pub muxer_capacity: usize,  // Глобальные каналы (Muxer <-> Engine)
+    pub stream_capacity: usize, // Локальные каналы 1 сокета (Engine <-> Muxer)
+
+    pub smoltcp_socket_buf: usize,
+    pub tcp_max_pending: usize,
+    pub tcp_chunk_size: usize,
 }
 
 impl NetworkConfig {
     pub fn new(system_mtu: usize) -> Self {
-        let transport_overhead = 28; // IPv4 + UDP
-
+        let transport_overhead = 28;
         let max_wire_frame = system_mtu.saturating_sub(transport_overhead);
+        let safe_payload = max_wire_frame.saturating_sub(10).saturating_sub(255);
 
-        let safe_payload = max_wire_frame
-            .saturating_sub(FRAME_HEADER_SIZE as usize)
-            .saturating_sub((MAX_PADDING_SIZE - 1) as usize);
-
-        let tcp_chunks_count = 65536 / safe_payload;
-        let tcp_buffer = safe_payload * tcp_chunks_count;
-
-        let udp_chunks_count = 16384 / safe_payload;
-        let udp_buffer = safe_payload * udp_chunks_count;
-
-        let channel_cap = 1024;
-
-        netrunner_logger::info!(
-            mtu = system_mtu,
-            payload = safe_payload,
-            tcp_buf = tcp_buffer,
-            "Network Optimizer: Calculations complete for current MTU"
-        );
+        let muxer_capacity = 64;
+        let stream_capacity = 4;
 
         Self {
             mtu: system_mtu,
             max_wire_frame_size: max_wire_frame,
             safe_payload_size: safe_payload,
-            tcp_buffer_size: tcp_buffer,
-            udp_buffer_size: udp_buffer,
-            channel_capacity: channel_cap,
+
+            // Заменяем громоздкие вычисления на стандартные 64KB чанки для системных сокетов
+            tcp_buffer_size: 64 * 1024,
+            udp_buffer_size: 64 * 1024,
+
+            muxer_capacity,
+            stream_capacity,
+            smoltcp_socket_buf: 64 * 1024,
+            tcp_max_pending: 64 * 1024,
+            tcp_chunk_size: 16 * 1024,
         }
     }
 
     pub fn init_global(system_mtu: usize) {
         let config = Self::new(system_mtu);
         if GLOBAL_NET_CONFIG.set(config).is_err() {
-            netrunner_logger::warn!("Global network config was already initialized!");
+            warn!("Global network config was already initialized!");
         }
     }
+
     pub fn global() -> &'static Self {
         GLOBAL_NET_CONFIG
             .get()

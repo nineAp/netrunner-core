@@ -29,9 +29,9 @@ impl ConnectionCore {
     pub fn new(handle: SocketHandle) -> (Self, mpsc::Receiver<Bytes>, mpsc::Sender<Bytes>) {
         trace!(%handle, "Creating ConnectionCore channels");
         let (tx_to_net, rx_from_smol) =
-            mpsc::channel::<Bytes>(NetworkConfig::global().channel_capacity);
+            mpsc::channel::<Bytes>(NetworkConfig::global().stream_capacity);
         let (tx_to_smol, rx_from_net) =
-            mpsc::channel::<Bytes>(NetworkConfig::global().channel_capacity);
+            mpsc::channel::<Bytes>(NetworkConfig::global().stream_capacity);
 
         let core = Self {
             handle,
@@ -42,7 +42,6 @@ impl ConnectionCore {
         (core, rx_from_smol, tx_to_smol)
     }
 }
-
 // ============================================================================
 // 2. TCP СОЕДИНЕНИЕ (TcpConnection)
 // ============================================================================
@@ -55,14 +54,13 @@ pub enum ConnectionState {
     Closed,
 }
 
-const MAX_PENDING: usize = 64 * 1024;
-const TCP_CHUNK_SIZE: usize = 1024 * 16;
-
 pub struct TcpConnection {
     core: ConnectionCore,
     state: ConnectionState,
     pending_data: BytesMut,
     handshake_rx: Option<oneshot::Receiver<()>>,
+    chunk_buf: Vec<u8>,
+    server_eof: bool, // <--- ДОБАВЛЕН ФЛАГ ОКОНЧАНИЯ ПЕРЕДАЧИ
 }
 
 impl TcpConnection {
@@ -83,18 +81,14 @@ impl TcpConnection {
             state: ConnectionState::Handshaking,
             pending_data: BytesMut::new(),
             handshake_rx: Some(handshake_rx),
+            chunk_buf: vec![0u8; NetworkConfig::global().tcp_chunk_size],
+            server_eof: false, // Инициализируем
         };
 
         (conn, rx_from_smol, tx_to_smol, handshake_tx)
     }
 
-    pub fn is_finished(&self, socket: &tcp::Socket) -> bool {
-        matches!(socket.state(), tcp::State::Closed | tcp::State::TimeWait)
-    }
-
     pub fn tick(&mut self, socket: &mut tcp::Socket) -> bool {
-        let state = socket.state();
-
         match self.state {
             ConnectionState::Handshaking => {
                 if let Some(rx) = &mut self.handshake_rx {
@@ -105,9 +99,8 @@ impl TcpConnection {
                             self.handshake_rx = None;
                             return true;
                         }
-                        Err(oneshot::error::TryRecvError::Empty) => return true, // Ждем
+                        Err(oneshot::error::TryRecvError::Empty) => return true,
                         Err(oneshot::error::TryRecvError::Closed) => {
-                            debug!(%self.core.handle, "TCP Handshake channel dropped/aborted, State -> Closed");
                             self.state = ConnectionState::Closed;
                             return false;
                         }
@@ -120,17 +113,10 @@ impl TcpConnection {
             ConnectionState::Active => {
                 self.poll_and_process(socket);
 
-                if state == tcp::State::CloseWait {
-                    debug!(%self.core.handle, "TCP Socket reached CloseWait state, closing");
-                    socket.close();
+                // Если сокет достиг финальных стадий, убиваем нашу сессию
+                if matches!(socket.state(), tcp::State::Closed | tcp::State::TimeWait) {
+                    debug!(%self.core.handle, "TCP Socket is finished, state -> Closed");
                     self.state = ConnectionState::Closed;
-                    return false;
-                }
-
-                if self.is_finished(socket) {
-                    debug!(%self.core.handle, "TCP Socket is finished (Closed/TimeWait), state -> Closed");
-                    self.state = ConnectionState::Closed;
-                    socket.close();
                     return false;
                 }
             }
@@ -146,30 +132,29 @@ impl TcpConnection {
     }
 
     fn poll_and_process(&mut self, socket: &mut tcp::Socket) {
+        let max_pending = NetworkConfig::global().tcp_max_pending;
+
         // 1. Вычитываем данные из smoltcp и шлем в Muxer
         while socket.can_recv() {
             let mut full = false;
-            let mut temp = [0u8; TCP_CHUNK_SIZE];
 
-            if let Ok(n) = socket.peek_slice(&mut temp) {
+            if let Ok(n) = socket.peek_slice(&mut self.chunk_buf) {
                 if n == 0 {
                     break;
                 }
 
-                let chunk = Bytes::copy_from_slice(&temp[..n]);
+                let chunk = Bytes::copy_from_slice(&self.chunk_buf[..n]);
                 match self.core.tx.try_send(chunk) {
                     Ok(_) => {
-                        trace!(%self.core.handle, "Forwarded {} bytes from smoltcp to Muxer", n);
-                        socket.recv_slice(&mut temp[..n]).unwrap();
+                        socket.recv_slice(&mut self.chunk_buf[..n]).unwrap();
                     }
                     Err(mpsc::error::TrySendError::Full(_)) => {
-                        debug!(%self.core.handle, "Muxer TX channel full, backpressure applied to smoltcp read");
                         full = true;
                     }
                     Err(_) => {
-                        debug!(%self.core.handle, "Muxer TX channel closed unexpectedly, state -> Closed");
-                        self.state = ConnectionState::Closed;
-                        return;
+                        // Канал Muxer'а закрыт
+                        self.server_eof = true;
+                        break;
                     }
                 }
             } else {
@@ -181,59 +166,56 @@ impl TcpConnection {
             }
         }
 
-        // 2. Читаем данные из Muxer'а с учетом Backpressure
-        let current_pending = self.pending_data.len();
-        let fill_ratio = (current_pending as f32 / MAX_PENDING as f32) * 100.0;
-
-        if current_pending >= MAX_PENDING {
-            warn!(
-                %self.core.handle,
-                "Backpressure ACTIVE: Buffer is FULL ({} bytes). Stalling RX channel.",
-                current_pending
-            );
-        } else if fill_ratio > 80.0 {
-            info!(
-                %self.core.handle,
-                "Bufferbloat Warning: Buffer {:.1}% full ({} bytes). Latency increasing.",
-                fill_ratio, current_pending
-            );
-
-            while let Ok(data) = self.core.rx.try_recv() {
-                trace!(%self.core.handle, "Received {} bytes from Muxer (high buffer)", data.len());
-                self.pending_data.extend_from_slice(&data);
-                if self.pending_data.len() >= MAX_PENDING {
-                    break;
-                }
-            }
-        } else {
-            while let Ok(data) = self.core.rx.try_recv() {
-                trace!(%self.core.handle, "Received {} bytes from Muxer", data.len());
-                self.pending_data.extend_from_slice(&data);
-                if self.pending_data.len() >= MAX_PENDING {
-                    break;
+        // 2. Читаем данные из Muxer'а
+        if !self.server_eof {
+            loop {
+                match self.core.rx.try_recv() {
+                    Ok(data) => {
+                        self.pending_data.extend_from_slice(&data);
+                        if self.pending_data.len() >= max_pending {
+                            break;
+                        }
+                    }
+                    Err(mpsc::error::TryRecvError::Empty) => {
+                        break;
+                    }
+                    Err(mpsc::error::TryRecvError::Disconnected) => {
+                        // ВАЖНО: Удаленный сервер прислал EOF!
+                        debug!(%self.core.handle, "Server sent EOF (channel disconnected).");
+                        self.server_eof = true;
+                        break;
+                    }
                 }
             }
         }
 
-        // 3. Отправляем буферизированные данные в smoltcp
+        // 3. Пишем данные браузеру
         if !self.pending_data.is_empty() && socket.can_send() {
             match socket.send_slice(&self.pending_data) {
                 Ok(n) => {
-                    trace!(%self.core.handle, "Wrote {} bytes from buffer to smoltcp", n);
                     self.pending_data.advance(n);
-
-                    if n > 0 && self.pending_data.len() < (MAX_PENDING / 2) && fill_ratio > 90.0 {
-                        info!(
-                            %self.core.handle,
-                            "Backpressure RELIEVED: Buffer drained to {} bytes",
-                            self.pending_data.len()
-                        );
-                    }
                 }
                 Err(e) => {
-                    debug!(%self.core.handle, "Smoltcp socket send error: {:?}", e);
+                    debug!(%self.core.handle, "Smoltcp send error: {:?}", e);
                 }
             }
+        }
+
+        // 4. ГРАЦИОЗНОЕ ЗАКРЫТИЕ (Отправка FIN браузеру)
+
+        // Сценарий А: Сервер закрыл соединение, и мы отдали все остатки данных браузеру
+        if self.server_eof && self.pending_data.is_empty() && socket.may_send() {
+            debug!(%self.core.handle, "All data flushed after server EOF, sending FIN to browser");
+            socket.close();
+        }
+
+        // Сценарий Б: Браузер сам инициировал закрытие (CloseWait), но мы дожидаемся опустошения буфера
+        if socket.state() == tcp::State::CloseWait
+            && self.pending_data.is_empty()
+            && socket.may_send()
+        {
+            debug!(%self.core.handle, "Browser in CloseWait and buffer flushed, sending FIN");
+            socket.close();
         }
     }
 }

@@ -1,4 +1,6 @@
 use netrunner_core::net::ClientHandler;
+use netrunner_core::net::network::NetworkConfig;
+use netrunner_core::rawcast::RawCastFrame;
 use smoltcp::iface::PollResult;
 use smoltcp::time::Instant;
 use smoltcp::wire::{IpAddress, IpCidr};
@@ -35,17 +37,25 @@ pub struct Engine {
     to_smoltcp_tx: UnboundedSender<TokenBuffer>,
     from_smoltcp_rx: Option<UnboundedReceiver<TokenBuffer>>,
     avail: Arc<AtomicBool>,
+    rx_from_tunnel: mpsc::Receiver<RawCastFrame>,
 }
-
 impl Engine {
-    pub fn new(config: Config, caps: DeviceCapabilities, dns_handler: DnsHandler) -> Self {
+    pub fn new(
+        config: Config,
+        caps: DeviceCapabilities,
+        dns_handler: DnsHandler,
+        tx_to_tunnel: mpsc::Sender<RawCastFrame>, // Куда менеджер будет слать пакеты
+        rx_from_tunnel: mpsc::Receiver<RawCastFrame>, // Откуда движок будет читать пакеты
+    ) -> Self {
         let now = Engine::current_time();
 
         let (mut device, to_smoltcp_tx, from_smoltcp_rx, avail) = VirtTunDevice::new(caps);
         let interface = Interface::new(config, &mut device, now);
 
         let socket_set = ConnectionManager::setup_sockets(2);
-        let manager = ConnectionManager::new(dns_handler);
+
+        // Передаем TX-канал в ConnectionManager
+        let manager = ConnectionManager::new(dns_handler, tx_to_tunnel);
 
         Self {
             interface,
@@ -55,6 +65,7 @@ impl Engine {
             from_smoltcp_rx: Some(from_smoltcp_rx),
             avail,
             manager,
+            rx_from_tunnel,
         }
     }
 
@@ -69,17 +80,36 @@ impl Engine {
         Self::spawn_tun_writer(writer, from_smoltcp_rx);
 
         let mut last_log = StdInstant::now();
+        let mut stuck_frame: Option<RawCastFrame> = None;
 
         loop {
+            // 1. Быстро читаем из TUN
             while let Ok(token) = tun_to_engine_rx.try_recv() {
                 self.manager
                     .try_create_socket_from_packet(&token, &mut self.socket_set);
-
                 if self.to_smoltcp_tx.send(token).is_ok() {
                     self.device.mark_rx_available();
                 }
             }
 
+            // 2. Пытаемся протолкнуть застрявший кадр
+            if let Some(frame) = stuck_frame.take() {
+                if let Err(returned_frame) = self.manager.try_inject_inbound(frame) {
+                    stuck_frame = Some(returned_frame);
+                }
+            }
+
+            // 3. Если затора нет, читаем новые кадры из VPN-туннеля
+            if stuck_frame.is_none() {
+                while let Ok(frame) = self.rx_from_tunnel.try_recv() {
+                    if let Err(returned_frame) = self.manager.try_inject_inbound(frame) {
+                        stuck_frame = Some(returned_frame);
+                        break; // СТОП! Локальный сокет переполнен, давим на тормоза!
+                    }
+                }
+            }
+
+            // 4. Двигаем стейт-машину smoltcp
             let result = self.poll();
             self.manager.process_sockets(&mut self.socket_set);
 
@@ -89,16 +119,48 @@ impl Engine {
             }
 
             if matches!(result, PollResult::SocketStateChanged) {
-                continue;
-            }
-
-            if self.avail.swap(false, Ordering::Acquire) {
-                tokio::task::yield_now().await;
+                self.manager.cleanup(&mut self.socket_set);
                 continue;
             }
 
             self.manager.cleanup(&mut self.socket_set);
-            self.poll_delay().await;
+
+            let delay = self
+                .interface
+                .poll_delay(Self::current_time(), &self.socket_set);
+            let sleep_duration = match delay {
+                Some(d) => Duration::from_micros(d.micros()),
+                None => Duration::from_millis(10),
+            };
+
+            // 5. Умный select!
+            if stuck_frame.is_none() {
+                tokio::select! {
+                    _ = sleep(sleep_duration) => {}
+                    Some(token) = tun_to_engine_rx.recv() => {
+                        self.manager.try_create_socket_from_packet(&token, &mut self.socket_set);
+                        if self.to_smoltcp_tx.send(token).is_ok() {
+                            self.device.mark_rx_available();
+                        }
+                    }
+                    Some(frame) = self.rx_from_tunnel.recv() => {
+                        if let Err(returned_frame) = self.manager.try_inject_inbound(frame) {
+                            stuck_frame = Some(returned_frame);
+                        }
+                    }
+                }
+            } else {
+                // Если буфер переполнен, ждем только таймер или данные от браузера
+                tokio::select! {
+                    _ = sleep(sleep_duration) => {}
+                    Some(token) = tun_to_engine_rx.recv() => {
+                        self.manager.try_create_socket_from_packet(&token, &mut self.socket_set);
+                        if self.to_smoltcp_tx.send(token).is_ok() {
+                            self.device.mark_rx_available();
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -106,16 +168,6 @@ impl Engine {
         let now = Self::current_time();
         self.interface
             .poll(now, &mut self.device, &mut self.socket_set)
-    }
-
-    async fn poll_delay(&mut self) {
-        let timestamp = Self::current_time();
-        let delay = self.interface.poll_delay(timestamp, &self.socket_set);
-        let sleep_duration = match delay {
-            Some(d) => Duration::from_micros(d.micros()),
-            None => Duration::from_millis(10),
-        };
-        sleep(sleep_duration).await;
     }
 
     fn spawn_tun_reader(
@@ -305,18 +357,36 @@ impl EngineBuilder {
         // 3. Конфигурация интерфейса smoltcp
         let smol_config = Config::new(smoltcp::wire::HardwareAddress::Ip);
         let mut caps = DeviceCapabilities::default();
-        caps.max_transmission_unit = self.config.mtu; // Берем из конфига
+        caps.max_transmission_unit = self.config.mtu;
         caps.medium = smoltcp::phy::Medium::Ip;
+
+        // --- СОЗДАЕМ КАНАЛЫ СВЯЗИ ДВИЖОК <-> ТУННЕЛЬ ---
+        // tx_to_tunnel: Движок пишет, ClientHandler читает (исходящий трафик)
+        let (tx_to_tunnel, rx_for_client_handler) =
+            mpsc::channel(NetworkConfig::global().muxer_capacity);
+
+        // tx_to_engine: ClientHandler пишет, Движок читает (входящий трафик)
+        let (tx_for_client_handler, rx_from_tunnel) =
+            mpsc::channel(NetworkConfig::global().muxer_capacity);
 
         // 4. Подключение к серверу
         info!("Establishing secure tunnel to proxy server...");
-        ClientHandler::connect(&self.config.remote_address)
-            .await
-            .map_err(|e| format!("Failed to establish secure tunnel: {}", e))?;
+
+        // ВАЖНО: Тебе нужно добавить эти аргументы в `ClientHandler::connect`,
+        // чтобы он знал, откуда забирать `RawCastFrame` для отправки на сервер,
+        // и куда отдавать `RawCastFrame`, прилетевшие от сервера.
+        ClientHandler::connect(
+            &self.config.remote_address,
+            rx_for_client_handler,
+            tx_for_client_handler,
+        )
+        .await
+        .map_err(|e| format!("Failed to establish secure tunnel: {}", e))?;
+
         info!("Secure tunnel established, Muxer is ready.");
 
-        // 5. Инициализация и настройка Engine
-        let mut engine = Engine::new(smol_config, caps, dns_handler);
+        // 5. Инициализация и настройка Engine (передаем каналы)
+        let mut engine = Engine::new(smol_config, caps, dns_handler, tx_to_tunnel, rx_from_tunnel);
 
         engine.set_any_ip(self.config.any_ip);
 
