@@ -2,7 +2,7 @@ namespace netrunner_client {};
 
 interface SessionManager {
     constructor();
-    Session start_mobile(string remote_address, optional i32 tun_fd, string cache_path);
+    Session spawn_session(string remote_address, optional i32 tun_fd, string cache_path);
 };
 
 interface Session {

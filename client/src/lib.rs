@@ -62,7 +62,12 @@ pub struct SessionManager;
 
 #[uniffi::export]
 impl SessionManager {
-    pub(crate) fn spawn_session(
+    #[uniffi::constructor]
+    pub fn new() -> Arc<Self> {
+        Arc::new(SessionManager)
+    }
+
+    pub fn spawn_session(
         &self,
         remote_address: String,
         tun_fd: Option<i32>,
