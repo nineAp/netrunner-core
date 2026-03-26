@@ -6,7 +6,7 @@ use smoltcp::{
     time::Instant,
     wire::IpEndpoint,
 };
-use std::{collections::HashSet, time::Duration};
+use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 // Добавили trace для частых логов (попакетно) и debug для состояний
 use netrunner_logger::{debug, error, info, trace, warn};
@@ -226,8 +226,8 @@ const UDP_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub struct UdpConnection {
     core: ConnectionCore,
-    client_endpoints: HashSet<IpEndpoint>,
-    last_activity: std::time::Instant, // Системное время для таймаутов
+    client_endpoint: Option<IpEndpoint>,
+    last_activity: Instant,
 }
 
 impl UdpConnection {
@@ -237,57 +237,93 @@ impl UdpConnection {
 
         let conn = Self {
             core,
-            client_endpoints: HashSet::new(), // Инициализируем пустое множество
-            last_activity: std::time::Instant::now(),
+            client_endpoint: None,
+            last_activity: Instant::now(),
         };
 
         (conn, rx_from_smol, tx_to_smol)
     }
 
     pub fn tick(&mut self, socket: &mut udp::Socket) -> bool {
-        // Проверка таймаутов (остается твоя рабочая)
-        if self.last_activity.elapsed() > UDP_TIMEOUT {
-            debug!(%self.core.handle, "UDP Session closed due to timeout");
+        // 1. Получаем текущее время системы в миллисекундах
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+
+        // 2. Считаем разницу (сколько мс прошло с последней активности)
+        let elapsed_ms = now_ms - self.last_activity.total_millis();
+
+        // 3. Сравниваем с UDP_TIMEOUT (переводим его тоже в мс)
+        if elapsed_ms > UDP_TIMEOUT.as_millis() as i64 {
+            debug!(
+                %self.core.handle,
+                "UDP Session closed due to {}s timeout",
+                UDP_TIMEOUT.as_secs()
+            );
             socket.close();
             return false;
         }
 
-        // ЧИТАЕМ ИЗ SMOLTCP (от клиента) И ШЛЕМ В ТУННЕЛЬ
         if socket.can_recv() {
+            let target_endpoint = socket.endpoint();
             while let Ok((data, metadata)) = socket.recv() {
                 let source_endpoint = metadata.endpoint;
 
-                // ЗАПОМИНАЕМ ВСЕ ПОРТЫ КЛИЕНТА, КОТОРЫЕ СЮДА СТУЧАТСЯ
-                if self.client_endpoints.insert(source_endpoint) {
+                if self.client_endpoint.is_none() {
                     info!(
                         %self.core.handle,
                         source = %source_endpoint,
-                        "Registered new client port for UDP session"
+                        target = %target_endpoint,
+                        "UDP Session Established. Pinning endpoint."
                     );
                 }
+                self.client_endpoint = Some(source_endpoint);
+
+                trace!(
+                    %self.core.handle,
+                    source = %source_endpoint,
+                    target = %target_endpoint,
+                    bytes = data.len(),
+                    "Forwarded UDP datagram from smoltcp to Muxer"
+                );
 
                 if self.core.tx.try_send(Bytes::copy_from_slice(data)).is_ok() {
-                    self.last_activity = std::time::Instant::now();
+                    self.last_activity = Instant::now();
+                } else {
+                    debug!(%self.core.handle, "Muxer TX channel full or closed, dropping UDP datagram");
                 }
             }
         }
 
-        // ЧИТАЕМ ИЗ ТУННЕЛЯ И ШЛЕМ В SMOLTCP (клиенту)
-        if socket.can_send() && !self.client_endpoints.is_empty() {
-            loop {
-                match self.core.rx.try_recv() {
-                    Ok(data) => {
-                        // БРОАДКАСТ: Отправляем ответ на ВСЕ порты, которые мы запомнили
-                        for endpoint in &self.client_endpoints {
-                            let _ = socket.send_slice(&data, *endpoint);
+        if socket.can_send() {
+            if let Some(client_endpoint) = self.client_endpoint {
+                loop {
+                    match self.core.rx.try_recv() {
+                        Ok(data) => match socket.send_slice(&data, client_endpoint) {
+                            Ok(_) => {
+                                info!(
+                                    %self.core.handle,
+                                    bytes = data.len(),
+                                    target = %client_endpoint,
+                                    "🟢 SUCCESS: Received UDP from tunnel, pushed to smoltcp!"
+                                );
+                                self.last_activity = smoltcp::time::Instant::now();
+                            }
+                            Err(e) => {
+                                error!(%self.core.handle, "Failed to send UDP datagram: {:?}", e);
+                                break;
+                            }
+                        },
+                        Err(mpsc::error::TryRecvError::Empty) => {
+                            break;
                         }
-                        self.last_activity = std::time::Instant::now();
-                    }
-                    Err(mpsc::error::TryRecvError::Empty) => break,
-                    Err(mpsc::error::TryRecvError::Disconnected) => {
-                        debug!(%self.core.handle, "Muxer channel disconnected");
-                        socket.close();
-                        return false;
+                        Err(mpsc::error::TryRecvError::Disconnected) => {
+                            // Сервер разорвал соединение!
+                            debug!(%self.core.handle, "Muxer channel disconnected, closing UDP socket");
+                            socket.close();
+                            return false;
+                        }
                     }
                 }
             }
