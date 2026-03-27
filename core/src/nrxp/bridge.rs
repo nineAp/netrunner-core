@@ -144,6 +144,10 @@ impl TlsBridge {
     ) -> Result<Bytes, TlsError> {
         if let HandshakeMessage::Client { base, extensions } = client_msg {
             if base.session_id.len() != 32 {
+                netrunner_logger::warn!(
+                    "❌ Auth failed: Expected 32 bytes SessionID, got {}. Client IP: ...",
+                    base.session_id.len()
+                );
                 return Err(TlsError::new(
                     ErrorStage::Handshake("Invalid SessionID len"),
                     ErrorAction::Drop,
@@ -152,7 +156,15 @@ impl TlsBridge {
             }
 
             let mut received_tag = [0u8; 16];
-            received_tag.copy_from_slice(&base.session_id[16..32]);
+            if base.session_id.len() >= 32 {
+                received_tag.copy_from_slice(&base.session_id[16..32]);
+            } else {
+                return Err(TlsError::new(
+                    ErrorStage::Handshake("Short SessionID"),
+                    ErrorAction::Drop,
+                    Bytes::new(),
+                ));
+            }
 
             if !keys.verify_auth_tag(&received_tag) {
                 netrunner_logger::warn!("Unauthorized ClientHello: Auth Tag mismatch");

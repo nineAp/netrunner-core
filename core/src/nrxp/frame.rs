@@ -25,7 +25,7 @@ impl Padding {
     }
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq)]
 pub(crate) enum FrameType {
     Connect = 0x00,
     Data = 0x01,
@@ -33,6 +33,7 @@ pub(crate) enum FrameType {
     Heartbeat = 0x03,
     UdpConnect = 0x04,
     UdpData = 0x05,
+    Handshake = 0x06,
 }
 #[derive(Copy, Clone)]
 pub(crate) struct FrameHeader {
@@ -122,6 +123,9 @@ impl Parser for FrameHeader {
             0x01 => FrameType::Data,
             0x02 => FrameType::Close,
             0x03 => FrameType::Heartbeat,
+            0x04 => FrameType::UdpConnect,
+            0x05 => FrameType::UdpData,
+            0x06 => FrameType::Handshake,
             _ => FrameType::Close,
         };
 

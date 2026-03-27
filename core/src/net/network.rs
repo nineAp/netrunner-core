@@ -12,22 +12,11 @@ pub struct Network {
     host: String,
     port: u16,
     role: ConnectionRole,
-    remote_proxy_addr: Option<String>,
 }
 
 impl Network {
-    pub fn new(
-        host: String,
-        port: u16,
-        role: ConnectionRole,
-        remote_proxy_addr: Option<String>,
-    ) -> Self {
-        Self {
-            host,
-            port,
-            role,
-            remote_proxy_addr,
-        }
+    pub fn new(host: String, port: u16, role: ConnectionRole) -> Self {
+        Self { host, port, role }
     }
 
     pub async fn run(&self, token: CancellationToken) {
@@ -60,7 +49,7 @@ impl Network {
 
                                 // Создаем соединение (init = true для сервера)
                                 let conn = Connection::new(stream, true);
-                                let handler = ServerHandler { conn };
+                                let handler = ServerHandler::new(conn);
 
                                 tokio::spawn(async move {
                                     if let Err(e) = handler.run().await {
@@ -108,7 +97,7 @@ impl NetworkConfig {
         // 2. Каналы Muxer (Баланс между скоростью и задержкой)
         let muxer_capacity = 512; // Глобальная очередь (выдержит много вкладок)
         let tcp_stream_capacity = 16; // Хватит для скорости, но не даст пингу взлететь
-        let udp_stream_capacity = 64; // Простор для голосового трафика и игр
+        let udp_stream_capacity = 32; // Простор для голосового трафика и игр
 
         Self {
             mtu: system_mtu,

@@ -2,9 +2,17 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
-use tokio::sync::mpsc::{error::SendError, Sender};
+use tokio::sync::mpsc::Sender;
 
+use crate::net::network::NetworkConfig;
 use crate::nrxp::FrameType;
+
+// Вспомогательная структура для отдельного TLS-соединения
+#[derive(Clone)]
+struct MuxLeg {
+    control_tx: Sender<MuxMessage>,
+    data_tx: Sender<MuxMessage>,
+}
 
 struct IdGenerator {
     counter: AtomicU32,
@@ -31,67 +39,129 @@ pub struct MuxMessage {
 
 #[derive(Clone)]
 pub struct Muxer {
-    control_tx: Sender<MuxMessage>,
-    data_tx: Sender<MuxMessage>,
+    legs: Arc<DashMap<u32, MuxLeg>>,
     streams: Arc<DashMap<u32, Sender<Bytes>>>,
     id_gen: Arc<IdGenerator>,
+    leg_selector: Arc<AtomicU32>,
 }
 
 impl Muxer {
-    pub fn new(
-        control_tx: Sender<MuxMessage>,
-        data_tx: Sender<MuxMessage>,
-        is_client: bool,
-    ) -> Self {
+    pub fn new(is_client: bool) -> Self {
         Self {
-            control_tx,
-            data_tx,
+            legs: Arc::new(DashMap::new()),
             streams: Arc::new(DashMap::new()),
             id_gen: Arc::new(IdGenerator::new(is_client)),
+            leg_selector: Arc::new(AtomicU32::new(0)),
+            // leg_id_gen удален!
         }
     }
 
-    pub fn next_id(&self) -> u32 {
-        self.id_gen.next()
+    // ТЕПЕРЬ leg_id ПЕРЕДАЕТСЯ СНАРУЖИ
+    pub fn add_leg(
+        &self,
+        leg_id: u32,
+        control_tx: Sender<MuxMessage>,
+        data_tx: Sender<MuxMessage>,
+    ) {
+        self.legs.insert(
+            leg_id,
+            MuxLeg {
+                control_tx,
+                data_tx,
+            },
+        );
+        netrunner_logger::info!(leg_id, "MUXER: Leg registered");
     }
 
-    pub async fn send_to_network(&self, message: MuxMessage) -> Result<(), SendError<MuxMessage>> {
-        self.data_tx.send(message).await
+    pub fn remove_leg(&self, leg_id: u32) {
+        self.legs.remove(&leg_id);
+        netrunner_logger::info!(leg_id, "MUXER: Leg removed");
     }
 
-    pub async fn send_data_safe(&self, stream_id: u32, mut data: Bytes) -> Result<(), String> {
-        // Лимит полезной нагрузки, чтобы вместе с заголовком и паддингом
-        // пакет оставался в пределах ~1400-1450 байт.
+    pub fn active_legs_count(&self) -> usize {
+        self.legs.len()
+    }
+
+    // Возвращаем кортеж (leg_id, MuxLeg), чтобы знать, кого удалять в случае ошибки
+    fn select_leg(&self, frame_type: &FrameType) -> Option<(u32, MuxLeg)> {
+        if self.legs.is_empty() {
+            return None;
+        }
+
+        match frame_type {
+            FrameType::UdpData | FrameType::UdpConnect => {
+                // Пытаемся взять UDP ногу (1), если её нет — берем TCP (0) как фоллбэк
+                if let Some(leg) = self.legs.get(&1) {
+                    Some((1, leg.clone()))
+                } else if let Some(leg) = self.legs.get(&0) {
+                    Some((0, leg.clone()))
+                } else {
+                    None
+                }
+            }
+            _ => {
+                // Пытаемся взять TCP ногу (0), фоллбэк на UDP (1)
+                if let Some(leg) = self.legs.get(&0) {
+                    Some((0, leg.clone()))
+                } else if let Some(leg) = self.legs.get(&1) {
+                    Some((1, leg.clone()))
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    pub async fn send_to_network(&self, message: MuxMessage) -> Result<(), String> {
+        let (leg_id, leg) = self
+            .select_leg(&message.frame_type)
+            .ok_or_else(|| "MUXER: No active legs available".to_string())?;
+
+        let target_tx = match message.frame_type {
+            FrameType::Connect
+            | FrameType::Close
+            | FrameType::UdpConnect
+            | FrameType::Handshake => &leg.control_tx,
+            _ => &leg.data_tx,
+        };
+
+        // Если канал мертв (TunnelEngine упал), удаляем ногу из роутинга!
+        if let Err(e) = target_tx.send(message).await {
+            self.remove_leg(leg_id);
+            return Err(format!("MUXER: Leg {} died during send: {}", leg_id, e));
+        }
+
+        Ok(())
+    }
+
+    pub async fn send_data_safe(
+        &self,
+        stream_id: u32,
+        mut data: Bytes,
+        is_udp: bool,
+    ) -> Result<(), String> {
         const MAX_PAYLOAD_CHUNK: usize = 1300;
+        let frame_type = if is_udp {
+            FrameType::UdpData
+        } else {
+            FrameType::Data
+        };
 
-        if data.len() <= MAX_PAYLOAD_CHUNK {
-            return self
-                .send_to_network(MuxMessage {
-                    stream_id,
-                    frame_type: FrameType::Data,
-                    data,
-                })
-                .await
-                .map_err(|e| e.to_string());
-        }
-
-        // Если данных много (например, те самые 4096 байт), режем их на куски
         while !data.is_empty() {
             let chunk_size = std::cmp::min(data.len(), MAX_PAYLOAD_CHUNK);
             let chunk = data.split_to(chunk_size);
 
             self.send_to_network(MuxMessage {
                 stream_id,
-                frame_type: FrameType::Data,
+                frame_type,
                 data: chunk,
             })
-            .await
-            .map_err(|e| e.to_string())?;
+            .await?;
 
-            // Небольшая уступка планировщику, чтобы не забить канал мгновенно
-            tokio::task::yield_now().await;
+            if !data.is_empty() {
+                tokio::task::yield_now().await;
+            }
         }
-
         Ok(())
     }
 
@@ -101,14 +171,12 @@ impl Muxer {
         f_type: FrameType,
         data: Bytes,
     ) -> Result<(), String> {
-        self.control_tx
-            .send(MuxMessage {
-                stream_id,
-                frame_type: f_type,
-                data,
-            })
-            .await
-            .map_err(|e| e.to_string())
+        self.send_to_network(MuxMessage {
+            stream_id,
+            frame_type: f_type,
+            data,
+        })
+        .await
     }
 
     pub fn register_stream(&self, stream_id: u32, tx: Sender<Bytes>) {
@@ -120,22 +188,10 @@ impl Muxer {
     }
 
     pub async fn dispatch_to_local(&self, stream_id: u32, data: Bytes) {
-        let tx = self.streams.get(&stream_id).map(|r| r.value().clone());
-
-        if let Some(tx) = tx {
-            if let Err(_e) = tx.send(data).await {
-                netrunner_logger::warn!(
-                    stream_id,
-                    "MUXER: [INBOUND_ERR] Local channel closed, dropping packet"
-                );
+        if let Some(tx) = self.streams.get(&stream_id) {
+            if let Err(_) = tx.send(data).await {
                 self.remove_stream(stream_id);
             }
-        } else {
-            netrunner_logger::trace!(
-                stream_id,
-                len = data.len(),
-                "MUXER: [IGNORE] Received data for already closed stream (draining pipe)"
-            );
         }
     }
 }

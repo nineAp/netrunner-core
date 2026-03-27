@@ -3,13 +3,12 @@ use netrunner_core::net::network::NetworkConfig;
 use smoltcp::{
     iface::SocketHandle,
     socket::{tcp, udp},
-    time::Instant,
     wire::IpEndpoint,
 };
-use std::{collections::HashSet, time::Duration};
+use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 // Добавили trace для частых логов (попакетно) и debug для состояний
-use netrunner_logger::{debug, error, info, trace, warn};
+use netrunner_logger::debug;
 
 // ============================================================================
 // 1. БАЗОВАЯ СТРУКТУРА (ConnectionCore)
@@ -17,19 +16,19 @@ use netrunner_logger::{debug, error, info, trace, warn};
 
 /// Фундамент для любого соединения.
 /// Инициализирует и хранит каналы связи между smoltcp и Muxer'ом.
-pub struct ConnectionCore {
+pub struct ConnectionCore<T> {
     pub handle: SocketHandle,
-    pub tx: mpsc::Sender<Bytes>,
-    pub rx: mpsc::Receiver<Bytes>,
+    pub tx: mpsc::Sender<T>,
+    pub rx: mpsc::Receiver<Bytes>, // Входящие из туннеля всегда байты
 }
 
-impl ConnectionCore {
-    pub fn new(handle: SocketHandle) -> (Self, mpsc::Receiver<Bytes>, mpsc::Sender<Bytes>) {
-        trace!(%handle, "Creating ConnectionCore channels");
-        let (tx_to_net, rx_from_smol) =
-            mpsc::channel::<Bytes>(NetworkConfig::global().tcp_stream_capacity);
-        let (tx_to_smol, rx_from_net) =
-            mpsc::channel::<Bytes>(NetworkConfig::global().tcp_stream_capacity);
+impl<T> ConnectionCore<T> {
+    pub fn new(
+        handle: SocketHandle,
+        capacity: usize,
+    ) -> (Self, mpsc::Receiver<T>, mpsc::Sender<Bytes>) {
+        let (tx_to_net, rx_from_smol) = mpsc::channel::<T>(capacity);
+        let (tx_to_smol, rx_from_net) = mpsc::channel::<Bytes>(capacity);
 
         let core = Self {
             handle,
@@ -53,7 +52,7 @@ pub enum ConnectionState {
 }
 
 pub struct TcpConnection {
-    core: ConnectionCore,
+    core: ConnectionCore<Bytes>,
     state: ConnectionState,
     pending_data: BytesMut,
     handshake_rx: Option<oneshot::Receiver<()>>,
@@ -70,8 +69,8 @@ impl TcpConnection {
         mpsc::Sender<Bytes>,
         oneshot::Sender<()>,
     ) {
-        debug!(%handle, "Initializing new TCP Connection (State -> Handshaking)");
-        let (core, rx_from_smol, tx_to_smol) = ConnectionCore::new(handle);
+        let capacity = NetworkConfig::global().tcp_stream_capacity;
+        let (core, rx_from_smol, tx_to_smol) = ConnectionCore::new(handle, capacity);
         let (handshake_tx, handshake_rx) = oneshot::channel();
 
         let conn = Self {
@@ -80,7 +79,7 @@ impl TcpConnection {
             pending_data: BytesMut::new(),
             handshake_rx: Some(handshake_rx),
             chunk_buf: vec![0u8; NetworkConfig::global().tcp_chunk_size],
-            server_eof: false, // Инициализируем
+            server_eof: false,
         };
 
         (conn, rx_from_smol, tx_to_smol, handshake_tx)
@@ -224,71 +223,63 @@ impl TcpConnection {
 
 const UDP_TIMEOUT: Duration = Duration::from_secs(60);
 
+pub type UdpPacketTarget = (Bytes, std::net::Ipv4Addr, u16);
 pub struct UdpConnection {
-    core: ConnectionCore,
-    client_endpoints: HashSet<IpEndpoint>,
-    last_activity: std::time::Instant, // Системное время для таймаутов
+    core: ConnectionCore<UdpPacketTarget>, // Используем кортеж
+    last_client_endpoint: Option<IpEndpoint>,
+    last_activity: std::time::Instant,
 }
 
 impl UdpConnection {
-    pub fn new(handle: SocketHandle) -> (Self, mpsc::Receiver<Bytes>, mpsc::Sender<Bytes>) {
-        debug!(%handle, "Initializing new UDP Connection");
-        let (core, rx_from_smol, tx_to_smol) = ConnectionCore::new(handle);
+    pub fn new(
+        handle: SocketHandle,
+        client_addr: smoltcp::wire::IpAddress,
+        client_port: u16,
+    ) -> (Self, mpsc::Receiver<UdpPacketTarget>, mpsc::Sender<Bytes>) {
+        // Для UDP используем фиксированный буфер 512
+        let (core, rx_from_smol, tx_to_smol) = ConnectionCore::new(handle, 512);
 
         let conn = Self {
             core,
-            client_endpoints: HashSet::new(), // Инициализируем пустое множество
+            last_client_endpoint: Some(IpEndpoint::new(client_addr, client_port)),
             last_activity: std::time::Instant::now(),
         };
 
         (conn, rx_from_smol, tx_to_smol)
     }
-
+    // Вспомогательный метод для Tracker'а
+    pub fn has_client(&self, port: u16) -> bool {
+        self.last_client_endpoint
+            .map_or(false, |ep| ep.port == port)
+    }
     pub fn tick(&mut self, socket: &mut udp::Socket) -> bool {
-        // Проверка таймаутов (остается твоя рабочая)
         if self.last_activity.elapsed() > UDP_TIMEOUT {
-            debug!(%self.core.handle, "UDP Session closed due to timeout");
             socket.close();
             return false;
         }
 
-        // ЧИТАЕМ ИЗ SMOLTCP (от клиента) И ШЛЕМ В ТУННЕЛЬ
         if socket.can_recv() {
             while let Ok((data, metadata)) = socket.recv() {
-                let source_endpoint = metadata.endpoint;
+                if let smoltcp::wire::IpAddress::Ipv4(ip) = metadata.endpoint.addr {
+                    self.last_client_endpoint = Some(metadata.endpoint);
 
-                // ЗАПОМИНАЕМ ВСЕ ПОРТЫ КЛИЕНТА, КОТОРЫЕ СЮДА СТУЧАТСЯ
-                if self.client_endpoints.insert(source_endpoint) {
-                    info!(
-                        %self.core.handle,
-                        source = %source_endpoint,
-                        "Registered new client port for UDP session"
-                    );
-                }
+                    let target_ip = std::net::Ipv4Addr::from(ip);
+                    let target_port = metadata.endpoint.port;
+                    let payload = (Bytes::copy_from_slice(data), target_ip, target_port);
 
-                if self.core.tx.try_send(Bytes::copy_from_slice(data)).is_ok() {
-                    self.last_activity = std::time::Instant::now();
+                    if self.core.tx.try_send(payload).is_ok() {
+                        self.last_activity = std::time::Instant::now();
+                    }
                 }
             }
         }
 
-        // ЧИТАЕМ ИЗ ТУННЕЛЯ И ШЛЕМ В SMOLTCP (клиенту)
-        if socket.can_send() && !self.client_endpoints.is_empty() {
-            loop {
-                match self.core.rx.try_recv() {
-                    Ok(data) => {
-                        // БРОАДКАСТ: Отправляем ответ на ВСЕ порты, которые мы запомнили
-                        for endpoint in &self.client_endpoints {
-                            let _ = socket.send_slice(&data, *endpoint);
-                        }
-                        self.last_activity = std::time::Instant::now();
-                    }
-                    Err(mpsc::error::TryRecvError::Empty) => break,
-                    Err(mpsc::error::TryRecvError::Disconnected) => {
-                        debug!(%self.core.handle, "Muxer channel disconnected");
-                        socket.close();
-                        return false;
-                    }
+        // Исходящие из туннеля (от Telegram) — всё еще просто Bytes
+        if socket.can_send() {
+            if let Some(client_endpoint) = self.last_client_endpoint {
+                while let Ok(data) = self.core.rx.try_recv() {
+                    let _ = socket.send_slice(&data, client_endpoint);
+                    self.last_activity = std::time::Instant::now();
                 }
             }
         }
