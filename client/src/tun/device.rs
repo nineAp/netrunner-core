@@ -4,7 +4,7 @@ use std::{
     ops::{Deref, DerefMut},
     sync::{
         Arc, LazyLock, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Instant as StdInstant,
 };
@@ -19,6 +19,11 @@ use tokio::sync::mpsc;
 
 const TOKEN_BUFFER_LIST_MAX_SIZE: usize = 64;
 static TOKEN_BUFFER_LIST: LazyLock<Mutex<Vec<BytesMut>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+
+pub static GLOBAL_RX_BYTES: AtomicU64 = AtomicU64::new(0);
+pub static GLOBAL_TX_BYTES: AtomicU64 = AtomicU64::new(0);
+pub static GLOBAL_RX_PACKETS: AtomicU64 = AtomicU64::new(0);
+pub static GLOBAL_TX_PACKETS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy)]
 pub struct TrafficStats {
@@ -190,8 +195,12 @@ impl Device for VirtTunDevice {
         self.check_and_log_stats();
 
         if let Ok(buffer) = self.rx_queue.try_recv() {
+            let len = buffer.len() as u64;
             self.rx_bytes += buffer.len() as u64;
             self.rx_packets += 1;
+
+            GLOBAL_RX_BYTES.fetch_add(len, Ordering::Relaxed);
+            GLOBAL_RX_PACKETS.fetch_add(1, Ordering::Relaxed);
 
             let rx = Self::RxToken {
                 buffer,
@@ -243,6 +252,9 @@ impl phy::TxToken for VirtTxToken<'_> {
 
         self.0.tx_bytes += len as u64;
         self.0.tx_packets += 1;
+
+        GLOBAL_TX_BYTES.fetch_add(len as u64, Ordering::Relaxed);
+        GLOBAL_TX_PACKETS.fetch_add(1, Ordering::Relaxed);
 
         let _ = self.0.tx_queue.send(buffer);
 

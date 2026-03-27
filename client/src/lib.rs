@@ -8,7 +8,10 @@ pub use crate::tun::{routing, tun::Tun};
 
 use crate::{
     net::engine::{EngineBuilder, EngineConfig},
-    tun::routing::reset_platform_routing,
+    tun::{
+        device::{GLOBAL_RX_BYTES, GLOBAL_RX_PACKETS, GLOBAL_TX_BYTES, GLOBAL_TX_PACKETS},
+        routing::reset_platform_routing,
+    },
 };
 use netrunner_logger::{error, info};
 use std::sync::{Arc, OnceLock};
@@ -24,6 +27,14 @@ fn get_runtime() -> &'static Runtime {
             .build()
             .expect("Failed to create tokio runtime")
     })
+}
+
+#[derive(uniffi::Record)]
+pub struct VpnTrafficStats {
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
+    pub rx_packets: u64,
+    pub tx_packets: u64,
 }
 
 // ==========================================
@@ -158,5 +169,14 @@ impl SessionManager {
             cancel_token: session_token,
             proxy_ip: remote_proxy_ip,
         })
+    }
+
+    pub fn get_traffic_stats(&self) -> VpnTrafficStats {
+        VpnTrafficStats {
+            rx_bytes: GLOBAL_RX_BYTES.load(std::sync::atomic::Ordering::Relaxed),
+            tx_bytes: GLOBAL_TX_BYTES.load(std::sync::atomic::Ordering::Relaxed),
+            rx_packets: GLOBAL_RX_PACKETS.load(std::sync::atomic::Ordering::Relaxed),
+            tx_packets: GLOBAL_TX_PACKETS.load(std::sync::atomic::Ordering::Relaxed),
+        }
     }
 }

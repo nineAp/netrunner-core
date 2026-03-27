@@ -1,8 +1,17 @@
 namespace netrunner_client {};
 
+dictionary VpnTrafficStats {
+    u64 rx_bytes;
+    u64 tx_bytes;
+    u64 rx_packets;
+    u64 tx_packets;
+};
+
 interface SessionManager {
     constructor();
-    Session spawn_session(string remote_address, optional i32 tun_fd, string cache_path);
+    Session spawn_session(string remote_address, i32? tun_fd, string cache_path);
+    
+    VpnTrafficStats get_traffic_stats();
 };
 
 interface Session {
