@@ -199,8 +199,8 @@ impl Device for VirtTunDevice {
             self.rx_bytes += buffer.len() as u64;
             self.rx_packets += 1;
 
-            GLOBAL_RX_BYTES.fetch_add(len, Ordering::Relaxed);
-            GLOBAL_RX_PACKETS.fetch_add(1, Ordering::Relaxed);
+            GLOBAL_TX_BYTES.fetch_add(len as u64, Ordering::Relaxed);
+            GLOBAL_TX_PACKETS.fetch_add(1, Ordering::Relaxed);
 
             let rx = Self::RxToken {
                 buffer,
@@ -253,8 +253,8 @@ impl phy::TxToken for VirtTxToken<'_> {
         self.0.tx_bytes += len as u64;
         self.0.tx_packets += 1;
 
-        GLOBAL_TX_BYTES.fetch_add(len as u64, Ordering::Relaxed);
-        GLOBAL_TX_PACKETS.fetch_add(1, Ordering::Relaxed);
+        GLOBAL_RX_BYTES.fetch_add(len as u64, Ordering::Relaxed);
+        GLOBAL_RX_PACKETS.fetch_add(1, Ordering::Relaxed);
 
         let _ = self.0.tx_queue.send(buffer);
 

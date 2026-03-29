@@ -87,7 +87,7 @@ pub struct NetworkConfig {
 impl NetworkConfig {
     pub fn new(system_mtu: usize) -> Self {
         // 1. Оверхед и MTU (Борьба с фрагментацией)
-        let transport_overhead = 28; // IPv4 (20) + UDP (8)
+        let transport_overhead = 48;
         let max_wire_frame = system_mtu.saturating_sub(transport_overhead);
 
         // ВАЖНО: Убираем вычитание 255! Оставляем 64 байта под заголовки твоего протокола и крипто-теги.
@@ -95,9 +95,9 @@ impl NetworkConfig {
         let safe_payload = max_wire_frame.saturating_sub(64);
 
         // 2. Каналы Muxer (Баланс между скоростью и задержкой)
-        let muxer_capacity = 512; // Глобальная очередь (выдержит много вкладок)
-        let tcp_stream_capacity = 16; // Хватит для скорости, но не даст пингу взлететь
-        let udp_stream_capacity = 32; // Простор для голосового трафика и игр
+        let muxer_capacity = 128; // Глобальная очередь (выдержит много вкладок)
+        let tcp_stream_capacity = 4; // Хватит для скорости, но не даст пингу взлететь
+        let udp_stream_capacity = 8; // Простор для голосового трафика и игр
 
         Self {
             mtu: system_mtu,
@@ -105,17 +105,17 @@ impl NetworkConfig {
             safe_payload_size: safe_payload,
 
             // 3. Системные буферы ОС (Широкие "входные ворота")
-            tcp_buffer_size: 256 * 1024, // 256 KB
-            udp_buffer_size: 512 * 1024, // 512 KB
+            tcp_buffer_size: 128 * 1024, // 256 KB
+            udp_buffer_size: 64 * 1024,  // 512 KB
 
             muxer_capacity,
             tcp_stream_capacity,
             udp_stream_capacity,
 
             // 4. Настройки виртуального стека smoltcp (Движок)
-            smoltcp_socket_buf: 256 * 1024, // 256 KB - КРИТИЧНО для скорости загрузки!
-            tcp_max_pending: 32 * 1024,     // 32 KB - Очередь на запись
-            tcp_chunk_size: 16 * 1024,      // 16 KB - Куски, которыми мы читаем данные
+            smoltcp_socket_buf: 64 * 1024,
+            tcp_max_pending: 4 * 1024,
+            tcp_chunk_size: 4 * 1024,
         }
     }
 
