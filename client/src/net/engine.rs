@@ -130,7 +130,7 @@ impl Engine {
                 .poll_delay(Self::current_time(), &self.socket_set);
             let sleep_duration = match delay {
                 Some(d) => Duration::from_micros(d.micros()),
-                None => Duration::from_millis(10),
+                None => Duration::from_millis(0),
             };
 
             // 5. Умный select!
