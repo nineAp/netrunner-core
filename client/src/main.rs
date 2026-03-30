@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    netrunner_logger::Logger::init();
+    netrunner_logger::Logger::init(None);
     netrunner_logger::Logger::global().set_level("debug");
     info!("Initializing NetRunner Stack...");
 
