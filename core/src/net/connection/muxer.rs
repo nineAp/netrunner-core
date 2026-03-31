@@ -7,7 +7,6 @@ use tokio::sync::mpsc::Sender;
 use crate::net::network::NetworkConfig;
 use crate::nrxp::FrameType;
 
-// Вспомогательная структура для отдельного TLS-соединения
 #[derive(Clone)]
 struct MuxLeg {
     control_tx: Sender<MuxMessage>,
@@ -52,11 +51,9 @@ impl Muxer {
             streams: Arc::new(DashMap::new()),
             id_gen: Arc::new(IdGenerator::new(is_client)),
             leg_selector: Arc::new(AtomicU32::new(0)),
-            // leg_id_gen удален!
         }
     }
 
-    // ТЕПЕРЬ leg_id ПЕРЕДАЕТСЯ СНАРУЖИ
     pub fn add_leg(
         &self,
         leg_id: u32,
@@ -82,7 +79,6 @@ impl Muxer {
         self.legs.len()
     }
 
-    // Возвращаем кортеж (leg_id, MuxLeg), чтобы знать, кого удалять в случае ошибки
     fn select_leg(&self, frame_type: &FrameType) -> Option<(u32, MuxLeg)> {
         if self.legs.is_empty() {
             return None;
@@ -90,7 +86,6 @@ impl Muxer {
 
         match frame_type {
             FrameType::UdpData | FrameType::UdpConnect => {
-                // Пытаемся взять UDP ногу (1), если её нет — берем TCP (0) как фоллбэк
                 if let Some(leg) = self.legs.get(&1) {
                     Some((1, leg.clone()))
                 } else if let Some(leg) = self.legs.get(&0) {
@@ -100,7 +95,6 @@ impl Muxer {
                 }
             }
             _ => {
-                // Пытаемся взять TCP ногу (0), фоллбэк на UDP (1)
                 if let Some(leg) = self.legs.get(&0) {
                     Some((0, leg.clone()))
                 } else if let Some(leg) = self.legs.get(&1) {
@@ -112,7 +106,8 @@ impl Muxer {
         }
     }
 
-    pub async fn send_to_network(&self, message: MuxMessage) -> Result<(), String> {
+    // ТЕПЕРЬ СИНХРОННАЯ ФУНКЦИЯ БЕЗ БЛОКИРОВОК
+    pub fn send_to_network(&self, message: MuxMessage) -> Result<(), String> {
         let (leg_id, leg) = self
             .select_leg(&message.frame_type)
             .ok_or_else(|| "MUXER: No active legs available".to_string())?;
@@ -125,16 +120,27 @@ impl Muxer {
             _ => &leg.data_tx,
         };
 
-        // Если канал мертв (TunnelEngine упал), удаляем ногу из роутинга!
-        if let Err(e) = target_tx.send(message).await {
-            self.remove_leg(leg_id);
-            return Err(format!("MUXER: Leg {} died during send: {}", leg_id, e));
+        // Используем try_send вместо send().await
+        match target_tx.try_send(message) {
+            Ok(_) => Ok(()),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                // Если очередь переполнена - просто дропаем пакет!
+                // Возвращаем Ok(()), чтобы не убивать соединение.
+                netrunner_logger::warn!(
+                    leg_id,
+                    "MUXER: Network queue full! Dropping outbound packet."
+                );
+                Ok(())
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                self.remove_leg(leg_id);
+                Err(format!("MUXER: Leg {} died during send", leg_id))
+            }
         }
-
-        Ok(())
     }
 
-    pub async fn send_data_safe(
+    // ТЕПЕРЬ СИНХРОННАЯ ФУНКЦИЯ БЕЗ БЛОКИРОВОК
+    pub fn send_data_safe(
         &self,
         stream_id: u32,
         mut data: Bytes,
@@ -153,19 +159,16 @@ impl Muxer {
 
             self.send_to_network(MuxMessage {
                 stream_id,
-                frame_type,
+                frame_type: frame_type.clone(),
                 data: chunk,
-            })
-            .await?;
-
-            if !data.is_empty() {
-                tokio::task::yield_now().await;
-            }
+            })?;
+            // task::yield_now().await удален, так как отправка теперь мгновенная
         }
         Ok(())
     }
 
-    pub async fn send_control(
+    // ТЕПЕРЬ СИНХРОННАЯ ФУНКЦИЯ БЕЗ БЛОКИРОВОК
+    pub fn send_control(
         &self,
         stream_id: u32,
         f_type: FrameType,
@@ -176,7 +179,6 @@ impl Muxer {
             frame_type: f_type,
             data,
         })
-        .await
     }
 
     pub fn register_stream(&self, stream_id: u32, tx: Sender<Bytes>) {
@@ -187,11 +189,28 @@ impl Muxer {
         self.streams.remove(&stream_id);
     }
 
-    pub async fn dispatch_to_local(&self, stream_id: u32, data: Bytes) {
-        if let Some(tx) = self.streams.get(&stream_id) {
-            if let Err(_) = tx.send(data).await {
-                self.remove_stream(stream_id);
+    // ТЕПЕРЬ СИНХРОННАЯ ФУНКЦИЯ БЕЗ БЛОКИРОВОК
+    pub fn dispatch_to_local(&self, stream_id: u32, data: Bytes) {
+        // Узнаем, мертв ли канал, не блокируя DashMap
+        let is_closed = if let Some(tx) = self.streams.get(&stream_id) {
+            match tx.try_send(data) {
+                Ok(_) => false,
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    netrunner_logger::warn!(
+                        stream_id,
+                        "MUXER: Local worker queue full! Dropping inbound packet."
+                    );
+                    false
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => true,
             }
+        } else {
+            false
+        };
+
+        // Удаляем стрим только после того, как отпустили ссылку на DashMap
+        if is_closed {
+            self.remove_stream(stream_id);
         }
     }
 }

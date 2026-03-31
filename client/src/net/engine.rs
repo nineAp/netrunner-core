@@ -99,19 +99,17 @@ impl Engine {
                 }
             }
 
-            // 3. Если затора нет, читаем новые кадры из VPN-туннеля
             if stuck_frame.is_none() {
                 while let Ok(frame) = self.rx_from_tunnel.try_recv() {
                     if let Err(returned_frame) = self.manager.try_inject_inbound(frame) {
-                        stuck_frame = Some(returned_frame);
-                        break; // СТОП! Локальный сокет переполнен, давим на тормоза!
+                        stuck_frame = Some(returned_frame); // Возвращаем пакет в "заначку"
+                        break; // ТОРМОЗИМ чтение туннеля, пока канал не освободится
                     }
                 }
             }
 
-            // 4. Двигаем стейт-машину smoltcp
-            let result = self.poll();
             self.manager.process_sockets(&mut self.socket_set);
+            let result = self.poll();
 
             if last_log.elapsed() >= Duration::from_secs(5) {
                 self.manager.log_status(&self.socket_set);

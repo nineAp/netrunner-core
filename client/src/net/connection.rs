@@ -129,8 +129,6 @@ impl TcpConnection {
     }
 
     fn poll_and_process(&mut self, socket: &mut tcp::Socket) {
-        let max_pending = NetworkConfig::global().tcp_max_pending;
-
         // 1. Вычитываем данные из smoltcp и шлем в Muxer
         while socket.can_recv() {
             let mut full = false;
@@ -166,19 +164,17 @@ impl TcpConnection {
         // 2. Читаем данные из Muxer'а
         if !self.server_eof {
             loop {
+                if self.pending_data.len() >= socket.send_capacity() {
+                    break;
+                }
+
                 match self.core.rx.try_recv() {
                     Ok(data) => {
                         self.pending_data.extend_from_slice(&data);
-                        if self.pending_data.len() >= max_pending {
-                            break;
-                        }
                     }
-                    Err(mpsc::error::TryRecvError::Empty) => {
-                        break;
-                    }
+                    Err(mpsc::error::TryRecvError::Empty) => break,
                     Err(mpsc::error::TryRecvError::Disconnected) => {
-                        // ВАЖНО: Удаленный сервер прислал EOF!
-                        debug!(%self.core.handle, "Server sent EOF (channel disconnected).");
+                        debug!(%self.core.handle, "Server sent EOF");
                         self.server_eof = true;
                         break;
                     }

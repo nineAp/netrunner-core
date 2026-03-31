@@ -80,7 +80,6 @@ pub struct NetworkConfig {
     pub udp_stream_capacity: usize, // Локальные каналы 1 сокета (Engine <-> Muxer)
 
     pub smoltcp_socket_buf: usize,
-    pub tcp_max_pending: usize,
     pub tcp_chunk_size: usize,
 }
 
@@ -95,19 +94,20 @@ impl NetworkConfig {
             max_wire_frame_size: max_wire_frame,
             safe_payload_size: safe_payload,
 
-            // Увеличиваем пропускную способность для видео
-            tcp_buffer_size: 512 * 1024,
-            udp_buffer_size: 256 * 1024,
+            // Буферы ОС/Tokio (держим с запасом под быстрые всплески)
+            tcp_buffer_size: 1024 * 1024,
+            udp_buffer_size: 512 * 1024,
 
-            // Уменьшаем очереди, чтобы не копить задержку
-            muxer_capacity: 64,
-            tcp_stream_capacity: 4,
-            udp_stream_capacity: 16, // Для видео (QUIC/UDP) лучше чуть больше
+            // Глобальная очередь. 4096 * 16KB = ~65 MB в памяти (безопасно)
+            // Это спасет от заторов, если 10 сокетов решат отправить данные одновременно
+            muxer_capacity: 2048,
+
+            tcp_stream_capacity: 128,
+            udp_stream_capacity: 64,
 
             // Настройки smoltcp
-            smoltcp_socket_buf: 256 * 1024, // Даем Ютубу раздышаться
-            tcp_max_pending: 32,            // Но не даем ему "тупить" в очереди
-            tcp_chunk_size: 16 * 1024,      // Чанки побольше — меньше системных вызовов
+            smoltcp_socket_buf: 512 * 1024,
+            tcp_chunk_size: 16 * 1024,
         }
     }
 

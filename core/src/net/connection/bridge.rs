@@ -34,7 +34,7 @@ pub(crate) async fn run_tcp_bridge<R, W>(
                             frame_type: FrameType::Data,
                             data: buf.split().freeze(),
                         };
-                        if muxer.send_to_network(msg).await.is_err() { break; }
+                        if muxer.send_to_network(msg).is_err() { break; }
                     }
                     Err(e) => {
                         error!(stream_id, error = %e, "Socket read error");
@@ -61,13 +61,11 @@ pub(crate) async fn run_tcp_bridge<R, W>(
         }
     }
 
-    let _ = muxer
-        .send_to_network(MuxMessage {
-            stream_id,
-            frame_type: FrameType::Close,
-            data: Bytes::new(),
-        })
-        .await;
+    let _ = muxer.send_to_network(MuxMessage {
+        stream_id,
+        frame_type: FrameType::Close,
+        data: Bytes::new(),
+    });
 
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
@@ -97,7 +95,7 @@ pub(crate) async fn run_udp_bridge(
 
                         // КРИТИЧЕСКИЙ МОМЕНТ: передаем true (is_udp),
                         // чтобы Muxer выбрал правильную ногу для реалтайм трафика
-                        if let Err(e) = muxer.send_data_safe(stream_id, data, true).await {
+                        if let Err(e) = muxer.send_data_safe(stream_id, data, true) {
                             error!("❌ [UDP {}] Failed to send to tunnel: {}", stream_id, e);
                             break;
                         }

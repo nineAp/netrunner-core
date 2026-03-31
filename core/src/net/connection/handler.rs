@@ -71,8 +71,9 @@ impl StreamHandler {
                         let elapsed = start.elapsed();
                         info!(stream_id, target = %target_str, "✅ [TCP] Established in {:?}. Starting bridge.", elapsed);
                         let (r, w) = stream.into_split();
-                        run_tcp_bridge(stream_id, r, w, muxer, v_rx).await;
+                        run_tcp_bridge(stream_id, r, w, muxer.clone(), v_rx).await;
                         info!(stream_id, "🔚 [TCP Worker] Bridge task finished");
+                        Self::close_stream(&muxer, stream_id).await;
                     }
                     Ok(Err(e)) => {
                         error!(stream_id, target = %target_str, error = %e, "❌ [TCP] Connection failed");
@@ -86,7 +87,7 @@ impl StreamHandler {
             });
         } else {
             info!(stream_id, "📲 [TCP] Dispatching payload to local stack");
-            self.muxer.dispatch_to_local(stream_id, payload).await;
+            self.muxer.dispatch_to_local(stream_id, payload);
         }
     }
 
@@ -143,19 +144,19 @@ impl StreamHandler {
                 stream_id,
                 "📲 [UDP] Dispatching connection payload to local stack"
             );
-            self.muxer.dispatch_to_local(stream_id, payload).await;
+            self.muxer.dispatch_to_local(stream_id, payload);
         }
     }
 
     async fn on_data(&self, stream_id: u32, payload: Bytes) {
         // Здесь info может быть избыточным при большой нагрузке, но для отладки полезно
         debug!(stream_id, "📦 [TCP Data] Size: {} bytes", payload.len());
-        self.muxer.dispatch_to_local(stream_id, payload).await;
+        self.muxer.dispatch_to_local(stream_id, payload);
     }
 
     async fn on_udp_data(&self, stream_id: u32, payload: Bytes) {
         debug!(stream_id, "📦 [UDP Data] Size: {} bytes", payload.len());
-        self.muxer.dispatch_to_local(stream_id, payload).await;
+        self.muxer.dispatch_to_local(stream_id, payload);
     }
 
     async fn on_close(&self, stream_id: u32) {
@@ -168,9 +169,7 @@ impl StreamHandler {
             stream_id,
             "📡 [Control] Sending CLOSE signal to remote peer"
         );
-        let _ = muxer
-            .send_control(stream_id, FrameType::Close, Bytes::new())
-            .await;
+        let _ = muxer.send_control(stream_id, FrameType::Close, Bytes::new());
         muxer.remove_stream(stream_id);
     }
 }

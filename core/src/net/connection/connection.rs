@@ -282,17 +282,15 @@ impl ClientHandler {
                         });
 
                         // Отправляем управляющий фрейм с адресом
-                        let _ = muxer_inner.send_control(stream_id, f_type, payload).await;
+                        let _ = muxer_inner.send_control(stream_id, f_type, payload);
                     }
 
                     FrameType::Data | FrameType::UdpData => {
-                        let _ = muxer_inner.send_data_safe(stream_id, payload, is_udp).await;
+                        let _ = muxer_inner.send_data_safe(stream_id, payload, is_udp);
                     }
 
                     FrameType::Close => {
-                        let _ = muxer_inner
-                            .send_control(stream_id, FrameType::Close, Bytes::new())
-                            .await;
+                        let _ = muxer_inner.send_control(stream_id, FrameType::Close, Bytes::new());
                         muxer_inner.remove_stream(stream_id);
                     }
 

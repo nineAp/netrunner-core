@@ -144,7 +144,7 @@ impl SocketFactory {
             443 | 80 | 8080 => max_buf,
             22 => 32 * 1024,
             53 => 16 * 1024,
-            _ => max_buf / 4,
+            _ => max_buf,
         };
 
         let mut socket = tcp::Socket::new(
@@ -240,9 +240,7 @@ impl ConnectionManager {
                 }
             }
         } else {
-            // Если это происходит во время Connecting - значит сервер шлет ответы,
-            // а клиент уже забыл про этот ID или еще не создал его.
-            error!(
+            trace!(
                 "👻 [Stream {}] ORPHAN packet from tunnel. ID mismatch?",
                 frame.socket_id
             );
