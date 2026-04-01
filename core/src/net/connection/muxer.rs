@@ -190,27 +190,18 @@ impl Muxer {
     }
 
     // ТЕПЕРЬ СИНХРОННАЯ ФУНКЦИЯ БЕЗ БЛОКИРОВОК
-    pub fn dispatch_to_local(&self, stream_id: u32, data: Bytes) {
-        // Узнаем, мертв ли канал, не блокируя DashMap
-        let is_closed = if let Some(tx) = self.streams.get(&stream_id) {
-            match tx.try_send(data) {
-                Ok(_) => false,
-                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                    netrunner_logger::warn!(
-                        stream_id,
-                        "MUXER: Local worker queue full! Dropping inbound packet."
-                    );
-                    false
-                }
-                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => true,
-            }
-        } else {
-            false
-        };
+    pub async fn dispatch_to_local(&self, stream_id: u32, data: Bytes) {
+        // 1. Клонируем Sender и СРАЗУ отпускаем блокировку DashMap.
+        // Это спасет Muxer от дедлока, пока мы будем висеть на .await
+        let tx_opt = self.streams.get(&stream_id).map(|tx_ref| tx_ref.clone());
 
-        // Удаляем стрим только после того, как отпустили ссылку на DashMap
-        if is_closed {
-            self.remove_stream(stream_id);
+        if let Some(tx) = tx_opt {
+            // 2. Ждем, если локальная очередь забита (Backpressure).
+            // Пакет НЕ дропается. Tokio перестает читать из физического сокета.
+            if tx.send(data).await.is_err() {
+                // Если канал закрыт (клиент отключился), удаляем стрим
+                self.remove_stream(stream_id);
+            }
         }
     }
 }
