@@ -95,18 +95,18 @@ impl NetworkConfig {
             safe_payload_size: safe_payload,
 
             // Буферы ОС/Tokio (держим с запасом под быстрые всплески)
-            tcp_buffer_size: 2 * 1024 * 1024,
+            tcp_buffer_size: 1024 * 1024,
             udp_buffer_size: 512 * 1024,
 
             // Глобальная очередь. 4096 * 16KB = ~65 MB в памяти (безопасно)
             // Это спасет от заторов, если 10 сокетов решат отправить данные одновременно
-            muxer_capacity: 1024,
+            muxer_capacity: 256,
 
             tcp_stream_capacity: 64,
             udp_stream_capacity: 64,
 
             // Настройки smoltcp
-            smoltcp_socket_buf: 1024 * 1024,
+            smoltcp_socket_buf: 256 * 1024,
             tcp_chunk_size: 16 * 1024,
         }
     }
