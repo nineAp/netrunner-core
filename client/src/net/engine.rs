@@ -54,7 +54,6 @@ impl Engine {
 
         let socket_set = ConnectionManager::setup_sockets(2);
 
-        // Передаем TX-канал в ConnectionManager
         let manager = ConnectionManager::new(dns_handler, tx_to_tunnel);
 
         Self {
@@ -99,6 +98,7 @@ impl Engine {
                 }
             }
 
+            // 3. Забираем новые кадры из туннеля
             if stuck_frame.is_none() {
                 while let Ok(frame) = self.rx_from_tunnel.try_recv() {
                     if let Err(returned_frame) = self.manager.try_inject_inbound(frame) {
@@ -118,23 +118,29 @@ impl Engine {
 
             if matches!(result, PollResult::SocketStateChanged) {
                 self.manager.cleanup(&mut self.socket_set);
-                continue;
+                continue; // Если стейт изменился, поллим еще раз без задержек
             }
 
             self.manager.cleanup(&mut self.socket_set);
 
+            // 4. Правильный расчет таймаута без Busy-Loop
             let delay = self
                 .interface
                 .poll_delay(Self::current_time(), &self.socket_set);
-            let sleep_duration = match delay {
-                Some(d) => Duration::from_micros(d.micros()),
-                None => Duration::from_millis(0),
+
+            // Создаем Future ожидания. Если None - ждем бесконечно (std::future::pending)
+            let sleep_fut = async {
+                if let Some(d) = delay {
+                    sleep(Duration::from_micros(d.micros())).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
             };
 
             // 5. Умный select!
             if stuck_frame.is_none() {
                 tokio::select! {
-                    _ = sleep(sleep_duration) => {}
+                    _ = sleep_fut => {}
                     Some(token) = tun_to_engine_rx.recv() => {
                         self.manager.try_create_socket_from_packet(&token, &mut self.socket_set);
                         if self.to_smoltcp_tx.send(token).is_ok() {
@@ -148,9 +154,10 @@ impl Engine {
                     }
                 }
             } else {
-                // Если буфер переполнен, ждем только таймер или данные от браузера
+                // Если буфер переполнен (stuck_frame), ждем ТОЛЬКО таймер или данные от браузера (ACK),
+                // чтобы освободить буфер. Из rx_from_tunnel пока не читаем!
                 tokio::select! {
-                    _ = sleep(sleep_duration) => {}
+                    _ = sleep_fut => {}
                     Some(token) = tun_to_engine_rx.recv() => {
                         self.manager.try_create_socket_from_packet(&token, &mut self.socket_set);
                         if self.to_smoltcp_tx.send(token).is_ok() {

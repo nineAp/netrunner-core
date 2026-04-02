@@ -10,7 +10,10 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    net::connection::{handler::StreamHandler, muxer::MuxMessage},
+    net::{
+        connection::{handler::StreamHandler, muxer::MuxMessage},
+        network::NetworkConfig,
+    },
     nrxp::{Codec, ErrorAction, FrameType},
 };
 
@@ -22,6 +25,8 @@ pub(crate) struct TunnelEngine {
     pub control_rx: Receiver<MuxMessage>,
     pub data_rx: Receiver<MuxMessage>,
     pub handler: Arc<StreamHandler>,
+    pub leg_id: u32,
+    pub muxer: Arc<crate::net::connection::muxer::Muxer>,
 }
 
 impl TunnelEngine {
@@ -35,6 +40,11 @@ impl TunnelEngine {
         let control_rx = self.control_rx;
         let data_rx = self.data_rx;
         let handler = self.handler;
+
+        // === ИЗВЛЕКАЕМ НОВЫЕ ПОЛЯ ===
+        let leg_id = self.leg_id;
+        let muxer = self.muxer.clone();
+
         let token = CancellationToken::new();
 
         let codec_reader = codec.clone();
@@ -56,7 +66,6 @@ impl TunnelEngine {
                     res = inbound.read_buf(&mut read_buf) => {
                         let n = res.map_err(|e| e.to_string())?;
 
-
                         if n == 0 {
                             if read_buf.is_empty() {
                                 info!("Connection closed by peer (Clean EOF)");
@@ -67,12 +76,12 @@ impl TunnelEngine {
                             return Err::<(), String>("EOF".into());
                         }
 
-
+                        // === РЕГИСТРИРУЕМ ВХОДЯЩИЙ ТРАФИК ДЛЯ СТАТИСТИКИ ===
+                        muxer.record_leg_rx(leg_id, n as u64);
 
                         let mut frames = Vec::new();
 
                         {
-
                             let mut c = codec_reader.lock().await;
                             loop {
                                 match c.inbound(&mut read_buf) {
@@ -92,7 +101,6 @@ impl TunnelEngine {
                                 }
                             }
                         }
-
 
                         for frame in frames {
                             handler.handle(frame).await;
@@ -118,7 +126,6 @@ impl TunnelEngine {
                         break;
                     }
 
-
                     msg_opt = control_rx.recv() => {
                         if let Some(msg) = msg_opt {
                             Self::handle_outbound(&mut outbound, &codec_writer, msg).await?;
@@ -127,12 +134,10 @@ impl TunnelEngine {
                         }
                     }
 
-
                     _ = heartbeat.tick() => {
                         let msg = MuxMessage { stream_id: 0, frame_type: FrameType::Heartbeat, data: Bytes::new() };
                         Self::handle_outbound(&mut outbound, &codec_writer, msg).await?;
                     }
-
 
                     msg_opt = data_rx.recv() => {
                         if let Some(msg) = msg_opt {
@@ -163,8 +168,6 @@ impl TunnelEngine {
         codec: &Arc<Mutex<Codec>>,
         msg: MuxMessage,
     ) -> Result<(), String> {
-        const MAX_CHUNK_SIZE: usize = 1024 * 4;
-
         let mut data = msg.data;
         let stream_id = msg.stream_id;
         let frame_type = msg.frame_type;
@@ -184,7 +187,8 @@ impl TunnelEngine {
                 }
             } else {
                 while !data.is_empty() {
-                    let chunk_size = std::cmp::min(data.len(), MAX_CHUNK_SIZE);
+                    let chunk_size =
+                        std::cmp::min(data.len(), NetworkConfig::global().tcp_chunk_size);
                     let chunk = data.split_to(chunk_size);
 
                     match c.encrypt_data(stream_id, frame_type.clone(), chunk) {

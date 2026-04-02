@@ -195,19 +195,10 @@ impl TcpConnection {
         }
 
         // 4. ГРАЦИОЗНОЕ ЗАКРЫТИЕ (Отправка FIN браузеру)
-
-        // Сценарий А: Сервер закрыл соединение, и мы отдали все остатки данных браузеру
+        // Закрываем сокет ТОЛЬКО если удаленный сервер закончил работу
+        // и мы отдали все накопленные данные браузеру.
         if self.server_eof && self.pending_data.is_empty() && socket.may_send() {
             debug!(%self.core.handle, "All data flushed after server EOF, sending FIN to browser");
-            socket.close();
-        }
-
-        // Сценарий Б: Браузер сам инициировал закрытие (CloseWait), но мы дожидаемся опустошения буфера
-        if socket.state() == tcp::State::CloseWait
-            && self.pending_data.is_empty()
-            && socket.may_send()
-        {
-            debug!(%self.core.handle, "Browser in CloseWait and buffer flushed, sending FIN");
             socket.close();
         }
     }
@@ -270,15 +261,28 @@ impl UdpConnection {
             }
         }
 
-        // Исходящие из туннеля (от Telegram) — всё еще просто Bytes
-        if socket.can_send() {
-            if let Some(client_endpoint) = self.last_client_endpoint {
-                while let Ok(data) = self.core.rx.try_recv() {
-                    let _ = socket.send_slice(&data, client_endpoint);
-                    self.last_activity = std::time::Instant::now();
+        // Исходящие из туннеля
+        if let Some(client_endpoint) = self.last_client_endpoint {
+            // Проверяем can_send() перед КАЖДЫМ извлечением пакета
+            while socket.can_send() {
+                match self.core.rx.try_recv() {
+                    Ok(data) => {
+                        if let Err(e) = socket.send_slice(&data, client_endpoint) {
+                            debug!("Dropped UDP packet due to smoltcp error: {:?}", e);
+                            // В UDP потеря пакетов нормальна, но мы хотя бы избежали
+                            // слепого выкачивания всего канала
+                        } else {
+                            self.last_activity = std::time::Instant::now();
+                        }
+                    }
+                    Err(_) => {
+                        // Канал пуст или отключен
+                        break;
+                    }
                 }
             }
         }
+
         true
     }
 }

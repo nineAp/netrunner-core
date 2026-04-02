@@ -32,8 +32,8 @@ struct SessionTracker {
     to_remove: Vec<SocketHandle>,
     next_socket_id: u64,
     handle_to_id: HashMap<SocketHandle, u64>,
+    pending_tcp: HashMap<SocketHandle, StdInstant>,
 }
-
 impl SessionTracker {
     fn new() -> Self {
         Self {
@@ -45,6 +45,7 @@ impl SessionTracker {
             to_remove: Vec::new(),
             next_socket_id: 1,
             handle_to_id: HashMap::new(),
+            pending_tcp: HashMap::new(),
         }
     }
 
@@ -62,15 +63,14 @@ impl SessionTracker {
 
     fn cleanup(&mut self, socket_set: &mut SocketSet) {
         for handle in self.to_remove.drain(..) {
-            debug!(%handle, "Cleanup: Removing socket from SocketSet and internal maps");
+            debug!(%handle, "Cleanup: Removing socket");
             socket_set.remove(handle);
             self.last_activity.remove(&handle);
             self.failed_until.remove(&handle);
             self.active_tcp.remove(&handle);
             self.active_udp.remove(&handle);
+            self.pending_tcp.remove(&handle); // Очищаем из pending!
 
-            // ВОТ ТУТ ГЛАВНОЕ ИСПРАВЛЕНИЕ:
-            // Достаем НАШ socket_id, который мы выдали этому handle при старте сессии
             if let Some(socket_id) = self.handle_to_id.remove(&handle) {
                 self.inbound_tx.remove(&socket_id);
             }
@@ -249,7 +249,17 @@ impl ConnectionManager {
     }
 
     pub fn setup_sockets(n_icmp: usize) -> SocketSet<'static> {
-        let mut sockets = SocketSet::new(Vec::with_capacity(48));
+        let mut sockets = SocketSet::new(Vec::with_capacity(64));
+
+        // 1. Создаем ОДИН постоянный UDP сокет для перехвата DNS (чтобы не плодить их)
+        let mut dns_socket = SocketFactory::create_udp(53);
+        let _ = dns_socket.bind(IpListenEndpoint {
+            addr: None,
+            port: 53,
+        });
+        sockets.add(dns_socket);
+
+        // 2. Создаем ICMP
         for _ in 0..n_icmp {
             sockets.add(SocketFactory::create_icmp());
         }
@@ -349,7 +359,10 @@ impl ConnectionManager {
                 addr: Some(dst),
                 port: dst_p,
             });
-            socket_set.add(socket);
+            let handle = socket_set.add(socket);
+
+            // Засекаем время создания! Если это левый пакет, мы убьем этот сокет позже.
+            self.tracker.pending_tcp.insert(handle, StdInstant::now());
         }
     }
 
@@ -370,25 +383,6 @@ impl ConnectionManager {
         }
 
         if dst_p == 53 {
-            debug!("🎯 [DNS] Intercepting local query: {}:{} -> 53", src, src_p);
-            let mut socket = SocketFactory::create_udp(53);
-            // Биндимся на адрес назначения, который ожидает клиент (обычно 10.0.0.2 или 8.8.8.8)
-            if socket
-                .bind(IpListenEndpoint {
-                    addr: Some(dst),
-                    port: 53,
-                })
-                .is_ok()
-            {
-                let handle = socket_set.add(socket);
-                let (conn, _rx_smol, tx_smol) = UdpConnection::new(handle, src, src_p);
-
-                // Регистрируем, но НЕ спавним задачу туннеля!
-                let socket_id = self.tracker.generate_socket_id();
-                self.tracker.handle_to_id.insert(handle, socket_id);
-                self.tracker.active_udp.insert(handle, conn);
-                self.tracker.inbound_tx.insert(socket_id, tx_smol);
-            }
             return;
         }
 
@@ -499,77 +493,83 @@ impl ConnectionManager {
             if let Some(id) = self.tracker.handle_to_id.get(&handle) {
                 info!("🏁 [TCP {}] Connection closed", id);
             }
+            self.tracker.pending_tcp.remove(&handle); // Чистим
             self.tracker.queue_removal(handle);
             return;
         }
 
-        if socket.state() == tcp::State::Established
-            && !self.tracker.active_tcp.contains_key(&handle)
-        {
-            let Some(ep) = socket.local_endpoint() else {
-                return;
-            };
-            let socket_id = self.tracker.generate_socket_id();
-            let (conn, mut rx_smol, tx_smol, handshake_tx) = TcpConnection::new(handle);
-
-            self.tracker.handle_to_id.insert(handle, socket_id);
-            self.tracker.active_tcp.insert(handle, conn);
-            self.tracker.inbound_tx.insert(socket_id, tx_smol);
-
-            // ДОБАВЛЕНО ЛОГИРОВАНИЕ ДЛЯ TCP
-            let (dst_ip, target) = match ep.addr {
-                smoltcp::wire::IpAddress::Ipv4(ip) => {
-                    let std_ip = std::net::Ipv4Addr::from(ip);
-                    if let Some(domain) = self.resolver.fake_ip_store.lookup_by_ip(&std_ip) {
-                        info!(
-                            "🔍 [TCP {}] Reverse lookup MATCH: {} -> {}",
-                            socket_id, std_ip, domain
-                        );
-                        (std_ip, format!("{}:{}", domain, ep.port))
-                    } else {
-                        info!(
-                            "🔍 [TCP {}] Reverse lookup MISS: using raw IP {}",
-                            socket_id, std_ip
-                        );
-                        (std_ip, format!("{}:{}", std_ip, ep.port))
-                    }
+        // УБИРАЕМ GHOST SOCKETS: Если сокет висит в Listen/SynReceived больше 20 секунд — убиваем!
+        if matches!(socket.state(), tcp::State::Listen | tcp::State::SynReceived) {
+            if let Some(created_at) = self.tracker.pending_tcp.get(&handle) {
+                if created_at.elapsed() > std::time::Duration::from_secs(20) {
+                    warn!(
+                        "🧹 [TCP] Cleaning up ghost socket stuck in {:?}",
+                        socket.state()
+                    );
+                    socket.abort();
+                    self.tracker.queue_removal(handle);
                 }
-                smoltcp::wire::IpAddress::Ipv6(ip) => (
-                    std::net::Ipv4Addr::new(0, 0, 0, 0),
-                    format!("[{}]:{}", ip, ep.port),
-                ),
-            };
-
-            info!("🔗 [TCP {}] established -> {}", socket_id, target);
-
-            let tx_tunnel = self.tx_to_tunnel.clone();
-            tokio::spawn(async move {
-                let mut frame =
-                    RawCastFrame::connect(LocalProtocol::Tcp, socket_id, dst_ip, ep.port);
-                frame.payload = bytes::Bytes::from(target.clone());
-
-                info!(
-                    "📦 [TCP {}] Packed Connect frame: dst_ip={}, dst_port={}, payload={}",
-                    socket_id, dst_ip, ep.port, target
-                );
-
-                if tx_tunnel.send(frame).await.is_ok() {
-                    let _ = handshake_tx.send(());
-                    while let Some(data) = rx_smol.recv().await {
-                        let _ = tx_tunnel
-                            .send(RawCastFrame::data(
-                                LocalProtocol::Tcp,
-                                socket_id,
-                                dst_ip,
-                                ep.port,
-                                data.to_vec(),
-                            ))
-                            .await;
-                    }
-                }
-            });
+            }
+            return; // Сокет еще не Established, делать тут пока нечего
         }
 
+        if socket.state() == tcp::State::Established {
+            // Только что подключился! Удаляем из pending и переводим в active_tcp
+            if self.tracker.pending_tcp.remove(&handle).is_some()
+                || !self.tracker.active_tcp.contains_key(&handle)
+            {
+                let Some(ep) = socket.local_endpoint() else {
+                    return;
+                };
+                let socket_id = self.tracker.generate_socket_id();
+                let (conn, mut rx_smol, tx_smol, handshake_tx) = TcpConnection::new(handle);
+
+                self.tracker.handle_to_id.insert(handle, socket_id);
+                self.tracker.active_tcp.insert(handle, conn);
+                self.tracker.inbound_tx.insert(socket_id, tx_smol);
+
+                let (dst_ip, target) = match ep.addr {
+                    smoltcp::wire::IpAddress::Ipv4(ip) => {
+                        let std_ip = std::net::Ipv4Addr::from(ip);
+                        if let Some(domain) = self.resolver.fake_ip_store.lookup_by_ip(&std_ip) {
+                            (std_ip, format!("{}:{}", domain, ep.port))
+                        } else {
+                            (std_ip, format!("{}:{}", std_ip, ep.port))
+                        }
+                    }
+                    smoltcp::wire::IpAddress::Ipv6(ip) => (
+                        std::net::Ipv4Addr::new(0, 0, 0, 0),
+                        format!("[{}]:{}", ip, ep.port),
+                    ),
+                };
+
+                info!("🔗 [TCP {}] established -> {}", socket_id, target);
+
+                let tx_tunnel = self.tx_to_tunnel.clone();
+                tokio::spawn(async move {
+                    let mut frame =
+                        RawCastFrame::connect(LocalProtocol::Tcp, socket_id, dst_ip, ep.port);
+                    frame.payload = bytes::Bytes::from(target.clone());
+
+                    if tx_tunnel.send(frame).await.is_ok() {
+                        let _ = handshake_tx.send(());
+                        while let Some(data) = rx_smol.recv().await {
+                            let _ = tx_tunnel
+                                .send(RawCastFrame::data(
+                                    LocalProtocol::Tcp,
+                                    socket_id,
+                                    dst_ip,
+                                    ep.port,
+                                    data.to_vec(),
+                                ))
+                                .await;
+                        }
+                    }
+                });
+            }
+        }
+
+        // Проталкиваем активные соединения
         if let Some(conn) = self.tracker.active_tcp.get_mut(&handle) {
             if !conn.tick(socket) {
                 info!("⚠️ [TCP] Tick failed, aborting handle {:?}", handle);

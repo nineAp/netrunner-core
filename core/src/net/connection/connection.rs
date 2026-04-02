@@ -33,7 +33,6 @@ impl SessionManager {
         }
     }
 
-    // Генерация переехала сюда
     pub fn generate_id() -> String {
         let mut rng = rand::rng();
         format!("{:016x}{:016x}", rng.next_u64(), rng.next_u64())
@@ -42,11 +41,11 @@ impl SessionManager {
     pub fn get_or_create(&self, session_id: &str) -> Arc<Muxer> {
         self.sessions
             .entry(session_id.to_string())
-            .or_insert_with(|| Arc::new(Muxer::new(false)))
+            // ОБНОВЛЕНО: Передаем session_id в конструктор Муксера
+            .or_insert_with(|| Arc::new(Muxer::new(false, session_id.to_string())))
             .clone()
     }
 
-    // Удаление мертвых сессий, чтобы не текла память
     pub fn remove(&self, session_id: &str) {
         if self.sessions.remove(session_id).is_some() {
             netrunner_logger::info!("🧹 Session {} completely closed and cleaned up", session_id);
@@ -95,6 +94,7 @@ impl Connection {
 
 type StreamContext = (Ipv4Addr, u16, LocalProtocol);
 pub struct ClientHandler;
+
 impl ClientHandler {
     async fn establish_leg(
         remote_proxy_addr: &str,
@@ -102,11 +102,15 @@ impl ClientHandler {
         muxer: Arc<Muxer>,
         session_id: &str,
     ) -> Result<(), String> {
-        let leg_name = if leg_id == 0 { "TCP-Leg" } else { "UDP-Leg" };
+        let leg_name = if leg_id % 2 == 0 {
+            "TCP-Leg"
+        } else {
+            "UDP-Leg"
+        };
 
         info!(
-            "Establishing dedicated {} to {}...",
-            leg_name, remote_proxy_addr
+            "Establishing dedicated {} (ID: {}) to {}...",
+            leg_name, leg_id, remote_proxy_addr
         );
 
         let stream = TcpStream::connect(remote_proxy_addr)
@@ -148,13 +152,12 @@ impl ClientHandler {
         info!("{} TLS Handshake complete.", leg_name);
         let handshake_payload = Bytes::from(format!("{}:{}", session_id, leg_id));
 
-        // 2. Шифруем через Codec! (Внутри сгенерится auth_tag)
+        // Шифруем кастомный Handshake
         let encrypted_handshake = conn
             .codec
             .encrypt_data(0, FrameType::Handshake, handshake_payload)
             .map_err(|e| format!("Failed to encrypt Handshake: {:?}", e))?;
 
-        // 3. Отправляем в сокет
         conn.outbound
             .write_all(&encrypted_handshake)
             .await
@@ -168,13 +171,13 @@ impl ClientHandler {
         let (control_tx, control_rx) = mpsc::channel(NetworkConfig::global().muxer_capacity);
         let (data_tx, data_rx) = mpsc::channel(NetworkConfig::global().muxer_capacity);
 
-        // ОБНОВЛЕННЫЙ ВЫЗОВ: передаем leg_id
         muxer.add_leg(leg_id, control_tx, data_tx);
 
         let handler =
             std::sync::Arc::new(StreamHandler::new(muxer.clone(), ConnectionRole::Client));
 
         let engine = TunnelEngine {
+            leg_id, // ОБНОВЛЕНО: Передаем leg_id, чтобы движок писал стату
             inbound: conn.inbound,
             outbound: conn.outbound,
             codec: conn.codec,
@@ -182,9 +185,10 @@ impl ClientHandler {
             control_rx,
             data_rx,
             handler,
+            muxer: muxer.clone(), // Не забудь передать muxer (он нужен движку для record_leg_rx)
         };
 
-        engine.run().await;
+        engine.run().await.map_err(|e| e.to_string())?;
         Err(format!("{} Engine stopped", leg_name))
     }
 
@@ -193,39 +197,54 @@ impl ClientHandler {
         mut rx_from_engine: mpsc::Receiver<RawCastFrame>,
         tx_to_engine: mpsc::Sender<RawCastFrame>,
     ) -> Result<(), String> {
-        let muxer = Arc::new(Muxer::new(true));
-        let registry: Arc<DashMap<u32, StreamContext>> = Arc::new(DashMap::new());
-
-        let mut rng = rand::rng();
-        let session_id = format!("{:016x}{:016x}", rng.next_u64(), rng.next_u64());
+        let session_id = SessionManager::generate_id();
         info!("🔑 Generated Master Session ID: {}", session_id);
 
-        for id in 0..2 {
+        // ОБНОВЛЕНО: Передаем session_id в Муксер
+        let muxer = Arc::new(Muxer::new(true, session_id.clone()));
+        let registry: Arc<DashMap<u32, StreamContext>> = Arc::new(DashMap::new());
+
+        info!("🚀 Netrunner Multi-Path Tunnel Initializing (10 Legs max).");
+
+        // === ДИНАМИЧЕСКИЙ ПУЛ НА 10 НОГ ===
+        for id in 0..10 {
             let addr = remote_proxy_addr.to_string();
             let m = muxer.clone();
             let sid = session_id.clone();
+
             tokio::spawn(async move {
+                // Плавный запуск (staggered start), чтобы не задудосить свой же сервер
+                tokio::time::sleep(std::time::Duration::from_millis(id as u64 * 250)).await;
                 loop {
                     if let Err(e) = Self::establish_leg(&addr, id, m.clone(), &sid).await {
-                        error!("Leg {} failed: {}. Reconnecting...", id, e);
-                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        error!("Leg {} disconnected: {}. Reconnecting in 3s...", id, e);
+                        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                     }
                 }
             });
         }
 
-        info!("🚀 Netrunner Dual-Leg Tunnel Active.");
+        // === ДЕМОН СТАТИСТИКИ (КЛИЕНТ) ===
+        let m_stats = muxer.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                if m_stats.active_legs_count() > 0 {
+                    m_stats.perform_health_check().await;
+                    m_stats.print_topology_tree();
+                }
+            }
+        });
 
+        // === ЛОКАЛЬНАЯ МАРШРУТИЗАЦИЯ (RawCast -> Nrxp) ===
         let muxer_inner = muxer.clone();
         tokio::spawn(async move {
             while let Some(raw_frame) = rx_from_engine.recv().await {
-                // 1. Сохраняем метаданные для локального реестра (до того, как raw_frame исчезнет)
                 let dst_ip = raw_frame.dst_ip;
                 let dst_port = raw_frame.dst_port;
                 let protocol = raw_frame.protocol;
                 let is_udp = protocol == LocalProtocol::Udp;
 
-                // 2. Вся магия здесь: адаптер сам решит, это Connect или Data, и склеит IP:Port
                 let nrxp_frame = match RawCastAdapter::to_nrxp(raw_frame) {
                     Ok(frame) => frame,
                     Err(e) => {
@@ -238,20 +257,19 @@ impl ClientHandler {
                 let f_type = nrxp_frame.header.frame_type;
                 let payload = nrxp_frame.payload;
 
-                // 3. Маршрутизация на основе ГОТОВОГО FrameType
                 match f_type {
                     FrameType::Connect | FrameType::UdpConnect => {
                         info!(
                             "🔗 [Muxer] Forwarding {} request to {} (stream {})",
                             if is_udp { "UDP" } else { "TCP" },
-                            String::from_utf8_lossy(&payload), // Адаптер уже положил сюда "IP:Port"
+                            String::from_utf8_lossy(&payload),
                             stream_id
                         );
 
                         registry.insert(stream_id, (dst_ip, dst_port, protocol));
 
                         let (v_tx, mut v_rx) =
-                            mpsc::channel(NetworkConfig::global().tcp_buffer_size);
+                            mpsc::channel(NetworkConfig::global().tcp_stream_capacity);
                         muxer_inner.register_stream(stream_id, v_tx);
 
                         let tx_to_tun = tx_to_engine.clone();
@@ -268,7 +286,6 @@ impl ClientHandler {
                                     };
                                     let mock_nrxp = Frame::new(stream_id, out_f_type, back_payload);
 
-                                    // Здесь from_nrxp уже используется у тебя правильно!
                                     if let Ok(raw) = RawCastAdapter::from_nrxp(
                                         mock_nrxp,
                                         ip,
@@ -281,7 +298,6 @@ impl ClientHandler {
                             }
                         });
 
-                        // Отправляем управляющий фрейм с адресом
                         let _ = muxer_inner.send_control(stream_id, f_type, payload);
                     }
 
@@ -304,6 +320,7 @@ impl ClientHandler {
         Ok(())
     }
 }
+
 pub struct ServerHandler {
     pub(crate) conn: Connection,
     pub(crate) session_manager: Arc<SessionManager>,
@@ -363,14 +380,12 @@ impl ServerHandler {
         }
     }
 }
-use crate::parser::Parser; // Не забудь импортировать трейт Parser!
 
 #[async_trait::async_trait]
 impl TunnelHandler for ServerHandler {
     async fn run(mut self) -> Result<(), String> {
         info!("Acting as TLS Server with Stealth Fallback");
 
-        // 1. TLS Хендшейк (без изменений)
         let handshake_timeout = std::time::Duration::from_secs(1);
         let hello = loop {
             let buf_snapshot = self.conn.read_buf.clone().freeze();
@@ -418,7 +433,6 @@ impl TunnelHandler for ServerHandler {
             .await
             .map_err(|e| e.to_string())?;
 
-        // 1. ЧИТАЕМ ЗАШИФРОВАННЫЙ HANDSHAKE ЧЕРЕЗ CODEC
         let (session_id, leg_id) = loop {
             let n = tokio::time::timeout(
                 std::time::Duration::from_secs(3),
@@ -432,7 +446,6 @@ impl TunnelHandler for ServerHandler {
                 return Err("Client closed connection before Handshake".into());
             }
 
-            // Кодек сам расшифрует и проверит auth_tag
             match self.conn.codec.inbound(&mut self.conn.read_buf) {
                 Ok(Some(frame)) => {
                     if frame.header.frame_type == FrameType::Handshake {
@@ -454,25 +467,39 @@ impl TunnelHandler for ServerHandler {
                         return Err("Invalid first frame (Expected Handshake)".into());
                     }
                 }
-                Ok(None) => continue, // Ждем еще байт
+                Ok(None) => continue,
                 Err(e) => return Err(format!("Decryption/Auth failed during Handshake: {:?}", e)),
             }
         };
 
-        // 2. РЕГИСТРИРУЕМ НОГУ
+        // РЕГИСТРИРУЕМ НОГУ
         let muxer = self.session_manager.get_or_create(&session_id);
 
         let (control_tx, control_rx) = mpsc::channel(NetworkConfig::global().muxer_capacity);
         let (data_tx, data_rx) = mpsc::channel(NetworkConfig::global().muxer_capacity);
 
-        // ОБНОВЛЕННЫЙ ВЫЗОВ: регистрируем конкретный ID ноги
         muxer.add_leg(leg_id, control_tx, data_tx);
 
         let handler =
             std::sync::Arc::new(StreamHandler::new(muxer.clone(), ConnectionRole::Server));
 
-        // 3. ЗАПУСКАЕМ ДВИЖОК
+        // === ДЕМОН СТАТИСТИКИ (СЕРВЕР) ===
+        let m_stats = muxer.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                if m_stats.active_legs_count() > 0 {
+                    m_stats.perform_health_check().await;
+                    m_stats.print_topology_tree();
+                } else {
+                    break;
+                }
+            }
+        });
+
+        // ЗАПУСКАЕМ ДВИЖОК
         let engine = TunnelEngine {
+            leg_id, // ОБНОВЛЕНО
             inbound: self.conn.inbound,
             outbound: self.conn.outbound,
             codec: self.conn.codec,
@@ -480,11 +507,12 @@ impl TunnelHandler for ServerHandler {
             control_rx,
             data_rx,
             handler,
+            muxer: muxer.clone(), // ОБНОВЛЕНО
         };
 
         let _ = engine.run().await;
 
-        // 4. ОЧИСТКА ПОСЛЕ ОТКЛЮЧЕНИЯ
+        // ОЧИСТКА ПОСЛЕ ОТКЛЮЧЕНИЯ НОГИ
         muxer.remove_leg(leg_id);
         if muxer.active_legs_count() == 0 {
             self.session_manager.remove(&session_id);
