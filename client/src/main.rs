@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     netrunner_logger::Logger::init(None);
-    netrunner_logger::Logger::global().set_level("debug");
+    netrunner_logger::Logger::global().set_level("error");
     info!("Initializing NetRunner Stack...");
 
     let remote_address = "147.45.43.70:443".to_string();

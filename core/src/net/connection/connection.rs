@@ -1,4 +1,4 @@
-use std::{net::Ipv4Addr, sync::Arc};
+use std::{net::Ipv4Addr, sync::Arc, time::Duration};
 
 use crate::{
     net::{
@@ -225,14 +225,14 @@ impl ClientHandler {
         }
 
         // === ДЕМОН СТАТИСТИКИ (КЛИЕНТ) ===
-        let m_stats = muxer.clone();
+        let m_weak = Arc::downgrade(&muxer);
         tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
-                if m_stats.active_legs_count() > 0 {
-                    m_stats.perform_health_check().await;
-                    m_stats.print_topology_tree();
+            while let Some(m_stats) = m_weak.upgrade() {
+                tokio::time::sleep(Duration::from_secs(15)).await;
+                if m_stats.active_legs_count() == 0 {
+                    break;
                 }
+                m_stats.print_topology_tree();
             }
         });
 
@@ -483,17 +483,14 @@ impl TunnelHandler for ServerHandler {
         let handler =
             std::sync::Arc::new(StreamHandler::new(muxer.clone(), ConnectionRole::Server));
 
-        // === ДЕМОН СТАТИСТИКИ (СЕРВЕР) ===
-        let m_stats = muxer.clone();
+        let m_weak = Arc::downgrade(&muxer);
         tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
-                if m_stats.active_legs_count() > 0 {
-                    m_stats.perform_health_check().await;
-                    m_stats.print_topology_tree();
-                } else {
+            while let Some(m_stats) = m_weak.upgrade() {
+                tokio::time::sleep(Duration::from_secs(15)).await;
+                if m_stats.active_legs_count() == 0 {
                     break;
                 }
+                m_stats.print_topology_tree();
             }
         });
 

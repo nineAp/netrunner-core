@@ -223,8 +223,8 @@ impl UdpConnection {
         client_addr: smoltcp::wire::IpAddress,
         client_port: u16,
     ) -> (Self, mpsc::Receiver<UdpPacketTarget>, mpsc::Sender<Bytes>) {
-        // Для UDP используем фиксированный буфер 512
-        let (core, rx_from_smol, tx_to_smol) = ConnectionCore::new(handle, 512);
+        let capacity = NetworkConfig::global().udp_stream_capacity;
+        let (core, rx_from_smol, tx_to_smol) = ConnectionCore::new(handle, capacity);
 
         let conn = Self {
             core,

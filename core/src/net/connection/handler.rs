@@ -87,7 +87,7 @@ impl StreamHandler {
             });
         } else {
             info!(stream_id, "📲 [TCP] Dispatching payload to local stack");
-            self.muxer.dispatch_to_local(stream_id, payload).await;
+            self.muxer.dispatch_to_local(stream_id, payload);
         }
     }
 
@@ -144,19 +144,19 @@ impl StreamHandler {
                 stream_id,
                 "📲 [UDP] Dispatching connection payload to local stack"
             );
-            self.muxer.dispatch_to_local(stream_id, payload).await;
+            self.muxer.dispatch_to_local(stream_id, payload);
         }
     }
 
     async fn on_data(&self, stream_id: u32, payload: Bytes) {
         // Здесь info может быть избыточным при большой нагрузке, но для отладки полезно
         debug!(stream_id, "📦 [TCP Data] Size: {} bytes", payload.len());
-        self.muxer.dispatch_to_local(stream_id, payload).await;
+        self.muxer.dispatch_to_local(stream_id, payload);
     }
 
     async fn on_udp_data(&self, stream_id: u32, payload: Bytes) {
         debug!(stream_id, "📦 [UDP Data] Size: {} bytes", payload.len());
-        self.muxer.dispatch_to_local(stream_id, payload).await;
+        self.muxer.dispatch_to_local(stream_id, payload);
     }
 
     async fn on_close(&self, stream_id: u32) {

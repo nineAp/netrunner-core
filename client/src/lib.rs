@@ -85,7 +85,7 @@ impl SessionManager {
         cache_dir: String,
     ) -> Arc<Session> {
         netrunner_logger::Logger::init(None);
-        netrunner_logger::Logger::global().set_level("info");
+        netrunner_logger::Logger::global().set_level("error");
         let runtime = get_runtime();
         let cancel_token = CancellationToken::new();
         let session_token = cancel_token.clone();

@@ -1,6 +1,7 @@
 use bytes::Bytes;
 use dashmap::DashMap;
-use netrunner_logger::{info, warn};
+use netrunner_logger::{debug, info, warn};
+use tokio::sync::mpsc::error::TrySendError;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc::Sender;
@@ -13,7 +14,7 @@ use crate::nrxp::FrameType;
 pub struct LegStats {
     pub tx_bytes: AtomicU64,
     pub rx_bytes: AtomicU64,
-    pub rtt_ms: AtomicU32, // Задержка (пинг) конкретно этой ноги
+    pub rtt_ms: AtomicU32,
 }
 
 #[derive(Default, Debug)]
@@ -107,35 +108,42 @@ impl Muxer {
         self.legs.len()
     }
 
-    // ДИНАМИЧЕСКИЙ ВЫБОР НОГИ ПО STREAM_ID (Session Affinity)
-    fn select_leg(&self, frame_type: &FrameType, stream_id: u32) -> Option<(u32, MuxLeg)> {
+  fn select_leg(&self, frame_type: &FrameType, stream_id: u32) -> Option<(u32, MuxLeg)> {
         if self.legs.is_empty() {
             return None;
         }
 
-        let mut active_legs: Vec<u32> = self.legs.iter().map(|kv| *kv.key()).collect();
-        active_legs.sort_unstable(); // Сортируем для предсказуемой привязки
-
         let is_udp = matches!(frame_type, FrameType::UdpData | FrameType::UdpConnect);
 
-        // Фильтруем: UDP идет по нечетным ногам, TCP по четным (если они есть)
-        let preferred_legs: Vec<u32> = active_legs
+        // Собираем доступные ноги
+        let mut candidates: Vec<(u32, MuxLeg)> = self.legs
             .iter()
-            .copied()
-            .filter(|id| if is_udp { id % 2 != 0 } else { id % 2 == 0 })
+            .map(|kv| (*kv.key(), kv.value().clone()))
+            .filter(|(id, _)| {
+                // Фильтр по протоколу, если ноги разделены
+                if is_udp { id % 2 != 0 } else { id % 2 == 0 }
+            })
             .collect();
 
-        // БАЛАНСИРОВКА: Привязываем stream_id к конкретной ноге.
-        // Все пакеты одного стрима пойдут строго по одному маршруту.
-        let target_id = if !preferred_legs.is_empty() {
-            preferred_legs[(stream_id as usize) % preferred_legs.len()]
-        } else {
-            active_legs[(stream_id as usize) % active_legs.len()]
-        };
+        // Если по протоколу ничего не нашли, берем любые активные
+        if candidates.is_empty() {
+            candidates = self.legs.iter().map(|kv| (*kv.key(), kv.value().clone())).collect();
+        }
 
-        self.legs
-            .get(&target_id)
-            .map(|leg| (target_id, leg.clone()))
+        // --- МАГИЯ ЗДЕСЬ ---
+        // Сортируем кандидатов по RTT (от меньшего к большему)
+        // Ноги с RTT = 0 (еще не проверенные) или таймаутом считаем медленными
+        candidates.sort_by_key(|(_, leg)| {
+            let rtt = leg.stats.rtt_ms.load(Ordering::Relaxed);
+            if rtt == 0 { 9999 } else { rtt }
+        });
+
+        // Выбираем из ТОП-2 лучших ног по RTT, используя stream_id для аффинити
+        // Это защитит от ситуации, когда все стримы прыгнут на одну ногу с RTT 10мс
+        let pool_size = std::cmp::min(candidates.len(), 2);
+        let target = &candidates[stream_id as usize % pool_size];
+
+        Some(target.clone())
     }
 
     // СИНХРОННАЯ ФУНКЦИЯ (с отбрасыванием пакетов при перегрузке)
@@ -232,23 +240,33 @@ impl Muxer {
         self.streams.remove(&stream_id);
     }
 
-    // ЛОКАЛЬНАЯ ДИСПЕТЧЕРИЗАЦИЯ (Остается async, так как тут мы используем wait для TUN)
-    pub async fn dispatch_to_local(&self, stream_id: u32, data: Bytes) {
-        let stream_opt = self
-            .streams
-            .get(&stream_id)
-            .map(|s| (s.0.clone(), s.1.clone()));
+pub fn dispatch_to_local(&self, stream_id: u32, data: Bytes) {
+    // Получаем клон Sender и Stats из DashMap
+    let stream_opt = self
+        .streams
+        .get(&stream_id)
+        .map(|s| (s.0.clone(), s.1.clone()));
 
-        if let Some((tx, stats)) = stream_opt {
-            let size = data.len() as u64;
+    if let Some((tx, stats)) = stream_opt {
+        let size = data.len() as u64;
 
-            if tx.send(data).await.is_err() {
-                self.remove_stream(stream_id);
-            } else {
+        // Используем try_send вместо send().await
+        match tx.try_send(data) {
+            Ok(_) => {
                 stats.rx_bytes.fetch_add(size, Ordering::Relaxed);
+            }
+            Err(TrySendError::Full(_)) => {
+                netrunner_logger::warn!(
+                    stream_id, 
+                    "Muxer -> Local: Buffer full, dropping packet. Check your bridge/TUN speed."
+                );
+            }
+            Err(TrySendError::Closed(_)) => {
+                self.remove_stream(stream_id);
             }
         }
     }
+}
 
     pub fn record_leg_rx(&self, leg_id: u32, bytes: u64) {
         if let Some(leg) = self.legs.get(&leg_id) {
@@ -256,41 +274,49 @@ impl Muxer {
         }
     }
 
-    // УМНЫЙ HEALTH CHECK: Пингуем каждую ногу отдельно для честного RTT
     pub async fn perform_health_check(&self) {
-        let legs: Vec<(u32, Sender<MuxMessage>)> = self
-            .legs
-            .iter()
+        // Создаем снапшот ног, чтобы не держать lock DashMap слишком долго
+        let legs: Vec<(u32, Sender<MuxMessage>)> = self.legs.iter()
             .map(|k| (*k.key(), k.value().control_tx.clone()))
             .collect();
 
         for (leg_id, tx) in legs {
             let probe_stream_id = self.id_gen.next();
             let (probe_tx, mut probe_rx) = tokio::sync::mpsc::channel(2);
+            
+            // Регистрируем временный стрим для ответа на PING
             self.register_stream(probe_stream_id, probe_tx);
 
-            let start = std::time::Instant::now();
             let msg = MuxMessage {
                 stream_id: probe_stream_id,
                 frame_type: FrameType::Handshake,
                 data: Bytes::from("PING"),
             };
 
-            // Отправляем PING прямо в конкретную ногу в обход балансировщика
+            let start = std::time::Instant::now();
+            
+            // Отправляем напрямую в ногу
             if tx.try_send(msg).is_ok() {
-                if let Ok(Some(_)) =
-                    tokio::time::timeout(std::time::Duration::from_secs(2), probe_rx.recv()).await
-                {
-                    let rtt = start.elapsed().as_millis() as u32;
-                    // Сохраняем RTT в стату ноги
-                    if let Some(leg) = self.legs.get(&leg_id) {
-                        leg.stats.rtt_ms.store(rtt, Ordering::Relaxed);
+                // Ждем ответа с жестким таймаутом
+                match tokio::time::timeout(std::time::Duration::from_secs(2), probe_rx.recv()).await {
+                    Ok(Some(_)) => {
+                        let rtt = start.elapsed().as_millis() as u32;
+                        if let Some(leg) = self.legs.get(&leg_id) {
+                            leg.stats.rtt_ms.store(rtt, Ordering::Relaxed);
+                            debug!(leg_id, rtt, "✅ Leg Health Check OK");
+                        }
                     }
-                } else {
-                    warn!(leg_id, "❌ Health check timed out for Leg");
+                    _ => {
+                        // Если таймаут — задираем RTT до небес, чтобы select_leg ее не выбирал
+                        if let Some(leg) = self.legs.get(&leg_id) {
+                            leg.stats.rtt_ms.store(5000, Ordering::Relaxed);
+                            warn!(leg_id, "❌ Leg Health Check Timeout (marked as slow)");
+                        }
+                    }
                 }
             }
 
+            // Обязательная очистка, чтобы не было утечки памяти в DashMap streams
             self.remove_stream(probe_stream_id);
         }
     }
