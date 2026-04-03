@@ -59,7 +59,7 @@ pub(crate) async fn run_tcp_bridge<R, W>(
                                 data: buf.split().freeze(),
                             };
 
-                            if muxer.send_to_network(msg).is_err() {
+                            if muxer.send_to_network(msg).await.is_err() {
                                 return Ok(false);
                             }
                             Ok(true)
@@ -139,7 +139,7 @@ pub(crate) async fn run_udp_bridge(
                     match res {
                         Ok(n) if n > 0 => {
                             let data = Bytes::copy_from_slice(&buf[..n]);
-                            if let Err(e) = muxer.send_data_safe(stream_id, data, true) {
+                            if let Err(e) = muxer.send_data_safe(stream_id, data, true).await {
                                 error!(stream_id, "UDP Failed to send to tunnel: {}", e);
                                 return Err(e);
                             }

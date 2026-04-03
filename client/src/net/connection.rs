@@ -209,7 +209,6 @@ impl TcpConnection {
         tx_tunnel: mpsc::Sender<RawCastFrame>,
     ) {
         tokio::spawn(async move {
-            // 1. Формируем и отправляем кадр на установку соединения
             let mut frame = RawCastFrame::connect(LocalProtocol::Tcp, socket_id, dst_ip, dst_port);
             frame.payload = Bytes::from(target);
 
@@ -218,10 +217,8 @@ impl TcpConnection {
                 return;
             }
 
-            // 2. Сигнализируем ConnectionManager, что запрос в туннель ушел успешно
             let _ = handshake_tx.send(());
 
-            // 3. Цикл пересылки данных из smoltcp -> туннель
             while let Some(data) = rx_smol.recv().await {
                 let data_frame = RawCastFrame::data(
                     LocalProtocol::Tcp,
@@ -232,7 +229,7 @@ impl TcpConnection {
                 );
 
                 if tx_tunnel.send(data_frame).await.is_err() {
-                    break; // Туннель закрыт
+                    break;
                 }
             }
 
@@ -328,7 +325,6 @@ impl UdpConnection {
         tokio::spawn(async move {
             debug!("📡 [UDP {}] Task started for {}", socket_id, target);
 
-            // 1. Регистрация UDP сессии в туннеле
             let mut frame = RawCastFrame::connect(LocalProtocol::Udp, socket_id, dst_ip, dst_port);
             frame.payload = Bytes::from(target);
 
@@ -337,8 +333,6 @@ impl UdpConnection {
                 return;
             }
 
-            // 2. Цикл пересылки пакетов
-            // rx_smol отдает кортеж (данные, ip, порт)
             while let Some((data, ip, port)) = rx_smol.recv().await {
                 let data_frame =
                     RawCastFrame::data(LocalProtocol::Udp, socket_id, ip, port, data.to_vec());
@@ -366,12 +360,9 @@ impl IcmpResponder {
             return;
         }
 
-        // 1. Сначала достаем данные и адрес
         let result = socket.recv();
 
         if let Ok((data, src_addr)) = result {
-            // 2. Копируем данные в Vec, чтобы разорвать связь с буфером сокета.
-            // Теперь заимствование `socket` от метода .recv() закончилось.
             let payload = data.to_vec();
 
             match src_addr {
@@ -381,7 +372,6 @@ impl IcmpResponder {
         }
     }
 
-    // Принимаем Vec<u8>, чтобы не делать to_vec() второй раз внутри
     fn reply_v4(socket: &mut icmp::Socket, mut payload: Vec<u8>, src: IpAddress) {
         if let Ok(pkt) = Icmpv4Packet::new_checked(&payload) {
             if pkt.msg_type() == Icmpv4Message::EchoRequest {

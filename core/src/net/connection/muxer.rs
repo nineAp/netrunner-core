@@ -1,13 +1,12 @@
 use bytes::Bytes;
 use dashmap::DashMap;
 use netrunner_logger::{debug, info, warn};
-use tokio::sync::mpsc::error::TrySendError;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::Sender;
 
 use crate::nrxp::FrameType;
-
 
 #[derive(Default, Debug)]
 pub struct LegStats {
@@ -59,9 +58,7 @@ pub struct Muxer {
     id_gen: Arc<IdGenerator>,
     session_id: Arc<String>,
 }
-
 impl Muxer {
-    
     pub fn new(is_client: bool, session_id: String) -> Self {
         Self {
             legs: Arc::new(DashMap::new()),
@@ -77,7 +74,6 @@ impl Muxer {
         control_tx: Sender<MuxMessage>,
         data_tx: Sender<MuxMessage>,
     ) {
-        
         if self.legs.len() >= 10 {
             warn!(
                 leg_id,
@@ -106,50 +102,47 @@ impl Muxer {
         self.legs.len()
     }
 
-  fn select_leg(&self, frame_type: &FrameType, stream_id: u32) -> Option<(u32, MuxLeg)> {
+    fn select_leg(&self, frame_type: &FrameType, stream_id: u32) -> Option<(u32, MuxLeg)> {
         if self.legs.is_empty() {
             return None;
         }
 
         let is_udp = matches!(frame_type, FrameType::UdpData | FrameType::UdpConnect);
 
-        
-        let mut candidates: Vec<(u32, MuxLeg)> = self.legs
+        let mut candidates: Vec<(u32, MuxLeg)> = self
+            .legs
             .iter()
             .map(|kv| (*kv.key(), kv.value().clone()))
-            .filter(|(id, _)| {
-                
-                if is_udp { id % 2 != 0 } else { id % 2 == 0 }
-            })
+            .filter(|(id, _)| if is_udp { id % 2 != 0 } else { id % 2 == 0 })
             .collect();
 
-        
         if candidates.is_empty() {
-            candidates = self.legs.iter().map(|kv| (*kv.key(), kv.value().clone())).collect();
+            candidates = self
+                .legs
+                .iter()
+                .map(|kv| (*kv.key(), kv.value().clone()))
+                .collect();
         }
 
-        
-        
-        
         candidates.sort_by_key(|(_, leg)| {
             let rtt = leg.stats.rtt_ms.load(Ordering::Relaxed);
-            if rtt == 0 { 9999 } else { rtt }
+            if rtt == 0 {
+                9999
+            } else {
+                rtt
+            }
         });
 
-        
-        
         let pool_size = std::cmp::min(candidates.len(), 2);
         let target = &candidates[stream_id as usize % pool_size];
 
         Some(target.clone())
     }
 
-    
-    pub fn send_to_network(&self, message: MuxMessage) -> Result<(), String> {
+    pub async fn send_to_network(&self, message: MuxMessage) -> Result<(), String> {
         let stream_id = message.stream_id;
         let size = message.data.len() as u64;
 
-        
         let (leg_id, leg) = self
             .select_leg(&message.frame_type, stream_id)
             .ok_or_else(|| "MUXER: No active legs available".to_string())?;
@@ -158,42 +151,30 @@ impl Muxer {
             FrameType::Connect
             | FrameType::Close
             | FrameType::UdpConnect
-            | FrameType::Handshake => &leg.control_tx,
-            _ => &leg.data_tx,
+            | FrameType::Handshake => leg.control_tx.clone(),
+            _ => leg.data_tx.clone(),
         };
 
-        match target_tx.try_send(message) {
+        match target_tx.send(message).await {
             Ok(_) => {
-                
                 leg.stats.tx_bytes.fetch_add(size, Ordering::Relaxed);
+
                 if let Some(stream_ref) = self.streams.get(&stream_id) {
-                    stream_ref
-                        .value()
-                        .1
-                        .tx_bytes
-                        .fetch_add(size, Ordering::Relaxed);
+                    stream_ref.1.tx_bytes.fetch_add(size, Ordering::Relaxed);
                 }
                 Ok(())
             }
-            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                
-                warn!(
-                    leg_id,
-                    "MUXER: Network queue full! Dropping outbound packet."
-                );
-                Ok(())
-            }
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+            Err(_) => {
                 self.remove_leg(leg_id);
                 Err(format!("MUXER: Leg {} died during send", leg_id))
             }
         }
     }
 
-    pub fn send_data_safe(
+    pub async fn send_data_safe(
         &self,
         stream_id: u32,
-        data: Bytes, // Больше не mut
+        data: Bytes,
         is_udp: bool,
     ) -> Result<(), String> {
         let frame_type = if is_udp {
@@ -202,15 +183,15 @@ impl Muxer {
             FrameType::Data
         };
 
-        // Отправляем как есть, целиком!
         self.send_to_network(MuxMessage {
             stream_id,
             frame_type,
             data,
         })
+        .await
     }
 
-    pub fn send_control(
+    pub async fn send_control(
         &self,
         stream_id: u32,
         f_type: FrameType,
@@ -221,6 +202,7 @@ impl Muxer {
             frame_type: f_type,
             data,
         })
+        .await
     }
 
     pub fn register_stream(&self, stream_id: u32, tx: Sender<Bytes>) {
@@ -232,33 +214,25 @@ impl Muxer {
         self.streams.remove(&stream_id);
     }
 
-pub fn dispatch_to_local(&self, stream_id: u32, data: Bytes) {
-    
-    let stream_opt = self
-        .streams
-        .get(&stream_id)
-        .map(|s| (s.0.clone(), s.1.clone()));
+    pub async fn dispatch_to_local(&self, stream_id: u32, data: Bytes) {
+        let stream_opt = self
+            .streams
+            .get(&stream_id)
+            .map(|s| (s.0.clone(), s.1.clone()));
 
-    if let Some((tx, stats)) = stream_opt {
-        let size = data.len() as u64;
+        if let Some((tx, stats)) = stream_opt {
+            let size = data.len() as u64;
 
-        
-        match tx.try_send(data) {
-            Ok(_) => {
-                stats.rx_bytes.fetch_add(size, Ordering::Relaxed);
-            }
-            Err(TrySendError::Full(_)) => {
-                netrunner_logger::warn!(
-                    stream_id, 
-                    "Muxer -> Local: Buffer full, dropping packet. Check your bridge/TUN speed."
-                );
-            }
-            Err(TrySendError::Closed(_)) => {
-                self.remove_stream(stream_id);
+            match tx.send(data).await {
+                Ok(_) => {
+                    stats.rx_bytes.fetch_add(size, Ordering::Relaxed);
+                }
+                Err(_) => {
+                    self.remove_stream(stream_id);
+                }
             }
         }
     }
-}
 
     pub fn record_leg_rx(&self, leg_id: u32, bytes: u64) {
         if let Some(leg) = self.legs.get(&leg_id) {
@@ -271,16 +245,16 @@ pub fn dispatch_to_local(&self, stream_id: u32, data: Bytes) {
     }
 
     pub async fn perform_health_check(&self) {
-        
-        let legs: Vec<(u32, Sender<MuxMessage>)> = self.legs.iter()
+        let legs: Vec<(u32, Sender<MuxMessage>)> = self
+            .legs
+            .iter()
             .map(|k| (*k.key(), k.value().control_tx.clone()))
             .collect();
 
         for (leg_id, tx) in legs {
             let probe_stream_id = self.id_gen.next();
             let (probe_tx, mut probe_rx) = tokio::sync::mpsc::channel(2);
-            
-            
+
             self.register_stream(probe_stream_id, probe_tx);
 
             let msg = MuxMessage {
@@ -290,11 +264,10 @@ pub fn dispatch_to_local(&self, stream_id: u32, data: Bytes) {
             };
 
             let start = std::time::Instant::now();
-            
-            
+
             if tx.try_send(msg).is_ok() {
-                
-                match tokio::time::timeout(std::time::Duration::from_secs(2), probe_rx.recv()).await {
+                match tokio::time::timeout(std::time::Duration::from_secs(2), probe_rx.recv()).await
+                {
                     Ok(Some(_)) => {
                         let rtt = start.elapsed().as_millis() as u32;
                         if let Some(leg) = self.legs.get(&leg_id) {
@@ -303,7 +276,6 @@ pub fn dispatch_to_local(&self, stream_id: u32, data: Bytes) {
                         }
                     }
                     _ => {
-                        
                         if let Some(leg) = self.legs.get(&leg_id) {
                             leg.stats.rtt_ms.store(5000, Ordering::Relaxed);
                             warn!(leg_id, "❌ Leg Health Check Timeout (marked as slow)");
@@ -312,12 +284,10 @@ pub fn dispatch_to_local(&self, stream_id: u32, data: Bytes) {
                 }
             }
 
-            
             self.remove_stream(probe_stream_id);
         }
     }
 
-    
     fn format_size(bytes: u64) -> String {
         const KB: u64 = 1024;
         const MB: u64 = KB * 1024;
@@ -333,7 +303,6 @@ pub fn dispatch_to_local(&self, stream_id: u32, data: Bytes) {
         }
     }
 
-    
     pub fn print_topology_tree(&self) {
         println!(
             "\n🌐 Netrunner Tunnel Topology [Session: {}]",

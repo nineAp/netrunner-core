@@ -289,7 +289,7 @@ impl EngineConfig {
 pub struct EngineBuilder {
     config: EngineConfig,
     tun_device: Option<Tun>,
-    // Добавляем возможность прокинуть кастомную фабрику сокетов
+
     socket_factory: Option<Arc<dyn SocketProvider>>,
 }
 
@@ -344,13 +344,10 @@ impl EngineBuilder {
         .map_err(|e| format!("Failed to establish secure tunnel: {}", e))?;
 
         let factory = self.socket_factory.unwrap_or_else(|| {
-            // 1. Разыменовываем ссылку и клонируем данные в новый объект
             let config_owned = (*NetworkConfig::global()).clone();
 
-            // 2. Оборачиваем во владеющий Arc
             let config = Arc::new(config_owned);
 
-            // Теперь типы совпадают: Arc<NetworkConfig> -> SmolSocketFactory::new
             Arc::new(SmolSocketFactory::new(config))
         });
 

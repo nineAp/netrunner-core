@@ -46,17 +46,15 @@ impl SmolSocketFactory {
     pub fn new(config: Arc<NetworkConfig>) -> Self {
         Self {
             config,
-            // Пул на 128 тяжелых буферов. Если нужно больше — queue вернет ошибку,
-            // и мы просто отдадим память ОС (что безопасно).
+
             heavy_pool: Arc::new(ArrayQueue::new(128)),
         }
     }
 
-    /// Берем буфер из пула или создаем новый, если пул пуст
     fn alloc_buf(&self, size: usize) -> Vec<u8> {
         if size == self.config.tcp_buf_heavy {
             if let Some(mut buf) = self.heavy_pool.pop() {
-                buf.fill(0); // Очищаем данные от прошлой сессии
+                buf.fill(0);
                 return buf;
             }
         }
@@ -144,7 +142,7 @@ impl SocketProvider for SmolSocketFactory {
 
     fn create_base_set(&self, n_icmp: usize) -> SocketSet<'static> {
         let mut sockets = SocketSet::new(Vec::with_capacity(128));
-        sockets.add(self.create_bound_udp(None, 53)); // DNS
+        sockets.add(self.create_bound_udp(None, 53));
         for _ in 0..n_icmp {
             sockets.add(self.create_icmp());
         }

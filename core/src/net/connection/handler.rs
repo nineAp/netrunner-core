@@ -14,8 +14,6 @@ use crate::net::{
 };
 use crate::nrxp::{Frame, FrameType};
 
-// --- ОТКРЫВАШКА ДЛЯ СЕРВЕРА (Remote) ---
-// Этот парень реально идет в интернет через сокеты ОС
 pub struct RemoteOpener {
     pub muxer: Arc<Muxer>,
 }
@@ -63,11 +61,9 @@ impl RemoteOpener {
     }
 }
 
-// --- ЕДИНЫЙ ХЭНДЛЕР ---
-
 pub(crate) struct StreamHandler {
     muxer: Arc<Muxer>,
-    opener: Option<Arc<RemoteOpener>>, // На сервере Some, на клиенте None
+    opener: Option<Arc<RemoteOpener>>,
 }
 
 impl StreamHandler {
@@ -89,8 +85,7 @@ impl StreamHandler {
             }
 
             FrameType::Data | FrameType::UdpData => {
-                // Унифицировано: просто кидаем в локальный канал
-                self.muxer.dispatch_to_local(stream_id, frame.payload);
+                self.muxer.dispatch_to_local(stream_id, frame.payload).await;
             }
 
             FrameType::Close => {
@@ -105,7 +100,6 @@ impl StreamHandler {
         let target = String::from_utf8_lossy(&payload).to_string();
 
         if let Some(opener) = &self.opener {
-            // Создаем виртуальную трубу для этого стрима
             let capacity = if is_udp {
                 NetworkConfig::global().udp_stream_capacity
             } else {
@@ -125,7 +119,7 @@ impl StreamHandler {
                 stream_id,
                 "⚠️ [Tunnel] Rejected incoming connection to {} (Client mode)", target
             );
-            // Если мы клиент, мы не принимаем входящие соединения из туннеля
+
             let _ = self
                 .muxer
                 .send_control(stream_id, FrameType::Close, Bytes::new());

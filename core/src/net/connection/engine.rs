@@ -185,7 +185,6 @@ impl TunnelEngine {
                     }
                 }
             } else {
-                // TCP - потоковый, режем на чанки по 16KB для совместимости с TLS Record
                 while !data.is_empty() {
                     let chunk_size =
                         std::cmp::min(data.len(), NetworkConfig::global().tcp_chunk_size);

@@ -16,7 +16,6 @@ impl Network {
     pub async fn run(&self, token: CancellationToken) {
         let addr = format!("{}:{}", self.host, self.port);
 
-        // Инициализируем конфиг для сервера
         NetworkConfig::init_global(1500);
 
         info!("🌐 Netrunner Server: Listening on {}", addr);
@@ -32,10 +31,10 @@ impl Network {
                     if let Ok((stream, client_addr)) = res {
                         info!("🔌 Connection from {}", client_addr);
 
-                        // Создаем объект соединения (включает кодек)
+
                         let conn = Connection::new(stream, true);
 
-                        // Создаем хэндлер. (Он сам разберется с SessionManager, если нужно)
+
                         let handler = ServerHandler::new(conn);
 
                         tokio::spawn(async move {

@@ -139,7 +139,7 @@ impl Codec {
 
             let decrypted = self.crypto.decrypt(&mut data_to_decrypt).map_err(|_| {
                 self.staging.clear();
-                // Сохраняем первые 32 байта зашифрованного пакета для логов, чтобы понять, что нам прислали
+
                 let bad_data =
                     Bytes::copy_from_slice(&data_to_decrypt[..data_to_decrypt.len().min(32)]);
                 TlsError::new(

@@ -44,9 +44,9 @@ impl NetworkConfig {
             tcp_buffer_size: 8 * 1024,
             udp_buffer_size: 64 * 1024,
 
-            muxer_capacity: 256,
-            tcp_stream_capacity: 32,
-            udp_stream_capacity: 128,
+            muxer_capacity: 64,
+            tcp_stream_capacity: 8,
+            udp_stream_capacity: 32,
 
             smoltcp_socket_buf: heavy_buf,
             tcp_chunk_size: chunk_size,

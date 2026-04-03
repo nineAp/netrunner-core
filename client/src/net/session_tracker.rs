@@ -19,7 +19,7 @@ pub struct SessionTracker {
     active_udp: HashMap<SocketHandle, UdpConnection>,
     inbound_tx: HashMap<u64, mpsc::Sender<Bytes>>,
     handle_to_id: HashMap<SocketHandle, u64>,
-    // 🔥 ДОБАВЛЕНО: Обратный маппинг, чтобы находить сокет по ID из туннеля
+
     id_to_handle: HashMap<u64, SocketHandle>,
     pending_tcp: HashMap<SocketHandle, StdInstant>,
     to_remove: Vec<SocketHandle>,
@@ -34,7 +34,7 @@ impl SessionTracker {
             active_udp: HashMap::new(),
             inbound_tx: HashMap::new(),
             handle_to_id: HashMap::new(),
-            id_to_handle: HashMap::new(), // Инициализация
+            id_to_handle: HashMap::new(),
             pending_tcp: HashMap::new(),
             to_remove: Vec::new(),
             next_socket_id: 1,
@@ -60,10 +60,10 @@ impl SessionTracker {
     ) {
         self.pending_tcp.remove(&handle);
         self.handle_to_id.insert(handle, id);
-        self.id_to_handle.insert(id, handle); // 🔥 Регистрация обратного индекса
+        self.id_to_handle.insert(id, handle);
         self.active_tcp.insert(handle, conn);
         self.inbound_tx.insert(id, tx);
-        self.last_activity.insert(handle, StdInstant::now()); // Для TCP тоже полезно
+        self.last_activity.insert(handle, StdInstant::now());
     }
 
     pub fn register_udp(
@@ -74,7 +74,7 @@ impl SessionTracker {
         tx: mpsc::Sender<Bytes>,
     ) {
         self.handle_to_id.insert(handle, id);
-        self.id_to_handle.insert(id, handle); // 🔥 Регистрация обратного индекса
+        self.id_to_handle.insert(id, handle);
         self.active_udp.insert(handle, conn);
         self.inbound_tx.insert(id, tx);
         self.last_activity.insert(handle, StdInstant::now());
@@ -128,7 +128,7 @@ impl SessionTracker {
 
     pub fn close_tunnel_session(&mut self, id: u64) {
         self.inbound_tx.remove(&id);
-        // 🔥 ИСПРАВЛЕНО: Теперь мы реально находим сокет и ставим его в очередь на удаление
+
         if let Some(handle) = self.id_to_handle.remove(&id) {
             self.queue_removal(handle);
         }
@@ -140,7 +140,6 @@ impl SessionTracker {
         }
     }
 
-    // 🔥 ДОБАВЛЕНО: Сборщик мусора для залипших сокетов
     pub fn enforce_idle_timeouts(&mut self, timeout: Duration) {
         let now = StdInstant::now();
         let mut ghosts = Vec::new();
@@ -159,8 +158,6 @@ impl SessionTracker {
 
     pub fn cleanup(&mut self, socket_set: &mut SocketSet) {
         for handle in self.to_remove.drain(..) {
-            // Удаление из socket_set автоматически делает abort() внутри smoltcp
-            // и освобождает память пула/буферов
             socket_set.remove(handle);
 
             self.active_tcp.remove(&handle);

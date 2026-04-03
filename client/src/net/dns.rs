@@ -162,7 +162,6 @@ impl DnsHandler {
             .set_recursion_available(true)
             .add_query(query.clone());
 
-        // 1. Проверка блокировок
         if self.forbidden_suffixes.iter().any(|s| name.ends_with(s))
             || self.block_list.contains(&name)
         {
@@ -171,7 +170,6 @@ impl DnsHandler {
             return res.to_vec().ok();
         }
 
-        // 2. Генерация Fake IP для A-записей
         if query.query_type() == RecordType::A {
             let fake_ip = store.get_or_assign(&name);
             res.add_answer(Record::from_rdata(
@@ -181,7 +179,6 @@ impl DnsHandler {
             ));
             res.set_response_code(ResponseCode::NoError);
         } else {
-            // Для остальных типов записей (AAAA и т.д.) просто возвращаем пустой NoError или NXDomain
             res.set_response_code(ResponseCode::NoError);
         }
 
