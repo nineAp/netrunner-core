@@ -87,7 +87,6 @@ impl TlsSignatures {
     pub const RSA_PSS_RSAE_SHA384: u16 = 0x0805;
     pub const RSA_PKCS1_SHA384: u16 = 0x0501;
     pub const RSA_PSS_RSAE_SHA512: u16 = 0x0806;
-    pub const RSA_PKCS1_SHA512: u16 = 0x0601;
 
     pub const BROWSER_STANDARD: Self = Self(&[
         Self::ECDSA_SECP256R1_SHA256,

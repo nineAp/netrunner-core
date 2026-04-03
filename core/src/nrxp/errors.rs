@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use netrunner_logger::{error, trace, warn};
+use netrunner_logger::{error, trace};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorAction {
@@ -63,7 +63,7 @@ impl TlsError {
                 );
             }
             ErrorAction::Redirect => {
-                warn!(
+                error!(
                     stage = stage_name,
                     action = ?self.action,
                     data = %data_preview,

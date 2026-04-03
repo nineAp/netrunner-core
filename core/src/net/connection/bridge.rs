@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::net::connection::muxer::{MuxMessage, Muxer};
-use crate::net::network::NetworkConfig;
+use crate::net::NetworkConfig;
 use crate::nrxp::FrameType;
 use bytes::{Bytes, BytesMut};
 use netrunner_logger::{debug, error, info, warn};
@@ -42,6 +42,7 @@ pub(crate) async fn run_tcp_bridge<R, W>(
     let mut buf = BytesMut::with_capacity(NetworkConfig::global().tcp_buffer_size);
 
     loop {
+        buf.reserve(NetworkConfig::global().tcp_buffer_size);
         let select_res = timeout(IDLE_TIMEOUT, async {
             tokio::select! {
 

@@ -1,5 +1,5 @@
 use netrunner_core::net::ClientHandler;
-use netrunner_core::net::network::NetworkConfig;
+use netrunner_core::net::NetworkConfig;
 use netrunner_core::rawcast::RawCastFrame;
 use smoltcp::iface::PollResult;
 use smoltcp::time::Instant;
@@ -23,6 +23,7 @@ use netrunner_logger::{debug, error, info, warn};
 
 use crate::net::connection_manager::ConnectionManager;
 use crate::net::dns::DnsHandler;
+use crate::net::socket_factory::{SmolSocketFactory, SocketProvider};
 use crate::tun::device::{TokenBuffer, VirtTunDevice};
 use crate::tun::routing::setup_platform_routing;
 use crate::tun::tun::Tun;
@@ -39,6 +40,7 @@ pub struct Engine {
     avail: Arc<AtomicBool>,
     rx_from_tunnel: mpsc::Receiver<RawCastFrame>,
 }
+
 impl Engine {
     pub fn new(
         config: Config,
@@ -46,15 +48,16 @@ impl Engine {
         dns_handler: DnsHandler,
         tx_to_tunnel: mpsc::Sender<RawCastFrame>,
         rx_from_tunnel: mpsc::Receiver<RawCastFrame>,
+        factory: Arc<dyn SocketProvider>,
     ) -> Self {
         let now = Engine::current_time();
 
         let (mut device, to_smoltcp_tx, from_smoltcp_rx, avail) = VirtTunDevice::new(caps);
         let interface = Interface::new(config, &mut device, now);
 
-        let socket_set = ConnectionManager::setup_sockets(2);
+        let socket_set = ConnectionManager::setup_sockets(factory.as_ref(), 2);
 
-        let manager = ConnectionManager::new(dns_handler, tx_to_tunnel);
+        let manager = ConnectionManager::new(dns_handler, tx_to_tunnel, factory.clone());
 
         Self {
             interface,
@@ -78,13 +81,13 @@ impl Engine {
         let from_smoltcp_rx = self.from_smoltcp_rx.take().expect("Engine started twice");
         Self::spawn_tun_writer(writer, from_smoltcp_rx);
 
-        let mut last_log = StdInstant::now();
         let mut stuck_frame: Option<RawCastFrame> = None;
 
         loop {
             while let Ok(token) = tun_to_engine_rx.try_recv() {
                 self.manager
                     .try_create_socket_from_packet(&token, &mut self.socket_set);
+
                 if self.to_smoltcp_tx.send(token).is_ok() {
                     self.device.mark_rx_available();
                 }
@@ -106,12 +109,8 @@ impl Engine {
             }
 
             self.manager.process_sockets(&mut self.socket_set);
-            let result = self.poll();
 
-            if last_log.elapsed() >= Duration::from_secs(5) {
-                self.manager.log_status(&self.socket_set);
-                last_log = StdInstant::now();
-            }
+            let result = self.poll();
 
             if matches!(result, PollResult::SocketStateChanged) {
                 self.manager.cleanup(&mut self.socket_set);
@@ -132,29 +131,17 @@ impl Engine {
                 }
             };
 
-            if stuck_frame.is_none() {
-                tokio::select! {
-                    _ = sleep_fut => {}
-                    Some(token) = tun_to_engine_rx.recv() => {
-                        self.manager.try_create_socket_from_packet(&token, &mut self.socket_set);
-                        if self.to_smoltcp_tx.send(token).is_ok() {
-                            self.device.mark_rx_available();
-                        }
-                    }
-                    Some(frame) = self.rx_from_tunnel.recv() => {
-                        if let Err(returned_frame) = self.manager.try_inject_inbound(frame) {
-                            stuck_frame = Some(returned_frame);
-                        }
+            tokio::select! {
+                _ = sleep_fut => {}
+                Some(token) = tun_to_engine_rx.recv() => {
+                    self.manager.try_create_socket_from_packet(&token, &mut self.socket_set);
+                    if self.to_smoltcp_tx.send(token).is_ok() {
+                        self.device.mark_rx_available();
                     }
                 }
-            } else {
-                tokio::select! {
-                    _ = sleep_fut => {}
-                    Some(token) = tun_to_engine_rx.recv() => {
-                        self.manager.try_create_socket_from_packet(&token, &mut self.socket_set);
-                        if self.to_smoltcp_tx.send(token).is_ok() {
-                            self.device.mark_rx_available();
-                        }
+                Some(frame) = self.rx_from_tunnel.recv(), if stuck_frame.is_none() => {
+                    if let Err(returned_frame) = self.manager.try_inject_inbound(frame) {
+                        stuck_frame = Some(returned_frame);
                     }
                 }
             }
@@ -302,6 +289,8 @@ impl EngineConfig {
 pub struct EngineBuilder {
     config: EngineConfig,
     tun_device: Option<Tun>,
+    // Добавляем возможность прокинуть кастомную фабрику сокетов
+    socket_factory: Option<Arc<dyn SocketProvider>>,
 }
 
 impl EngineBuilder {
@@ -309,6 +298,7 @@ impl EngineBuilder {
         Self {
             config,
             tun_device: None,
+            socket_factory: None,
         }
     }
 
@@ -320,10 +310,7 @@ impl EngineBuilder {
     pub async fn build(self) -> Result<(Engine, Tun), String> {
         let tun = self.tun_device.ok_or("TUN device is required")?;
 
-        info!(
-            "Initializing Engine components with config: {:?}",
-            self.config
-        );
+        info!("Initializing Engine with config: {:?}", self.config);
 
         let mut dns_handler = DnsHandler::new(&self.config.cache_path);
         if let Err(e) = dns_handler.init().await {
@@ -332,11 +319,8 @@ impl EngineBuilder {
 
         if self.config.setup_routing {
             info!("Applying platform routing rules...");
-            if let Err(e) = setup_platform_routing(&self.config.remote_address) {
-                return Err(format!("Routing setup failed: {}", e));
-            }
-        } else {
-            info!("Platform routing setup skipped via config.");
+            setup_platform_routing(&self.config.remote_address)
+                .map_err(|e| format!("Routing setup failed: {}", e))?;
         }
 
         let smol_config = Config::new(smoltcp::wire::HardwareAddress::Ip);
@@ -351,7 +335,6 @@ impl EngineBuilder {
             mpsc::channel(NetworkConfig::global().muxer_capacity);
 
         info!("Establishing secure tunnel to proxy server...");
-
         ClientHandler::connect(
             &self.config.remote_address,
             rx_for_client_handler,
@@ -360,12 +343,27 @@ impl EngineBuilder {
         .await
         .map_err(|e| format!("Failed to establish secure tunnel: {}", e))?;
 
-        info!("Secure tunnel established, Muxer is ready.");
+        let factory = self.socket_factory.unwrap_or_else(|| {
+            // 1. Разыменовываем ссылку и клонируем данные в новый объект
+            let config_owned = (*NetworkConfig::global()).clone();
 
-        let mut engine = Engine::new(smol_config, caps, dns_handler, tx_to_tunnel, rx_from_tunnel);
+            // 2. Оборачиваем во владеющий Arc
+            let config = Arc::new(config_owned);
+
+            // Теперь типы совпадают: Arc<NetworkConfig> -> SmolSocketFactory::new
+            Arc::new(SmolSocketFactory::new(config))
+        });
+
+        let mut engine = Engine::new(
+            smol_config,
+            caps,
+            dns_handler,
+            tx_to_tunnel,
+            rx_from_tunnel,
+            factory,
+        );
 
         engine.set_any_ip(self.config.any_ip);
-
         if self.config.transparent_mode {
             engine.set_transparent_mode();
         }
@@ -373,7 +371,10 @@ impl EngineBuilder {
         engine.set_default_gateway(self.config.default_gateway);
         engine.activate();
 
-        info!("Stack IP initialized: {}", self.config.default_gateway);
+        info!(
+            "Engine successfully built. Stack IP: {}",
+            self.config.default_gateway
+        );
 
         Ok((engine, tun))
     }

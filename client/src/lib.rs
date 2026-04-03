@@ -1,4 +1,4 @@
-use netrunner_core::net::network::NetworkConfig;
+use netrunner_core::net::NetworkConfig;
 use uniffi;
 uniffi::setup_scaffolding!();
 
@@ -77,7 +77,8 @@ impl SessionManager {
         cache_dir: String,
     ) -> Arc<Session> {
         netrunner_logger::Logger::init(None);
-        netrunner_logger::Logger::global().set_level("error");
+        netrunner_logger::Logger::global().set_level("info"); // Поменял на info для дебага
+
         let runtime = get_runtime();
         let cancel_token = CancellationToken::new();
         let session_token = cancel_token.clone();
@@ -159,7 +160,6 @@ impl SessionManager {
             proxy_ip: remote_proxy_ip,
         })
     }
-
     pub fn get_traffic_stats(&self) -> VpnTrafficStats {
         VpnTrafficStats {
             rx_bytes: GLOBAL_RX_BYTES.load(std::sync::atomic::Ordering::Relaxed),

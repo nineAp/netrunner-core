@@ -88,7 +88,7 @@ impl Parser for TlsRecord {
         let record_len = bytes.get_u16() as usize;
 
         let content_type = ContentType::try_from(raw_content_type)
-            .map_err(|e| TlsError::new(ErrorStage::Tls(e), ErrorAction::Drop, Bytes::new()))?;
+            .map_err(|e| TlsError::new(ErrorStage::Tls(e), ErrorAction::Redirect, Bytes::new()))?;
 
         let version = ProtocolVersion::try_from(raw_version)
             .map_err(|e| TlsError::new(ErrorStage::Tls(e), ErrorAction::Drop, Bytes::new()))?;

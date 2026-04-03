@@ -5,7 +5,7 @@ mod tun;
 use crate::tun::{routing::reset_platform_routing, tun::Tun};
 use net::engine::{EngineBuilder, EngineConfig};
 
-use netrunner_core::net::network::NetworkConfig;
+use netrunner_core::net::NetworkConfig;
 use tokio_util::sync::CancellationToken;
 
 #[tokio::main]

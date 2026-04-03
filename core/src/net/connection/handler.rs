@@ -1,174 +1,134 @@
-use std::sync::Arc;
-
 use bytes::Bytes;
 use netrunner_logger::{debug, error, info, warn};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::net::{TcpStream, UdpSocket};
+use tokio::sync::mpsc;
 
-use crate::{
-    net::{
-        connection::{
-            bridge::{run_tcp_bridge, run_udp_bridge},
-            connection::ConnectionRole,
-            muxer::Muxer,
-        },
-        network::NetworkConfig,
+use crate::net::{
+    connection::{
+        bridge::{run_tcp_bridge, run_udp_bridge},
+        muxer::Muxer,
     },
-    nrxp::{Frame, FrameType},
+    NetworkConfig,
 };
+use crate::nrxp::{Frame, FrameType};
+
+// --- ОТКРЫВАШКА ДЛЯ СЕРВЕРА (Remote) ---
+// Этот парень реально идет в интернет через сокеты ОС
+pub struct RemoteOpener {
+    pub muxer: Arc<Muxer>,
+}
+
+impl RemoteOpener {
+    pub async fn open_tcp(&self, stream_id: u32, target: String, v_rx: mpsc::Receiver<Bytes>) {
+        let muxer = self.muxer.clone();
+        tokio::spawn(async move {
+            info!(stream_id, "🌐 [Remote] Connecting to {}", target);
+            let start = Instant::now();
+
+            let connect_res =
+                tokio::time::timeout(Duration::from_secs(7), TcpStream::connect(&target)).await;
+
+            match connect_res {
+                Ok(Ok(stream)) => {
+                    info!(stream_id, "✅ [Remote] Connected in {:?}", start.elapsed());
+                    let (r, w) = stream.into_split();
+                    run_tcp_bridge(stream_id, r, w, muxer.clone(), v_rx).await;
+                }
+                _ => {
+                    error!(
+                        stream_id,
+                        "❌ [Remote] Target connection failed: {}", target
+                    );
+                    let _ = muxer.send_control(stream_id, FrameType::Close, Bytes::new());
+                }
+            }
+            muxer.remove_stream(stream_id);
+        });
+    }
+
+    pub async fn open_udp(&self, stream_id: u32, target: String, v_rx: mpsc::Receiver<Bytes>) {
+        let muxer = self.muxer.clone();
+        tokio::spawn(async move {
+            info!(stream_id, "🚀 [Remote] Binding UDP for {}", target);
+            let socket = UdpSocket::bind("0.0.0.0:0").await.ok();
+            if let Some(s) = socket {
+                if s.connect(&target).await.is_ok() {
+                    run_udp_bridge(stream_id, s, muxer.clone(), v_rx).await;
+                }
+            }
+            muxer.remove_stream(stream_id);
+        });
+    }
+}
+
+// --- ЕДИНЫЙ ХЭНДЛЕР ---
 
 pub(crate) struct StreamHandler {
     muxer: Arc<Muxer>,
-    role: ConnectionRole,
+    opener: Option<Arc<RemoteOpener>>, // На сервере Some, на клиенте None
 }
 
 impl StreamHandler {
-    pub(crate) fn new(muxer: Arc<Muxer>, role: ConnectionRole) -> Self {
-        Self { muxer, role }
+    pub(crate) fn new(muxer: Arc<Muxer>, opener: Option<Arc<RemoteOpener>>) -> Self {
+        Self { muxer, opener }
     }
 
     pub(crate) async fn handle(&self, frame: Frame) {
         let stream_id = frame.header.stream_id;
 
-        info!(
-            stream_id,
-            "📥 [Tunnel] Received frame: {:?}", frame.header.frame_type
-        );
-
         match frame.header.frame_type {
-            FrameType::Connect => self.on_connect(stream_id, frame.payload).await,
-            FrameType::UdpConnect => self.on_udp_connect(stream_id, frame.payload).await,
-            FrameType::Data => self.on_data(stream_id, frame.payload).await,
-            FrameType::UdpData => self.on_udp_data(stream_id, frame.payload).await,
-            FrameType::Close => self.on_close(stream_id).await,
-            _ => debug!(stream_id, "Unhandled frame type"),
-        }
-    }
-    async fn on_connect(&self, stream_id: u32, payload: Bytes) {
-        let target_str = String::from_utf8_lossy(&payload).to_string();
+            FrameType::Connect => {
+                self.handle_conn_request(stream_id, frame.payload, false)
+                    .await
+            }
+            FrameType::UdpConnect => {
+                self.handle_conn_request(stream_id, frame.payload, true)
+                    .await
+            }
 
-        if self.role == ConnectionRole::Server {
-            info!(stream_id, target = %target_str, "🌐 [TCP] Request to establish remote connection");
-            let muxer = self.muxer.clone();
+            FrameType::Data | FrameType::UdpData => {
+                // Унифицировано: просто кидаем в локальный канал
+                self.muxer.dispatch_to_local(stream_id, frame.payload);
+            }
 
-            let (v_tx, v_rx) =
-                tokio::sync::mpsc::channel(NetworkConfig::global().tcp_stream_capacity);
-            muxer.register_stream(stream_id, v_tx);
-
-            tokio::spawn(async move {
-                let start = std::time::Instant::now();
-                info!(
-                    stream_id,
-                    "⏳ [TCP Worker] Attempting connection to {}", target_str
-                );
-
-                let connect_res = tokio::time::timeout(
-                    std::time::Duration::from_secs(7),
-                    tokio::net::TcpStream::connect(&target_str),
-                )
-                .await;
-
-                match connect_res {
-                    Ok(Ok(stream)) => {
-                        let elapsed = start.elapsed();
-                        info!(stream_id, target = %target_str, "✅ [TCP] Established in {:?}. Starting bridge.", elapsed);
-                        let (r, w) = stream.into_split();
-                        run_tcp_bridge(stream_id, r, w, muxer.clone(), v_rx).await;
-                        info!(stream_id, "🔚 [TCP Worker] Bridge task finished");
-                        Self::close_stream(&muxer, stream_id).await;
-                    }
-                    Ok(Err(e)) => {
-                        error!(stream_id, target = %target_str, error = %e, "❌ [TCP] Connection failed");
-                        Self::close_stream(&muxer, stream_id).await;
-                    }
-                    Err(_) => {
-                        error!(stream_id, target = %target_str, "⏰ [TCP] Connection timeout (DNS or IP unreachable)");
-                        Self::close_stream(&muxer, stream_id).await;
-                    }
-                }
-            });
-        } else {
-            info!(stream_id, "📲 [TCP] Dispatching payload to local stack");
-            self.muxer.dispatch_to_local(stream_id, payload);
+            FrameType::Close => {
+                debug!(stream_id, "🏁 [Tunnel] Peer closed stream");
+                self.muxer.remove_stream(stream_id);
+            }
+            _ => debug!(stream_id, "Unhandled frame: {:?}", frame.header.frame_type),
         }
     }
 
-    async fn on_udp_connect(&self, stream_id: u32, payload: Bytes) {
-        let target_str = String::from_utf8_lossy(&payload).to_string();
+    async fn handle_conn_request(&self, stream_id: u32, payload: Bytes, is_udp: bool) {
+        let target = String::from_utf8_lossy(&payload).to_string();
 
-        if self.role == ConnectionRole::Server {
-            info!(stream_id, target = %target_str, "🚀 [UDP] Request to establish remote bridge");
-            let muxer = self.muxer.clone();
+        if let Some(opener) = &self.opener {
+            // Создаем виртуальную трубу для этого стрима
+            let capacity = if is_udp {
+                NetworkConfig::global().udp_stream_capacity
+            } else {
+                NetworkConfig::global().tcp_stream_capacity
+            };
 
-            let (v_tx, v_rx) =
-                tokio::sync::mpsc::channel(NetworkConfig::global().udp_stream_capacity);
-            muxer.register_stream(stream_id, v_tx);
+            let (v_tx, v_rx) = mpsc::channel(capacity);
+            self.muxer.register_stream(stream_id, v_tx);
 
-            tokio::spawn(async move {
-                info!(
-                    stream_id,
-                    "⏳ [UDP Worker] Binding socket for {}", target_str
-                );
-
-                let socket_res = tokio::net::UdpSocket::bind("[::]:0").await;
-                let socket = match socket_res {
-                    Ok(s) => s,
-                    Err(e) => {
-                        warn!(
-                            stream_id,
-                            "⚠️ [UDP] IPv6 bind failed, falling back to IPv4: {}", e
-                        );
-                        tokio::net::UdpSocket::bind("0.0.0.0:0")
-                            .await
-                            .expect("UDP bind fail")
-                    }
-                };
-
-                match socket.connect(&target_str).await {
-                    Ok(_) => {
-                        let local = socket.local_addr().unwrap();
-                        let remote = socket.peer_addr().unwrap();
-                        info!(
-                            "✅ [UDP {}] Socket ready. Local: {}, Remote: {}. Starting bridge.",
-                            stream_id, local, remote
-                        );
-                        run_udp_bridge(stream_id, socket, muxer, v_rx).await;
-                        info!(stream_id, "🔚 [UDP Worker] Bridge task finished");
-                    }
-                    Err(e) => {
-                        error!(stream_id, target = %target_str, error = %e, "❌ [UDP] Target connect failed");
-                        Self::close_stream(&muxer, stream_id).await;
-                    }
-                }
-            });
+            if is_udp {
+                opener.open_udp(stream_id, target, v_rx).await;
+            } else {
+                opener.open_tcp(stream_id, target, v_rx).await;
+            }
         } else {
-            info!(
+            warn!(
                 stream_id,
-                "📲 [UDP] Dispatching connection payload to local stack"
+                "⚠️ [Tunnel] Rejected incoming connection to {} (Client mode)", target
             );
-            self.muxer.dispatch_to_local(stream_id, payload);
+            // Если мы клиент, мы не принимаем входящие соединения из туннеля
+            let _ = self
+                .muxer
+                .send_control(stream_id, FrameType::Close, Bytes::new());
         }
-    }
-
-    async fn on_data(&self, stream_id: u32, payload: Bytes) {
-        debug!(stream_id, "📦 [TCP Data] Size: {} bytes", payload.len());
-        self.muxer.dispatch_to_local(stream_id, payload);
-    }
-
-    async fn on_udp_data(&self, stream_id: u32, payload: Bytes) {
-        debug!(stream_id, "📦 [UDP Data] Size: {} bytes", payload.len());
-        self.muxer.dispatch_to_local(stream_id, payload);
-    }
-
-    async fn on_close(&self, stream_id: u32) {
-        info!(stream_id, "🏁 [Close] Received close signal for stream");
-        self.muxer.remove_stream(stream_id);
-    }
-
-    async fn close_stream(muxer: &Muxer, stream_id: u32) {
-        info!(
-            stream_id,
-            "📡 [Control] Sending CLOSE signal to remote peer"
-        );
-        let _ = muxer.send_control(stream_id, FrameType::Close, Bytes::new());
-        muxer.remove_stream(stream_id);
     }
 }

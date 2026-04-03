@@ -1,0 +1,153 @@
+use crossbeam_queue::ArrayQueue;
+use netrunner_core::net::NetworkConfig;
+use smoltcp::{
+    iface::SocketSet,
+    socket::{icmp, tcp, udp},
+    time::Duration,
+    wire::{IpAddress, IpListenEndpoint},
+};
+use std::sync::Arc;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrafficProfile {
+    Interactive,
+    Bulk,
+    Dns,
+    Default,
+}
+
+impl TrafficProfile {
+    pub fn guess_from_port(port: u16, is_tcp: bool) -> Self {
+        match (port, is_tcp) {
+            (22, true) | (3389, true) | (5900, true) => Self::Interactive,
+            (443, true) | (80, true) | (8080, true) | (1935, true) => Self::Bulk,
+            (53, false) | (123, false) => Self::Dns,
+            _ => Self::Default,
+        }
+    }
+}
+
+pub trait SocketProvider: Send + Sync {
+    fn create_tcp(&self, profile: TrafficProfile) -> tcp::Socket<'static>;
+    fn create_udp(&self, profile: TrafficProfile) -> udp::Socket<'static>;
+    fn create_icmp(&self) -> icmp::Socket<'static>;
+    fn create_listening_tcp(&self, addr: Option<IpAddress>, port: u16) -> tcp::Socket<'static>;
+    fn create_bound_udp(&self, addr: Option<IpAddress>, port: u16) -> udp::Socket<'static>;
+    fn create_base_set(&self, n_icmp: usize) -> SocketSet<'static>;
+    fn reconfigure_tcp(&self, socket: &mut tcp::Socket, profile: TrafficProfile);
+}
+
+pub struct SmolSocketFactory {
+    config: Arc<NetworkConfig>,
+    heavy_pool: Arc<ArrayQueue<Vec<u8>>>,
+}
+
+impl SmolSocketFactory {
+    pub fn new(config: Arc<NetworkConfig>) -> Self {
+        Self {
+            config,
+            // Пул на 128 тяжелых буферов. Если нужно больше — queue вернет ошибку,
+            // и мы просто отдадим память ОС (что безопасно).
+            heavy_pool: Arc::new(ArrayQueue::new(128)),
+        }
+    }
+
+    /// Берем буфер из пула или создаем новый, если пул пуст
+    fn alloc_buf(&self, size: usize) -> Vec<u8> {
+        if size == self.config.tcp_buf_heavy {
+            if let Some(mut buf) = self.heavy_pool.pop() {
+                buf.fill(0); // Очищаем данные от прошлой сессии
+                return buf;
+            }
+        }
+        vec![0u8; size]
+    }
+}
+
+impl SocketProvider for SmolSocketFactory {
+    fn create_tcp(&self, profile: TrafficProfile) -> tcp::Socket<'static> {
+        let (rx_size, tx_size) = match profile {
+            TrafficProfile::Bulk => (self.config.tcp_buf_heavy, self.config.tcp_buf_heavy),
+            TrafficProfile::Interactive => (self.config.tcp_buf_light, self.config.tcp_buf_light),
+            _ => (self.config.tcp_buf_light * 2, self.config.tcp_buf_light * 2),
+        };
+
+        let rx_buffer = tcp::SocketBuffer::new(self.alloc_buf(rx_size));
+        let tx_buffer = tcp::SocketBuffer::new(self.alloc_buf(tx_size));
+
+        let mut socket = tcp::Socket::new(rx_buffer, tx_buffer);
+
+        self.reconfigure_tcp(&mut socket, profile);
+
+        socket.set_keep_alive(Some(Duration::from_secs(30)));
+        socket.set_timeout(Some(Duration::from_secs(60)));
+
+        socket
+    }
+
+    fn reconfigure_tcp(&self, socket: &mut tcp::Socket, profile: TrafficProfile) {
+        match profile {
+            TrafficProfile::Interactive => {
+                socket.set_nagle_enabled(false);
+                socket.set_ack_delay(None);
+            }
+            TrafficProfile::Bulk | TrafficProfile::Default => {
+                socket.set_nagle_enabled(true);
+                socket.set_ack_delay(Some(Duration::from_millis(10)));
+            }
+            _ => {}
+        }
+    }
+
+    fn create_udp(&self, profile: TrafficProfile) -> udp::Socket<'static> {
+        let (buf_size, meta_count) = match profile {
+            TrafficProfile::Bulk => (self.config.udp_buf_heavy, self.config.udp_meta_heavy),
+            TrafficProfile::Dns => (self.config.udp_buf_light, self.config.udp_meta_light),
+            _ => (
+                self.config.udp_buf_heavy / 2,
+                self.config.udp_meta_heavy / 2,
+            ),
+        };
+
+        udp::Socket::new(
+            udp::PacketBuffer::new(
+                vec![udp::PacketMetadata::EMPTY; meta_count],
+                self.alloc_buf(buf_size),
+            ),
+            udp::PacketBuffer::new(
+                vec![udp::PacketMetadata::EMPTY; meta_count],
+                self.alloc_buf(buf_size),
+            ),
+        )
+    }
+
+    fn create_icmp(&self) -> icmp::Socket<'static> {
+        icmp::Socket::new(
+            icmp::PacketBuffer::new(vec![icmp::PacketMetadata::EMPTY; 4], vec![0; 512]),
+            icmp::PacketBuffer::new(vec![icmp::PacketMetadata::EMPTY; 4], vec![0; 512]),
+        )
+    }
+
+    fn create_listening_tcp(&self, addr: Option<IpAddress>, port: u16) -> tcp::Socket<'static> {
+        let profile = TrafficProfile::guess_from_port(port, true);
+        let mut socket = self.create_tcp(profile);
+        let _ = socket.listen(IpListenEndpoint { addr, port });
+        socket
+    }
+
+    fn create_bound_udp(&self, addr: Option<IpAddress>, port: u16) -> udp::Socket<'static> {
+        let profile = TrafficProfile::guess_from_port(port, false);
+        let mut socket = self.create_udp(profile);
+        let _ = socket.bind(IpListenEndpoint { addr, port });
+        socket
+    }
+
+    fn create_base_set(&self, n_icmp: usize) -> SocketSet<'static> {
+        let mut sockets = SocketSet::new(Vec::with_capacity(128));
+        sockets.add(self.create_bound_udp(None, 53)); // DNS
+        for _ in 0..n_icmp {
+            sockets.add(self.create_icmp());
+        }
+        sockets
+    }
+}

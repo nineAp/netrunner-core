@@ -1,14 +1,20 @@
 use bytes::{Buf, Bytes, BytesMut};
-use netrunner_core::net::network::NetworkConfig;
+use netrunner_core::{
+    net::NetworkConfig,
+    rawcast::{LocalProtocol, RawCastFrame},
+};
 use smoltcp::{
     iface::SocketHandle,
     socket::{tcp, udp},
-    wire::IpEndpoint,
+    wire::{
+        Icmpv4Message, Icmpv4Packet, Icmpv6Message, Icmpv6Packet, IpAddress, IpEndpoint,
+        Ipv6Address,
+    },
 };
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
-use netrunner_logger::debug;
+use netrunner_logger::{debug, info};
 
 pub struct ConnectionCore<T> {
     pub handle: SocketHandle,
@@ -83,7 +89,7 @@ impl TcpConnection {
                     match rx.try_recv() {
                         Ok(_) => {
                             debug!(%self.core.handle, "TCP Handshake successful, State -> Active");
-                            self.state = ConnectionState::Active;
+                            self.state = ConnectionState::Established;
                             self.handshake_rx = None;
                             return true;
                         }
@@ -112,7 +118,14 @@ impl TcpConnection {
                 return false;
             }
 
-            _ => {}
+            ConnectionState::Established => {
+                info!(
+                    "✅ [TCP {}] Connection fully established and ready for data",
+                    self.core.handle
+                );
+                self.state = ConnectionState::Active;
+                return true;
+            }
         }
 
         true
@@ -184,6 +197,50 @@ impl TcpConnection {
             debug!(%self.core.handle, "All data flushed after server EOF, sending FIN to browser");
             socket.close();
         }
+    }
+
+    pub fn spawn(
+        socket_id: u64,
+        dst_ip: std::net::Ipv4Addr,
+        dst_port: u16,
+        target: String,
+        mut rx_smol: mpsc::Receiver<Bytes>,
+        handshake_tx: oneshot::Sender<()>,
+        tx_tunnel: mpsc::Sender<RawCastFrame>,
+    ) {
+        tokio::spawn(async move {
+            // 1. Формируем и отправляем кадр на установку соединения
+            let mut frame = RawCastFrame::connect(LocalProtocol::Tcp, socket_id, dst_ip, dst_port);
+            frame.payload = Bytes::from(target);
+
+            if tx_tunnel.send(frame).await.is_err() {
+                netrunner_logger::error!("❌ [TCP {}] Failed to send CONNECT to tunnel", socket_id);
+                return;
+            }
+
+            // 2. Сигнализируем ConnectionManager, что запрос в туннель ушел успешно
+            let _ = handshake_tx.send(());
+
+            // 3. Цикл пересылки данных из smoltcp -> туннель
+            while let Some(data) = rx_smol.recv().await {
+                let data_frame = RawCastFrame::data(
+                    LocalProtocol::Tcp,
+                    socket_id,
+                    dst_ip,
+                    dst_port,
+                    data.to_vec(),
+                );
+
+                if tx_tunnel.send(data_frame).await.is_err() {
+                    break; // Туннель закрыт
+                }
+            }
+
+            let close_frame = RawCastFrame::close(LocalProtocol::Tcp, socket_id, dst_ip, dst_port);
+            let _ = tx_tunnel.send(close_frame).await;
+
+            debug!("🏁 [TCP {}] Spawned task finished", socket_id);
+        });
     }
 }
 
@@ -258,5 +315,98 @@ impl UdpConnection {
         }
 
         true
+    }
+
+    pub fn spawn(
+        socket_id: u64,
+        dst_ip: std::net::Ipv4Addr,
+        dst_port: u16,
+        target: String,
+        mut rx_smol: mpsc::Receiver<UdpPacketTarget>,
+        tx_tunnel: mpsc::Sender<RawCastFrame>,
+    ) {
+        tokio::spawn(async move {
+            debug!("📡 [UDP {}] Task started for {}", socket_id, target);
+
+            // 1. Регистрация UDP сессии в туннеле
+            let mut frame = RawCastFrame::connect(LocalProtocol::Udp, socket_id, dst_ip, dst_port);
+            frame.payload = Bytes::from(target);
+
+            if tx_tunnel.send(frame).await.is_err() {
+                netrunner_logger::error!("❌ [UDP {}] Failed to send CONNECT to tunnel", socket_id);
+                return;
+            }
+
+            // 2. Цикл пересылки пакетов
+            // rx_smol отдает кортеж (данные, ip, порт)
+            while let Some((data, ip, port)) = rx_smol.recv().await {
+                let data_frame =
+                    RawCastFrame::data(LocalProtocol::Udp, socket_id, ip, port, data.to_vec());
+
+                if tx_tunnel.send(data_frame).await.is_err() {
+                    break;
+                }
+            }
+
+            let close_frame = RawCastFrame::close(LocalProtocol::Udp, socket_id, dst_ip, dst_port);
+            let _ = tx_tunnel.send(close_frame).await;
+
+            info!("🛑 [UDP {}] Task stopped", socket_id);
+        });
+    }
+}
+
+use smoltcp::socket::icmp;
+
+pub struct IcmpResponder;
+
+impl IcmpResponder {
+    pub fn handle(socket: &mut icmp::Socket) {
+        if !socket.can_recv() {
+            return;
+        }
+
+        // 1. Сначала достаем данные и адрес
+        let result = socket.recv();
+
+        if let Ok((data, src_addr)) = result {
+            // 2. Копируем данные в Vec, чтобы разорвать связь с буфером сокета.
+            // Теперь заимствование `socket` от метода .recv() закончилось.
+            let payload = data.to_vec();
+
+            match src_addr {
+                IpAddress::Ipv4(_) => Self::reply_v4(socket, payload, src_addr),
+                IpAddress::Ipv6(v6) => Self::reply_v6(socket, payload, v6),
+            }
+        }
+    }
+
+    // Принимаем Vec<u8>, чтобы не делать to_vec() второй раз внутри
+    fn reply_v4(socket: &mut icmp::Socket, mut payload: Vec<u8>, src: IpAddress) {
+        if let Ok(pkt) = Icmpv4Packet::new_checked(&payload) {
+            if pkt.msg_type() == Icmpv4Message::EchoRequest {
+                let mut reply_pkt = Icmpv4Packet::new_unchecked(&mut payload);
+                reply_pkt.set_msg_type(Icmpv4Message::EchoReply);
+                reply_pkt.fill_checksum();
+
+                let _ = socket.send_slice(&payload, src);
+                info!("🏓 [ICMPv4] Echo Reply -> {}", src);
+            }
+        }
+    }
+
+    fn reply_v6(socket: &mut icmp::Socket, mut payload: Vec<u8>, src: Ipv6Address) {
+        if let Ok(pkt) = Icmpv6Packet::new_checked(&payload) {
+            if pkt.msg_type() == Icmpv6Message::EchoRequest {
+                let mut reply_pkt = Icmpv6Packet::new_unchecked(&mut payload);
+                reply_pkt.set_msg_type(Icmpv6Message::EchoReply);
+
+                let gateway = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
+                reply_pkt.fill_checksum(&gateway, &src);
+
+                let _ = socket.send_slice(&payload, src.into());
+                info!("🏓 [ICMPv6] Echo Reply -> {}", src);
+            }
+        }
     }
 }

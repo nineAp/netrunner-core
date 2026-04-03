@@ -1,4 +1,5 @@
+mod config;
 mod connection;
-pub mod network;
 
-pub use connection::{ClientHandler, ConnectionRole, ServerHandler, TunnelHandler};
+pub use config::NetworkConfig;
+pub use connection::{ClientHandler, Connection, ServerHandler, TunnelHandler};

@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     net::{
         connection::{handler::StreamHandler, muxer::MuxMessage},
-        network::NetworkConfig,
+        NetworkConfig,
     },
     nrxp::{Codec, ErrorAction, FrameType},
 };
@@ -176,15 +176,16 @@ impl TunnelEngine {
         {
             let mut c = codec.lock().await;
 
-            if data.is_empty() {
-                match c.encrypt_data(stream_id, frame_type.clone(), Bytes::new()) {
+            if frame_type == FrameType::UdpData {
+                match c.encrypt_data(stream_id, frame_type.clone(), data) {
                     Ok(pkt) => packets.push(pkt),
                     Err(e) => {
-                        error!(stream_id, error = ?e, "Encryption failed for empty message");
+                        error!(stream_id, error = ?e, "Encryption failed for UDP datagram");
                         return Err(format!("Encryption error: {:?}", e));
                     }
                 }
             } else {
+                // TCP - потоковый, режем на чанки по 16KB для совместимости с TLS Record
                 while !data.is_empty() {
                     let chunk_size =
                         std::cmp::min(data.len(), NetworkConfig::global().tcp_chunk_size);
@@ -193,7 +194,7 @@ impl TunnelEngine {
                     match c.encrypt_data(stream_id, frame_type.clone(), chunk) {
                         Ok(pkt) => packets.push(pkt),
                         Err(e) => {
-                            error!(stream_id, error = ?e, "Encryption failed for chunked message");
+                            error!(stream_id, error = ?e, "Encryption failed for TCP chunk");
                             return Err(format!("Encryption error: {:?}", e));
                         }
                     }

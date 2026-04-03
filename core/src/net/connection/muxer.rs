@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc::Sender;
 
-use crate::net::network::NetworkConfig;
+use crate::net::NetworkConfig;
 use crate::nrxp::FrameType;
 
 
@@ -56,7 +56,6 @@ pub struct MuxMessage {
 #[derive(Clone)]
 pub struct Muxer {
     legs: Arc<DashMap<u32, MuxLeg>>,
-    
     streams: Arc<DashMap<u32, (Sender<Bytes>, Arc<StreamStats>)>>,
     id_gen: Arc<IdGenerator>,
     session_id: Arc<String>,
@@ -195,27 +194,21 @@ impl Muxer {
     pub fn send_data_safe(
         &self,
         stream_id: u32,
-        mut data: Bytes,
+        data: Bytes, // Больше не mut
         is_udp: bool,
     ) -> Result<(), String> {
-        let max_chunk = NetworkConfig::global().tcp_chunk_size;
         let frame_type = if is_udp {
             FrameType::UdpData
         } else {
             FrameType::Data
         };
 
-        while !data.is_empty() {
-            let chunk_size = std::cmp::min(data.len(), max_chunk);
-            let chunk = data.split_to(chunk_size);
-
-            self.send_to_network(MuxMessage {
-                stream_id,
-                frame_type: frame_type.clone(),
-                data: chunk,
-            })?;
-        }
-        Ok(())
+        // Отправляем как есть, целиком!
+        self.send_to_network(MuxMessage {
+            stream_id,
+            frame_type,
+            data,
+        })
     }
 
     pub fn send_control(
@@ -272,6 +265,10 @@ pub fn dispatch_to_local(&self, stream_id: u32, data: Bytes) {
         if let Some(leg) = self.legs.get(&leg_id) {
             leg.stats.rx_bytes.fetch_add(bytes, Ordering::Relaxed);
         }
+    }
+
+    pub fn next_stream_id(&self) -> u32 {
+        self.id_gen.next()
     }
 
     pub async fn perform_health_check(&self) {

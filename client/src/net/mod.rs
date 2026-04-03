@@ -1,5 +1,6 @@
 mod connection;
 pub mod connection_manager;
-pub mod dns;
+mod dns;
 pub mod engine;
-pub mod ip_store;
+mod session_tracker;
+mod socket_factory;

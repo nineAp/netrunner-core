@@ -2,8 +2,12 @@ use std::{net::Ipv4Addr, sync::Arc, time::Duration};
 
 use crate::{
     net::{
-        connection::{engine::TunnelEngine, handler::StreamHandler, muxer::Muxer},
-        network::NetworkConfig,
+        connection::{
+            engine::TunnelEngine,
+            handler::{RemoteOpener, StreamHandler},
+            muxer::Muxer,
+        },
+        NetworkConfig,
     },
     nrxp::{Codec, ErrorAction, Frame, FrameType},
     rawcast::{LocalProtocol, RawCastAdapter, RawCastFrame},
@@ -52,12 +56,6 @@ impl SessionManager {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum ConnectionRole {
-    Client,
-    Server,
-}
-
 #[async_trait::async_trait]
 pub trait TunnelHandler {
     async fn run(self) -> Result<(), String>;
@@ -91,7 +89,9 @@ impl Connection {
     }
 }
 
-type StreamContext = (Ipv4Addr, u16, LocalProtocol);
+// Измененный контекст: теперь храним оригинальный (локальный) socket_id
+type StreamContext = (u32, Ipv4Addr, u16, LocalProtocol);
+
 pub struct ClientHandler;
 
 impl ClientHandler {
@@ -115,7 +115,6 @@ impl ClientHandler {
         let stream = TcpStream::connect(remote_proxy_addr)
             .await
             .map_err(|e| format!("Failed to connect: {}", e))?;
-
         let _ = stream.set_nodelay(true);
         let (inbound, outbound) = stream.into_split();
         let mut conn = Connection::new_raw(inbound, outbound);
@@ -170,8 +169,7 @@ impl ClientHandler {
 
         muxer.add_leg(leg_id, control_tx, data_tx);
 
-        let handler =
-            std::sync::Arc::new(StreamHandler::new(muxer.clone(), ConnectionRole::Client));
+        let handler = Arc::new(StreamHandler::new(muxer.clone(), None));
 
         let engine = TunnelEngine {
             leg_id,
@@ -198,7 +196,11 @@ impl ClientHandler {
         info!("🔑 Generated Master Session ID: {}", session_id);
 
         let muxer = Arc::new(Muxer::new(true, session_id.clone()));
+
+        // Реестр для отправки данных обратно в виртуальный сетевой стек
         let registry: Arc<DashMap<u32, StreamContext>> = Arc::new(DashMap::new());
+        // Мапа для трансляции: локальный socket_id -> глобальный stream_id
+        let local_to_global: Arc<DashMap<u32, u32>> = Arc::new(DashMap::new());
 
         info!("🚀 Netrunner Multi-Path Tunnel Initializing (10 Legs max).");
 
@@ -225,6 +227,11 @@ impl ClientHandler {
                 if m_stats.active_legs_count() == 0 {
                     break;
                 }
+
+                // 🔥 ЗАПУСК HEALTH CHECK: Пингуем все леги
+                m_stats.perform_health_check().await;
+
+                // После пинга выводим красивую топологию
                 m_stats.print_topology_tree();
             }
         });
@@ -232,78 +239,105 @@ impl ClientHandler {
         let muxer_inner = muxer.clone();
         tokio::spawn(async move {
             while let Some(raw_frame) = rx_from_engine.recv().await {
+                // Извлекаем нужные метаданные до передачи во фрейм
                 let dst_ip = raw_frame.dst_ip;
                 let dst_port = raw_frame.dst_port;
                 let protocol = raw_frame.protocol;
                 let is_udp = protocol == LocalProtocol::Udp;
 
-                let nrxp_frame = match RawCastAdapter::to_nrxp(raw_frame) {
-                    Ok(frame) => frame,
-                    Err(e) => {
-                        error!("⚠️ [Adapter] Failed to cast frame: {}", e);
-                        continue;
-                    }
-                };
+                if let Ok(nrxp_frame) = RawCastAdapter::to_nrxp(raw_frame) {
+                    // Адаптер кладет socket_id от smoltcp в заголовок stream_id
+                    let local_socket_id = nrxp_frame.header.stream_id;
+                    let f_type = nrxp_frame.header.frame_type;
+                    let payload = nrxp_frame.payload;
 
-                let stream_id = nrxp_frame.header.stream_id;
-                let f_type = nrxp_frame.header.frame_type;
-                let payload = nrxp_frame.payload;
+                    match f_type {
+                        FrameType::Connect | FrameType::UdpConnect => {
+                            // 🔥 ШАГ 2: Выделяем глобальный ID для нового потока
+                            let global_stream_id = muxer_inner.next_stream_id();
 
-                match f_type {
-                    FrameType::Connect | FrameType::UdpConnect => {
-                        info!(
-                            "🔗 [Muxer] Forwarding {} request to {} (stream {})",
-                            if is_udp { "UDP" } else { "TCP" },
-                            String::from_utf8_lossy(&payload),
-                            stream_id
-                        );
+                            info!(
+                                "🔗 [Muxer] Forwarding {} request to {} (Local ID: {} -> Global ID: {})",
+                                if is_udp { "UDP" } else { "TCP" },
+                                String::from_utf8_lossy(&payload),
+                                local_socket_id,
+                                global_stream_id
+                            );
 
-                        registry.insert(stream_id, (dst_ip, dst_port, protocol));
+                            // Запоминаем связь
+                            local_to_global.insert(local_socket_id, global_stream_id);
+                            registry.insert(
+                                global_stream_id,
+                                (local_socket_id, dst_ip, dst_port, protocol),
+                            );
 
-                        let (v_tx, mut v_rx) =
-                            mpsc::channel(NetworkConfig::global().tcp_stream_capacity);
-                        muxer_inner.register_stream(stream_id, v_tx);
+                            let (v_tx, mut v_rx) =
+                                mpsc::channel(NetworkConfig::global().tcp_stream_capacity);
 
-                        let tx_to_tun = tx_to_engine.clone();
-                        let reg = registry.clone();
+                            // Регистрируем локальный поток под глобальным ID
+                            muxer_inner.register_stream(global_stream_id, v_tx);
 
-                        tokio::spawn(async move {
-                            while let Some(back_payload) = v_rx.recv().await {
-                                if let Some(ctx) = reg.get(&stream_id) {
-                                    let (ip, port, proto) = *ctx;
-                                    let out_f_type = if proto == LocalProtocol::Udp {
-                                        FrameType::UdpData
-                                    } else {
-                                        FrameType::Data
-                                    };
-                                    let mock_nrxp = Frame::new(stream_id, out_f_type, back_payload);
+                            let tx_to_tun = tx_to_engine.clone();
+                            let reg = registry.clone();
 
-                                    if let Ok(raw) = RawCastAdapter::from_nrxp(
-                                        mock_nrxp,
-                                        ip,
-                                        port,
-                                        proto == LocalProtocol::Udp,
-                                    ) {
-                                        let _ = tx_to_tun.send(raw).await;
+                            tokio::spawn(async move {
+                                while let Some(back_payload) = v_rx.recv().await {
+                                    if let Some(ctx) = reg.get(&global_stream_id) {
+                                        let (orig_local_id, ip, port, proto) = *ctx;
+                                        let out_f_type = if proto == LocalProtocol::Udp {
+                                            FrameType::UdpData
+                                        } else {
+                                            FrameType::Data
+                                        };
+
+                                        // Оборачиваем обратно в оригинальный локальный ID,
+                                        // чтобы smoltcp и tun-адаптер поняли, кому это принадлежит
+                                        let mock_nrxp =
+                                            Frame::new(orig_local_id, out_f_type, back_payload);
+
+                                        if let Ok(raw) = RawCastAdapter::from_nrxp(
+                                            mock_nrxp,
+                                            ip,
+                                            port,
+                                            proto == LocalProtocol::Udp,
+                                        ) {
+                                            let _ = tx_to_tun.send(raw).await;
+                                        }
                                     }
                                 }
+                            });
+
+                            let _ = muxer_inner.send_control(global_stream_id, f_type, payload);
+                        }
+                        FrameType::Data | FrameType::UdpData => {
+                            // Ищем глобальный ID по локальному
+                            if let Some(global_ref) = local_to_global.get(&local_socket_id) {
+                                let global_stream_id = *global_ref;
+                                let _ =
+                                    muxer_inner.send_data_safe(global_stream_id, payload, is_udp);
+                            } else {
+                                warn!(
+                                    "Data received for unknown local socket_id: {}",
+                                    local_socket_id
+                                );
                             }
-                        });
-
-                        let _ = muxer_inner.send_control(stream_id, f_type, payload);
-                    }
-
-                    FrameType::Data | FrameType::UdpData => {
-                        let _ = muxer_inner.send_data_safe(stream_id, payload, is_udp);
-                    }
-
-                    FrameType::Close => {
-                        let _ = muxer_inner.send_control(stream_id, FrameType::Close, Bytes::new());
-                        muxer_inner.remove_stream(stream_id);
-                    }
-
-                    _ => {
-                        warn!("Unhandled FrameType from adapter: {:?}", f_type);
+                        }
+                        FrameType::Close => {
+                            if let Some((_, global_stream_id)) =
+                                local_to_global.remove(&local_socket_id)
+                            {
+                                let _ = muxer_inner.send_control(
+                                    global_stream_id,
+                                    FrameType::Close,
+                                    Bytes::new(),
+                                );
+                                muxer_inner.remove_stream(global_stream_id);
+                                registry.remove(&global_stream_id);
+                            }
+                        }
+                        _ => {
+                            warn!("Unhandled FrameType from adapter: {:?}", f_type);
+                        }
                     }
                 }
             }
@@ -379,6 +413,8 @@ impl TunnelHandler for ServerHandler {
         info!("Acting as TLS Server with Stealth Fallback");
 
         let handshake_timeout = std::time::Duration::from_secs(1);
+
+        // 1. ФАЗА TLS HANDSHAKE
         let hello = loop {
             let buf_snapshot = self.conn.read_buf.clone().freeze();
             match self
@@ -387,17 +423,35 @@ impl TunnelHandler for ServerHandler {
                 .make_server_handshake(&mut self.conn.read_buf)
             {
                 Ok(b) => break b,
-                Err(e) if e.action == ErrorAction::Wait => {
-                    let res = tokio::time::timeout(
-                        handshake_timeout,
-                        self.conn.inbound.read_buf(&mut self.conn.read_buf),
-                    )
-                    .await;
-                    match res {
-                        Ok(Ok(0)) => return Err("Client closed".into()),
-                        Ok(Ok(_)) => continue,
-                        _ => {
-                            ServerHandler::handle_stealth_fallback(
+                Err(e) => {
+                    // 🔥 ВЫЗЫВАЕМ СТРАТЕГИЮ (Она заодно и залогирует ошибку)
+                    match e.execute_strategy() {
+                        ErrorAction::Wait => {
+                            let res = tokio::time::timeout(
+                                handshake_timeout,
+                                self.conn.inbound.read_buf(&mut self.conn.read_buf),
+                            )
+                            .await;
+
+                            match res {
+                                Ok(Ok(0)) => return Err("Client closed".into()),
+                                Ok(Ok(_)) => continue,
+                                _ => {
+                                    // По таймауту тоже редиректим, так как сканеры часто
+                                    // присылают пол-пакета и "висят"
+                                    Self::handle_stealth_fallback(
+                                        self.conn.inbound,
+                                        self.conn.outbound,
+                                        buf_snapshot,
+                                    )
+                                    .await;
+                                    return Ok(());
+                                }
+                            }
+                        }
+                        ErrorAction::Redirect => {
+                            // Пришел валидный TLS пакет, но от чужака -> притворяемся сайтом
+                            Self::handle_stealth_fallback(
                                 self.conn.inbound,
                                 self.conn.outbound,
                                 buf_snapshot,
@@ -405,26 +459,23 @@ impl TunnelHandler for ServerHandler {
                             .await;
                             return Ok(());
                         }
+                        ErrorAction::Drop => {
+                            // Полный мусор, отключаем немедленно (экономим сокеты ОС)
+                            return Err("Dropped by security strategy (TLS Phase)".into());
+                        }
                     }
-                }
-                Err(_) => {
-                    ServerHandler::handle_stealth_fallback(
-                        self.conn.inbound,
-                        self.conn.outbound,
-                        buf_snapshot,
-                    )
-                    .await;
-                    return Ok(());
                 }
             }
         };
 
+        // Отвечаем ServerHello
         self.conn
             .outbound
             .write_all(&hello)
             .await
             .map_err(|e| e.to_string())?;
 
+        // 2. ФАЗА NETRUNNER HANDSHAKE (Внутри туннеля)
         let (session_id, leg_id) = loop {
             let n = tokio::time::timeout(
                 std::time::Duration::from_secs(3),
@@ -452,32 +503,50 @@ impl TunnelHandler for ServerHandler {
                                 sid, lid
                             );
                             break (sid, lid);
-                        } else {
-                            return Err("Invalid Handshake format".into());
                         }
-                    } else {
-                        return Err("Invalid first frame (Expected Handshake)".into());
+                        return Err("Invalid Handshake format".into());
                     }
+                    return Err("Expected Handshake frame".into());
                 }
                 Ok(None) => continue,
-                Err(e) => return Err(format!("Decryption/Auth failed during Handshake: {:?}", e)),
+                Err(e) => {
+                    let buf_snapshot = self.conn.read_buf.clone().freeze();
+                    match e.execute_strategy() {
+                        ErrorAction::Redirect => {
+                            // Если мы решаем прятать VPN даже на уровне неудачной криптографии
+                            Self::handle_stealth_fallback(
+                                self.conn.inbound,
+                                self.conn.outbound,
+                                buf_snapshot, // Отправляем зашифрованный мусор на целевой сервак (он сам его дропнет)
+                            )
+                            .await;
+                            return Ok(());
+                        }
+                        _ => {
+                            // Wait или Drop на этапе Handshake лучше просто дропать
+                            return Err("Dropped by security strategy (Auth Phase)".into());
+                        }
+                    }
+                }
             }
         };
 
+        // ... Инициализация Muxer и TunnelEngine (остается без изменений)
         let muxer = self.session_manager.get_or_create(&session_id);
 
         let (control_tx, control_rx) = mpsc::channel(NetworkConfig::global().muxer_capacity);
         let (data_tx, data_rx) = mpsc::channel(NetworkConfig::global().muxer_capacity);
-
         muxer.add_leg(leg_id, control_tx, data_tx);
 
-        let handler =
-            std::sync::Arc::new(StreamHandler::new(muxer.clone(), ConnectionRole::Server));
+        let opener = Arc::new(RemoteOpener {
+            muxer: muxer.clone(),
+        });
+        let handler = Arc::new(StreamHandler::new(muxer.clone(), Some(opener)));
 
         let m_weak = Arc::downgrade(&muxer);
         tokio::spawn(async move {
             while let Some(m_stats) = m_weak.upgrade() {
-                tokio::time::sleep(Duration::from_secs(15)).await;
+                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
                 if m_stats.active_legs_count() == 0 {
                     break;
                 }
@@ -497,13 +566,13 @@ impl TunnelHandler for ServerHandler {
             muxer: muxer.clone(),
         };
 
-        let _ = engine.run().await;
+        let res = engine.run().await;
 
         muxer.remove_leg(leg_id);
         if muxer.active_legs_count() == 0 {
             self.session_manager.remove(&session_id);
         }
 
-        Ok(())
+        res
     }
 }
