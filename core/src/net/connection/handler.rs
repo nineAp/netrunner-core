@@ -149,7 +149,6 @@ impl StreamHandler {
     }
 
     async fn on_data(&self, stream_id: u32, payload: Bytes) {
-        // Здесь info может быть избыточным при большой нагрузке, но для отладки полезно
         debug!(stream_id, "📦 [TCP Data] Size: {} bytes", payload.len());
         self.muxer.dispatch_to_local(stream_id, payload);
     }

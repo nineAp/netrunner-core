@@ -44,8 +44,8 @@ impl Engine {
         config: Config,
         caps: DeviceCapabilities,
         dns_handler: DnsHandler,
-        tx_to_tunnel: mpsc::Sender<RawCastFrame>, // Куда менеджер будет слать пакеты
-        rx_from_tunnel: mpsc::Receiver<RawCastFrame>, // Откуда движок будет читать пакеты
+        tx_to_tunnel: mpsc::Sender<RawCastFrame>,
+        rx_from_tunnel: mpsc::Receiver<RawCastFrame>,
     ) -> Self {
         let now = Engine::current_time();
 
@@ -82,7 +82,6 @@ impl Engine {
         let mut stuck_frame: Option<RawCastFrame> = None;
 
         loop {
-            // 1. Быстро читаем из TUN
             while let Ok(token) = tun_to_engine_rx.try_recv() {
                 self.manager
                     .try_create_socket_from_packet(&token, &mut self.socket_set);
@@ -91,19 +90,17 @@ impl Engine {
                 }
             }
 
-            // 2. Пытаемся протолкнуть застрявший кадр
             if let Some(frame) = stuck_frame.take() {
                 if let Err(returned_frame) = self.manager.try_inject_inbound(frame) {
                     stuck_frame = Some(returned_frame);
                 }
             }
 
-            // 3. Забираем новые кадры из туннеля
             if stuck_frame.is_none() {
                 while let Ok(frame) = self.rx_from_tunnel.try_recv() {
                     if let Err(returned_frame) = self.manager.try_inject_inbound(frame) {
-                        stuck_frame = Some(returned_frame); // Возвращаем пакет в "заначку"
-                        break; // ТОРМОЗИМ чтение туннеля, пока канал не освободится
+                        stuck_frame = Some(returned_frame);
+                        break;
                     }
                 }
             }
@@ -118,17 +115,15 @@ impl Engine {
 
             if matches!(result, PollResult::SocketStateChanged) {
                 self.manager.cleanup(&mut self.socket_set);
-                continue; // Если стейт изменился, поллим еще раз без задержек
+                continue;
             }
 
             self.manager.cleanup(&mut self.socket_set);
 
-            // 4. Правильный расчет таймаута без Busy-Loop
             let delay = self
                 .interface
                 .poll_delay(Self::current_time(), &self.socket_set);
 
-            // Создаем Future ожидания. Если None - ждем бесконечно (std::future::pending)
             let sleep_fut = async {
                 if let Some(d) = delay {
                     sleep(Duration::from_micros(d.micros())).await;
@@ -137,7 +132,6 @@ impl Engine {
                 }
             };
 
-            // 5. Умный select!
             if stuck_frame.is_none() {
                 tokio::select! {
                     _ = sleep_fut => {}
@@ -154,8 +148,6 @@ impl Engine {
                     }
                 }
             } else {
-                // Если буфер переполнен (stuck_frame), ждем ТОЛЬКО таймер или данные от браузера (ACK),
-                // чтобы освободить буфер. Из rx_from_tunnel пока не читаем!
                 tokio::select! {
                     _ = sleep_fut => {}
                     Some(token) = tun_to_engine_rx.recv() => {
@@ -267,10 +259,6 @@ impl Engine {
     }
 }
 
-// ============================================================================
-// КОНФИГУРАЦИЯ ДВИЖКА
-// ============================================================================
-
 #[derive(Clone, Debug)]
 pub struct EngineConfig {
     pub remote_address: String,
@@ -311,17 +299,12 @@ impl EngineConfig {
     }
 }
 
-// ============================================================================
-// БИЛДЕР ДВИЖКА
-// ============================================================================
-
 pub struct EngineBuilder {
     config: EngineConfig,
     tun_device: Option<Tun>,
 }
 
 impl EngineBuilder {
-    /// Инициализируем билдер на основе готового конфига
     pub fn new(config: EngineConfig) -> Self {
         Self {
             config,
@@ -329,7 +312,6 @@ impl EngineBuilder {
         }
     }
 
-    /// Передаем TUN интерфейс (зависит от платформы, поэтому не в конфиге)
     pub fn with_tun(mut self, tun: Tun) -> Self {
         self.tun_device = Some(tun);
         self
@@ -343,13 +325,11 @@ impl EngineBuilder {
             self.config
         );
 
-        // 1. Инициализация DNS
         let mut dns_handler = DnsHandler::new(&self.config.cache_path);
         if let Err(e) = dns_handler.init().await {
             error!("Failed to initialize DNS blocklist: {}", e);
         }
 
-        // 2. Настройка системного роутинга (Опционально)
         if self.config.setup_routing {
             info!("Applying platform routing rules...");
             if let Err(e) = setup_platform_routing(&self.config.remote_address) {
@@ -359,27 +339,19 @@ impl EngineBuilder {
             info!("Platform routing setup skipped via config.");
         }
 
-        // 3. Конфигурация интерфейса smoltcp
         let smol_config = Config::new(smoltcp::wire::HardwareAddress::Ip);
         let mut caps = DeviceCapabilities::default();
         caps.max_transmission_unit = self.config.mtu;
         caps.medium = smoltcp::phy::Medium::Ip;
 
-        // --- СОЗДАЕМ КАНАЛЫ СВЯЗИ ДВИЖОК <-> ТУННЕЛЬ ---
-        // tx_to_tunnel: Движок пишет, ClientHandler читает (исходящий трафик)
         let (tx_to_tunnel, rx_for_client_handler) =
             mpsc::channel(NetworkConfig::global().muxer_capacity);
 
-        // tx_to_engine: ClientHandler пишет, Движок читает (входящий трафик)
         let (tx_for_client_handler, rx_from_tunnel) =
             mpsc::channel(NetworkConfig::global().muxer_capacity);
 
-        // 4. Подключение к серверу
         info!("Establishing secure tunnel to proxy server...");
 
-        // ВАЖНО: Тебе нужно добавить эти аргументы в `ClientHandler::connect`,
-        // чтобы он знал, откуда забирать `RawCastFrame` для отправки на сервер,
-        // и куда отдавать `RawCastFrame`, прилетевшие от сервера.
         ClientHandler::connect(
             &self.config.remote_address,
             rx_for_client_handler,
@@ -390,7 +362,6 @@ impl EngineBuilder {
 
         info!("Secure tunnel established, Muxer is ready.");
 
-        // 5. Инициализация и настройка Engine (передаем каналы)
         let mut engine = Engine::new(smol_config, caps, dns_handler, tx_to_tunnel, rx_from_tunnel);
 
         engine.set_any_ip(self.config.any_ip);

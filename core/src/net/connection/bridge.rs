@@ -10,11 +10,8 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
-/// Тайм-аут бездействия. Если данных нет 5 минут — закрываем мост.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// RAII Guard: гарантирует удаление стрима из Muxer при любом выходе из функции,
-/// даже если произошла паника (panic) или ранняя ошибка.
 struct StreamGuard {
     stream_id: u32,
     muxer: Arc<Muxer>,
@@ -37,7 +34,6 @@ pub(crate) async fn run_tcp_bridge<R, W>(
     R: tokio::io::AsyncReadExt + Unpin,
     W: tokio::io::AsyncWriteExt + Unpin,
 {
-    // Инициализируем защитника ресурсов
     let _guard = StreamGuard {
         stream_id,
         muxer: muxer.clone(),
@@ -46,15 +42,14 @@ pub(crate) async fn run_tcp_bridge<R, W>(
     let mut buf = BytesMut::with_capacity(NetworkConfig::global().tcp_buffer_size);
 
     loop {
-        // Оборачиваем весь select в таймаут, чтобы убивать "мертвые" задачи
         let select_res = timeout(IDLE_TIMEOUT, async {
             tokio::select! {
-                // Данные из реального TCP сокета -> в Muxer
+
                 res = reader.read_buf(&mut buf) => {
                     match res {
                         Ok(0) => {
                             debug!(stream_id, "TCP Socket reached EOF");
-                            return Ok(false); // Выход из цикла
+                            return Ok(false);
                         }
                         Ok(_) => {
                             let msg = MuxMessage {
@@ -62,7 +57,7 @@ pub(crate) async fn run_tcp_bridge<R, W>(
                                 frame_type: FrameType::Data,
                                 data: buf.split().freeze(),
                             };
-                            // Если туннель закрыт — выходим
+
                             if muxer.send_to_network(msg).is_err() {
                                 return Ok(false);
                             }
@@ -75,7 +70,7 @@ pub(crate) async fn run_tcp_bridge<R, W>(
                     }
                 }
 
-                // Данные из туннеля -> в реальный TCP сокет
+
                 maybe_data = v_rx.recv() => {
                     match maybe_data {
                         Some(data) => {
@@ -98,7 +93,7 @@ pub(crate) async fn run_tcp_bridge<R, W>(
 
         match select_res {
             Ok(Ok(true)) => continue,
-            Ok(Ok(false)) => break, // Штатное закрытие
+            Ok(Ok(false)) => break,
             Ok(Err(e)) => {
                 debug!(stream_id, "Bridge closing due to error: {}", e);
                 break;
@@ -110,14 +105,12 @@ pub(crate) async fn run_tcp_bridge<R, W>(
         }
     }
 
-    // Попытка вежливо сказать удаленной стороне, что мы закрылись
     let _ = muxer.send_to_network(MuxMessage {
         stream_id,
         frame_type: FrameType::Close,
         data: Bytes::new(),
     });
 
-    // Небольшая пауза, чтобы пакет Close успел уйти в сеть перед тем, как Guard удалит стрим
     tokio::time::sleep(Duration::from_millis(50)).await;
 }
 
@@ -140,7 +133,7 @@ pub(crate) async fn run_udp_bridge(
     loop {
         let select_res = timeout(IDLE_TIMEOUT, async {
             tokio::select! {
-                // Из интернета в туннель
+
                 res = socket.recv(&mut buf) => {
                     match res {
                         Ok(n) if n > 0 => {
@@ -159,7 +152,7 @@ pub(crate) async fn run_udp_bridge(
                     }
                 }
 
-                // Из туннеля в интернет
+
                 maybe_data = v_rx.recv() => {
                     match maybe_data {
                         Some(data) => {
@@ -178,7 +171,7 @@ pub(crate) async fn run_udp_bridge(
 
         match select_res {
             Ok(Ok(true)) => continue,
-            _ => break, // Любая ошибка или таймаут закрывают UDP мост
+            _ => break,
         }
     }
 

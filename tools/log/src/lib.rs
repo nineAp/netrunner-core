@@ -24,16 +24,14 @@ impl Logger {
             let mut file_guard = None;
             let mut file_layer = None;
 
-            // Настраиваем запись в файл, если передан путь
             if let Some(path) = log_dir {
-                // Ротация: новый файл каждый день, префикс "netrunner.log"
                 let file_appender = tracing_appender::rolling::daily(path, "netrunner.log");
                 let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
                 file_layer = Some(
                     fmt::layer()
                         .with_writer(non_blocking)
-                        .with_ansi(false) // В файле цвета не нужны
+                        .with_ansi(false)
                         .with_target(true)
                         .with_line_number(true),
                 );
@@ -42,7 +40,6 @@ impl Logger {
 
             let registry = tracing_subscriber::registry().with(filter_layer);
 
-            // Слой для Android
             #[cfg(target_os = "android")]
             let registry = {
                 let android_layer = tracing_android::layer("NETRUNNER_RUST")
@@ -50,7 +47,6 @@ impl Logger {
                 registry.with(android_layer)
             };
 
-            // Слой для консоли (Desktop/Server)
             #[cfg(not(target_os = "android"))]
             let registry = {
                 let fmt_layer = fmt::layer()
@@ -61,7 +57,6 @@ impl Logger {
                 registry.with(fmt_layer)
             };
 
-            // Добавляем файловый слой, если он был создан
             if let Some(f_layer) = file_layer {
                 registry.with(f_layer).init();
             } else {

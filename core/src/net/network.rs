@@ -22,13 +22,10 @@ impl Network {
     pub async fn run(&self, token: CancellationToken) {
         let addr = format!("{}:{}", self.host, self.port);
 
-        // Инициализируем глобальный конфиг сети (MTU, размеры буферов)
         NetworkConfig::init_global(1500);
 
         match self.role {
             ConnectionRole::Client => {
-                // В новой архитектуре клиент запускается через EngineBuilder + TUN.
-                // Структура Network теперь используется только для запуска Сервера.
                 error!("Client mode cannot be run via Network::run anymore.");
                 error!("Please use EngineBuilder to initialize the TUN client.");
                 panic!("Legacy SOCKS5 client mode has been removed.");
@@ -47,7 +44,7 @@ impl Network {
                             if let Ok((stream, client_addr)) = res {
                                 info!("New connection from {}", client_addr);
 
-                                // Создаем соединение (init = true для сервера)
+
                                 let conn = Connection::new(stream, true);
                                 let handler = ServerHandler::new(conn);
 
@@ -72,40 +69,55 @@ pub struct NetworkConfig {
     pub max_wire_frame_size: usize,
     pub safe_payload_size: usize,
 
-    // --- ИЗМЕНЕНИЯ ЗДЕСЬ ---
-    pub tcp_buffer_size: usize, // Размер буфера для системного tokio::TcpStream
+    pub tcp_buffer_size: usize,
     pub udp_buffer_size: usize,
-    pub muxer_capacity: usize,      // Глобальные каналы (Muxer <-> Engine)
-    pub tcp_stream_capacity: usize, // Локальные каналы 1 сокета (Engine <-> Muxer)
-    pub udp_stream_capacity: usize, // Локальные каналы 1 сокета (Engine <-> Muxer)
+    pub muxer_capacity: usize,
+    pub tcp_stream_capacity: usize,
+    pub udp_stream_capacity: usize,
 
     pub smoltcp_socket_buf: usize,
     pub tcp_chunk_size: usize,
-}
 
+    pub tcp_buf_heavy: usize,
+    pub tcp_buf_light: usize,
+
+    pub udp_buf_heavy: usize,
+    pub udp_meta_heavy: usize,
+    pub udp_buf_light: usize,
+    pub udp_meta_light: usize,
+}
 impl NetworkConfig {
     pub fn new(system_mtu: usize) -> Self {
         let transport_overhead = 48;
         let max_wire_frame = system_mtu.saturating_sub(transport_overhead);
         let safe_payload = max_wire_frame.saturating_sub(64);
 
+        let chunk_size = 16 * 1024;
+        let heavy_buf = 1024 * 1024;
+
         Self {
             mtu: system_mtu,
             max_wire_frame_size: max_wire_frame,
             safe_payload_size: safe_payload,
 
-            // Буферы ОС/Tokio (держим с запасом под быстрые всплески)
-            tcp_buffer_size: 1024 * 1024,
-            udp_buffer_size: 64 * 1024,
+            tcp_buffer_size: heavy_buf,
+            udp_buffer_size: 256 * 1024,
 
             muxer_capacity: 512,
-
             tcp_stream_capacity: 16,
             udp_stream_capacity: 128,
 
-            // Настройки smoltcp
-            smoltcp_socket_buf: 256 * 1024,
-            tcp_chunk_size: 16 * 1024,
+            smoltcp_socket_buf: heavy_buf,
+            tcp_chunk_size: chunk_size,
+
+            tcp_buf_heavy: heavy_buf,
+            tcp_buf_light: 64 * 1024,
+
+            udp_buf_heavy: heavy_buf,
+            udp_meta_heavy: 512,
+
+            udp_buf_light: 32 * 1024,
+            udp_meta_light: 16,
         }
     }
 

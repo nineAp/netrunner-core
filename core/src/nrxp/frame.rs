@@ -74,14 +74,11 @@ impl Frame {
         }
     }
 
-    // 3. БЕЗОПАСНАЯ СЕРИАЛИЗАЦИЯ С ИСПРАВЛЕННЫМ БАГОМ РАЗМЕРА
     pub(crate) fn into_bytes(mut self, auth_key: &[u8; 16]) -> BytesMut {
         let generated_padding = Padding::generate_padding();
 
-        // Обновляем заголовок реальной длиной сгенерированного паддинга
         self.header.padding_len = generated_padding.len;
 
-        // Теперь размер считается правильно!
         let total_size =
             FRAME_HEADER_SIZE as usize + self.payload.len() + generated_padding.len as usize;
         let mut buf = BytesMut::with_capacity(total_size);

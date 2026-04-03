@@ -2,11 +2,9 @@ use netrunner_logger::{error, info};
 mod net;
 mod tun;
 
-// Импортируем Билдер, Конфиг и модули маршрутизации
 use crate::tun::{routing::reset_platform_routing, tun::Tun};
 use net::engine::{EngineBuilder, EngineConfig};
 
-// Импортируем глобальный конфиг сети
 use netrunner_core::net::network::NetworkConfig;
 use tokio_util::sync::CancellationToken;
 
@@ -19,14 +17,10 @@ async fn main() -> anyhow::Result<()> {
     let remote_address = "147.45.43.70:443".to_string();
     let cancel_token = CancellationToken::new();
 
-    // ==================================================
-    // 1. ИНИЦИАЛИЗАЦИЯ ДВИЖКА И TUN
-    // ==================================================
     let config = EngineConfig::new(&remote_address)
         .with_cache_path(".")
         .with_mtu(1500);
 
-    // ВАЖНО: Инициализируем глобальные настройки сети (MTU, размеры буферов Muxer'а)
     NetworkConfig::init_global(config.mtu);
 
     let tun_device = Tun::create(|tun_cfg| {
@@ -47,9 +41,6 @@ async fn main() -> anyhow::Result<()> {
         .build()
         .await;
 
-    // ==================================================
-    // 2. ГЛАВНЫЙ ЦИКЛ ENGINE
-    // ==================================================
     match builder_result {
         Ok((mut engine, tun)) => {
             info!("Engine starting process loop...");
@@ -70,9 +61,6 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // ==================================================
-    // 3. ОЧИСТКА РОУТИНГА
-    // ==================================================
     info!("Restoring system routing...");
     let addr: std::net::SocketAddr = remote_address.parse().expect("Invalid address format");
     let p_ip = addr.ip().to_string();

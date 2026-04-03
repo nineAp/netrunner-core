@@ -93,7 +93,6 @@ impl Parser for RawCastFrame {
             return false;
         }
 
-        // читаем длину payload без сдвига буфера
         let payload_len_pos = LOCAL_HEADER_SIZE;
         let payload_len =
             u16::from_be_bytes([bytes[payload_len_pos], bytes[payload_len_pos + 1]]) as usize;

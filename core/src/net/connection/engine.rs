@@ -41,7 +41,6 @@ impl TunnelEngine {
         let data_rx = self.data_rx;
         let handler = self.handler;
 
-        // === ИЗВЛЕКАЕМ НОВЫЕ ПОЛЯ ===
         let leg_id = self.leg_id;
         let muxer = self.muxer.clone();
 
@@ -76,7 +75,7 @@ impl TunnelEngine {
                             return Err::<(), String>("EOF".into());
                         }
 
-                        // === РЕГИСТРИРУЕМ ВХОДЯЩИЙ ТРАФИК ДЛЯ СТАТИСТИКИ ===
+
                         muxer.record_leg_rx(leg_id, n as u64);
 
                         let mut frames = Vec::new();

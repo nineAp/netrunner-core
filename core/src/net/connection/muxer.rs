@@ -9,7 +9,7 @@ use tokio::sync::mpsc::Sender;
 use crate::net::network::NetworkConfig;
 use crate::nrxp::FrameType;
 
-// === СТРУКТУРЫ СТАТИСТИКИ ===
+
 #[derive(Default, Debug)]
 pub struct LegStats {
     pub tx_bytes: AtomicU64,
@@ -56,14 +56,14 @@ pub struct MuxMessage {
 #[derive(Clone)]
 pub struct Muxer {
     legs: Arc<DashMap<u32, MuxLeg>>,
-    // Храним канал + статистику стрима
+    
     streams: Arc<DashMap<u32, (Sender<Bytes>, Arc<StreamStats>)>>,
     id_gen: Arc<IdGenerator>,
     session_id: Arc<String>,
 }
 
 impl Muxer {
-    // Конструктор теперь принимает session_id
+    
     pub fn new(is_client: bool, session_id: String) -> Self {
         Self {
             legs: Arc::new(DashMap::new()),
@@ -79,7 +79,7 @@ impl Muxer {
         control_tx: Sender<MuxMessage>,
         data_tx: Sender<MuxMessage>,
     ) {
-        // Ограничение: максимум 10 физических ног
+        
         if self.legs.len() >= 10 {
             warn!(
                 leg_id,
@@ -115,43 +115,43 @@ impl Muxer {
 
         let is_udp = matches!(frame_type, FrameType::UdpData | FrameType::UdpConnect);
 
-        // Собираем доступные ноги
+        
         let mut candidates: Vec<(u32, MuxLeg)> = self.legs
             .iter()
             .map(|kv| (*kv.key(), kv.value().clone()))
             .filter(|(id, _)| {
-                // Фильтр по протоколу, если ноги разделены
+                
                 if is_udp { id % 2 != 0 } else { id % 2 == 0 }
             })
             .collect();
 
-        // Если по протоколу ничего не нашли, берем любые активные
+        
         if candidates.is_empty() {
             candidates = self.legs.iter().map(|kv| (*kv.key(), kv.value().clone())).collect();
         }
 
-        // --- МАГИЯ ЗДЕСЬ ---
-        // Сортируем кандидатов по RTT (от меньшего к большему)
-        // Ноги с RTT = 0 (еще не проверенные) или таймаутом считаем медленными
+        
+        
+        
         candidates.sort_by_key(|(_, leg)| {
             let rtt = leg.stats.rtt_ms.load(Ordering::Relaxed);
             if rtt == 0 { 9999 } else { rtt }
         });
 
-        // Выбираем из ТОП-2 лучших ног по RTT, используя stream_id для аффинити
-        // Это защитит от ситуации, когда все стримы прыгнут на одну ногу с RTT 10мс
+        
+        
         let pool_size = std::cmp::min(candidates.len(), 2);
         let target = &candidates[stream_id as usize % pool_size];
 
         Some(target.clone())
     }
 
-    // СИНХРОННАЯ ФУНКЦИЯ (с отбрасыванием пакетов при перегрузке)
+    
     pub fn send_to_network(&self, message: MuxMessage) -> Result<(), String> {
         let stream_id = message.stream_id;
         let size = message.data.len() as u64;
 
-        // Передаем stream_id в select_leg
+        
         let (leg_id, leg) = self
             .select_leg(&message.frame_type, stream_id)
             .ok_or_else(|| "MUXER: No active legs available".to_string())?;
@@ -166,7 +166,7 @@ impl Muxer {
 
         match target_tx.try_send(message) {
             Ok(_) => {
-                // Пишем стату только если пакет успешно ушел в канал
+                
                 leg.stats.tx_bytes.fetch_add(size, Ordering::Relaxed);
                 if let Some(stream_ref) = self.streams.get(&stream_id) {
                     stream_ref
@@ -178,7 +178,7 @@ impl Muxer {
                 Ok(())
             }
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                // Если очередь переполнена - просто дропаем пакет (Backpressure)
+                
                 warn!(
                     leg_id,
                     "MUXER: Network queue full! Dropping outbound packet."
@@ -241,7 +241,7 @@ impl Muxer {
     }
 
 pub fn dispatch_to_local(&self, stream_id: u32, data: Bytes) {
-    // Получаем клон Sender и Stats из DashMap
+    
     let stream_opt = self
         .streams
         .get(&stream_id)
@@ -250,7 +250,7 @@ pub fn dispatch_to_local(&self, stream_id: u32, data: Bytes) {
     if let Some((tx, stats)) = stream_opt {
         let size = data.len() as u64;
 
-        // Используем try_send вместо send().await
+        
         match tx.try_send(data) {
             Ok(_) => {
                 stats.rx_bytes.fetch_add(size, Ordering::Relaxed);
@@ -275,7 +275,7 @@ pub fn dispatch_to_local(&self, stream_id: u32, data: Bytes) {
     }
 
     pub async fn perform_health_check(&self) {
-        // Создаем снапшот ног, чтобы не держать lock DashMap слишком долго
+        
         let legs: Vec<(u32, Sender<MuxMessage>)> = self.legs.iter()
             .map(|k| (*k.key(), k.value().control_tx.clone()))
             .collect();
@@ -284,7 +284,7 @@ pub fn dispatch_to_local(&self, stream_id: u32, data: Bytes) {
             let probe_stream_id = self.id_gen.next();
             let (probe_tx, mut probe_rx) = tokio::sync::mpsc::channel(2);
             
-            // Регистрируем временный стрим для ответа на PING
+            
             self.register_stream(probe_stream_id, probe_tx);
 
             let msg = MuxMessage {
@@ -295,9 +295,9 @@ pub fn dispatch_to_local(&self, stream_id: u32, data: Bytes) {
 
             let start = std::time::Instant::now();
             
-            // Отправляем напрямую в ногу
+            
             if tx.try_send(msg).is_ok() {
-                // Ждем ответа с жестким таймаутом
+                
                 match tokio::time::timeout(std::time::Duration::from_secs(2), probe_rx.recv()).await {
                     Ok(Some(_)) => {
                         let rtt = start.elapsed().as_millis() as u32;
@@ -307,7 +307,7 @@ pub fn dispatch_to_local(&self, stream_id: u32, data: Bytes) {
                         }
                     }
                     _ => {
-                        // Если таймаут — задираем RTT до небес, чтобы select_leg ее не выбирал
+                        
                         if let Some(leg) = self.legs.get(&leg_id) {
                             leg.stats.rtt_ms.store(5000, Ordering::Relaxed);
                             warn!(leg_id, "❌ Leg Health Check Timeout (marked as slow)");
@@ -316,12 +316,12 @@ pub fn dispatch_to_local(&self, stream_id: u32, data: Bytes) {
                 }
             }
 
-            // Обязательная очистка, чтобы не было утечки памяти в DashMap streams
+            
             self.remove_stream(probe_stream_id);
         }
     }
 
-    // ФОРМАТИРОВАНИЕ БАЙТ
+    
     fn format_size(bytes: u64) -> String {
         const KB: u64 = 1024;
         const MB: u64 = KB * 1024;
@@ -337,7 +337,7 @@ pub fn dispatch_to_local(&self, stream_id: u32, data: Bytes) {
         }
     }
 
-    // ВЫВОД КРАСИВОЙ СТАТИСТИКИ
+    
     pub fn print_topology_tree(&self) {
         println!(
             "\n🌐 Netrunner Tunnel Topology [Session: {}]",

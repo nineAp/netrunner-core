@@ -14,7 +14,7 @@ struct Args {
 
 fn main() {
     Logger::init("./logs".into());
-    Logger::global().set_level("error"); //set error in prod
+    Logger::global().set_level("error");
     let args = Args::parse();
     let net = Network::new(args.host, args.port, ConnectionRole::Server);
 

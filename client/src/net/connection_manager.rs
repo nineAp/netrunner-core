@@ -20,9 +20,6 @@ use crate::net::{
     ip_store::FakeIpStore,
 };
 
-// ============================================================================
-// 1. УПРАВЛЕНИЕ СОСТОЯНИЕМ СЕССИЙ (SessionTracker)
-// ============================================================================
 struct SessionTracker {
     last_activity: HashMap<SocketHandle, StdInstant>,
     active_tcp: HashMap<SocketHandle, TcpConnection>,
@@ -69,7 +66,7 @@ impl SessionTracker {
             self.failed_until.remove(&handle);
             self.active_tcp.remove(&handle);
             self.active_udp.remove(&handle);
-            self.pending_tcp.remove(&handle); // Очищаем из pending!
+            self.pending_tcp.remove(&handle);
 
             if let Some(socket_id) = self.handle_to_id.remove(&handle) {
                 self.inbound_tx.remove(&socket_id);
@@ -85,7 +82,6 @@ impl SessionTracker {
     ) -> bool {
         socket_set.iter().any(|(_, s)| {
             if let Some(tcp) = tcp::Socket::downcast(s) {
-                // Если сокет уже привязался к клиенту, проверяем его исходные данные
                 if let Some(remote) = tcp.remote_endpoint() {
                     if remote.addr == src_addr && remote.port == src_port {
                         return true;
@@ -107,10 +103,6 @@ impl SessionTracker {
     }
 }
 
-// ============================================================================
-// 2. РАЗРЕШЕНИЕ АДРЕСОВ И DNS (TargetResolver)
-// ============================================================================
-
 struct TargetResolver {
     dns_handler: DnsHandler,
     fake_ip_store: FakeIpStore,
@@ -129,58 +121,47 @@ impl TargetResolver {
     }
 }
 
-// ============================================================================
-// 3. ФАБРИКА СОКЕТОВ (SocketFactory)
-// ============================================================================
 struct SocketFactory;
 
 impl SocketFactory {
     fn create_tcp<'a>(port: u16) -> tcp::Socket<'a> {
-        let max_buf = NetworkConfig::global().smoltcp_socket_buf;
+        let cfg = NetworkConfig::global();
 
-        // Для Web-трафика используем максимум из конфига (например, 2 МБ)
-        // Для остальных урезаем в 4 раза, чтобы сэкономить RAM на фоновых соединениях
         let buf_size = match port {
-            443 | 80 | 8080 => max_buf,
-            22 => 32 * 1024,
-            53 => 16 * 1024,
-            _ => max_buf,
+            443 | 80 | 8080 | 1935 => cfg.tcp_buf_heavy,
+            _ => cfg.tcp_buf_light,
         };
 
         let mut socket = tcp::Socket::new(
             tcp::SocketBuffer::new(vec![0; buf_size]),
             tcp::SocketBuffer::new(vec![0; buf_size]),
         );
+
         socket.set_nagle_enabled(false);
         socket.set_ack_delay(None);
         socket
     }
 
     fn create_udp<'a>(port: u16) -> udp::Socket<'a> {
-        let config = NetworkConfig::global();
-        let max_buf = config.smoltcp_socket_buf;
-        let payload_size = config.safe_payload_size.max(1); // Защита от деления на 0
+        let cfg = NetworkConfig::global();
 
-        // Вычисляем размер буфера и количество пакетов
-        let (buf_size, packet_count) = match port {
-            443 => (max_buf, max_buf / payload_size), // QUIC/HTTP3 трафик
-            53 => (64 * 1024, (64 * 1024) / payload_size), // DNS
-            _ => (max_buf, max_buf / payload_size),
+        let (buf_size, meta_count) = match port {
+            443 | 4433 | 10000..=60000 => (cfg.udp_buf_heavy, cfg.udp_meta_heavy),
+            53 | 123 => (cfg.udp_buf_light, cfg.udp_meta_light),
+            _ => (cfg.udp_buf_heavy / 2, cfg.udp_meta_heavy / 2),
         };
-        let packet_count = packet_count.max(32);
 
         udp::Socket::new(
             udp::PacketBuffer::new(
-                vec![udp::PacketMetadata::EMPTY; packet_count],
+                vec![udp::PacketMetadata::EMPTY; meta_count],
                 vec![0; buf_size],
             ),
             udp::PacketBuffer::new(
-                vec![udp::PacketMetadata::EMPTY; packet_count],
+                vec![udp::PacketMetadata::EMPTY; meta_count],
                 vec![0; buf_size],
             ),
         )
     }
-
     fn create_icmp<'a>() -> icmp::Socket<'a> {
         icmp::Socket::new(
             icmp::PacketBuffer::new(vec![icmp::PacketMetadata::EMPTY; 8], vec![0; 2048]),
@@ -189,9 +170,6 @@ impl SocketFactory {
     }
 }
 
-// ============================================================================
-// 4. ГЛАВНЫЙ КООРДИНАТОР (ConnectionManager)
-// ============================================================================
 pub struct ConnectionManager {
     tracker: SessionTracker,
     resolver: TargetResolver,
@@ -207,8 +185,6 @@ impl ConnectionManager {
         }
     }
 
-    // ВАЖНО: Метод для получения данных из сети (от VPN) и инъекции их в smoltcp
-    // Пытается внедрить пакет. Если канал переполнен — возвращает пакет обратно!
     pub fn try_inject_inbound(&mut self, frame: RawCastFrame) -> Result<(), RawCastFrame> {
         if frame.event != RawCastEvent::Data {
             if frame.event == RawCastEvent::Close {
@@ -221,7 +197,6 @@ impl ConnectionManager {
         if let Some(tx) = self.tracker.inbound_tx.get(&frame.socket_id) {
             match tx.try_send(frame.payload.clone()) {
                 Ok(_) => {
-                    // Логируем входящие данные (trace чтобы не спамить, но можно временно info)
                     trace!(
                         "📥 [Stream {}] Inbound data: {} bytes",
                         frame.socket_id,
@@ -251,7 +226,6 @@ impl ConnectionManager {
     pub fn setup_sockets(n_icmp: usize) -> SocketSet<'static> {
         let mut sockets = SocketSet::new(Vec::with_capacity(64));
 
-        // 1. Создаем ОДИН постоянный UDP сокет для перехвата DNS (чтобы не плодить их)
         let mut dns_socket = SocketFactory::create_udp(53);
         let _ = dns_socket.bind(IpListenEndpoint {
             addr: None,
@@ -259,7 +233,6 @@ impl ConnectionManager {
         });
         sockets.add(dns_socket);
 
-        // 2. Создаем ICMP
         for _ in 0..n_icmp {
             sockets.add(SocketFactory::create_icmp());
         }
@@ -339,8 +312,6 @@ impl ConnectionManager {
         }
     }
 
-    // В TCP мы просто открываем "слушающий" сокет на конкретный IP:Port,
-    // а саму сессию туннеля запустим позже в handle_tcp, когда handshake завершится.
     fn intercept_tcp(
         &mut self,
         src: smoltcp::wire::IpAddress,
@@ -361,7 +332,6 @@ impl ConnectionManager {
             });
             let handle = socket_set.add(socket);
 
-            // Засекаем время создания! Если это левый пакет, мы убьем этот сокет позже.
             self.tracker.pending_tcp.insert(handle, StdInstant::now());
         }
     }
@@ -388,7 +358,6 @@ impl ConnectionManager {
 
         let socket_id = self.tracker.generate_socket_id();
 
-        // ВОТ ТУТ МЫ ИЗВЛЕКАЕМ IP И ДЕЛАЕМ LOOKUP С ЛОГИРОВАНИЕМ
         let (dst_ip, target) = match dst {
             smoltcp::wire::IpAddress::Ipv4(ip) => {
                 let std_ip = std::net::Ipv4Addr::from(ip);
@@ -436,7 +405,6 @@ impl ConnectionManager {
             tokio::spawn(async move {
                 info!("📡 [UDP {}] Task started for {}", socket_id, target);
 
-                // ВОТ ТУТ ИСПРАВЛЕН ХАРДКОД! Передаем dst_ip вместо нулей
                 let mut frame = RawCastFrame::connect(LocalProtocol::Udp, socket_id, dst_ip, dst_p);
                 frame.payload = bytes::Bytes::from(target.clone());
 
@@ -471,8 +439,6 @@ impl ConnectionManager {
         }
     }
 
-    // --- ЦИКЛ ОБРАБОТКИ СОКЕТОВ (Pumping) ---
-
     pub fn process_sockets(&mut self, socket_set: &mut SocketSet) {
         for (handle, socket) in socket_set.iter_mut() {
             if let Some(s) = tcp::Socket::downcast_mut(socket) {
@@ -480,8 +446,6 @@ impl ConnectionManager {
             } else if let Some(s) = udp::Socket::downcast_mut(socket) {
                 self.handle_udp(handle, s);
             } else if let Some(s) = icmp::Socket::downcast_mut(socket) {
-                // smoltcp использует один тип icmp::Socket для v4 и v6
-                // разделяем логику по содержимому или конфигурации
                 self.handle_icmp(handle, s);
                 self.handle_icmpv6(handle, s);
             }
@@ -493,12 +457,11 @@ impl ConnectionManager {
             if let Some(id) = self.tracker.handle_to_id.get(&handle) {
                 info!("🏁 [TCP {}] Connection closed", id);
             }
-            self.tracker.pending_tcp.remove(&handle); // Чистим
+            self.tracker.pending_tcp.remove(&handle);
             self.tracker.queue_removal(handle);
             return;
         }
 
-        // УБИРАЕМ GHOST SOCKETS: Если сокет висит в Listen/SynReceived больше 20 секунд — убиваем!
         if matches!(socket.state(), tcp::State::Listen | tcp::State::SynReceived) {
             if let Some(created_at) = self.tracker.pending_tcp.get(&handle) {
                 if created_at.elapsed() > std::time::Duration::from_secs(20) {
@@ -510,11 +473,10 @@ impl ConnectionManager {
                     self.tracker.queue_removal(handle);
                 }
             }
-            return; // Сокет еще не Established, делать тут пока нечего
+            return;
         }
 
         if socket.state() == tcp::State::Established {
-            // Только что подключился! Удаляем из pending и переводим в active_tcp
             if self.tracker.pending_tcp.remove(&handle).is_some()
                 || !self.tracker.active_tcp.contains_key(&handle)
             {
@@ -569,7 +531,6 @@ impl ConnectionManager {
             }
         }
 
-        // Проталкиваем активные соединения
         if let Some(conn) = self.tracker.active_tcp.get_mut(&handle) {
             if !conn.tick(socket) {
                 info!("⚠️ [TCP] Tick failed, aborting handle {:?}", handle);
@@ -581,11 +542,9 @@ impl ConnectionManager {
     fn handle_udp(&mut self, handle: SocketHandle, socket: &mut udp::Socket) {
         self.tracker.last_activity.insert(handle, StdInstant::now());
 
-        // 1. DNS перехват с логированием
         if socket.endpoint().port == 53 {
             while let Ok((data, meta)) = socket.recv() {
                 if let Some(res) = self.resolver.process_dns_query(data) {
-                    // Используем debug, чтобы не заливать консоль, но видеть активность
                     debug!("🔍 [DNS] Resolved query for client {}", meta.endpoint);
                     if let Err(e) = socket.send_slice(&res, meta) {
                         warn!("❌ [DNS] Failed to send response: {:?}", e);
@@ -595,7 +554,6 @@ impl ConnectionManager {
             return;
         }
 
-        // 2. Жизненный цикл обычных UDP сессий
         if let Some(conn) = self.tracker.active_udp.get_mut(&handle) {
             if !conn.tick(socket) {
                 if let Some(socket_id) = self.tracker.handle_to_id.get(&handle) {
@@ -621,7 +579,6 @@ impl ConnectionManager {
                     smoltcp::wire::Icmpv4Message::EchoRequest => {
                         info!("🏓 [ICMPv4] Ping Request from {}", src_addr);
 
-                        // Формируем ответ (Echo Reply)
                         let mut reply_data = data.to_vec();
                         let mut reply_pkt =
                             smoltcp::wire::Icmpv4Packet::new_unchecked(&mut reply_data);
@@ -654,9 +611,8 @@ impl ConnectionManager {
 
         match socket.recv() {
             Ok((data, src_addr)) => {
-                // 1. Извлекаем конкретно Ipv6Address из перечисления IpAddress
                 let smoltcp::wire::IpAddress::Ipv6(ipv6_src) = src_addr else {
-                    return; // Если пришел не IPv6, выходим
+                    return;
                 };
 
                 let Ok(pkt) = smoltcp::wire::Icmpv6Packet::new_checked(data) else {
@@ -673,7 +629,6 @@ impl ConnectionManager {
 
                         reply_pkt.set_msg_type(smoltcp::wire::Icmpv6Message::EchoReply);
 
-                        // 2. РАСЧЕТ ЧЕКСУММЫ (Критический момент)
                         let my_v6_gateway =
                             smoltcp::wire::Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
 

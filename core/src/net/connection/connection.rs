@@ -41,7 +41,6 @@ impl SessionManager {
     pub fn get_or_create(&self, session_id: &str) -> Arc<Muxer> {
         self.sessions
             .entry(session_id.to_string())
-            // ОБНОВЛЕНО: Передаем session_id в конструктор Муксера
             .or_insert_with(|| Arc::new(Muxer::new(false, session_id.to_string())))
             .clone()
     }
@@ -121,7 +120,6 @@ impl ClientHandler {
         let (inbound, outbound) = stream.into_split();
         let mut conn = Connection::new_raw(inbound, outbound);
 
-        // TLS Handshake
         let ch = conn
             .codec
             .make_client_handshake(&BrowserProfile::CHROME_131, "ubuntu.com")
@@ -152,7 +150,6 @@ impl ClientHandler {
         info!("{} TLS Handshake complete.", leg_name);
         let handshake_payload = Bytes::from(format!("{}:{}", session_id, leg_id));
 
-        // Шифруем кастомный Handshake
         let encrypted_handshake = conn
             .codec
             .encrypt_data(0, FrameType::Handshake, handshake_payload)
@@ -177,7 +174,7 @@ impl ClientHandler {
             std::sync::Arc::new(StreamHandler::new(muxer.clone(), ConnectionRole::Client));
 
         let engine = TunnelEngine {
-            leg_id, // ОБНОВЛЕНО: Передаем leg_id, чтобы движок писал стату
+            leg_id,
             inbound: conn.inbound,
             outbound: conn.outbound,
             codec: conn.codec,
@@ -185,7 +182,7 @@ impl ClientHandler {
             control_rx,
             data_rx,
             handler,
-            muxer: muxer.clone(), // Не забудь передать muxer (он нужен движку для record_leg_rx)
+            muxer: muxer.clone(),
         };
 
         engine.run().await.map_err(|e| e.to_string())?;
@@ -200,20 +197,17 @@ impl ClientHandler {
         let session_id = SessionManager::generate_id();
         info!("🔑 Generated Master Session ID: {}", session_id);
 
-        // ОБНОВЛЕНО: Передаем session_id в Муксер
         let muxer = Arc::new(Muxer::new(true, session_id.clone()));
         let registry: Arc<DashMap<u32, StreamContext>> = Arc::new(DashMap::new());
 
         info!("🚀 Netrunner Multi-Path Tunnel Initializing (10 Legs max).");
 
-        // === ДИНАМИЧЕСКИЙ ПУЛ НА 10 НОГ ===
         for id in 0..10 {
             let addr = remote_proxy_addr.to_string();
             let m = muxer.clone();
             let sid = session_id.clone();
 
             tokio::spawn(async move {
-                // Плавный запуск (staggered start), чтобы не задудосить свой же сервер
                 tokio::time::sleep(std::time::Duration::from_millis(id as u64 * 250)).await;
                 loop {
                     if let Err(e) = Self::establish_leg(&addr, id, m.clone(), &sid).await {
@@ -224,7 +218,6 @@ impl ClientHandler {
             });
         }
 
-        // === ДЕМОН СТАТИСТИКИ (КЛИЕНТ) ===
         let m_weak = Arc::downgrade(&muxer);
         tokio::spawn(async move {
             while let Some(m_stats) = m_weak.upgrade() {
@@ -236,7 +229,6 @@ impl ClientHandler {
             }
         });
 
-        // === ЛОКАЛЬНАЯ МАРШРУТИЗАЦИЯ (RawCast -> Nrxp) ===
         let muxer_inner = muxer.clone();
         tokio::spawn(async move {
             while let Some(raw_frame) = rx_from_engine.recv().await {
@@ -472,7 +464,6 @@ impl TunnelHandler for ServerHandler {
             }
         };
 
-        // РЕГИСТРИРУЕМ НОГУ
         let muxer = self.session_manager.get_or_create(&session_id);
 
         let (control_tx, control_rx) = mpsc::channel(NetworkConfig::global().muxer_capacity);
@@ -494,9 +485,8 @@ impl TunnelHandler for ServerHandler {
             }
         });
 
-        // ЗАПУСКАЕМ ДВИЖОК
         let engine = TunnelEngine {
-            leg_id, // ОБНОВЛЕНО
+            leg_id,
             inbound: self.conn.inbound,
             outbound: self.conn.outbound,
             codec: self.conn.codec,
@@ -504,12 +494,11 @@ impl TunnelHandler for ServerHandler {
             control_rx,
             data_rx,
             handler,
-            muxer: muxer.clone(), // ОБНОВЛЕНО
+            muxer: muxer.clone(),
         };
 
         let _ = engine.run().await;
 
-        // ОЧИСТКА ПОСЛЕ ОТКЛЮЧЕНИЯ НОГИ
         muxer.remove_leg(leg_id);
         if muxer.active_legs_count() == 0 {
             self.session_manager.remove(&session_id);

@@ -37,10 +37,6 @@ pub struct VpnTrafficStats {
     pub tx_packets: u64,
 }
 
-// ==========================================
-// SESSION
-// ==========================================
-
 #[derive(uniffi::Object)]
 pub struct Session {
     pub(crate) cancel_token: CancellationToken,
@@ -63,10 +59,6 @@ impl Drop for Session {
         let _ = reset_platform_routing(Some(&self.proxy_ip));
     }
 }
-
-// ==========================================
-// SESSION MANAGER
-// ==========================================
 
 #[derive(uniffi::Object)]
 pub struct SessionManager;
@@ -107,7 +99,6 @@ impl SessionManager {
 
         NetworkConfig::init_global(config.mtu);
 
-        // --- ЗАПУСК ENGINE И TUN ---
         let engine_token = cancel_token.clone();
         runtime.spawn(async move {
             info!("Starting VPN Engine thread...");
@@ -148,8 +139,6 @@ impl SessionManager {
                 Ok((mut engine, tun)) => {
                     info!("Engine built successfully, starting loop...");
 
-                    // tokio::select! позволяет моментально прервать бесконечный цикл
-                    // engine.run() при вызове session.stop()
                     tokio::select! {
                         _ = engine.run(tun) => {
                             info!("Engine loop finished normally.");
