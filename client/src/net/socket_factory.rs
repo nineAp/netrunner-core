@@ -90,8 +90,8 @@ impl SocketProvider for SmolSocketFactory {
                 socket.set_ack_delay(None);
             }
             TrafficProfile::Bulk | TrafficProfile::Default => {
-                socket.set_nagle_enabled(true);
-                socket.set_ack_delay(Some(Duration::from_millis(10)));
+                socket.set_nagle_enabled(false);
+                socket.set_ack_delay(None);
             }
             _ => {}
         }

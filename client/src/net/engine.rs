@@ -262,7 +262,7 @@ impl EngineConfig {
         Self {
             remote_address: remote_address.into(),
             cache_path: ".".to_string(),
-            mtu: 1500,
+            mtu: 1380,
             setup_routing: true,
             any_ip: true,
             transparent_mode: true,

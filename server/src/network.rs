@@ -16,7 +16,7 @@ impl Network {
     pub async fn run(&self, token: CancellationToken) {
         let addr = format!("{}:{}", self.host, self.port);
 
-        NetworkConfig::init_global(1500);
+        NetworkConfig::init_global(1380);
 
         info!("🌐 Netrunner Server: Listening on {}", addr);
         let listener = TcpListener::bind(&addr).await.expect("Server bind failed");

@@ -111,7 +111,8 @@ impl ConnectionManager {
         for (_, socket) in socket_set.iter_mut() {
             match socket {
                 Socket::Tcp(tcp) => {
-                    if !tcp.is_open() {
+                    // 🛡️ ИСПРАВЛЕНО: Только пустые базовые сокеты слушают 443
+                    if !tcp.is_open() && tcp.local_endpoint().is_none() {
                         let _ = tcp.listen(IpListenEndpoint {
                             addr: None,
                             port: 443,
@@ -119,7 +120,8 @@ impl ConnectionManager {
                     }
                 }
                 Socket::Udp(udp) => {
-                    if !udp.is_open() {
+                    // 🛡️ ИСПРАВЛЕНО: Только пустые базовые сокеты биндят 53
+                    if !udp.is_open() && udp.endpoint().port == 0 {
                         let _ = udp.bind(IpListenEndpoint {
                             addr: None,
                             port: 53,
@@ -204,6 +206,11 @@ impl ConnectionManager {
 
     fn intercept_tcp(&mut self, f: Flow, socket_set: &mut SocketSet) {
         if !self.tracker.has_connection_from(f.src, f.src_p, socket_set) {
+            if socket_set.iter().count() >= 2048 {
+                netrunner_logger::warn!("🔥 TCP Socket limit reached! Dropping SYN.");
+                return;
+            }
+
             let socket = self.factory.create_listening_tcp(Some(f.dst), f.dst_p);
             let handle = socket_set.add(socket);
             self.tracker.add_pending_tcp(handle);
@@ -217,6 +224,11 @@ impl ConnectionManager {
             || f.dst_p == 53
             || self.tracker.is_client_known(f.src_p)
         {
+            return;
+        }
+
+        if socket_set.iter().count() >= 2048 {
+            netrunner_logger::warn!("🔥 UDP Socket limit reached! Dropping packet.");
             return;
         }
 
@@ -249,15 +261,32 @@ impl ConnectionManager {
             }
         }
     }
-
     fn handle_tcp(&mut self, handle: SocketHandle, socket: &mut tcp::Socket) {
         self.tracker.update_activity(handle);
 
-        if socket.state() == tcp::State::Closed {
+        let state = socket.state();
+
+        // 1. Терминальные состояния (уже закрыты)
+        if state == tcp::State::Closed || state == tcp::State::TimeWait {
             self.tracker.queue_removal(handle);
             return;
         }
 
+        // 🛡️ ИСПРАВЛЕНИЕ: Мы не считаем сокет "мертвым", если он в процессе Handshake
+        let is_handshaking = state == tcp::State::SynSent || state == tcp::State::SynReceived;
+
+        // 🚨 Логика очистки Half-Close (CloseWait/FinWait2)
+        // Убиваем сокет ТОЛЬКО если он не слушает, не коннектится И при этом не может передавать данные
+        if !is_handshaking && state != tcp::State::Listen {
+            if !socket.may_recv() && !socket.may_send() {
+                trace!(%handle, ?state, "💀 Cleaning up dead half-closed socket");
+                socket.abort();
+                self.tracker.queue_removal(handle);
+                return;
+            }
+        }
+
+        // Тайм-аут на установку соединения (если SYN висит слишком долго)
         if self
             .tracker
             .check_pending_timeout(handle, Duration::from_secs(20))
@@ -267,28 +296,33 @@ impl ConnectionManager {
             return;
         }
 
-        if socket.state() == tcp::State::Established && self.tracker.should_init_tcp(handle) {
-            let ep = socket.local_endpoint().unwrap();
-            let socket_id = self.tracker.next_id();
-            let (dst_ip, target) = self.resolver.resolve_destination(ep.addr, ep.port);
+        // Инициализация туннеля при успешном коннекте
+        if state == tcp::State::Established && self.tracker.should_init_tcp(handle) {
+            if let Some(ep) = socket.local_endpoint() {
+                let socket_id = self.tracker.next_id();
+                let (dst_ip, target) = self.resolver.resolve_destination(ep.addr, ep.port);
 
-            let (conn, rx_smol, tx_smol, handshake_tx) = TcpConnection::new(handle);
-            self.tracker.register_tcp(handle, socket_id, conn, tx_smol);
+                let (conn, rx_smol, tx_smol, handshake_tx) = TcpConnection::new(handle);
+                self.tracker.register_tcp(handle, socket_id, conn, tx_smol);
 
-            TcpConnection::spawn(
-                socket_id,
-                dst_ip,
-                ep.port,
-                target,
-                rx_smol,
-                handshake_tx,
-                self.tx_to_tunnel.clone(),
-            );
+                TcpConnection::spawn(
+                    socket_id,
+                    dst_ip,
+                    ep.port,
+                    target,
+                    rx_smol,
+                    handshake_tx,
+                    self.tx_to_tunnel.clone(),
+                );
+            }
         }
 
+        // Прокачка данных
         if let Some(conn) = self.tracker.get_tcp_mut(handle) {
             if !conn.tick(socket) {
+                // Если tick вернул false (ошибка в каналах или Close от туннеля)
                 socket.abort();
+                self.tracker.queue_removal(handle);
             }
         }
     }
@@ -314,7 +348,6 @@ impl ConnectionManager {
 
     pub fn cleanup(&mut self, socket_set: &mut SocketSet) {
         self.tracker.enforce_idle_timeouts(Duration::from_secs(120));
-
         self.tracker.cleanup(socket_set);
     }
 }

@@ -90,12 +90,12 @@ impl SessionManager {
 
         #[cfg(any(target_os = "android", target_os = "ios"))]
         {
-            config = config.disable_routing().with_mtu(1500);
+            config = config.disable_routing().with_mtu(1380);
         }
 
         #[cfg(target_os = "linux")]
         {
-            config = config.with_mtu(1500);
+            config = config.with_mtu(1380);
         }
 
         NetworkConfig::init_global(config.mtu);

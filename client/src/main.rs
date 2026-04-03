@@ -19,7 +19,7 @@ async fn main() -> anyhow::Result<()> {
 
     let config = EngineConfig::new(&remote_address)
         .with_cache_path(".")
-        .with_mtu(1500);
+        .with_mtu(1380);
 
     NetworkConfig::init_global(config.mtu);
 
