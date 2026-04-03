@@ -42,7 +42,7 @@ impl NetworkConfig {
             safe_payload_size: safe_payload,
 
             tcp_buffer_size: 8 * 1024,
-            udp_buffer_size: 1500,
+            udp_buffer_size: 64 * 1024,
 
             muxer_capacity: 256,
             tcp_stream_capacity: 32,
@@ -58,7 +58,7 @@ impl NetworkConfig {
             udp_meta_heavy: 512,
 
             udp_buf_light: 16 * 1024,
-            udp_meta_light: 16,
+            udp_meta_light: 32,
         }
     }
 

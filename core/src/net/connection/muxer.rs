@@ -6,7 +6,6 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc::Sender;
 
-use crate::net::NetworkConfig;
 use crate::nrxp::FrameType;
 
 
