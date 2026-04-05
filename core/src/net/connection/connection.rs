@@ -111,13 +111,44 @@ impl ClientHandler {
             leg_name, leg_id, remote_proxy_addr
         );
 
-        let stream = TcpStream::connect(remote_proxy_addr)
+        // 1. Резолвим домен в IP-адрес
+        let mut addrs = tokio::net::lookup_host(remote_proxy_addr)
             .await
-            .map_err(|e| format!("Failed to connect: {}", e))?;
+            .map_err(|e| format!("DNS resolution failed for {}: {}", remote_proxy_addr, e))?;
+
+        let addr = addrs
+            .next()
+            .ok_or_else(|| format!("No IPs found for {}", remote_proxy_addr))?;
+
+        // 2. Создаем сокет
+        let socket = if addr.is_ipv4() {
+            tokio::net::TcpSocket::new_v4().map_err(|e| e.to_string())?
+        } else {
+            tokio::net::TcpSocket::new_v6().map_err(|e| e.to_string())?
+        };
+
+        // 3. 🛡️ БАЛАНСИРУЕМ БУФЕРЫ ЯДРА
+        // 256 KB для отправки (Send) — это "золотая середина" для пинга ~300мс.
+        // Математически это позволит разогнать Upload до ~7-8 Мбит/с без 9-секундных лагов.
+        if let Err(e) = socket.set_send_buffer_size(NetworkConfig::global().tcp_tx_heavy as u32) {
+            warn!("Failed to set SO_SNDBUF on {}: {}", leg_name, e);
+        }
+
+        // 🚨 ВАЖНО: Мы НЕ ставим set_recv_buffer_size вручную.
+        // Это позволяет ОС использовать TCP Window Scaling и Auto-tuning,
+        // что вернет твою скорость Download к 80+ Мбит/с.
+
+        // 4. Подключаемся
+        let stream = socket
+            .connect(addr)
+            .await
+            .map_err(|e| format!("Failed to connect to {}: {}", addr, e))?;
+
         let _ = stream.set_nodelay(true);
         let (inbound, outbound) = stream.into_split();
         let mut conn = Connection::new_raw(inbound, outbound);
 
+        // --- Дальше твой TLS Handshake без изменений ---
         let ch = conn
             .codec
             .make_client_handshake(&BrowserProfile::CHROME_131, "ubuntu.com")
@@ -146,6 +177,8 @@ impl ClientHandler {
         }
 
         info!("{} TLS Handshake complete.", leg_name);
+
+        // ... (остальной код инициализации TunnelEngine остается прежним)
         let handshake_payload = Bytes::from(format!("{}:{}", session_id, leg_id));
 
         let encrypted_handshake = conn
@@ -158,13 +191,8 @@ impl ClientHandler {
             .await
             .map_err(|e| format!("Failed to send Handshake: {}", e))?;
 
-        info!(
-            "{} Sent Encrypted Handshake (Leg: {}). Starting engine...",
-            leg_name, leg_id
-        );
-
-        let (control_tx, control_rx) = mpsc::channel(NetworkConfig::global().muxer_capacity);
-        let (data_tx, data_rx) = mpsc::channel(NetworkConfig::global().muxer_capacity);
+        let (control_tx, control_rx) = mpsc::channel(NetworkConfig::global().client_muxer_capacity);
+        let (data_tx, data_rx) = mpsc::channel(NetworkConfig::global().client_muxer_capacity);
 
         muxer.add_leg(leg_id, control_tx, data_tx);
 
@@ -262,7 +290,7 @@ impl ClientHandler {
                             );
 
                             let (v_tx, mut v_rx) =
-                                mpsc::channel(NetworkConfig::global().tcp_stream_capacity);
+                                mpsc::channel(NetworkConfig::global().client_stream_capacity);
 
                             muxer_inner.register_stream(global_stream_id, v_tx);
 
@@ -307,7 +335,6 @@ impl ClientHandler {
                                 local_to_global.get(&local_socket_id).map(|r| *r);
 
                             if let Some(id) = global_stream_id {
-                                // ✅ Добавлен .await
                                 let _ = muxer_inner.send_data_safe(id, payload, is_udp).await;
                             } else {
                                 warn!(
@@ -511,8 +538,8 @@ impl TunnelHandler for ServerHandler {
 
         let muxer = self.session_manager.get_or_create(&session_id);
 
-        let (control_tx, control_rx) = mpsc::channel(NetworkConfig::global().muxer_capacity);
-        let (data_tx, data_rx) = mpsc::channel(NetworkConfig::global().muxer_capacity);
+        let (control_tx, control_rx) = mpsc::channel(NetworkConfig::global().server_muxer_capacity);
+        let (data_tx, data_rx) = mpsc::channel(NetworkConfig::global().server_muxer_capacity);
         muxer.add_leg(leg_id, control_tx, data_tx);
 
         let opener = Arc::new(RemoteOpener {

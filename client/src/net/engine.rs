@@ -75,74 +75,69 @@ impl Engine {
         info!("Current routes: {:?}", self.interface.routes());
         let (writer, reader) = tun.split().expect("Failed to split TUN");
 
-        let (tun_to_engine_tx, mut tun_to_engine_rx) = mpsc::unbounded_channel();
+        // 🚨 ПРАВИЛО 1: ОГРАНИЧИВАЕМ КАНАЛ ОТ TUN, чтобы ОС не затопила нас памятью!
+        let (tun_to_engine_tx, mut tun_to_engine_rx) =
+            mpsc::channel(NetworkConfig::global().client_tun_capacity);
+
         Self::spawn_tun_reader(reader, tun_to_engine_tx, self.avail.clone());
 
         let from_smoltcp_rx = self.from_smoltcp_rx.take().expect("Engine started twice");
         Self::spawn_tun_writer(writer, from_smoltcp_rx);
-
-        let mut stuck_frame: Option<RawCastFrame> = None;
-
         loop {
-            while let Ok(token) = tun_to_engine_rx.try_recv() {
-                self.manager
-                    .try_create_socket_from_packet(&token, &mut self.socket_set);
-
-                if self.to_smoltcp_tx.send(token).is_ok() {
-                    self.device.mark_rx_available();
-                }
-            }
-
-            if let Some(frame) = stuck_frame.take() {
-                if let Err(returned_frame) = self.manager.try_inject_inbound(frame) {
-                    stuck_frame = Some(returned_frame);
-                }
-            }
-
-            if stuck_frame.is_none() {
-                while let Ok(frame) = self.rx_from_tunnel.try_recv() {
-                    if let Err(returned_frame) = self.manager.try_inject_inbound(frame) {
-                        stuck_frame = Some(returned_frame);
-                        break;
-                    }
-                }
-            }
-
-            self.manager.process_sockets(&mut self.socket_set);
-
-            let result = self.poll();
-
-            if matches!(result, PollResult::SocketStateChanged) {
+            // 1. Сначала обрабатываем всё, что накопилось в стеке
+            let mut repeat_poll = true;
+            while repeat_poll {
+                self.manager.process_sockets(&mut self.socket_set);
+                let poll_res = self.poll();
                 self.manager.cleanup(&mut self.socket_set);
-                continue;
+                // Если сокеты изменились, крутим еще раз, пока не вытолкнем всё
+                repeat_poll = matches!(poll_res, PollResult::SocketStateChanged);
             }
 
-            self.manager.cleanup(&mut self.socket_set);
-
+            // 2. Считаем задержку
             let delay = self
                 .interface
                 .poll_delay(Self::current_time(), &self.socket_set);
-
-            let sleep_fut = async {
-                if let Some(d) = delay {
-                    sleep(Duration::from_micros(d.micros())).await;
-                } else {
-                    std::future::pending::<()>().await;
-                }
-            };
+            let sleep_time = delay
+                .map(|d| std::cmp::min(Duration::from_micros(d.micros()), Duration::from_millis(5)))
+                .unwrap_or(Duration::from_millis(5));
 
             tokio::select! {
-                _ = sleep_fut => {}
-                Some(token) = tun_to_engine_rx.recv() => {
-                    self.manager.try_create_socket_from_packet(&token, &mut self.socket_set);
-                    if self.to_smoltcp_tx.send(token).is_ok() {
-                        self.device.mark_rx_available();
-                    }
+                _ = sleep(sleep_time) => {}
+
+                msg = self.rx_from_tunnel.recv() => {
+                    if let Some(frame) = msg {
+                        let _ = self.manager.try_inject_inbound(frame);
+                        // Читаем по чуть-чуть (max 32), чтобы чаще делать poll()
+                        let mut count = 0;
+                        while let Ok(frame) = self.rx_from_tunnel.try_recv() {
+                            let _ = self.manager.try_inject_inbound(frame);
+                            count += 1;
+                            if count >= 32 { break; }
+                        }
+                    } else { break; }
                 }
-                Some(frame) = self.rx_from_tunnel.recv(), if stuck_frame.is_none() => {
-                    if let Err(returned_frame) = self.manager.try_inject_inbound(frame) {
-                        stuck_frame = Some(returned_frame);
-                    }
+
+                msg = tun_to_engine_rx.recv() => {
+                    if let Some(token) = msg {
+                        self.manager.try_create_socket_from_packet(&token, &mut self.socket_set);
+
+                        // Если Muxer вернул "BUSY", smoltcp не запишет этот пакет,
+                        // и mark_rx_available не сработает. Это ПРАВИЛЬНО.
+                        if self.to_smoltcp_tx.send(token).is_ok() {
+                            self.device.mark_rx_available();
+                        }
+
+                        let mut count = 0;
+                        while let Ok(token) = tun_to_engine_rx.try_recv() {
+                            self.manager.try_create_socket_from_packet(&token, &mut self.socket_set);
+                            if self.to_smoltcp_tx.send(token).is_ok() {
+                                self.device.mark_rx_available();
+                            }
+                            count += 1;
+                            if count >= 32 { break; }
+                        }
+                    } else { break; }
                 }
             }
         }
@@ -156,7 +151,7 @@ impl Engine {
 
     fn spawn_tun_reader(
         mut reader: DeviceReader,
-        to_engine: UnboundedSender<TokenBuffer>,
+        to_engine: mpsc::Sender<TokenBuffer>, // 👈 ИЗМЕНЕНО ЗДЕСЬ
         is_avail: Arc<AtomicBool>,
     ) {
         tokio::spawn(async move {
@@ -185,7 +180,9 @@ impl Engine {
                 let mut token = TokenBuffer::with_capacity(n);
                 token.extend_from_slice(&buf[..n]);
 
-                if to_engine.send(token).is_ok() {
+                // 🚨 ИСПОЛЬЗУЕМ .await. Это создаст идеальный Backpressure!
+                // Если Engine занят, TUN просто перестанет читать из ОС телефона!
+                if to_engine.send(token).await.is_ok() {
                     is_avail.store(true, Ordering::Release);
                 } else {
                     break;
@@ -194,7 +191,6 @@ impl Engine {
             warn!("TUN Reader task stopped");
         });
     }
-
     fn spawn_tun_writer(
         mut writer: DeviceWriter,
         mut from_smoltcp: UnboundedReceiver<TokenBuffer>,
@@ -329,10 +325,10 @@ impl EngineBuilder {
         caps.medium = smoltcp::phy::Medium::Ip;
 
         let (tx_to_tunnel, rx_for_client_handler) =
-            mpsc::channel(NetworkConfig::global().muxer_capacity);
+            mpsc::channel(NetworkConfig::global().client_tun_capacity);
 
         let (tx_for_client_handler, rx_from_tunnel) =
-            mpsc::channel(NetworkConfig::global().muxer_capacity);
+            mpsc::channel(NetworkConfig::global().client_tun_capacity);
 
         info!("Establishing secure tunnel to proxy server...");
         ClientHandler::connect(

@@ -17,7 +17,7 @@ use smoltcp::{
 };
 use tokio::sync::mpsc;
 
-const TOKEN_BUFFER_LIST_MAX_SIZE: usize = 64;
+const TOKEN_BUFFER_LIST_MAX_SIZE: usize = 1024;
 static TOKEN_BUFFER_LIST: LazyLock<Mutex<Vec<BytesMut>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 
 pub static GLOBAL_RX_BYTES: AtomicU64 = AtomicU64::new(0);

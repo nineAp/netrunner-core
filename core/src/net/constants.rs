@@ -10,8 +10,8 @@ pub const TCP_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20); // Врем
 pub const UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(60); // Смерть UDP сессии без данных
 pub const GLOBAL_IDLE_TIMEOUT: Duration = Duration::from_secs(120); // Очистка Tracker-ом
 pub const HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(5); // Частота пинга Leg-ов
-pub const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
-pub const LEG_RECONNECT_DELAY: Duration = Duration::from_secs(5); // Пауза перед реконнектом Leg
+pub const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(15);
+pub const LEG_RECONNECT_DELAY: Duration = Duration::from_secs(30); // Пауза перед реконнектом Leg
 pub const BRIDGE_IDLE_TIMEOUT: Duration = Duration::from_secs(300); // Таймаут задач-бриджей
 
 // --- Сетевые порты ---

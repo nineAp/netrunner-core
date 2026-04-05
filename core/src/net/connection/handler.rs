@@ -101,9 +101,9 @@ impl StreamHandler {
 
         if let Some(opener) = &self.opener {
             let capacity = if is_udp {
-                NetworkConfig::global().udp_stream_capacity
+                NetworkConfig::global().server_stream_capacity
             } else {
-                NetworkConfig::global().tcp_stream_capacity
+                NetworkConfig::global().server_stream_capacity
             };
 
             let (v_tx, v_rx) = mpsc::channel(capacity);

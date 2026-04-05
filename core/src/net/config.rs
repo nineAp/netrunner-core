@@ -6,18 +6,22 @@ pub static GLOBAL_NET_CONFIG: OnceLock<NetworkConfig> = OnceLock::new();
 #[derive(Debug, Clone)]
 pub struct NetworkConfig {
     pub mtu: usize,
-
     pub tcp_buffer_size: usize,
     pub udp_buffer_size: usize,
 
-    // Очереди MPSC
-    pub muxer_capacity: usize,
-    pub tcp_stream_capacity: usize,
-    pub udp_stream_capacity: usize,
+    // --- Очереди MPSC (Разделенные) ---
+    // Для Клиента (мобильный интернет)
+    pub client_muxer_capacity: usize,  // Подушка для 10 ног
+    pub client_tun_capacity: usize,    // Стык TUN <-> Engine
+    pub client_stream_capacity: usize, // Быстрый Backpressure для сокета
+
+    // Для Сервера (Дата-центр)
+    pub server_muxer_capacity: usize, // Огромная очередь для входящего трафика
+    pub server_stream_capacity: usize, // Чтобы сервер не тормозил на отдачу
 
     pub tcp_chunk_size: usize,
 
-    // 👈 Разделяем буферы на RX (Чтение/Download) и TX (Запись/Upload)
+    // Буферы сокетов smoltcp
     pub tcp_rx_heavy: usize,
     pub tcp_tx_heavy: usize,
     pub tcp_rx_light: usize,
@@ -33,28 +37,27 @@ impl NetworkConfig {
     pub fn new(system_mtu: usize) -> Self {
         Self {
             mtu: system_mtu,
-
             tcp_buffer_size: 8 * 1024,
             udp_buffer_size: 64 * 1024,
 
-            // 1. Убиваем лаги Муксера: меньше сообщений в очереди
-            muxer_capacity: 256, // Было 32
-            tcp_stream_capacity: 16,
-            udp_stream_capacity: 32,
+            tcp_chunk_size: 16 * 1024,
 
-            // 2. Делаем чанки меньше для более быстрого срабатывания Backpressure
-            tcp_chunk_size: 4 * 1024, // Было 16KB
+            client_muxer_capacity: 256,
+            client_tun_capacity: 16,
+            client_stream_capacity: 32,
 
-            // 3. АСИММЕТРИЧНЫЕ БУФЕРЫ TCP (Магия хорошего Upload)
-            tcp_rx_heavy: 256 * 1024, // 1 МБ! Качаем на все бабки (Быстрый Download)
-            tcp_tx_heavy: 32 * 1024,  // 64 КБ! Микро-буфер отдачи (Убивает Bufferbloat на Upload)
+            // --- СЕРВЕР ---
+            server_muxer_capacity: 128,
+            server_stream_capacity: 32,
 
-            tcp_rx_light: 16 * 1024,
-            tcp_tx_light: 16 * 1024,
+            tcp_rx_heavy: 256 * 1024,
+            tcp_tx_heavy: 512 * 1024,
+
+            tcp_rx_light: 256 * 1024,
+            tcp_tx_light: 32 * 1024,
 
             udp_buf_heavy: 256 * 1024,
             udp_meta_heavy: 512,
-
             udp_buf_light: 16 * 1024,
             udp_meta_light: 32,
         }

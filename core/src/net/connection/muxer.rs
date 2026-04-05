@@ -1,12 +1,11 @@
 use bytes::Bytes;
 use dashmap::DashMap;
-use netrunner_logger::{debug, info, warn};
+use netrunner_logger::{debug, info, trace, warn};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc::Sender;
 
-// Подключаем твои константы (убедись, что путь импорта совпадает с твоей структурой)
-use crate::net::constants::{HEALTH_CHECK_TIMEOUT, MAX_TUNNEL_LEGS, MUXER_POOL_SIZE};
+use crate::net::{HEALTH_CHECK_TIMEOUT, MAX_TUNNEL_LEGS, MUXER_POOL_SIZE};
 use crate::nrxp::FrameType;
 
 #[derive(Default, Debug)]
@@ -14,7 +13,6 @@ pub struct LegStats {
     pub tx_bytes: AtomicU64,
     pub rx_bytes: AtomicU64,
     pub rtt_ms: AtomicU32,
-    pub strikes: AtomicU32, // 👈 Счетчик пропущенных пингов (страйков)
 }
 
 #[derive(Default, Debug)]
@@ -57,6 +55,8 @@ pub struct MuxMessage {
 pub struct Muxer {
     legs: Arc<DashMap<u32, MuxLeg>>,
     streams: Arc<DashMap<u32, (Sender<Bytes>, Arc<StreamStats>)>>,
+    // 🚨 Sticky Sessions: Привязка Stream ID -> Leg ID
+    stream_bindings: Arc<DashMap<u32, u32>>,
     id_gen: Arc<IdGenerator>,
     session_id: Arc<String>,
 }
@@ -66,6 +66,7 @@ impl Muxer {
         Self {
             legs: Arc::new(DashMap::new()),
             streams: Arc::new(DashMap::new()),
+            stream_bindings: Arc::new(DashMap::new()),
             id_gen: Arc::new(IdGenerator::new(is_client)),
             session_id: Arc::new(session_id),
         }
@@ -77,7 +78,6 @@ impl Muxer {
         control_tx: Sender<MuxMessage>,
         data_tx: Sender<MuxMessage>,
     ) {
-        // 👈 Используем константу вместо магической 10
         if self.legs.len() >= MAX_TUNNEL_LEGS as usize {
             warn!(leg_id, "MUXER: Max legs reached: {}", MAX_TUNNEL_LEGS);
             return;
@@ -96,7 +96,10 @@ impl Muxer {
 
     pub fn remove_leg(&self, leg_id: u32) {
         self.legs.remove(&leg_id);
-        info!(leg_id, "MUXER: Leg removed");
+        // Удаляем все привязки стримов к этой ноге, чтобы они перебалансировались
+        self.stream_bindings
+            .retain(|_, target_leg| *target_leg != leg_id);
+        info!(leg_id, "MUXER: Leg removed and bindings cleared");
     }
 
     pub fn active_legs_count(&self) -> usize {
@@ -108,15 +111,26 @@ impl Muxer {
             return None;
         }
 
+        // 1. Ищем существующую привязку (Sticky Session)
+        if let Some(leg_id_ref) = self.stream_bindings.get(&stream_id) {
+            let leg_id = *leg_id_ref;
+            if let Some(leg) = self.legs.get(&leg_id) {
+                return Some((leg_id, leg.clone()));
+            }
+        }
+
+        // 2. Если привязки нет — выбираем новую ногу
         let is_udp = matches!(frame_type, FrameType::UdpData | FrameType::UdpConnect);
 
         let mut candidates: Vec<(u32, MuxLeg)> = self
             .legs
             .iter()
             .map(|kv| (*kv.key(), kv.value().clone()))
+            // Фильтруем по типу: четные ID — TCP, нечетные — UDP
             .filter(|(id, _)| if is_udp { id % 2 != 0 } else { id % 2 == 0 })
             .collect();
 
+        // Fallback: если подходящих по типу ног нет, берем любые
         if candidates.is_empty() {
             candidates = self
                 .legs
@@ -125,7 +139,7 @@ impl Muxer {
                 .collect();
         }
 
-        // Выбираем ноги с наименьшим RTT (ноги со страйками = 5000ms будут в конце)
+        // Сортируем по RTT (Health Check записывает сюда данные)
         candidates.sort_by_key(|(_, leg)| {
             let rtt = leg.stats.rtt_ms.load(Ordering::Relaxed);
             if rtt == 0 {
@@ -135,11 +149,18 @@ impl Muxer {
             }
         });
 
-        // 👈 Используем константу
         let pool_size = std::cmp::min(candidates.len(), MUXER_POOL_SIZE);
-        let target = &candidates[stream_id as usize % pool_size];
+        if pool_size == 0 {
+            return None;
+        }
 
-        Some(target.clone())
+        // Выбираем из топа лучших
+        let (selected_id, selected_leg) = candidates[stream_id as usize % pool_size].clone();
+
+        // Запоминаем выбор для этого стрима
+        self.stream_bindings.insert(stream_id, selected_id);
+
+        Some((selected_id, selected_leg))
     }
 
     pub async fn send_to_network(&self, message: MuxMessage) -> Result<(), String> {
@@ -150,6 +171,9 @@ impl Muxer {
             .select_leg(&message.frame_type, stream_id)
             .ok_or_else(|| "MUXER: No active legs available".to_string())?;
 
+        // Используем обычный .await для всех типов кадров.
+        // Это гарантирует, что пакет попадет в очередь ноги, но может притормозить цикл Engine,
+        // если очередь физического соединения переполнена.
         let target_tx = match message.frame_type {
             FrameType::Connect
             | FrameType::Close
@@ -158,20 +182,18 @@ impl Muxer {
             _ => leg.data_tx.clone(),
         };
 
-        match target_tx.send(message).await {
-            Ok(_) => {
-                leg.stats.tx_bytes.fetch_add(size, Ordering::Relaxed);
-
-                if let Some(stream_ref) = self.streams.get(&stream_id) {
-                    stream_ref.1.tx_bytes.fetch_add(size, Ordering::Relaxed);
-                }
-                Ok(())
-            }
-            Err(_) => {
-                self.remove_leg(leg_id);
-                Err(format!("MUXER: Leg {} died during send", leg_id))
-            }
+        if let Err(_) = target_tx.send(message).await {
+            self.remove_leg(leg_id);
+            return Err(format!("MUXER: Leg {} died during send", leg_id));
         }
+
+        // Обновляем статистику
+        leg.stats.tx_bytes.fetch_add(size, Ordering::Relaxed);
+        if let Some(stream_ref) = self.streams.get(&stream_id) {
+            stream_ref.1.tx_bytes.fetch_add(size, Ordering::Relaxed);
+        }
+
+        Ok(())
     }
 
     pub async fn send_data_safe(
@@ -215,6 +237,8 @@ impl Muxer {
 
     pub fn remove_stream(&self, stream_id: u32) {
         self.streams.remove(&stream_id);
+        self.stream_bindings.remove(&stream_id); // Чистим привязку
+        trace!(stream_id, "MUXER: Stream and bindings removed");
     }
 
     pub async fn dispatch_to_local(&self, stream_id: u32, data: Bytes) {
@@ -247,7 +271,6 @@ impl Muxer {
         self.id_gen.next()
     }
 
-    // 👈 Полностью переписанный параллельный Health Check со страйками
     pub async fn perform_health_check(&self) {
         let legs: Vec<(u32, Sender<MuxMessage>)> = self
             .legs
@@ -255,67 +278,38 @@ impl Muxer {
             .map(|k| (*k.key(), k.value().control_tx.clone()))
             .collect();
 
-        // Запускаем проверку каждой ноги параллельно
         for (leg_id, tx) in legs {
-            let muxer = self.clone(); // Дешевое клонирование (внутри Arc)
+            let probe_stream_id = self.id_gen.next();
+            let (probe_tx, mut probe_rx) = tokio::sync::mpsc::channel(2);
 
-            tokio::spawn(async move {
-                let probe_stream_id = muxer.id_gen.next();
-                let (probe_tx, mut probe_rx) = tokio::sync::mpsc::channel(2);
+            self.register_stream(probe_stream_id, probe_tx);
 
-                muxer.register_stream(probe_stream_id, probe_tx);
+            let msg = MuxMessage {
+                stream_id: probe_stream_id,
+                frame_type: FrameType::Handshake,
+                data: Bytes::from("PING"),
+            };
 
-                let msg = MuxMessage {
-                    stream_id: probe_stream_id,
-                    frame_type: FrameType::Handshake,
-                    data: Bytes::from("PING"),
-                };
+            let start = std::time::Instant::now();
 
-                let start = std::time::Instant::now();
-
-                if tx.try_send(msg).is_ok() {
-                    // Используем новую константу таймаута
-                    match tokio::time::timeout(HEALTH_CHECK_TIMEOUT, probe_rx.recv()).await {
-                        Ok(Some(_)) => {
-                            let rtt = start.elapsed().as_millis() as u32;
-                            if let Some(leg) = muxer.legs.get(&leg_id) {
-                                // Пинг прошел: обновляем RTT и СБРАСЫВАЕМ страйки
-                                leg.stats.rtt_ms.store(rtt, Ordering::Relaxed);
-                                leg.stats.strikes.store(0, Ordering::Relaxed);
-                                debug!(leg_id, rtt, "✅ Leg Health Check OK");
-                            }
-                        }
-                        _ => {
-                            // Пинг провален: увеличиваем страйки
-                            if let Some(leg) = muxer.legs.get(&leg_id) {
-                                let strikes = leg.stats.strikes.fetch_add(1, Ordering::Relaxed) + 1;
-
-                                if strikes >= 3 {
-                                    // 3 промаха = смерть. Балансировщик перестанет кидать сюда трафик
-                                    leg.stats.rtt_ms.store(5000, Ordering::Relaxed);
-                                    warn!(
-                                        leg_id,
-                                        strikes, "❌ Leg DEAD (3 strikes). RTT set to 5000."
-                                    );
-                                } else {
-                                    // 1-2 промаха: ждем, возможно это радио-пауза в мобильной сети
-                                    warn!(
-                                        leg_id,
-                                        strikes, "⚠️ Leg missed ping. Strike {}/3", strikes
-                                    );
-                                }
-                            }
+            if tx.try_send(msg).is_ok() {
+                match tokio::time::timeout(HEALTH_CHECK_TIMEOUT, probe_rx.recv()).await {
+                    Ok(Some(_)) => {
+                        let rtt = start.elapsed().as_millis() as u32;
+                        if let Some(leg) = self.legs.get(&leg_id) {
+                            leg.stats.rtt_ms.store(rtt, Ordering::Relaxed);
+                            debug!(leg_id, rtt, "✅ Leg Health Check OK");
                         }
                     }
-                } else {
-                    // Если канал (mpsc) забит или закрыт, считаем ногу мертвой сразу
-                    if let Some(leg) = muxer.legs.get(&leg_id) {
-                        leg.stats.rtt_ms.store(5000, Ordering::Relaxed);
+                    _ => {
+                        if let Some(leg) = self.legs.get(&leg_id) {
+                            leg.stats.rtt_ms.store(5000, Ordering::Relaxed);
+                            warn!(leg_id, "❌ Leg Health Check Timeout");
+                        }
                     }
                 }
-
-                muxer.remove_stream(probe_stream_id);
-            });
+            }
+            self.remove_stream(probe_stream_id);
         }
     }
 
@@ -350,7 +344,6 @@ impl Muxer {
             let tx = stats.tx_bytes.load(Ordering::Relaxed);
             let rx = stats.rx_bytes.load(Ordering::Relaxed);
             let rtt = stats.rtt_ms.load(Ordering::Relaxed);
-            let strikes = stats.strikes.load(Ordering::Relaxed);
 
             total_tx += tx;
             total_rx += rx;
@@ -362,23 +355,13 @@ impl Muxer {
                 format!("{}ms", rtt)
             };
 
-            // 👈 Добавлен визуальный статус ноги для отладки
-            let status_icon = if strikes >= 3 {
-                "💀"
-            } else if strikes > 0 {
-                "⚠️"
-            } else {
-                "✅"
-            };
-
             legs_info.push(format!(
-                "   ├─ Leg {} ({}) ─ ⇡ {:<9} | ⇣ {:<9} [RTT: {:<6}] [Status: {}]",
+                "   ├─ Leg {} ({}) ─ ⇡ {:<9} | ⇣ {:<9} [RTT: {}]",
                 id,
                 leg_type,
                 Self::format_size(tx),
                 Self::format_size(rx),
-                rtt_str,
-                status_icon
+                rtt_str
             ));
         }
 
