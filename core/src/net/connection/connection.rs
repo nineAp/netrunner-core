@@ -1,4 +1,4 @@
-use std::{net::Ipv4Addr, sync::Arc, time::Duration};
+use std::{net::Ipv4Addr, sync::Arc};
 
 use crate::{
     net::{
@@ -7,7 +7,8 @@ use crate::{
             handler::{RemoteOpener, StreamHandler},
             muxer::Muxer,
         },
-        NetworkConfig,
+        NetworkConfig, FALLBACK_CONNECT_TIMEOUT, LEG_RECONNECT_DELAY, LEG_STAGGER_DELAY,
+        MAX_TUNNEL_LEGS, SECURE_HANDSHAKE_TIMEOUT, TLS_HELLO_TIMEOUT, TOPOLOGY_PRINT_INTERVAL,
     },
     nrxp::{Codec, ErrorAction, Frame, FrameType},
     rawcast::{LocalProtocol, RawCastAdapter, RawCastFrame},
@@ -200,17 +201,17 @@ impl ClientHandler {
 
         info!("🚀 Netrunner Multi-Path Tunnel Initializing (10 Legs max).");
 
-        for id in 0..10 {
+        for id in 0..MAX_TUNNEL_LEGS {
             let addr = remote_proxy_addr.to_string();
             let m = muxer.clone();
             let sid = session_id.clone();
 
             tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_millis(id as u64 * 250)).await;
+                tokio::time::sleep(LEG_STAGGER_DELAY * id).await;
                 loop {
                     if let Err(e) = Self::establish_leg(&addr, id, m.clone(), &sid).await {
                         error!("Leg {} disconnected: {}. Reconnecting in 3s...", id, e);
-                        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                        tokio::time::sleep(LEG_RECONNECT_DELAY).await;
                     }
                 }
             });
@@ -219,7 +220,7 @@ impl ClientHandler {
         let m_weak = Arc::downgrade(&muxer);
         tokio::spawn(async move {
             while let Some(m_stats) = m_weak.upgrade() {
-                tokio::time::sleep(Duration::from_secs(15)).await;
+                tokio::time::sleep(TOPOLOGY_PRINT_INTERVAL).await;
                 if m_stats.active_legs_count() == 0 {
                     break;
                 }
@@ -362,11 +363,8 @@ impl ServerHandler {
         let target_host = "ubuntu.com:443";
         info!(target = %target_host, "Stealth fallback: bridging to Target");
 
-        let target_stream = tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            TcpStream::connect(target_host),
-        )
-        .await;
+        let target_stream =
+            tokio::time::timeout(FALLBACK_CONNECT_TIMEOUT, TcpStream::connect(target_host)).await;
 
         match target_stream {
             Ok(Ok(target_server)) => {
@@ -406,8 +404,6 @@ impl TunnelHandler for ServerHandler {
     async fn run(mut self) -> Result<(), String> {
         info!("Acting as TLS Server with Stealth Fallback");
 
-        let handshake_timeout = std::time::Duration::from_secs(1);
-
         let hello = loop {
             let buf_snapshot = self.conn.read_buf.clone().freeze();
             match self
@@ -419,7 +415,7 @@ impl TunnelHandler for ServerHandler {
                 Err(e) => match e.execute_strategy() {
                     ErrorAction::Wait => {
                         let res = tokio::time::timeout(
-                            handshake_timeout,
+                            TLS_HELLO_TIMEOUT,
                             self.conn.inbound.read_buf(&mut self.conn.read_buf),
                         )
                         .await;
@@ -462,7 +458,7 @@ impl TunnelHandler for ServerHandler {
 
         let (session_id, leg_id) = loop {
             let n = tokio::time::timeout(
-                std::time::Duration::from_secs(3),
+                SECURE_HANDSHAKE_TIMEOUT,
                 self.conn.inbound.read_buf(&mut self.conn.read_buf),
             )
             .await
@@ -527,7 +523,7 @@ impl TunnelHandler for ServerHandler {
         let m_weak = Arc::downgrade(&muxer);
         tokio::spawn(async move {
             while let Some(m_stats) = m_weak.upgrade() {
-                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                tokio::time::sleep(TOPOLOGY_PRINT_INTERVAL).await;
                 if m_stats.active_legs_count() == 0 {
                     break;
                 }

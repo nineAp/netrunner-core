@@ -7,8 +7,6 @@ pub static GLOBAL_NET_CONFIG: OnceLock<NetworkConfig> = OnceLock::new();
 #[derive(Debug, Clone)]
 pub struct NetworkConfig {
     pub mtu: usize,
-    pub max_wire_frame_size: usize,
-    pub safe_payload_size: usize,
 
     pub tcp_buffer_size: usize,
     pub udp_buffer_size: usize,
@@ -29,17 +27,11 @@ pub struct NetworkConfig {
 }
 impl NetworkConfig {
     pub fn new(system_mtu: usize) -> Self {
-        let transport_overhead = 48;
-        let max_wire_frame = system_mtu.saturating_sub(transport_overhead);
-        let safe_payload = max_wire_frame.saturating_sub(64);
-
         let chunk_size = 16 * 1024;
         let heavy_buf = 256 * 1024;
 
         Self {
             mtu: system_mtu,
-            max_wire_frame_size: max_wire_frame,
-            safe_payload_size: safe_payload,
 
             tcp_buffer_size: 8 * 1024,
             udp_buffer_size: 64 * 1024,

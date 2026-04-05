@@ -16,6 +16,9 @@ pub enum TrafficProfile {
     Default,
 }
 
+pub const TCP_SOCKET_KEEP_ALIVE: Duration = Duration::from_secs(15);
+pub const TCP_SOCKET_ACTIVE_TIMEOUT: Duration = Duration::from_secs(20);
+
 impl TrafficProfile {
     pub fn guess_from_port(port: u16, is_tcp: bool) -> Self {
         match (port, is_tcp) {
@@ -77,8 +80,8 @@ impl SocketProvider for SmolSocketFactory {
 
         self.reconfigure_tcp(&mut socket, profile);
 
-        socket.set_keep_alive(Some(Duration::from_secs(30)));
-        socket.set_timeout(Some(Duration::from_secs(60)));
+        socket.set_keep_alive(Some(TCP_SOCKET_KEEP_ALIVE));
+        socket.set_timeout(Some(TCP_SOCKET_ACTIVE_TIMEOUT));
 
         socket
     }

@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     net::{
         connection::{handler::StreamHandler, muxer::MuxMessage},
-        NetworkConfig,
+        NetworkConfig, HEALTH_CHECK_INTERVAL,
     },
     nrxp::{Codec, ErrorAction, FrameType},
 };
@@ -114,7 +114,7 @@ impl TunnelEngine {
             let mut outbound = outbound;
             let mut control_rx = control_rx;
             let mut data_rx = data_rx;
-            let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(15));
+            let mut heartbeat = tokio::time::interval(HEALTH_CHECK_INTERVAL);
 
             loop {
                 tokio::select! {

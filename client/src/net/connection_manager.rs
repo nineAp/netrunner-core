@@ -1,4 +1,7 @@
-use netrunner_core::rawcast::{RawCastEvent, RawCastFrame};
+use netrunner_core::{
+    net::{DNS_PORT, GLOBAL_IDLE_TIMEOUT, HTTPS_PORT, MAX_SOCKETS, NETBIOS_PORTS, TCP_HANDSHAKE_TIMEOUT},
+    rawcast::{RawCastEvent, RawCastFrame},
+};
 use netrunner_logger::{info, trace};
 use smoltcp::{
     iface::{SocketHandle, SocketSet},
@@ -115,7 +118,7 @@ impl ConnectionManager {
                     if !tcp.is_open() && tcp.local_endpoint().is_none() {
                         let _ = tcp.listen(IpListenEndpoint {
                             addr: None,
-                            port: 443,
+                            port: HTTPS_PORT,
                         });
                     }
                 }
@@ -124,7 +127,7 @@ impl ConnectionManager {
                     if !udp.is_open() && udp.endpoint().port == 0 {
                         let _ = udp.bind(IpListenEndpoint {
                             addr: None,
-                            port: 53,
+                            port: DNS_PORT,
                         });
                     }
                 }
@@ -218,16 +221,15 @@ impl ConnectionManager {
     }
 
     fn intercept_udp(&mut self, f: Flow, socket_set: &mut SocketSet) {
-        if f.dst_p == 0
-            || f.dst_p == 137
-            || f.dst_p == 138
-            || f.dst_p == 53
-            || self.tracker.is_client_known(f.src_p)
+        if f.dst_p == 0 
+           || f.dst_p == DNS_PORT 
+           || NETBIOS_PORTS.contains(&f.dst_p) // 👈 Используй массив
+           || self.tracker.is_client_known(f.src_p) 
         {
             return;
         }
 
-        if socket_set.iter().count() >= 2048 {
+        if socket_set.iter().count() >= MAX_SOCKETS {
             netrunner_logger::warn!("🔥 UDP Socket limit reached! Dropping packet.");
             return;
         }
@@ -289,7 +291,7 @@ impl ConnectionManager {
         // Тайм-аут на установку соединения (если SYN висит слишком долго)
         if self
             .tracker
-            .check_pending_timeout(handle, Duration::from_secs(20))
+            .check_pending_timeout(handle, TCP_HANDSHAKE_TIMEOUT)
         {
             socket.abort();
             self.tracker.queue_removal(handle);
@@ -347,7 +349,7 @@ impl ConnectionManager {
     }
 
     pub fn cleanup(&mut self, socket_set: &mut SocketSet) {
-        self.tracker.enforce_idle_timeouts(Duration::from_secs(120));
+        self.tracker.enforce_idle_timeouts(GLOBAL_IDLE_TIMEOUT);
         self.tracker.cleanup(socket_set);
     }
 }

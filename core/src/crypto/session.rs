@@ -2,6 +2,7 @@ use x25519_dalek::PublicKey;
 
 use crate::{
     crypto::{ecdh::ECDH, hkdf::HKDF},
+    net::{AUTH_TIME_STEP, AUTH_WINDOW_SIZE},
     tlseng::ExtensionStack,
 };
 
@@ -191,9 +192,11 @@ impl SessionKeys {
             .expect("Time went backwards")
             .as_secs();
 
-        let current_step = now / 60;
+        let current_step = now / AUTH_TIME_STEP;
 
-        for step in (current_step.saturating_sub(2))..=(current_step.saturating_add(2)) {
+        for step in (current_step.saturating_sub(AUTH_WINDOW_SIZE))
+            ..=(current_step.saturating_add(AUTH_WINDOW_SIZE))
+        {
             if &Self::compute_tag(&self.auth_key, step) == received_tag {
                 if step != current_step {
                     netrunner_logger::debug!(expected = %current_step, matched = %step, "Auth tag valid with time offset");

@@ -1,6 +1,6 @@
 use bytes::{Buf, Bytes, BytesMut};
 use netrunner_core::{
-    net::NetworkConfig,
+    net::{NetworkConfig, UDP_IDLE_TIMEOUT},
     rawcast::{LocalProtocol, RawCastFrame},
 };
 use smoltcp::{
@@ -241,8 +241,6 @@ impl TcpConnection {
     }
 }
 
-const UDP_TIMEOUT: Duration = Duration::from_secs(60);
-
 pub type UdpPacketTarget = (Bytes, std::net::Ipv4Addr, u16);
 pub struct UdpConnection {
     core: ConnectionCore<UdpPacketTarget>,
@@ -273,7 +271,7 @@ impl UdpConnection {
             .map_or(false, |ep| ep.port == port)
     }
     pub fn tick(&mut self, socket: &mut udp::Socket) -> bool {
-        if self.last_activity.elapsed() > UDP_TIMEOUT {
+        if self.last_activity.elapsed() > UDP_IDLE_TIMEOUT {
             socket.close();
             return false;
         }

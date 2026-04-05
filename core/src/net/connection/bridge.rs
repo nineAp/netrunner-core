@@ -2,15 +2,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::net::connection::muxer::{MuxMessage, Muxer};
-use crate::net::NetworkConfig;
+use crate::net::{NetworkConfig, BRIDGE_IDLE_TIMEOUT};
 use crate::nrxp::FrameType;
 use bytes::{Bytes, BytesMut};
 use netrunner_logger::{debug, error, info, warn};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
-
-const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 struct StreamGuard {
     stream_id: u32,
@@ -43,7 +41,7 @@ pub(crate) async fn run_tcp_bridge<R, W>(
 
     loop {
         buf.reserve(NetworkConfig::global().tcp_buffer_size);
-        let select_res = timeout(IDLE_TIMEOUT, async {
+        let select_res = timeout(BRIDGE_IDLE_TIMEOUT, async {
             tokio::select! {
 
                 res = reader.read_buf(&mut buf) => {
@@ -132,7 +130,7 @@ pub(crate) async fn run_udp_bridge(
     info!(stream_id, "🌉 UDP Bridge active");
 
     loop {
-        let select_res = timeout(IDLE_TIMEOUT, async {
+        let select_res = timeout(BRIDGE_IDLE_TIMEOUT, async {
             tokio::select! {
 
                 res = socket.recv(&mut buf) => {
