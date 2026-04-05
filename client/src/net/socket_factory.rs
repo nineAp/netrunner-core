@@ -1,4 +1,3 @@
-use crossbeam_queue::ArrayQueue;
 use netrunner_core::net::NetworkConfig;
 use smoltcp::{
     iface::SocketSet,
@@ -42,35 +41,27 @@ pub trait SocketProvider: Send + Sync {
 
 pub struct SmolSocketFactory {
     config: Arc<NetworkConfig>,
-    heavy_pool: Arc<ArrayQueue<Vec<u8>>>,
 }
 
 impl SmolSocketFactory {
     pub fn new(config: Arc<NetworkConfig>) -> Self {
-        Self {
-            config,
-
-            heavy_pool: Arc::new(ArrayQueue::new(128)),
-        }
+        Self { config }
     }
 
     fn alloc_buf(&self, size: usize) -> Vec<u8> {
-        if size == self.config.tcp_buf_heavy {
-            if let Some(mut buf) = self.heavy_pool.pop() {
-                buf.fill(0);
-                return buf;
-            }
-        }
+        // Убрали пул памяти, так как 1MB RX буферы раздуют оперативку (128MB+).
+        // Выделение памяти через vec! при старте сокета работает достаточно быстро.
         vec![0u8; size]
     }
 }
 
 impl SocketProvider for SmolSocketFactory {
     fn create_tcp(&self, profile: TrafficProfile) -> tcp::Socket<'static> {
+        // 👈 Асимметричные буферы: RX большой (Download), TX маленький (Upload)
         let (rx_size, tx_size) = match profile {
-            TrafficProfile::Bulk => (self.config.tcp_buf_heavy, self.config.tcp_buf_heavy),
-            TrafficProfile::Interactive => (self.config.tcp_buf_light, self.config.tcp_buf_light),
-            _ => (self.config.tcp_buf_light * 2, self.config.tcp_buf_light * 2),
+            TrafficProfile::Bulk => (self.config.tcp_rx_heavy, self.config.tcp_tx_heavy),
+            TrafficProfile::Interactive => (self.config.tcp_rx_light, self.config.tcp_tx_light),
+            _ => (self.config.tcp_rx_light * 2, self.config.tcp_tx_light * 2),
         };
 
         let rx_buffer = tcp::SocketBuffer::new(self.alloc_buf(rx_size));
