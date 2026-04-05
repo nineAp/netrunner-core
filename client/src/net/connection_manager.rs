@@ -8,7 +8,7 @@ use smoltcp::{
     socket::{Socket, tcp, udp},
     wire::{IpAddress, IpListenEndpoint, IpProtocol, Ipv4Packet, Ipv6Packet, TcpPacket, UdpPacket},
 };
-use std::{sync::Arc, time::Duration};
+use std::{sync::Arc};
 
 use tokio::sync::mpsc;
 

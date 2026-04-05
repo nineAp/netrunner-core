@@ -11,7 +11,6 @@ use smoltcp::{
         Ipv6Address,
     },
 };
-use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
 use netrunner_logger::{debug, info};
