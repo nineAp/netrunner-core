@@ -14,6 +14,7 @@ pub struct NetworkConfig {
     pub client_muxer_capacity: usize,  // Подушка для 10 ног
     pub client_tun_capacity: usize,    // Стык TUN <-> Engine
     pub client_stream_capacity: usize, // Быстрый Backpressure для сокета
+    pub client_virtual_stream_capacity: usize,
 
     // Для Сервера (Дата-центр)
     pub server_muxer_capacity: usize, // Огромная очередь для входящего трафика
@@ -42,19 +43,19 @@ impl NetworkConfig {
 
             tcp_chunk_size: 16 * 1024,
 
-            client_muxer_capacity: 256,
+            client_muxer_capacity: 32,
             client_tun_capacity: 16,
-            client_stream_capacity: 32,
+            client_stream_capacity: 16,
+            client_virtual_stream_capacity: 8,
 
-            // --- СЕРВЕР ---
             server_muxer_capacity: 128,
             server_stream_capacity: 32,
 
-            tcp_rx_heavy: 256 * 1024,
-            tcp_tx_heavy: 512 * 1024,
+            tcp_rx_heavy: 256 * 1024, //download
+            tcp_tx_heavy: 128 * 1024, //upload
 
-            tcp_rx_light: 256 * 1024,
-            tcp_tx_light: 32 * 1024,
+            tcp_rx_light: 64 * 1024, //download
+            tcp_tx_light: 64 * 1024, //upload
 
             udp_buf_heavy: 256 * 1024,
             udp_meta_heavy: 512,

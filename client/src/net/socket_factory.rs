@@ -1,7 +1,11 @@
 use netrunner_core::net::NetworkConfig;
 use smoltcp::{
     iface::SocketSet,
-    socket::{icmp, tcp, udp},
+    socket::{
+        icmp,
+        tcp::{self, CongestionControl},
+        udp,
+    },
     time::Duration,
     wire::{IpAddress, IpListenEndpoint},
 };
@@ -16,7 +20,7 @@ pub enum TrafficProfile {
 }
 
 pub const TCP_SOCKET_KEEP_ALIVE: Duration = Duration::from_secs(15);
-pub const TCP_SOCKET_ACTIVE_TIMEOUT: Duration = Duration::from_secs(20);
+pub const TCP_SOCKET_ACTIVE_TIMEOUT: Duration = Duration::from_secs(60);
 
 impl TrafficProfile {
     pub fn guess_from_port(port: u16, is_tcp: bool) -> Self {
@@ -83,12 +87,16 @@ impl SocketProvider for SmolSocketFactory {
                 socket.set_nagle_enabled(false);
                 socket.set_ack_delay(None);
             }
-            TrafficProfile::Bulk | TrafficProfile::Default => {
+            TrafficProfile::Bulk => {
+                socket.set_nagle_enabled(false);
+                socket.set_ack_delay(Some(Duration::from_millis(15)));
+            }
+            _ => {
                 socket.set_nagle_enabled(false);
                 socket.set_ack_delay(None);
             }
-            _ => {}
         }
+        socket.set_congestion_control(CongestionControl::Cubic);
     }
 
     fn create_udp(&self, profile: TrafficProfile) -> udp::Socket<'static> {

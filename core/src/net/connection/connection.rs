@@ -127,17 +127,6 @@ impl ClientHandler {
             tokio::net::TcpSocket::new_v6().map_err(|e| e.to_string())?
         };
 
-        // 3. 🛡️ БАЛАНСИРУЕМ БУФЕРЫ ЯДРА
-        // 256 KB для отправки (Send) — это "золотая середина" для пинга ~300мс.
-        // Математически это позволит разогнать Upload до ~7-8 Мбит/с без 9-секундных лагов.
-        if let Err(e) = socket.set_send_buffer_size(NetworkConfig::global().tcp_tx_heavy as u32) {
-            warn!("Failed to set SO_SNDBUF on {}: {}", leg_name, e);
-        }
-
-        // 🚨 ВАЖНО: Мы НЕ ставим set_recv_buffer_size вручную.
-        // Это позволяет ОС использовать TCP Window Scaling и Auto-tuning,
-        // что вернет твою скорость Download к 80+ Мбит/с.
-
         // 4. Подключаемся
         let stream = socket
             .connect(addr)
