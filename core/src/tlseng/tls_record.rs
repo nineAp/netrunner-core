@@ -91,7 +91,7 @@ impl Parser for TlsRecord {
             .map_err(|e| TlsError::new(ErrorStage::Tls(e), ErrorAction::Redirect, Bytes::new()))?;
 
         let version = ProtocolVersion::try_from(raw_version)
-            .map_err(|e| TlsError::new(ErrorStage::Tls(e), ErrorAction::Drop, Bytes::new()))?;
+            .map_err(|e| TlsError::new(ErrorStage::Tls(e), ErrorAction::Redirect, Bytes::new()))?;
 
         let payload = bytes.split_to(record_len).freeze();
 

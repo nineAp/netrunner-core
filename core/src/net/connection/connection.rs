@@ -8,7 +8,8 @@ use crate::{
             muxer::Muxer,
         },
         NetworkConfig, FALLBACK_CONNECT_TIMEOUT, LEG_RECONNECT_DELAY, LEG_STAGGER_DELAY,
-        MAX_TUNNEL_LEGS, SECURE_HANDSHAKE_TIMEOUT, TLS_HELLO_TIMEOUT, TOPOLOGY_PRINT_INTERVAL,
+        MAX_TUNNEL_LEGS, SECURE_HANDSHAKE_TIMEOUT, STEALTH_FALLBACK_HOST, TLS_HELLO_TIMEOUT,
+        TOPOLOGY_PRINT_INTERVAL,
     },
     nrxp::{Codec, ErrorAction, Frame, FrameType},
     rawcast::{LocalProtocol, RawCastAdapter, RawCastFrame},
@@ -16,7 +17,7 @@ use crate::{
 };
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
-use netrunner_logger::{error, info, warn};
+use netrunner_logger::{debug, error, info, warn};
 use rand::Rng;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -376,11 +377,13 @@ impl ServerHandler {
         mut client_outbound: OwnedWriteHalf,
         initial_data: bytes::Bytes,
     ) {
-        let target_host = "ubuntu.com:443";
-        info!(target = %target_host, "Stealth fallback: bridging to Target");
+        info!(target = %STEALTH_FALLBACK_HOST, "Stealth fallback: bridging to Target");
 
-        let target_stream =
-            tokio::time::timeout(FALLBACK_CONNECT_TIMEOUT, TcpStream::connect(target_host)).await;
+        let target_stream = tokio::time::timeout(
+            FALLBACK_CONNECT_TIMEOUT,
+            TcpStream::connect(STEALTH_FALLBACK_HOST),
+        )
+        .await;
 
         match target_stream {
             Ok(Ok(target_server)) => {
@@ -420,58 +423,110 @@ impl TunnelHandler for ServerHandler {
     async fn run(mut self) -> Result<(), String> {
         info!("Acting as TLS Server with Stealth Fallback");
 
+        // --- PHASE 1: TLS Hello & Protocol Identification ---
         let hello = loop {
+            // Делаем снимок текущего буфера для возможного фолбэка
             let buf_snapshot = self.conn.read_buf.clone().freeze();
+
+            // Лог для отладки входящих байт (первые 16 байт в хексе)
+            if !buf_snapshot.is_empty() {
+                debug!(
+                    "Buffer state: {:02x?}",
+                    &buf_snapshot[..std::cmp::min(buf_snapshot.len(), 16)]
+                );
+            }
+
             match self
                 .conn
                 .codec
                 .make_server_handshake(&mut self.conn.read_buf)
             {
-                Ok(b) => break b,
-                Err(e) => match e.execute_strategy() {
-                    ErrorAction::Wait => {
-                        let res = tokio::time::timeout(
-                            TLS_HELLO_TIMEOUT,
-                            self.conn.inbound.read_buf(&mut self.conn.read_buf),
-                        )
-                        .await;
+                Ok(b) => {
+                    info!("✅ Valid Netrunner ClientHello detected");
+                    break b;
+                }
+                Err(e) => {
+                    let strategy = e.execute_strategy();
 
-                        match res {
-                            Ok(Ok(0)) => return Err("Client closed".into()),
-                            Ok(Ok(_)) => continue,
-                            _ => {
-                                Self::handle_stealth_fallback(
-                                    self.conn.inbound,
-                                    self.conn.outbound,
-                                    buf_snapshot,
-                                )
-                                .await;
-                                return Ok(());
-                            }
+                    // Анализируем контент для принятия решения о фолбэке
+                    if !buf_snapshot.is_empty() {
+                        let first_byte = buf_snapshot[0];
+
+                        // Проверка на стандартный TLS (0x16) или HTTP (G, P, H)
+                        let is_common_web = first_byte == 0x16
+                            || first_byte == b'G'
+                            || first_byte == b'P'
+                            || first_byte == b'H';
+
+                        if is_common_web && strategy != ErrorAction::Wait {
+                            warn!("🕵️ Stealth: Intercepted web traffic (Byte: 0x{:02x}), forcing Redirect", first_byte);
+                            Self::handle_stealth_fallback(
+                                self.conn.inbound,
+                                self.conn.outbound,
+                                buf_snapshot,
+                            )
+                            .await;
+                            return Ok(());
                         }
                     }
-                    ErrorAction::Redirect => {
-                        Self::handle_stealth_fallback(
-                            self.conn.inbound,
-                            self.conn.outbound,
-                            buf_snapshot,
-                        )
-                        .await;
-                        return Ok(());
+
+                    match strategy {
+                        ErrorAction::Wait => {
+                            let res = tokio::time::timeout(
+                                TLS_HELLO_TIMEOUT,
+                                self.conn.inbound.read_buf(&mut self.conn.read_buf),
+                            )
+                            .await;
+
+                            match res {
+                                Ok(Ok(0)) => return Err("Client closed".into()),
+                                Ok(Ok(n)) => {
+                                    debug!("Read {} more bytes, retrying handshake...", n);
+                                    continue;
+                                }
+                                _ => {
+                                    warn!("⏰ TLS_HELLO_TIMEOUT reached. Triggering fallback...");
+                                    Self::handle_stealth_fallback(
+                                        self.conn.inbound,
+                                        self.conn.outbound,
+                                        buf_snapshot,
+                                    )
+                                    .await;
+                                    return Ok(());
+                                }
+                            }
+                        }
+                        ErrorAction::Redirect => {
+                            info!("🔀 Strategy is REDIRECT. Switching to stealth fallback...");
+                            Self::handle_stealth_fallback(
+                                self.conn.inbound,
+                                self.conn.outbound,
+                                buf_snapshot,
+                            )
+                            .await;
+                            return Ok(());
+                        }
+                        ErrorAction::Drop => {
+                            // Сюда попадет только реальный мусор, не похожий на TLS/HTTP
+                            error!(
+                                "❌ Strategy is DROP. Suspicious connection terminated. Buf: {:02x?}",
+                                &buf_snapshot
+                            );
+                            return Err("Dropped by security strategy (TLS Phase)".into());
+                        }
                     }
-                    ErrorAction::Drop => {
-                        return Err("Dropped by security strategy (TLS Phase)".into());
-                    }
-                },
+                }
             }
         };
 
+        // --- PHASE 2: Send Server Hello ---
         self.conn
             .outbound
             .write_all(&hello)
             .await
             .map_err(|e| e.to_string())?;
 
+        // --- PHASE 3: Secure Handshake (Auth) ---
         let (session_id, leg_id) = loop {
             let n = tokio::time::timeout(
                 SECURE_HANDSHAKE_TIMEOUT,
@@ -517,14 +572,13 @@ impl TunnelHandler for ServerHandler {
                             .await;
                             return Ok(());
                         }
-                        _ => {
-                            return Err("Dropped by security strategy (Auth Phase)".into());
-                        }
+                        _ => return Err("Dropped by security strategy (Auth Phase)".into()),
                     }
                 }
             }
         };
 
+        // --- PHASE 4: Engine Startup ---
         let muxer = self.session_manager.get_or_create(&session_id);
 
         let (control_tx, control_rx) = mpsc::channel(NetworkConfig::global().server_muxer_capacity);
@@ -535,17 +589,6 @@ impl TunnelHandler for ServerHandler {
             muxer: muxer.clone(),
         });
         let handler = Arc::new(StreamHandler::new(muxer.clone(), Some(opener)));
-
-        let m_weak = Arc::downgrade(&muxer);
-        tokio::spawn(async move {
-            while let Some(m_stats) = m_weak.upgrade() {
-                tokio::time::sleep(TOPOLOGY_PRINT_INTERVAL).await;
-                if m_stats.active_legs_count() == 0 {
-                    break;
-                }
-                m_stats.print_topology_tree();
-            }
-        });
 
         let engine = TunnelEngine {
             leg_id,
@@ -561,6 +604,7 @@ impl TunnelHandler for ServerHandler {
 
         let res = engine.run().await;
 
+        // Cleanup
         muxer.remove_leg(leg_id);
         if muxer.active_legs_count() == 0 {
             self.session_manager.remove(&session_id);
