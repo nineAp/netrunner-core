@@ -11,7 +11,7 @@ pub const UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(60); // Смерть 
 pub const GLOBAL_IDLE_TIMEOUT: Duration = Duration::from_secs(120); // Очистка Tracker-ом
 pub const HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(5); // Частота пинга Leg-ов
 pub const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(15);
-pub const LEG_RECONNECT_DELAY: Duration = Duration::from_secs(30); // Пауза перед реконнектом Leg
+pub const LEG_RECONNECT_DELAY: Duration = Duration::from_secs(5); // Пауза перед реконнектом Leg
 pub const BRIDGE_IDLE_TIMEOUT: Duration = Duration::from_secs(300); // Таймаут задач-бриджей
 
 // --- Сетевые порты ---
@@ -19,10 +19,6 @@ pub const DNS_PORT: u16 = 53;
 pub const HTTP_PORT: u16 = 80;
 pub const HTTPS_PORT: u16 = 443;
 pub const NETBIOS_PORTS: [u16; 2] = [137, 138];
-
-// --- Критические оверхеды (для MTU/MSS) ---
-pub const IPV4_TCP_OVERHEAD: usize = 40; // IPv4(20) + TCP(20)
-pub const NRXP_OVERHEAD: usize = 254; // Запас под заголовки твоего протокола и TLS
 
 // --- Настройки безопасности ---
 pub const AUTH_TIME_STEP: u64 = 60; // Шаг генерации токена (секунды)
@@ -34,8 +30,8 @@ pub const TOPOLOGY_PRINT_INTERVAL: Duration = Duration::from_secs(15);
 
 // --- Настройки Stealth Fallback (Маскировка) ---
 pub const STEALTH_FALLBACK_HOST: &str = "ubuntu.com:443";
-pub const FALLBACK_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+pub const FALLBACK_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 // --- Таймауты Handshake ---
-pub const TLS_HELLO_TIMEOUT: Duration = Duration::from_secs(1);
-pub const SECURE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
+pub const TLS_HELLO_TIMEOUT: Duration = Duration::from_secs(10);
+pub const SECURE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);

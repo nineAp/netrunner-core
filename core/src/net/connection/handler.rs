@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use netrunner_logger::{debug, error, info, warn};
+use netrunner_logger::{debug, error, info, trace, warn};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::{TcpStream, UdpSocket};
@@ -75,6 +75,21 @@ impl StreamHandler {
         let stream_id = frame.header.stream_id;
 
         match frame.header.frame_type {
+            FrameType::Heartbeat => {
+                // Проверяем: если мы Opener (т.е. мы Сервер), то отвечаем.
+                // Если мы Клиент (opener == None), то мы сюда вообще не должны дойти
+                // (т.к. перехватили в TunnelEngine), но на всякий случай логируем.
+                if self.opener.is_some() {
+                    trace!(stream_id, "💓 [Server] Ping received, sending Pong");
+                    let _ = self
+                        .muxer
+                        .send_control(stream_id, FrameType::Heartbeat, Bytes::new())
+                        .await;
+                } else {
+                    trace!(stream_id, "💓 [Client] Pong received (captured by Engine)");
+                }
+            }
+
             FrameType::Connect => {
                 self.handle_conn_request(stream_id, frame.payload, false)
                     .await
@@ -92,10 +107,10 @@ impl StreamHandler {
                 debug!(stream_id, "🏁 [Tunnel] Peer closed stream");
                 self.muxer.remove_stream(stream_id);
             }
+
             _ => debug!(stream_id, "Unhandled frame: {:?}", frame.header.frame_type),
         }
     }
-
     async fn handle_conn_request(&self, stream_id: u32, payload: Bytes, is_udp: bool) {
         let target = String::from_utf8_lossy(&payload).to_string();
 

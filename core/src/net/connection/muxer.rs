@@ -3,6 +3,7 @@ use dashmap::DashMap;
 use netrunner_logger::{debug, info, trace, warn};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::mpsc::Sender;
 
 use crate::net::{HEALTH_CHECK_TIMEOUT, MAX_TUNNEL_LEGS, MUXER_POOL_SIZE};
@@ -55,8 +56,9 @@ pub struct MuxMessage {
 pub struct Muxer {
     legs: Arc<DashMap<u32, MuxLeg>>,
     streams: Arc<DashMap<u32, (Sender<Bytes>, Arc<StreamStats>)>>,
-    // 🚨 Sticky Sessions: Привязка Stream ID -> Leg ID
     stream_bindings: Arc<DashMap<u32, u32>>,
+    // 🚨 Добавляем сюда:
+    pending_pings: Arc<DashMap<u32, Instant>>,
     id_gen: Arc<IdGenerator>,
     session_id: Arc<String>,
 }
@@ -68,6 +70,7 @@ impl Muxer {
             streams: Arc::new(DashMap::new()),
             stream_bindings: Arc::new(DashMap::new()),
             id_gen: Arc::new(IdGenerator::new(is_client)),
+            pending_pings: Arc::new(DashMap::new()),
             session_id: Arc::new(session_id),
         }
     }
@@ -161,6 +164,22 @@ impl Muxer {
         self.stream_bindings.insert(stream_id, selected_id);
 
         Some((selected_id, selected_leg))
+    }
+
+    pub fn record_ping_sent(&self, leg_id: u32) {
+        self.pending_pings.insert(leg_id, Instant::now());
+    }
+
+    pub async fn record_pong(&self, leg_id: u32) {
+        if let Some((_, start_time)) = self.pending_pings.remove(&leg_id) {
+            let rtt = start_time.elapsed().as_millis() as u32;
+
+            if let Some(leg) = self.legs.get(&leg_id) {
+                // Обновляем атомик, который потом прочитает принт топологии
+                leg.stats.rtt_ms.store(rtt, Ordering::Relaxed);
+                trace!(leg_id, rtt, "💓 [Muxer] RTT updated for leg");
+            }
+        }
     }
 
     pub async fn send_to_network(&self, message: MuxMessage) -> Result<(), String> {

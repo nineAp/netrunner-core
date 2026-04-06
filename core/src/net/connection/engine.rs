@@ -44,6 +44,8 @@ impl TunnelEngine {
         let leg_id = self.leg_id;
         let muxer = self.muxer.clone();
 
+        let muxer_pong = muxer.clone();
+
         let token = CancellationToken::new();
 
         let codec_reader = codec.clone();
@@ -102,6 +104,10 @@ impl TunnelEngine {
                         }
 
                         for frame in frames {
+                            if frame.header.frame_type == FrameType::Heartbeat {
+                                muxer.record_pong(leg_id).await;
+                                continue;
+                            }
                             handler.handle(frame).await;
                         }
                     }
@@ -134,6 +140,9 @@ impl TunnelEngine {
                     }
 
                     _ = heartbeat.tick() => {
+                        // 1. Фиксируем время
+                        muxer_pong.record_ping_sent(leg_id);
+                        // 2. Шлем пакет
                         let msg = MuxMessage { stream_id: 0, frame_type: FrameType::Heartbeat, data: Bytes::new() };
                         Self::handle_outbound(&mut outbound, &codec_writer, msg).await?;
                     }
