@@ -34,10 +34,14 @@ impl TrafficProfile {
 }
 
 pub trait SocketProvider: Send + Sync {
-    fn create_tcp(&self, profile: TrafficProfile) -> tcp::Socket<'static>;
+    // Убрали <'static> у tcp::Socket
+    fn create_tcp(&self, profile: TrafficProfile) -> tcp::Socket; 
     fn create_udp(&self, profile: TrafficProfile) -> udp::Socket<'static>;
     fn create_icmp(&self) -> icmp::Socket<'static>;
-    fn create_listening_tcp(&self, addr: Option<IpAddress>, port: u16) -> tcp::Socket<'static>;
+    
+    // Убрали <'static> у tcp::Socket
+    fn create_listening_tcp(&self, addr: Option<IpAddress>, port: u16) -> tcp::Socket; 
+    
     fn create_bound_udp(&self, addr: Option<IpAddress>, port: u16) -> udp::Socket<'static>;
     fn create_base_set(&self, n_icmp: usize) -> SocketSet<'static>;
     fn reconfigure_tcp(&self, socket: &mut tcp::Socket, profile: TrafficProfile);
@@ -60,7 +64,8 @@ impl SmolSocketFactory {
 }
 
 impl SocketProvider for SmolSocketFactory {
-    fn create_tcp(&self, profile: TrafficProfile) -> tcp::Socket<'static> {
+// Убрали <'static>
+    fn create_tcp(&self, profile: TrafficProfile) -> tcp::Socket {
         // 👈 Асимметричные буферы: RX большой (Download), TX маленький (Upload)
         let (rx_size, tx_size) = match profile {
             TrafficProfile::Bulk => (self.config.tcp_rx_heavy, self.config.tcp_tx_heavy),
@@ -68,16 +73,16 @@ impl SocketProvider for SmolSocketFactory {
             _ => (self.config.tcp_rx_light * 2, self.config.tcp_tx_light * 2),
         };
 
-        let rx_buffer = tcp::SocketBuffer::new(self.alloc_buf(rx_size));
-        let tx_buffer = tcp::SocketBuffer::new(self.alloc_buf(tx_size));
-
+        // 🔥 ИСПОЛЬЗУЕМ НАШИ НОВЫЕ ДИНАМИЧЕСКИЕ БУФЕРЫ 🔥
+        // Мы больше не аллоцируем векторы снаружи, буфер сам управляет памятью
+        let rx_buffer = tcp::DynamicSocketBuffer::new(rx_size);
+        let tx_buffer = tcp::DynamicSocketBuffer::new(tx_size);
         let mut socket = tcp::Socket::new(rx_buffer, tx_buffer);
 
         self.reconfigure_tcp(&mut socket, profile);
 
         socket.set_keep_alive(Some(TCP_SOCKET_KEEP_ALIVE));
         socket.set_timeout(Some(TCP_SOCKET_ACTIVE_TIMEOUT));
-
         socket
     }
 
@@ -128,13 +133,13 @@ impl SocketProvider for SmolSocketFactory {
         )
     }
 
-    fn create_listening_tcp(&self, addr: Option<IpAddress>, port: u16) -> tcp::Socket<'static> {
+   fn create_listening_tcp(&self, addr: Option<IpAddress>, port: u16) -> tcp::Socket {
         let profile = TrafficProfile::guess_from_port(port, true);
         let mut socket = self.create_tcp(profile);
         let _ = socket.listen(IpListenEndpoint { addr, port });
         socket
     }
-
+    
     fn create_bound_udp(&self, addr: Option<IpAddress>, port: u16) -> udp::Socket<'static> {
         let profile = TrafficProfile::guess_from_port(port, false);
         let mut socket = self.create_udp(profile);

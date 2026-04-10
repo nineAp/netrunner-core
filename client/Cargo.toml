@@ -9,7 +9,7 @@ crate-type = ["cdylib", "rlib", "staticlib"]
 
 [dependencies]
 netrunner-core = { path = "../core" }
-smoltcp = { version = "0.12", default-features = false, features = [
+smoltcp = { git = "ssh://git@github.com/nineAp/nxrp-smoltcp.git", default-features = false, features = [
     "std",
     "log",
     "medium-ip",
@@ -20,6 +20,7 @@ smoltcp = { version = "0.12", default-features = false, features = [
     "socket-udp",
     "socket-tcp",
     "socket-tcp-cubic",
+    "socket-tcp-bbr", # <--- Добавили нашу новую фичу для BBR!
 ] }
 tokio = { version = "1.36", features = ["full"] }
 bytes = "1.5"
@@ -31,7 +32,7 @@ hickory-proto = "0.25.2"
 lru = "0.16.3"
 tokio-util = "0.7.18"
 shlex = "1.3"
-uniffi = { version = "0.31.0", features = ["tokio", ] }
+uniffi = { version = "0.31.0", features = ["tokio"] }
 reqwest = { version = "0.13.2", features = ["json"] } 
 anyhow = "1.0"
 netrunner-logger = { path = "../tools/log" }
@@ -39,7 +40,5 @@ netrunner-logger = { path = "../tools/log" }
 [build-dependencies]
 uniffi = { version = "0.31.0", features = ["build"] }
 
-
 [target.'cfg(target_os = "windows")'.dependencies]
 wintun = "0.5.1"
-

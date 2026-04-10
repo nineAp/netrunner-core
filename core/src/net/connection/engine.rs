@@ -5,7 +5,7 @@ use netrunner_logger::{debug, error, info};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::tcp::{OwnedReadHalf, OwnedWriteHalf},
-    sync::{mpsc::Receiver, Mutex},
+    sync::mpsc::Receiver,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -14,13 +14,14 @@ use crate::{
         connection::{handler::StreamHandler, muxer::MuxMessage},
         NetworkConfig, HEALTH_CHECK_INTERVAL,
     },
-    nrxp::{Codec, ErrorAction, FrameType},
+    nrxp::{ErrorAction, FrameType, RxCodec, TxCodec},
 };
 
 pub(crate) struct TunnelEngine {
     pub inbound: OwnedReadHalf,
     pub outbound: OwnedWriteHalf,
-    pub codec: Codec,
+    pub rx_codec: RxCodec,
+    pub tx_codec: TxCodec,
     pub read_buf: BytesMut,
     pub control_rx: Receiver<MuxMessage>,
     pub data_rx: Receiver<MuxMessage>,
@@ -33,9 +34,11 @@ impl TunnelEngine {
     pub async fn run(self) -> Result<(), String> {
         let inbound = self.inbound;
         let outbound = self.outbound;
-
-        let codec = Arc::new(Mutex::new(self.codec));
         let read_buf = self.read_buf;
+
+        // Распаковываем наши кодеки
+        let mut rx_codec = self.rx_codec;
+        let mut tx_codec = self.tx_codec;
 
         let control_rx = self.control_rx;
         let data_rx = self.data_rx;
@@ -43,14 +46,9 @@ impl TunnelEngine {
 
         let leg_id = self.leg_id;
         let muxer = self.muxer.clone();
-
         let muxer_pong = muxer.clone();
 
         let token = CancellationToken::new();
-
-        let codec_reader = codec.clone();
-        let codec_writer = codec.clone();
-
         let token_reader = token.clone();
         let token_writer = token.clone();
 
@@ -73,32 +71,28 @@ impl TunnelEngine {
                             } else {
                                 error!("Connection abruptly closed by peer (Incomplete frame: {} bytes left)", read_buf.len());
                             }
-
                             return Err::<(), String>("EOF".into());
                         }
-
 
                         muxer.record_leg_rx(leg_id, n as u64);
 
                         let mut frames = Vec::new();
 
-                        {
-                            let mut c = codec_reader.lock().await;
-                            loop {
-                                match c.inbound(&mut read_buf) {
-                                    Ok(Some(frame)) => frames.push(frame),
-                                    Ok(None) => break,
-                                    Err(e) => {
-                                        if e.action == ErrorAction::Wait {
-                                            break;
-                                        }
-                                        if e.action == ErrorAction::Drop {
-                                            error!("CRITICAL: Crypto tampering or sync lost. Hard dropping tunnel!");
-                                            return Err("Crypto drop".into());
-                                        }
-                                        error!(error = ?e, "Codec inbound failed");
-                                        return Err(format!("Codec error: {:?}", e));
+                        // Чтение из RxCodec без блокировок!
+                        loop {
+                            match rx_codec.decode_inbound(&mut read_buf) {
+                                Ok(Some(frame)) => frames.push(frame),
+                                Ok(None) => break,
+                                Err(e) => {
+                                    if e.action == ErrorAction::Wait {
+                                        break;
                                     }
+                                    if e.action == ErrorAction::Drop {
+                                        error!("CRITICAL: Crypto tampering or sync lost. Hard dropping tunnel!");
+                                        return Err("Crypto drop".into());
+                                    }
+                                    error!(error = ?e, "Codec inbound failed");
+                                    return Err(format!("Codec error: {:?}", e));
                                 }
                             }
                         }
@@ -133,23 +127,21 @@ impl TunnelEngine {
 
                     msg_opt = control_rx.recv() => {
                         if let Some(msg) = msg_opt {
-                            Self::handle_outbound(&mut outbound, &codec_writer, msg).await?;
+                            Self::handle_outbound(&mut outbound, &mut tx_codec, msg).await?;
                         } else {
                             break;
                         }
                     }
 
                     _ = heartbeat.tick() => {
-                        // 1. Фиксируем время
                         muxer_pong.record_ping_sent(leg_id);
-                        // 2. Шлем пакет
                         let msg = MuxMessage { stream_id: 0, frame_type: FrameType::Heartbeat, data: Bytes::new() };
-                        Self::handle_outbound(&mut outbound, &codec_writer, msg).await?;
+                        Self::handle_outbound(&mut outbound, &mut tx_codec, msg).await?;
                     }
 
                     msg_opt = data_rx.recv() => {
                         if let Some(msg) = msg_opt {
-                            Self::handle_outbound(&mut outbound, &codec_writer, msg).await?;
+                            Self::handle_outbound(&mut outbound, &mut tx_codec, msg).await?;
                         } else {
                             break;
                         }
@@ -173,7 +165,7 @@ impl TunnelEngine {
 
     async fn handle_outbound(
         outbound: &mut OwnedWriteHalf,
-        codec: &Arc<Mutex<Codec>>,
+        tx_codec: &mut TxCodec,
         msg: MuxMessage,
     ) -> Result<(), String> {
         let mut data = msg.data;
@@ -182,29 +174,25 @@ impl TunnelEngine {
 
         let mut packets = Vec::new();
 
-        {
-            let mut c = codec.lock().await;
+        if frame_type == FrameType::UdpData {
+            match tx_codec.encode_frame(stream_id, frame_type.clone(), data) {
+                Ok(pkt) => packets.push(pkt),
+                Err(e) => {
+                    error!(stream_id, error = ?e, "Encryption failed for UDP datagram");
+                    return Err(format!("Encryption error: {:?}", e));
+                }
+            }
+        } else {
+            while !data.is_empty() {
+                let chunk_size =
+                    std::cmp::min(data.len(), NetworkConfig::global().tcp_chunk_size);
+                let chunk = data.split_to(chunk_size);
 
-            if frame_type == FrameType::UdpData {
-                match c.encrypt_data(stream_id, frame_type.clone(), data) {
+                match tx_codec.encode_frame(stream_id, frame_type.clone(), chunk) {
                     Ok(pkt) => packets.push(pkt),
                     Err(e) => {
-                        error!(stream_id, error = ?e, "Encryption failed for UDP datagram");
+                        error!(stream_id, error = ?e, "Encryption failed for TCP chunk");
                         return Err(format!("Encryption error: {:?}", e));
-                    }
-                }
-            } else {
-                while !data.is_empty() {
-                    let chunk_size =
-                        std::cmp::min(data.len(), NetworkConfig::global().tcp_chunk_size);
-                    let chunk = data.split_to(chunk_size);
-
-                    match c.encrypt_data(stream_id, frame_type.clone(), chunk) {
-                        Ok(pkt) => packets.push(pkt),
-                        Err(e) => {
-                            error!(stream_id, error = ?e, "Encryption failed for TCP chunk");
-                            return Err(format!("Encryption error: {:?}", e));
-                        }
                     }
                 }
             }

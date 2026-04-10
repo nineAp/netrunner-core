@@ -2,7 +2,7 @@ use aead::{rand_core::RngCore, OsRng};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 use crate::{
-    crypto::SessionKeys,
+    crypto::{SessionAuth, SessionKeys},
     nrxp::{ErrorAction, ErrorStage, TlsError},
     parser::Parser,
     tlseng::{
@@ -51,13 +51,9 @@ impl Parser for HelloHeader {
 
 pub(crate) struct ClientHello {
     pub _version: ProtocolVersion,
-
     pub random: [u8; 32],
-
     pub session_id: Bytes,
-
     pub cipher_suites: Vec<u16>,
-
     pub extensions: Bytes,
 }
 
@@ -99,7 +95,10 @@ impl ClientHello {
         let tls_random = keys.local_salt();
         let mut session_id_bytes = [0u8; 32];
         OsRng.fill_bytes(&mut session_id_bytes[..16]);
-        session_id_bytes[16..].copy_from_slice(&keys.generate_auth_tag());
+        
+        // ИСПРАВЛЕНИЕ: Используем SessionAuth для генерации тега
+        let auth = SessionAuth::new(keys.get_auth_key());
+        session_id_bytes[16..].copy_from_slice(&auth.generate_current_tag());
 
         let record_header = 5;
         let handshake_header = 4;

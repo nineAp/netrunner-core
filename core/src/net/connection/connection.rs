@@ -1,19 +1,13 @@
 use std::{net::Ipv4Addr, sync::Arc};
 
 use crate::{
-    net::{
-        connection::{
+    crypto::{ChaChaCipher, SessionKeys}, net::{
+        FALLBACK_CONNECT_TIMEOUT, LEG_RECONNECT_DELAY, LEG_STAGGER_DELAY, MAX_TUNNEL_LEGS, NetworkConfig, SECURE_HANDSHAKE_TIMEOUT, STEALTH_FALLBACK_HOST, TLS_HELLO_TIMEOUT, TOPOLOGY_PRINT_INTERVAL, connection::{
             engine::TunnelEngine,
             handler::{RemoteOpener, StreamHandler},
             muxer::Muxer,
-        },
-        NetworkConfig, FALLBACK_CONNECT_TIMEOUT, LEG_RECONNECT_DELAY, LEG_STAGGER_DELAY,
-        MAX_TUNNEL_LEGS, SECURE_HANDSHAKE_TIMEOUT, STEALTH_FALLBACK_HOST, TLS_HELLO_TIMEOUT,
-        TOPOLOGY_PRINT_INTERVAL,
-    },
-    nrxp::{Codec, ErrorAction, Frame, FrameType},
-    rawcast::{LocalProtocol, RawCastAdapter, RawCastFrame},
-    tlseng::BrowserProfile,
+        }
+    }, nrxp::{Codec, ErrorAction, Frame, FrameType, TlsBridge}, rawcast::{LocalProtocol, RawCastAdapter, RawCastFrame}, tlseng::{BrowserProfile, ServerProfile}
 };
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
@@ -34,9 +28,7 @@ pub struct SessionManager {
 
 impl SessionManager {
     pub fn new() -> Self {
-        Self {
-            sessions: DashMap::new(),
-        }
+        Self { sessions: DashMap::new() }
     }
 
     pub fn generate_id() -> String {
@@ -53,7 +45,7 @@ impl SessionManager {
 
     pub fn remove(&self, session_id: &str) {
         if self.sessions.remove(session_id).is_some() {
-            netrunner_logger::info!("🧹 Session {} completely closed and cleaned up", session_id);
+            info!("🧹 Session {} completely closed and cleaned up", session_id);
         }
     }
 }
@@ -63,30 +55,20 @@ pub trait TunnelHandler {
     async fn run(self) -> Result<(), String>;
 }
 
+// ⚠️ Connection теперь содержит только транспорт, без Codec
 pub struct Connection {
     pub(crate) inbound: OwnedReadHalf,
     pub(crate) outbound: OwnedWriteHalf,
     pub(crate) read_buf: BytesMut,
-    pub(crate) codec: Codec,
 }
 
 impl Connection {
-    pub fn new(stream: TcpStream, init: bool) -> Self {
+    pub fn new(stream: TcpStream) -> Self {
         let (inbound, outbound) = stream.into_split();
         Self {
             inbound,
             outbound,
             read_buf: BytesMut::with_capacity(NetworkConfig::global().tcp_buffer_size),
-            codec: Codec::new(init),
-        }
-    }
-
-    pub fn new_raw(inbound: OwnedReadHalf, outbound: OwnedWriteHalf) -> Self {
-        Self {
-            inbound,
-            outbound,
-            read_buf: BytesMut::with_capacity(NetworkConfig::global().tcp_buffer_size),
-            codec: Codec::new(false),
         }
     }
 }
@@ -101,66 +83,42 @@ impl ClientHandler {
         muxer: Arc<Muxer>,
         session_id: &str,
     ) -> Result<(), String> {
-        let leg_name = if leg_id % 2 == 0 {
-            "TCP-Leg"
-        } else {
-            "UDP-Leg"
-        };
+        let leg_name = if leg_id % 2 == 0 { "TCP-Leg" } else { "UDP-Leg" };
+        info!("Establishing dedicated {} (ID: {}) to {}...", leg_name, leg_id, remote_proxy_addr);
 
-        info!(
-            "Establishing dedicated {} (ID: {}) to {}...",
-            leg_name, leg_id, remote_proxy_addr
-        );
-
-        // 1. Резолвим домен в IP-адрес
         let mut addrs = tokio::net::lookup_host(remote_proxy_addr)
             .await
-            .map_err(|e| format!("DNS resolution failed for {}: {}", remote_proxy_addr, e))?;
+            .map_err(|e| format!("DNS resolution failed: {}", e))?;
 
-        let addr = addrs
-            .next()
-            .ok_or_else(|| format!("No IPs found for {}", remote_proxy_addr))?;
+        let addr = addrs.next().ok_or_else(|| format!("No IPs found for {}", remote_proxy_addr))?;
 
-        // 2. Создаем сокет
         let socket = if addr.is_ipv4() {
             tokio::net::TcpSocket::new_v4().map_err(|e| e.to_string())?
         } else {
             tokio::net::TcpSocket::new_v6().map_err(|e| e.to_string())?
         };
 
-        // 4. Подключаемся
-        let stream = socket
-            .connect(addr)
-            .await
-            .map_err(|e| format!("Failed to connect to {}: {}", addr, e))?;
-
+        let stream = socket.connect(addr).await.map_err(|e| format!("Connect failed: {}", e))?;
         let _ = stream.set_nodelay(true);
-        let (inbound, outbound) = stream.into_split();
-        let mut conn = Connection::new_raw(inbound, outbound);
+        let mut conn = Connection::new(stream);
 
-        // --- Дальше твой TLS Handshake без изменений ---
-        let ch = conn
-            .codec
-            .make_client_handshake(&BrowserProfile::CHROME_131, "ubuntu.com")
-            .map_err(|e| format!("Handshake generation failed: {:?}", e))?;
+        // --- 1. TLS Handshake Phase ---
+        let mut session_keys = SessionKeys::new(true);
+        let ch = TlsBridge::wrap_client_hello(&BrowserProfile::CHROME_131, "ubuntu.com", &session_keys);
 
-        conn.outbound
-            .write_all(&ch)
-            .await
-            .map_err(|e| e.to_string())?;
+        conn.outbound.write_all(&ch).await.map_err(|e| e.to_string())?;
 
         loop {
-            match conn.codec.process_handshake(&mut conn.read_buf) {
-                Ok(_) => break,
-                Err(e) if e.action == ErrorAction::Wait => {
-                    let n = conn
-                        .inbound
-                        .read_buf(&mut conn.read_buf)
-                        .await
-                        .map_err(|e| e.to_string())?;
-                    if n == 0 {
-                        return Err(format!("EOF on {}", leg_name));
-                    }
+            // Проверяем, есть ли уже ServerHello в буфере
+            match TlsBridge::unpack_handshake(&mut conn.read_buf) {
+                Ok(Some(msg)) => {
+                    session_keys.update_keys(msg.random(), msg.extensions(), false)
+                        .map_err(|e| format!("Keys update error: {}", e))?;
+                    break;
+                }
+                Ok(None) => {
+                    let n = conn.inbound.read_buf(&mut conn.read_buf).await.map_err(|e| e.to_string())?;
+                    if n == 0 { return Err(format!("EOF on {}", leg_name)); }
                 }
                 Err(e) => return Err(format!("TLS error on {}: {:?}", leg_name, e)),
             }
@@ -168,31 +126,33 @@ impl ClientHandler {
 
         info!("{} TLS Handshake complete.", leg_name);
 
-        // ... (остальной код инициализации TunnelEngine остается прежним)
-        let handshake_payload = Bytes::from(format!("{}:{}", session_id, leg_id));
+        // --- 2. Data Phase Initialization ---
+        let (tx_key, tx_iv, rx_key, rx_iv) = session_keys.get_aead_parameters();
+        let mut cipher = ChaChaCipher::new();
+        cipher.set_keys(tx_key, tx_iv, rx_key, rx_iv);
 
-        let encrypted_handshake = conn
-            .codec
-            .encrypt_data(0, FrameType::Handshake, handshake_payload)
+        // Забираем остатки из хендшейка в новый кодек
+        let codec = Codec::new(cipher, session_keys.get_auth_key());
+        let (rx_codec, mut tx_codec) = codec.split();
+
+        // --- 3. Encrypted Handshake ---
+        let handshake_payload = Bytes::from(format!("{}:{}", session_id, leg_id));
+        let encrypted_handshake = tx_codec.encode_frame(0, FrameType::Handshake, handshake_payload)
             .map_err(|e| format!("Failed to encrypt Handshake: {:?}", e))?;
 
-        conn.outbound
-            .write_all(&encrypted_handshake)
-            .await
-            .map_err(|e| format!("Failed to send Handshake: {}", e))?;
+        conn.outbound.write_all(&encrypted_handshake).await.map_err(|e| e.to_string())?;
 
         let (control_tx, control_rx) = mpsc::channel(NetworkConfig::global().client_muxer_capacity);
         let (data_tx, data_rx) = mpsc::channel(NetworkConfig::global().client_muxer_capacity);
-
         muxer.add_leg(leg_id, control_tx, data_tx);
-
         let handler = Arc::new(StreamHandler::new(muxer.clone(), None));
 
         let engine = TunnelEngine {
             leg_id,
             inbound: conn.inbound,
             outbound: conn.outbound,
-            codec: conn.codec,
+            rx_codec,
+            tx_codec,
             read_buf: conn.read_buf,
             control_rx,
             data_rx,
@@ -211,19 +171,14 @@ impl ClientHandler {
     ) -> Result<(), String> {
         let session_id = SessionManager::generate_id();
         info!("🔑 Generated Master Session ID: {}", session_id);
-
         let muxer = Arc::new(Muxer::new(true, session_id.clone()));
-
         let registry: Arc<DashMap<u32, StreamContext>> = Arc::new(DashMap::new());
         let local_to_global: Arc<DashMap<u32, u32>> = Arc::new(DashMap::new());
-
-        info!("🚀 Netrunner Multi-Path Tunnel Initializing (10 Legs max).");
 
         for id in 0..MAX_TUNNEL_LEGS {
             let addr = remote_proxy_addr.to_string();
             let m = muxer.clone();
             let sid = session_id.clone();
-
             tokio::spawn(async move {
                 tokio::time::sleep(LEG_STAGGER_DELAY * id).await;
                 loop {
@@ -239,10 +194,7 @@ impl ClientHandler {
         tokio::spawn(async move {
             while let Some(m_stats) = m_weak.upgrade() {
                 tokio::time::sleep(TOPOLOGY_PRINT_INTERVAL).await;
-                if m_stats.active_legs_count() == 0 {
-                    break;
-                }
-
+                if m_stats.active_legs_count() == 0 { break; }
                 m_stats.perform_health_check().await;
                 m_stats.print_topology_tree();
             }
@@ -264,24 +216,10 @@ impl ClientHandler {
                     match f_type {
                         FrameType::Connect | FrameType::UdpConnect => {
                             let global_stream_id = muxer_inner.next_stream_id();
-
-                            info!(
-                                "🔗 [Muxer] Forwarding {} request to {} (Local ID: {} -> Global ID: {})",
-                                if is_udp { "UDP" } else { "TCP" },
-                                String::from_utf8_lossy(&payload),
-                                local_socket_id,
-                                global_stream_id
-                            );
-
                             local_to_global.insert(local_socket_id, global_stream_id);
-                            registry.insert(
-                                global_stream_id,
-                                (local_socket_id, dst_ip, dst_port, protocol),
-                            );
+                            registry.insert(global_stream_id, (local_socket_id, dst_ip, dst_port, protocol));
 
-                            let (v_tx, mut v_rx) =
-                                mpsc::channel(NetworkConfig::global().client_stream_capacity);
-
+                            let (v_tx, mut v_rx) = mpsc::channel(NetworkConfig::global().client_stream_capacity);
                             muxer_inner.register_stream(global_stream_id, v_tx);
 
                             let tx_to_tun = tx_to_engine.clone();
@@ -289,68 +227,30 @@ impl ClientHandler {
 
                             tokio::spawn(async move {
                                 while let Some(back_payload) = v_rx.recv().await {
-                                    // ✅ ИСПРАВЛЕНИЕ 1: Копируем данные и отпускаем DashMap до .await
-                                    let ctx = reg.get(&global_stream_id).map(|r| *r);
-
-                                    if let Some((orig_local_id, ip, port, proto)) = ctx {
-                                        let out_f_type = if proto == LocalProtocol::Udp {
-                                            FrameType::UdpData
-                                        } else {
-                                            FrameType::Data
-                                        };
-
-                                        let mock_nrxp =
-                                            Frame::new(orig_local_id, out_f_type, back_payload);
-
-                                        if let Ok(raw) = RawCastAdapter::from_nrxp(
-                                            mock_nrxp,
-                                            ip,
-                                            port,
-                                            proto == LocalProtocol::Udp,
-                                        ) {
+                                    if let Some((orig_local_id, ip, port, proto)) = reg.get(&global_stream_id).map(|r| *r) {
+                                        let out_f_type = if proto == LocalProtocol::Udp { FrameType::UdpData } else { FrameType::Data };
+                                        let mock_nrxp = Frame::new(orig_local_id, out_f_type, back_payload);
+                                        if let Ok(raw) = RawCastAdapter::from_nrxp(mock_nrxp, ip, port, proto == LocalProtocol::Udp) {
                                             let _ = tx_to_tun.send(raw).await;
                                         }
                                     }
                                 }
                             });
-
-                            // ✅ Добавлен .await
-                            let _ = muxer_inner
-                                .send_control(global_stream_id, f_type, payload)
-                                .await;
+                            let _ = muxer_inner.send_control(global_stream_id, f_type, payload).await;
                         }
                         FrameType::Data | FrameType::UdpData => {
-                            // ✅ ИСПРАВЛЕНИЕ 2: Сброс блокировки DashMap
-                            let global_stream_id =
-                                local_to_global.get(&local_socket_id).map(|r| *r);
-
-                            if let Some(id) = global_stream_id {
+                            if let Some(id) = local_to_global.get(&local_socket_id).map(|r| *r) {
                                 let _ = muxer_inner.send_data_safe(id, payload, is_udp).await;
-                            } else {
-                                warn!(
-                                    "Data received for unknown local socket_id: {}",
-                                    local_socket_id
-                                );
                             }
                         }
                         FrameType::Close => {
-                            // .remove() сам по себе возвращает владение данными и снимает лок мгновенно,
-                            // поэтому здесь дедлока не было, но мы добавляем .await для вызова Муксера.
-                            if let Some((_, global_stream_id)) =
-                                local_to_global.remove(&local_socket_id)
-                            {
-                                // ✅ Добавлен .await
-                                let _ = muxer_inner
-                                    .send_control(global_stream_id, FrameType::Close, Bytes::new())
-                                    .await;
-
+                            if let Some((_, global_stream_id)) = local_to_global.remove(&local_socket_id) {
+                                let _ = muxer_inner.send_control(global_stream_id, FrameType::Close, Bytes::new()).await;
                                 muxer_inner.remove_stream(global_stream_id);
                                 registry.remove(&global_stream_id);
                             }
                         }
-                        _ => {
-                            warn!("Unhandled FrameType from adapter: {:?}", f_type);
-                        }
+                        _ => {}
                     }
                 }
             }
@@ -359,6 +259,7 @@ impl ClientHandler {
         Ok(())
     }
 }
+
 pub struct ServerHandler {
     pub(crate) conn: Connection,
     pub(crate) session_manager: Arc<SessionManager>,
@@ -366,236 +267,133 @@ pub struct ServerHandler {
 
 impl ServerHandler {
     pub fn new(connection: Connection) -> Self {
-        Self {
-            conn: connection,
-            session_manager: Arc::new(SessionManager::new()),
-        }
+        Self { conn: connection, session_manager: Arc::new(SessionManager::new()) }
     }
 
-    async fn handle_stealth_fallback(
-        mut client_inbound: OwnedReadHalf,
-        mut client_outbound: OwnedWriteHalf,
-        initial_data: bytes::Bytes,
-    ) {
+    async fn handle_stealth_fallback(mut client_inbound: OwnedReadHalf, mut client_outbound: OwnedWriteHalf, initial_data: Bytes) {
         info!(target = %STEALTH_FALLBACK_HOST, "Stealth fallback: bridging to Target");
+        let target_stream = tokio::time::timeout(FALLBACK_CONNECT_TIMEOUT, TcpStream::connect(STEALTH_FALLBACK_HOST)).await;
 
-        let target_stream = tokio::time::timeout(
-            FALLBACK_CONNECT_TIMEOUT,
-            TcpStream::connect(STEALTH_FALLBACK_HOST),
-        )
-        .await;
-
-        match target_stream {
-            Ok(Ok(target_server)) => {
-                let (mut server_read, mut server_write) = target_server.into_split();
-
-                if !initial_data.is_empty() {
-                    if let Err(e) = server_write.write_all(&initial_data).await {
-                        warn!("Failed to push initial data to fallback: {}", e);
-                        return;
-                    }
-                }
-
-                let res = tokio::io::copy_bidirectional(
-                    &mut tokio::io::join(&mut client_inbound, &mut client_outbound),
-                    &mut tokio::io::join(&mut server_read, &mut server_write),
-                )
-                .await;
-
-                match res {
-                    Ok((from_client, from_server)) => {
-                        info!(
-                            "Fallback closed. Sent: {} bytes, Recv: {} bytes",
-                            from_client, from_server
-                        );
-                    }
-                    Err(e) => warn!("Fallback bridge error: {}", e),
-                }
+        if let Ok(Ok(target_server)) = target_stream {
+            let (mut server_read, mut server_write) = target_server.into_split();
+            if !initial_data.is_empty() {
+                let _ = server_write.write_all(&initial_data).await;
             }
-            Ok(Err(e)) => warn!("Fallback connect error: {}", e),
-            Err(_) => warn!("Fallback connection timed out (Target unreachable)"),
+            let _ = tokio::io::copy_bidirectional(
+                &mut tokio::io::join(&mut client_inbound, &mut client_outbound),
+                &mut tokio::io::join(&mut server_read, &mut server_write),
+            ).await;
         }
     }
 }
 
 #[async_trait::async_trait]
 impl TunnelHandler for ServerHandler {
-    async fn run(mut self) -> Result<(), String> {
+    async fn run(self) -> Result<(), String> {
         info!("Acting as TLS Server with Stealth Fallback");
+
+        let Connection { mut inbound, mut outbound, mut read_buf } = self.conn;
+        let mut session_keys = SessionKeys::new(false);
 
         // --- PHASE 1: TLS Hello & Protocol Identification ---
         let hello = loop {
-            // Делаем снимок текущего буфера для возможного фолбэка
-            let buf_snapshot = self.conn.read_buf.clone().freeze();
+            let buf_snapshot = read_buf.clone().freeze();
 
-            // Лог для отладки входящих байт (первые 16 байт в хексе)
-            if !buf_snapshot.is_empty() {
-                debug!(
-                    "Buffer state: {:02x?}",
-                    &buf_snapshot[..std::cmp::min(buf_snapshot.len(), 16)]
-                );
-            }
-
-            match self
-                .conn
-                .codec
-                .make_server_handshake(&mut self.conn.read_buf)
-            {
-                Ok(b) => {
+            match TlsBridge::unpack_handshake(&mut read_buf) {
+                Ok(Some(client_msg)) => {
                     info!("✅ Valid Netrunner ClientHello detected");
-                    break b;
+                    match TlsBridge::wrap_server_hello(&client_msg, &mut session_keys, &ServerProfile::MODERN) {
+                        Ok(sh) => break sh,
+                        Err(e) => {
+                            if e.execute_strategy() == ErrorAction::Redirect {
+                                Self::handle_stealth_fallback(inbound, outbound, buf_snapshot).await;
+                                return Ok(());
+                            }
+                            return Err("ServerHello Generation Failed".into());
+                        }
+                    }
+                }
+                Ok(None) => {
+                    let res = tokio::time::timeout(TLS_HELLO_TIMEOUT, inbound.read_buf(&mut read_buf)).await;
+                    match res {
+                        Ok(Ok(0)) => return Err("Client closed".into()),
+                        Ok(Ok(_)) => continue,
+                        _ => {
+                            warn!("⏰ TLS_HELLO_TIMEOUT reached. Triggering fallback...");
+                            Self::handle_stealth_fallback(inbound, outbound, buf_snapshot).await;
+                            return Ok(());
+                        }
+                    }
                 }
                 Err(e) => {
                     let strategy = e.execute_strategy();
-
-                    // Анализируем контент для принятия решения о фолбэке
-                    if !buf_snapshot.is_empty() {
-                        let first_byte = buf_snapshot[0];
-
-                        // Проверка на стандартный TLS (0x16) или HTTP (G, P, H)
-                        let is_common_web = first_byte == 0x16
-                            || first_byte == b'G'
-                            || first_byte == b'P'
-                            || first_byte == b'H';
-
-                        if is_common_web && strategy != ErrorAction::Wait {
-                            warn!("🕵️ Stealth: Intercepted web traffic (Byte: 0x{:02x}), forcing Redirect", first_byte);
-                            Self::handle_stealth_fallback(
-                                self.conn.inbound,
-                                self.conn.outbound,
-                                buf_snapshot,
-                            )
-                            .await;
-                            return Ok(());
-                        }
+                    if strategy == ErrorAction::Redirect {
+                        Self::handle_stealth_fallback(inbound, outbound, buf_snapshot).await;
                     }
-
-                    match strategy {
-                        ErrorAction::Wait => {
-                            let res = tokio::time::timeout(
-                                TLS_HELLO_TIMEOUT,
-                                self.conn.inbound.read_buf(&mut self.conn.read_buf),
-                            )
-                            .await;
-
-                            match res {
-                                Ok(Ok(0)) => return Err("Client closed".into()),
-                                Ok(Ok(n)) => {
-                                    debug!("Read {} more bytes, retrying handshake...", n);
-                                    continue;
-                                }
-                                _ => {
-                                    warn!("⏰ TLS_HELLO_TIMEOUT reached. Triggering fallback...");
-                                    Self::handle_stealth_fallback(
-                                        self.conn.inbound,
-                                        self.conn.outbound,
-                                        buf_snapshot,
-                                    )
-                                    .await;
-                                    return Ok(());
-                                }
-                            }
-                        }
-                        ErrorAction::Redirect => {
-                            info!("🔀 Strategy is REDIRECT. Switching to stealth fallback...");
-                            Self::handle_stealth_fallback(
-                                self.conn.inbound,
-                                self.conn.outbound,
-                                buf_snapshot,
-                            )
-                            .await;
-                            return Ok(());
-                        }
-                        ErrorAction::Drop => {
-                            // Сюда попадет только реальный мусор, не похожий на TLS/HTTP
-                            error!(
-                                "❌ Strategy is DROP. Suspicious connection terminated. Buf: {:02x?}",
-                                &buf_snapshot
-                            );
-                            return Err("Dropped by security strategy (TLS Phase)".into());
-                        }
-                    }
+                    return Ok(());
                 }
             }
         };
 
         // --- PHASE 2: Send Server Hello ---
-        self.conn
-            .outbound
-            .write_all(&hello)
-            .await
-            .map_err(|e| e.to_string())?;
+        outbound.write_all(&hello).await.map_err(|e| e.to_string())?;
 
-        // --- PHASE 3: Secure Handshake (Auth) ---
+// --- PHASE 3: Secure Handshake & Engine Startup ---
+        let (tx_key, tx_iv, rx_key, rx_iv) = session_keys.get_aead_parameters();
+        let mut cipher = ChaChaCipher::new();
+        cipher.set_keys(tx_key, tx_iv, rx_key, rx_iv);
+
+        let codec = Codec::new(cipher, session_keys.get_auth_key());
+        let (mut rx_codec, tx_codec) = codec.split();
+
         let (session_id, leg_id) = loop {
-            let n = tokio::time::timeout(
-                SECURE_HANDSHAKE_TIMEOUT,
-                self.conn.inbound.read_buf(&mut self.conn.read_buf),
-            )
-            .await
-            .map_err(|_| "Timeout waiting for Handshake".to_string())?
-            .map_err(|e| e.to_string())?;
-
-            if n == 0 {
-                return Err("Client closed connection before Handshake".into());
-            }
-
-            match self.conn.codec.inbound(&mut self.conn.read_buf) {
+            // ✅ ИСПРАВЛЕНИЕ: Теперь мы не игнорируем Err!
+            match rx_codec.decode_inbound(&mut read_buf) {
                 Ok(Some(frame)) => {
                     if frame.header.frame_type == FrameType::Handshake {
-                        let payload_str = String::from_utf8_lossy(&frame.payload).to_string();
-                        let parts: Vec<&str> = payload_str.split(':').collect();
-
+                        let parts: Vec<&str> = std::str::from_utf8(&frame.payload).unwrap_or("").split(':').collect();
                         if parts.len() == 2 {
                             let sid = parts[0].to_string();
                             let lid: u32 = parts[1].parse().unwrap_or(0);
-                            info!(
-                                "🤝 Secure Handshake verified! Session: {}, Leg: {}",
-                                sid, lid
-                            );
+                            info!("🤝 Secure Handshake verified! Session: {}, Leg: {}", sid, lid);
                             break (sid, lid);
                         }
-                        return Err("Invalid Handshake format".into());
                     }
                     return Err("Expected Handshake frame".into());
                 }
-                Ok(None) => continue,
-                Err(e) => {
-                    let buf_snapshot = self.conn.read_buf.clone().freeze();
-                    match e.execute_strategy() {
-                        ErrorAction::Redirect => {
-                            Self::handle_stealth_fallback(
-                                self.conn.inbound,
-                                self.conn.outbound,
-                                buf_snapshot,
-                            )
-                            .await;
-                            return Ok(());
-                        }
-                        _ => return Err("Dropped by security strategy (Auth Phase)".into()),
+                Ok(None) => {
+                    // Ждем новых данных из сети
+                    let n = tokio::time::timeout(SECURE_HANDSHAKE_TIMEOUT, inbound.read_buf(&mut read_buf)).await
+                        .map_err(|_| "Timeout waiting for Handshake")?.map_err(|e| e.to_string())?;
+
+                    if n == 0 { 
+                        return Err("Client closed connection before Handshake".into()); 
                     }
+                }
+                Err(e) => {
+                    // Если криптография сломалась, сразу рвем соединение и логируем
+                    error!("❌ Secure Handshake Failed: {:?}", e);
+                    return Err("Dropped by security strategy (Auth Phase)".into());
                 }
             }
         };
 
         // --- PHASE 4: Engine Startup ---
         let muxer = self.session_manager.get_or_create(&session_id);
-
         let (control_tx, control_rx) = mpsc::channel(NetworkConfig::global().server_muxer_capacity);
         let (data_tx, data_rx) = mpsc::channel(NetworkConfig::global().server_muxer_capacity);
         muxer.add_leg(leg_id, control_tx, data_tx);
 
-        let opener = Arc::new(RemoteOpener {
-            muxer: muxer.clone(),
-        });
+        let opener = Arc::new(RemoteOpener { muxer: muxer.clone() });
         let handler = Arc::new(StreamHandler::new(muxer.clone(), Some(opener)));
 
         let engine = TunnelEngine {
             leg_id,
-            inbound: self.conn.inbound,
-            outbound: self.conn.outbound,
-            codec: self.conn.codec,
-            read_buf: self.conn.read_buf,
+            inbound,
+            outbound,
+            rx_codec,
+            tx_codec,
+            read_buf,
             control_rx,
             data_rx,
             handler,
@@ -603,13 +401,8 @@ impl TunnelHandler for ServerHandler {
         };
 
         let res = engine.run().await;
-
-        // Cleanup
         muxer.remove_leg(leg_id);
-        if muxer.active_legs_count() == 0 {
-            self.session_manager.remove(&session_id);
-        }
-
+        if muxer.active_legs_count() == 0 { self.session_manager.remove(&session_id); }
         res
     }
 }

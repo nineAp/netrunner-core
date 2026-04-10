@@ -3,6 +3,7 @@ use chacha20poly1305::aead::generic_array::GenericArray;
 use chacha20poly1305::{AeadInPlace, ChaCha20Poly1305, Key, KeyInit, Nonce};
 
 use crate::crypto::aead::AeadPacker;
+
 struct NonceState {
     counter: u64,
     base_iv: [u8; 12],
@@ -18,7 +19,6 @@ impl NonceState {
 
     pub fn next_nonce(&mut self) -> Nonce {
         let mut iv = self.base_iv;
-
         let counter_bytes = self.counter.to_be_bytes();
 
         for i in 0..8 {
@@ -30,43 +30,29 @@ impl NonceState {
     }
 }
 
-pub struct ChaChaCipher {
-    encrypt_cipher: ChaCha20Poly1305,
-    decrypt_cipher: ChaCha20Poly1305,
-    encrypt_state: NonceState,
-    decrypt_state: NonceState,
+// Универсальная структура для одного направления трафика (Tx или Rx)
+pub struct ChaChaStream {
+    cipher: ChaCha20Poly1305,
+    state: NonceState,
 }
 
-impl ChaChaCipher {
-    pub fn new() -> Self {
-        let start_key = Key::from([0u8; 32]);
-        let encrypt_cipher = ChaCha20Poly1305::new(&start_key);
-        let decrypt_cipher = ChaCha20Poly1305::new(&start_key);
+impl ChaChaStream {
+    pub fn new(key: &[u8; 32], iv: [u8; 12]) -> Self {
         Self {
-            encrypt_state: NonceState::new([0u8; 12]),
-            decrypt_state: NonceState::new([0u8; 12]),
-            encrypt_cipher,
-            decrypt_cipher,
+            cipher: ChaCha20Poly1305::new(Key::from_slice(key)),
+            state: NonceState::new(iv),
         }
     }
-
-    pub fn set_keys(&mut self, w_key: [u8; 32], w_iv: [u8; 12], r_key: [u8; 32], r_iv: [u8; 12]) {
-        self.encrypt_cipher = ChaCha20Poly1305::new(Key::from_slice(&w_key));
-        self.decrypt_cipher = ChaCha20Poly1305::new(Key::from_slice(&r_key));
-
-        self.encrypt_state = NonceState::new(w_iv);
-        self.decrypt_state = NonceState::new(r_iv);
-
-        netrunner_logger::debug!("Cipher keys and IVs updated for both directions");
-    }
 }
-impl AeadPacker for ChaChaCipher {
+
+// Реализуем трейт AeadPacker для однонаправленного потока
+impl AeadPacker for ChaChaStream {
     fn encrypt(&mut self, data: &mut BytesMut) -> Result<Bytes, chacha20poly1305::aead::Error> {
-        let current_counter = self.encrypt_state.counter;
-        let nonce = self.encrypt_state.next_nonce();
+        let current_counter = self.state.counter;
+        let nonce = self.state.next_nonce();
         let data_len = data.len();
 
-        match self.encrypt_cipher.encrypt_in_place(&nonce, &nonce, data) {
+        match self.cipher.encrypt_in_place(&nonce, &nonce, data) {
             Ok(_) => {
                 netrunner_logger::trace!(
                     counter = current_counter,
@@ -90,11 +76,11 @@ impl AeadPacker for ChaChaCipher {
     }
 
     fn decrypt(&mut self, data: &mut BytesMut) -> Result<Bytes, chacha20poly1305::aead::Error> {
-        let current_counter = self.decrypt_state.counter;
-        let nonce = self.decrypt_state.next_nonce();
+        let current_counter = self.state.counter;
+        let nonce = self.state.next_nonce();
         let data_len = data.len();
 
-        match self.decrypt_cipher.decrypt_in_place(&nonce, &nonce, data) {
+        match self.cipher.decrypt_in_place(&nonce, &nonce, data) {
             Ok(_) => {
                 netrunner_logger::trace!(
                     counter = current_counter,
@@ -121,5 +107,31 @@ impl AeadPacker for ChaChaCipher {
                 Err(e)
             }
         }
+    }
+}
+
+// Контейнер для двух потоков, который легко разделяется
+pub struct ChaChaCipher {
+    pub tx: ChaChaStream,
+    pub rx: ChaChaStream,
+}
+
+impl ChaChaCipher {
+    pub fn new() -> Self {
+        Self {
+            tx: ChaChaStream::new(&[0u8; 32], [0u8; 12]),
+            rx: ChaChaStream::new(&[0u8; 32], [0u8; 12]),
+        }
+    }
+
+    pub fn set_keys(&mut self, w_key: [u8; 32], w_iv: [u8; 12], r_key: [u8; 32], r_iv: [u8; 12]) {
+        self.tx = ChaChaStream::new(&w_key, w_iv);
+        self.rx = ChaChaStream::new(&r_key, r_iv);
+        netrunner_logger::debug!("Cipher keys and IVs updated for both directions");
+    }
+
+    // Возвращает независимые потоки (Rx, Tx) для параллельной работы в Tokio
+    pub fn split(self) -> (ChaChaStream, ChaChaStream) {
+        (self.rx, self.tx)
     }
 }

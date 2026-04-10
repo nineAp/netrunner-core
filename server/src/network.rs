@@ -32,7 +32,7 @@ impl Network {
                         info!("🔌 Connection from {}", client_addr);
 
 
-                        let conn = Connection::new(stream, true);
+                        let conn = Connection::new(stream);
 
 
                         let handler = ServerHandler::new(conn);

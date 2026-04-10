@@ -5,5 +5,5 @@ mod hkdf;
 mod session;
 
 pub(crate) use aead::AeadPacker;
-pub(crate) use chacha::ChaChaCipher;
-pub(crate) use session::SessionKeys;
+pub(crate) use chacha::{ChaChaStream, ChaChaCipher};
+pub(crate) use session::{SessionKeys, SessionAuth};

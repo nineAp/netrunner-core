@@ -13,6 +13,10 @@ type HmacSha256 = Hmac<Sha256>;
 
 use aead::{rand_core::RngCore, OsRng};
 
+// ==========================================
+// 1. HANDSHAKE (Генерация ключей)
+// ==========================================
+
 pub(crate) struct SaltPair {
     local_salt: [u8; 32],
     remote_salt: [u8; 32],
@@ -72,6 +76,10 @@ impl SessionKeys {
     pub(crate) fn get_aead_parameters(&self) -> ([u8; 32], [u8; 12], [u8; 32], [u8; 12]) {
         self.current_aead
             .expect("Keys not generated yet. Call update_keys first.")
+    }
+
+    pub fn get_auth_key(&self) -> [u8; 32] {
+        self.auth_key
     }
 
     pub(crate) fn update_keys(
@@ -139,6 +147,7 @@ impl SessionKeys {
             Err("No KeyShare extension found in handshake".into())
         }
     }
+
     fn generate_keys(
         &mut self,
         public_key: &PublicKey,
@@ -168,7 +177,36 @@ impl SessionKeys {
         Ok(keys)
     }
 
-    fn compute_tag(secret: &[u8], step: u64) -> [u8; 16] {
+    pub(crate) fn local_salt(&self) -> [u8; 32] {
+        self.salt.get_local()
+    }
+
+    pub(crate) fn public_key_bytes(&self) -> [u8; 32] {
+        self.ecdh.public_key.to_bytes()
+    }
+
+    pub(crate) fn auth_key_fingerprint(&self) -> String {
+        hex::encode(&self.auth_key[..4])
+    }
+}
+
+// ==========================================
+// 2. DATA PHASE (Авторизация Кодека)
+// ==========================================
+
+/// Легковесная структура, которая передается в RxCodec и TxCodec 
+/// после завершения Handshake.
+#[derive(Clone, Copy)]
+pub struct SessionAuth {
+    auth_key: [u8; 32],
+}
+
+impl SessionAuth {
+    pub fn new(auth_key: [u8; 32]) -> Self {
+        Self { auth_key }
+    }
+
+    pub fn compute_tag(secret: &[u8], step: u64) -> [u8; 16] {
         let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC error");
         mac.update(&step.to_be_bytes());
         let result = mac.finalize().into_bytes();
@@ -177,16 +215,16 @@ impl SessionKeys {
         tag
     }
 
-    pub(crate) fn generate_auth_tag(&self) -> [u8; 16] {
+    pub fn generate_current_tag(&self) -> [u8; 16] {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
 
-        Self::compute_tag(&self.auth_key, now / 60)
+        Self::compute_tag(&self.auth_key, now / AUTH_TIME_STEP)
     }
 
-    pub(crate) fn verify_auth_tag(&self, received_tag: &[u8; 16]) -> bool {
+    pub fn verify_tag(&self, received_tag: &[u8; 16]) -> bool {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("Time went backwards")
@@ -210,17 +248,5 @@ impl SessionKeys {
             "AUTH MISMATCH: All tags rejected for current window"
         );
         false
-    }
-
-    pub(crate) fn local_salt(&self) -> [u8; 32] {
-        self.salt.get_local()
-    }
-
-    pub(crate) fn public_key_bytes(&self) -> [u8; 32] {
-        self.ecdh.public_key.to_bytes()
-    }
-
-    pub(crate) fn auth_key_fingerprint(&self) -> String {
-        hex::encode(&self.auth_key[..4])
     }
 }

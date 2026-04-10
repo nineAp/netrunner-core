@@ -1,4 +1,4 @@
-use crate::crypto::SessionKeys;
+use crate::crypto::{SessionAuth, SessionKeys};
 use crate::nrxp::errors::{ErrorAction, ErrorStage, TlsError};
 use crate::parser::Parser;
 use crate::tlseng::ExtensionStack;
@@ -69,16 +69,9 @@ impl TlsInterceptor for HandshakeMessage {
                         let ext =
                             ExtensionStack::parse(&mut BytesMut::from(hello.extensions.as_ref()))?
                                 .ok_or_else(|| {
-                                    TlsError::new(
-                                        ErrorStage::Handshake("Ext Err"),
-                                        ErrorAction::Drop,
-                                        Bytes::new(),
-                                    )
+                                    TlsError::new(ErrorStage::Handshake("Ext Err"), ErrorAction::Drop, Bytes::new())
                                 })?;
-                        return Ok(Some(HandshakeMessage::Client {
-                            base: hello,
-                            extensions: ext,
-                        }));
+                        return Ok(Some(HandshakeMessage::Client { base: hello, extensions: ext }));
                     }
                 }
                 HelloType::Server => {
@@ -86,16 +79,9 @@ impl TlsInterceptor for HandshakeMessage {
                         let ext =
                             ExtensionStack::parse(&mut BytesMut::from(hello.extensions.as_ref()))?
                                 .ok_or_else(|| {
-                                    TlsError::new(
-                                        ErrorStage::Handshake("Ext Err"),
-                                        ErrorAction::Drop,
-                                        Bytes::new(),
-                                    )
+                                    TlsError::new(ErrorStage::Handshake("Ext Err"), ErrorAction::Drop, Bytes::new())
                                 })?;
-                        return Ok(Some(HandshakeMessage::Server {
-                            base: hello,
-                            extensions: ext,
-                        }));
+                        return Ok(Some(HandshakeMessage::Server { base: hello, extensions: ext }));
                     }
                 }
             }
@@ -144,63 +130,32 @@ impl TlsBridge {
     ) -> Result<Bytes, TlsError> {
         if let HandshakeMessage::Client { base, extensions } = client_msg {
             if base.session_id.len() != 32 {
-                netrunner_logger::warn!(
-                    "❌ Auth failed: Expected 32 bytes SessionID, got {}. Client IP: ...",
-                    base.session_id.len()
-                );
-                return Err(TlsError::new(
-                    ErrorStage::Handshake("Invalid SessionID len"),
-                    ErrorAction::Drop,
-                    Bytes::new(),
-                ));
+                return Err(TlsError::new(ErrorStage::Handshake("Invalid SessionID len"), ErrorAction::Drop, Bytes::new()));
             }
 
             let mut received_tag = [0u8; 16];
-            if base.session_id.len() >= 32 {
-                received_tag.copy_from_slice(&base.session_id[16..32]);
-            } else {
-                return Err(TlsError::new(
-                    ErrorStage::Handshake("Short SessionID"),
-                    ErrorAction::Drop,
-                    Bytes::new(),
-                ));
-            }
+            received_tag.copy_from_slice(&base.session_id[16..32]);
 
-            if !keys.verify_auth_tag(&received_tag) {
+            // ВАЖНО: Используем SessionAuth для проверки начального тега хендшейка
+            let auth = SessionAuth::new(keys.get_auth_key());
+            if !auth.verify_tag(&received_tag) {
                 netrunner_logger::warn!("Unauthorized ClientHello: Auth Tag mismatch");
-                return Err(TlsError::new(
-                    ErrorStage::Handshake("Auth Failed"),
-                    ErrorAction::Drop,
-                    Bytes::new(),
-                ));
+                return Err(TlsError::new(ErrorStage::Handshake("Auth Failed"), ErrorAction::Drop, Bytes::new()));
             }
 
-            keys.update_keys(base.random, extensions, true)
-                .map_err(|e| {
-                    netrunner_logger::error!(error = %e, "Server failed key update");
-                    TlsError::new(
-                        ErrorStage::Handshake("Key Exchange Failed"),
-                        ErrorAction::Drop,
-                        Bytes::new(),
-                    )
-                })?;
+            keys.update_keys(base.random, extensions, true).map_err(|e| {
+                netrunner_logger::error!(error = %e, "Server failed key update");
+                TlsError::new(ErrorStage::Handshake("Key Exchange Failed"), ErrorAction::Drop, Bytes::new())
+            })?;
 
             let server_pub_key = keys.public_key_bytes();
 
-            Ok(ServerHello::make_server_hello(
-                base,
-                &server_pub_key,
-                keys.local_salt(),
-                profile,
-            ))
+            Ok(ServerHello::make_server_hello(base, &server_pub_key, keys.local_salt(), profile))
         } else {
-            Err(TlsError::new(
-                ErrorStage::Handshake("Expected ClientHello for SH generation"),
-                ErrorAction::Drop,
-                Bytes::new(),
-            ))
+            Err(TlsError::new(ErrorStage::Handshake("Expected ClientHello"), ErrorAction::Drop, Bytes::new()))
         }
     }
+    
     pub fn pack_app_data(buffer: Bytes) -> Bytes {
         TlsRecord::build_application_data(buffer)
     }
