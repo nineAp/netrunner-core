@@ -165,11 +165,6 @@ impl TcpConnection {
 
         if !self.server_eof {
             loop {
-                // Если буфер сокета заполнился, нет смысла выкачивать канал MPSC
-                if !socket.can_send() {
-                    break;
-                }
-
                 match self.core.rx.try_recv() {
                     Ok(data) => {
                         self.pending_data.push_back(data);
