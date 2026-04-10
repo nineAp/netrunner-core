@@ -49,13 +49,13 @@ impl NetworkConfig {
             client_muxer_capacity: 8,
             client_tun_capacity: 16,
             client_stream_capacity: 16,
-            client_virtual_stream_capacity: 8,
+            client_virtual_stream_capacity: 128,
 
             server_muxer_capacity: 64,  // Кардинально режем
             server_stream_capacity: 32,
 
             // 🔥 Расширяем TCP окна под BBR (Разблокируем Gigabit на дальние дистанции)
-            tcp_rx_heavy: 64 * 1024, //64KB
+            tcp_rx_heavy: 512 * 1024, //512
             tcp_tx_heavy: 1 * 1024 * 1024, // 1 MB
 
             tcp_rx_light: 16 * 1024,

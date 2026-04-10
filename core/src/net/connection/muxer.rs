@@ -29,6 +29,21 @@ struct MuxLeg {
     stats: Arc<LegStats>,
 }
 
+impl MuxLeg {
+    /// Возвращает коэффициент загруженности очереди (0.0 - пуста, 1.0 - полна)
+    fn congestion_factor(&self) -> f64 {
+        let cap = self.data_tx.capacity() as f64;
+        let max = crate::net::NetworkConfig::global().client_muxer_capacity as f64;
+        
+        // Защита от деления на ноль, если конфигурация задана криво
+        if max <= 0.0 {
+            return 0.0;
+        }
+        
+        1.0 - (cap / max)
+    }
+}
+
 struct IdGenerator {
     counter: AtomicU32,
 }
@@ -57,7 +72,6 @@ pub struct Muxer {
     legs: Arc<DashMap<u32, MuxLeg>>,
     streams: Arc<DashMap<u32, (Sender<Bytes>, Arc<StreamStats>)>>,
     stream_bindings: Arc<DashMap<u32, u32>>,
-    // 🚨 Добавляем сюда:
     pending_pings: Arc<DashMap<u32, Instant>>,
     id_gen: Arc<IdGenerator>,
     session_id: Arc<String>,
@@ -100,8 +114,7 @@ impl Muxer {
     pub fn remove_leg(&self, leg_id: u32) {
         self.legs.remove(&leg_id);
         // Удаляем все привязки стримов к этой ноге, чтобы они перебалансировались
-        self.stream_bindings
-            .retain(|_, target_leg| *target_leg != leg_id);
+        self.stream_bindings.retain(|_, target_leg| *target_leg != leg_id);
         info!(leg_id, "MUXER: Leg removed and bindings cleared");
     }
 
@@ -142,14 +155,15 @@ impl Muxer {
                 .collect();
         }
 
-        // Сортируем по RTT (Health Check записывает сюда данные)
-        candidates.sort_by_key(|(_, leg)| {
-            let rtt = leg.stats.rtt_ms.load(Ordering::Relaxed);
-            if rtt == 0 {
-                9999
-            } else {
-                rtt
-            }
+        // 🔥 Умная балансировка: RTT + Штраф за забитость канала
+        candidates.sort_by(|(_, leg_a), (_, leg_b)| {
+            let rtt_a = leg_a.stats.rtt_ms.load(Ordering::Relaxed) as f64;
+            let rtt_b = leg_b.stats.rtt_ms.load(Ordering::Relaxed) as f64;
+            
+            let score_a = rtt_a + (leg_a.congestion_factor() * 500.0);
+            let score_b = rtt_b + (leg_b.congestion_factor() * 500.0);
+            
+            score_a.partial_cmp(&score_b).unwrap_or(std::cmp::Ordering::Equal)
         });
 
         let pool_size = std::cmp::min(candidates.len(), MUXER_POOL_SIZE);
@@ -175,7 +189,6 @@ impl Muxer {
             let rtt = start_time.elapsed().as_millis() as u32;
 
             if let Some(leg) = self.legs.get(&leg_id) {
-                // Обновляем атомик, который потом прочитает принт топологии
                 leg.stats.rtt_ms.store(rtt, Ordering::Relaxed);
                 trace!(leg_id, rtt, "💓 [Muxer] RTT updated for leg");
             }
@@ -190,9 +203,6 @@ impl Muxer {
             .select_leg(&message.frame_type, stream_id)
             .ok_or_else(|| "MUXER: No active legs available".to_string())?;
 
-        // Используем обычный .await для всех типов кадров.
-        // Это гарантирует, что пакет попадет в очередь ноги, но может притормозить цикл Engine,
-        // если очередь физического соединения переполнена.
         let target_tx = match message.frame_type {
             FrameType::Connect
             | FrameType::Close
@@ -201,15 +211,14 @@ impl Muxer {
             _ => leg.data_tx.clone(),
         };
 
-        if let Err(_) = target_tx.send(message).await {
+        if target_tx.send(message).await.is_err() {
             self.remove_leg(leg_id);
             return Err(format!("MUXER: Leg {} died during send", leg_id));
         }
 
-        // Обновляем статистику
         leg.stats.tx_bytes.fetch_add(size, Ordering::Relaxed);
         if let Some(stream_ref) = self.streams.get(&stream_id) {
-            stream_ref.1.tx_bytes.fetch_add(size, Ordering::Relaxed);
+            stream_ref.value().1.tx_bytes.fetch_add(size, Ordering::Relaxed);
         }
 
         Ok(())
@@ -250,32 +259,25 @@ impl Muxer {
     }
 
     pub fn register_stream(&self, stream_id: u32, tx: Sender<Bytes>) {
-        self.streams
-            .insert(stream_id, (tx, Arc::new(StreamStats::default())));
+        self.streams.insert(stream_id, (tx, Arc::new(StreamStats::default())));
     }
 
     pub fn remove_stream(&self, stream_id: u32) {
         self.streams.remove(&stream_id);
-        self.stream_bindings.remove(&stream_id); // Чистим привязку
+        self.stream_bindings.remove(&stream_id);
         trace!(stream_id, "MUXER: Stream and bindings removed");
     }
 
     pub async fn dispatch_to_local(&self, stream_id: u32, data: Bytes) {
-        let stream_opt = self
-            .streams
-            .get(&stream_id)
-            .map(|s| (s.0.clone(), s.1.clone()));
+        let stream_opt = self.streams.get(&stream_id).map(|s| (s.value().0.clone(), s.value().1.clone()));
 
         if let Some((tx, stats)) = stream_opt {
             let size = data.len() as u64;
 
-            match tx.send(data).await {
-                Ok(_) => {
-                    stats.rx_bytes.fetch_add(size, Ordering::Relaxed);
-                }
-                Err(_) => {
-                    self.remove_stream(stream_id);
-                }
+            if tx.send(data).await.is_ok() {
+                stats.rx_bytes.fetch_add(size, Ordering::Relaxed);
+            } else {
+                self.remove_stream(stream_id);
             }
         }
     }

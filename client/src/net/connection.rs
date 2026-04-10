@@ -165,6 +165,12 @@ impl TcpConnection {
 
         if !self.server_eof {
             loop {
+
+                let pending_size: usize = self.pending_data.iter().map(|b| b.len()).sum();
+                if pending_size >= 4 * NetworkConfig::global().mtu {
+                    break;
+                }
+
                 match self.core.rx.try_recv() {
                     Ok(data) => {
                         self.pending_data.push_back(data);

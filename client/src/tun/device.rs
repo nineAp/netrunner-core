@@ -79,9 +79,8 @@ impl DerefMut for TokenBuffer {
 
 pub struct VirtTunDevice {
     capabilities: DeviceCapabilities,
-    // 🔥 ФИКС: Используем ограниченные каналы вместо Unbounded
-    rx_queue: mpsc::Receiver<TokenBuffer>,
-    tx_queue: mpsc::Sender<TokenBuffer>,
+    rx_queue: mpsc::Receiver<TokenBuffer>, // Входящие из TUN оставляем ограниченными (Backpressure)
+    tx_queue: mpsc::UnboundedSender<TokenBuffer>, // 🔥 ФИКС: Исходящие в TUN делаем БЕЗЛИМИТНЫМИ
     rx_avail: Arc<AtomicBool>,
 
     rx_bytes: u64,
@@ -104,12 +103,11 @@ impl VirtTunDevice {
     ) -> (
         Self,
         mpsc::Sender<TokenBuffer>,
-        mpsc::Receiver<TokenBuffer>,
+        mpsc::UnboundedReceiver<TokenBuffer>,
         Arc<AtomicBool>,
     ) {
-        // 🔥 ФИКС: Ограничиваем очередь физики до 128 пакетов
         let (to_smoltcp_tx, to_smoltcp_rx) = mpsc::channel(128);
-        let (from_smoltcp_tx, from_smoltcp_rx) = mpsc::channel(128);
+        let (from_smoltcp_tx, from_smoltcp_rx) = mpsc::unbounded_channel(); // 🔥 Безлимитный канал
         let rx_avail = Arc::new(AtomicBool::new(false));
 
         let now = StdInstant::now();
@@ -250,9 +248,8 @@ impl phy::TxToken for VirtTxToken<'_> {
         GLOBAL_RX_BYTES.fetch_add(len as u64, Ordering::Relaxed);
         GLOBAL_RX_PACKETS.fetch_add(1, Ordering::Relaxed);
 
-        // 🔥 ФИКС: Используем try_send. Если буфер полон (сеть тормозит), дропаем пакет!
-        // Это сигнализирует TCP-стеку об ограничении канала.
-        let _ = self.0.tx_queue.try_send(buffer);
+        // 🔥 ФИКС: Отправляем в безлимитный канал. Никаких дропов внутри локальной машины!
+        let _ = self.0.tx_queue.send(buffer);
         result
     }
 }

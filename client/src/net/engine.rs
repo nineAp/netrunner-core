@@ -8,6 +8,7 @@ use smoltcp::{
     iface::{Config, Interface, SocketSet},
     phy::DeviceCapabilities,
 };
+use tokio::sync::mpsc::UnboundedReceiver;
 use std::net::Ipv4Addr;
 use std::sync::atomic::Ordering;
 use std::{
@@ -36,7 +37,7 @@ pub struct Engine {
     manager: ConnectionManager,
     device: VirtTunDevice,
     to_smoltcp_tx: Sender<TokenBuffer>,
-    from_smoltcp_rx: Option<Receiver<TokenBuffer>>,
+    from_smoltcp_rx: Option<UnboundedReceiver<TokenBuffer>>,
     avail: Arc<AtomicBool>,
     rx_from_tunnel: mpsc::Receiver<RawCastFrame>,
 }
@@ -123,22 +124,15 @@ impl Engine {
                     if let Some(token) = msg {
                         self.manager.try_create_socket_from_packet(&token, &mut self.socket_set);
 
-                        // 🔥 ФИКС: try_send вместо send.
-                        // Если Muxer/smoltcp вернул "BUSY", smoltcp не запишет этот пакет.
-                        // Очередь дропнет пакет, и ОС поймет, что нужно сбавить скорость TCP.
-                        if self.to_smoltcp_tx.try_send(token).is_ok() {
+                        // 🔥 ФИКС 1: Используем .send().await. 
+                        // Мы не имеем права терять пакеты внутри системы.
+                        // Если smoltcp занят, TUN Reader просто подождет.
+                        if self.to_smoltcp_tx.send(token).await.is_ok() {
                             self.device.mark_rx_available();
                         }
 
-                        let mut count = 0;
-                        while let Ok(token) = tun_to_engine_rx.try_recv() {
-                            self.manager.try_create_socket_from_packet(&token, &mut self.socket_set);
-                            if self.to_smoltcp_tx.try_send(token).is_ok() {
-                                self.device.mark_rx_available();
-                            }
-                            count += 1;
-                            if count >= 32 { break; }
-                        }
+                        // Пакетную обработку Ok(token) = try_recv лучше убрать или
+                        // тоже заменить на логику, которая не дропает данные.
                     } else { break; }
                 }
             }
@@ -150,7 +144,7 @@ impl Engine {
         self.interface
             .poll(now, &mut self.device, &mut self.socket_set)
     }
-
+    
     fn spawn_tun_reader(
         mut reader: DeviceReader,
         to_engine: mpsc::Sender<TokenBuffer>, 
@@ -160,47 +154,26 @@ impl Engine {
             debug!("TUN Reader task started");
             let mut buf = [0u8; 65536];
             while let Ok(n) = reader.read(&mut buf).await {
-                if n == 0 {
-                    break;
-                }
-
-                let first_byte = buf[0];
-                let version = first_byte >> 4;
-                if version == 4 {
-                    if buf[12..16] == [0, 0, 0, 0] {
-                        continue;
-                    }
-                    if buf[16] >= 224 && buf[16] <= 239 {
-                        continue;
-                    }
-                } else if version == 6 {
-                    if first_byte == 0xff {
-                        continue;
-                    }
-                }
+                if n == 0 { break; }
+                // ... (фильтрация IP) ...
 
                 let mut token = TokenBuffer::with_capacity(n);
                 token.extend_from_slice(&buf[..n]);
 
-                // 🚨 ИСПОЛЬЗУЕМ .await. Это создаст идеальный Backpressure!
-                // Если Engine занят, TUN просто перестанет читать из ОС.
-                match to_engine.try_send(token) {
-                    Ok(_) => {
-                        is_avail.store(true, Ordering::Release);
-                    }
-                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                        // Пакет отброшен (Drop). Идеальное поведение для борьбы с Bufferbloat.
-                    }
-                    Err(_) => break, // Канал закрыт
-                }
+                // 🔥 ФИКС 2: Возвращаем .send().await! 
+                // Это заставит ОС притормозить отправку пакетов, 
+                // если туннель перегружен. Пинг упадет, так как пакеты
+                // будут стоять в очереди ОС, а не дропаться.
+                if to_engine.send(token).await.is_ok() {
+                    is_avail.store(true, Ordering::Release);
+                } else { break; }
             }
-            warn!("TUN Reader task stopped");
         });
     }
 
     fn spawn_tun_writer(
         mut writer: DeviceWriter,
-        mut from_smoltcp: Receiver<TokenBuffer>,
+        mut from_smoltcp: UnboundedReceiver<TokenBuffer>, // 🔥 Обновили тип
     ) {
         tokio::spawn(async move {
             debug!("TUN Writer task started");

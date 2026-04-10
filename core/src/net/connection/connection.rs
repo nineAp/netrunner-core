@@ -13,6 +13,7 @@ use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use netrunner_logger::{debug, error, info, warn};
 use rand::Rng;
+use socket2::{Domain, Protocol, Socket, Type};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{
@@ -84,33 +85,51 @@ impl ClientHandler {
         session_id: &str,
     ) -> Result<(), String> {
         let leg_name = if leg_id % 2 == 0 { "TCP-Leg" } else { "UDP-Leg" };
-        info!("Establishing dedicated {} (ID: {}) to {}...", leg_name, leg_id, remote_proxy_addr);
-
+        
         let mut addrs = tokio::net::lookup_host(remote_proxy_addr)
             .await
             .map_err(|e| format!("DNS resolution failed: {}", e))?;
-
         let addr = addrs.next().ok_or_else(|| format!("No IPs found for {}", remote_proxy_addr))?;
 
-        let socket = if addr.is_ipv4() {
-            tokio::net::TcpSocket::new_v4().map_err(|e| e.to_string())?
-        } else {
-            tokio::net::TcpSocket::new_v6().map_err(|e| e.to_string())?
-        };
+        // --- Шаг 1: Создание сырого сокета через socket2 ---
+        let domain = if addr.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 };
+        let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))
+            .map_err(|e| e.to_string())?;
 
-       
-        let stream = socket.connect(addr).await.map_err(|e| format!("Connect failed: {}", e))?;
-        let _ = stream.set_nodelay(true);
+        // --- Шаг 2: Настройка кроссплатформенных опций ---
+        socket.set_nonblocking(true).map_err(|e| e.to_string())?;
+        socket.set_nodelay(true).map_err(|e| e.to_string())?;
+
+        // 🔥 Шаг 3: Установка TCP_NOTSENT_LOWAT через libc (Linux, Android, iOS, macOS)
+        #[cfg(any(target_os = "linux", target_os = "android", target_os = "ios", target_os = "macos"))]
+        unsafe {
+            use std::os::fd::AsRawFd;
+
+            let lowat: libc::c_int = 16384; // 16 КБ
+            let ret = libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::IPPROTO_TCP,
+                libc::TCP_NOTSENT_LOWAT,
+                &lowat as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+            if ret != 0 {
+                warn!("Could not set TCP_NOTSENT_LOWAT: {}", std::io::Error::last_os_error());
+            }
+        }
+
+        // --- Шаг 4: Подключение и конвертация в TcpStream для Tokio ---
+        let _ = socket.connect(&addr.into()); 
+        let std_stream: std::net::TcpStream = socket.into();
+        let stream = TcpStream::from_std(std_stream).map_err(|e| e.to_string())?;
+        
         let mut conn = Connection::new(stream);
-
-        // --- 1. TLS Handshake Phase ---
         let mut session_keys = SessionKeys::new(true);
         let ch = TlsBridge::wrap_client_hello(&BrowserProfile::CHROME_131, "ubuntu.com", &session_keys);
 
         conn.outbound.write_all(&ch).await.map_err(|e| e.to_string())?;
 
         loop {
-            // Проверяем, есть ли уже ServerHello в буфере
             match TlsBridge::unpack_handshake(&mut conn.read_buf) {
                 Ok(Some(msg)) => {
                     session_keys.update_keys(msg.random(), msg.extensions(), false)
@@ -125,29 +144,22 @@ impl ClientHandler {
             }
         }
 
-        info!("{} TLS Handshake complete.", leg_name);
-
-        // --- 2. Data Phase Initialization ---
         let (tx_key, tx_iv, rx_key, rx_iv) = session_keys.get_aead_parameters();
         let mut cipher = ChaChaCipher::new();
         cipher.set_keys(tx_key, tx_iv, rx_key, rx_iv);
-
-        // Забираем остатки из хендшейка в новый кодек
         let codec = Codec::new(cipher, session_keys.get_auth_key());
         let (rx_codec, mut tx_codec) = codec.split();
 
-        // --- 3. Encrypted Handshake ---
         let handshake_payload = Bytes::from(format!("{}:{}", session_id, leg_id));
         let encrypted_handshake = tx_codec.encode_frame(0, FrameType::Handshake, handshake_payload)
             .map_err(|e| format!("Failed to encrypt Handshake: {:?}", e))?;
-
         conn.outbound.write_all(&encrypted_handshake).await.map_err(|e| e.to_string())?;
 
         let (control_tx, control_rx) = mpsc::channel(NetworkConfig::global().client_muxer_capacity);
         let (data_tx, data_rx) = mpsc::channel(NetworkConfig::global().client_muxer_capacity);
         muxer.add_leg(leg_id, control_tx, data_tx);
+        
         let handler = Arc::new(StreamHandler::new(muxer.clone(), None));
-
         let engine = TunnelEngine {
             leg_id,
             inbound: conn.inbound,
@@ -160,7 +172,6 @@ impl ClientHandler {
             handler,
             muxer: muxer.clone(),
         };
-
         engine.run().await.map_err(|e| e.to_string())?;
         Err(format!("{} Engine stopped", leg_name))
     }
@@ -171,10 +182,9 @@ impl ClientHandler {
         tx_to_engine: mpsc::Sender<RawCastFrame>,
     ) -> Result<(), String> {
         let session_id = SessionManager::generate_id();
-        info!("🔑 Generated Master Session ID: {}", session_id);
         let muxer = Arc::new(Muxer::new(true, session_id.clone()));
-        let registry: Arc<DashMap<u32, StreamContext>> = Arc::new(DashMap::new());
-        let local_to_global: Arc<DashMap<u32, u32>> = Arc::new(DashMap::new());
+        let registry: Arc<DashMap<u32, (u64, Ipv4Addr, u16, LocalProtocol)>> = Arc::new(DashMap::new());
+        let local_to_global: Arc<DashMap<u64, u32>> = Arc::new(DashMap::new());
 
         for id in 0..MAX_TUNNEL_LEGS {
             let addr = remote_proxy_addr.to_string();
@@ -204,13 +214,8 @@ impl ClientHandler {
         let muxer_inner = muxer.clone();
         tokio::spawn(async move {
             while let Some(raw_frame) = rx_from_engine.recv().await {
-                let dst_ip = raw_frame.dst_ip;
-                let dst_port = raw_frame.dst_port;
-                let protocol = raw_frame.protocol;
-                let is_udp = protocol == LocalProtocol::Udp;
-
-                if let Ok(nrxp_frame) = RawCastAdapter::to_nrxp(raw_frame) {
-                    let local_socket_id = nrxp_frame.header.stream_id;
+                if let Ok(nrxp_frame) = RawCastAdapter::to_nrxp(raw_frame.clone()) {
+                    let local_socket_id = raw_frame.socket_id;
                     let f_type = nrxp_frame.header.frame_type;
                     let payload = nrxp_frame.payload;
 
@@ -218,19 +223,19 @@ impl ClientHandler {
                         FrameType::Connect | FrameType::UdpConnect => {
                             let global_stream_id = muxer_inner.next_stream_id();
                             local_to_global.insert(local_socket_id, global_stream_id);
-                            registry.insert(global_stream_id, (local_socket_id, dst_ip, dst_port, protocol));
+                            registry.insert(global_stream_id, (local_socket_id, raw_frame.dst_ip, raw_frame.dst_port, raw_frame.protocol));
 
                             let (v_tx, mut v_rx) = mpsc::channel(NetworkConfig::global().client_stream_capacity);
                             muxer_inner.register_stream(global_stream_id, v_tx);
 
                             let tx_to_tun = tx_to_engine.clone();
                             let reg = registry.clone();
-
                             tokio::spawn(async move {
                                 while let Some(back_payload) = v_rx.recv().await {
-                                    if let Some((orig_local_id, ip, port, proto)) = reg.get(&global_stream_id).map(|r| *r) {
+                                    if let Some(r) = reg.get(&global_stream_id) {
+                                        let (orig_local_id, ip, port, proto) = *r;
                                         let out_f_type = if proto == LocalProtocol::Udp { FrameType::UdpData } else { FrameType::Data };
-                                        let mock_nrxp = Frame::new(orig_local_id, out_f_type, back_payload);
+                                        let mock_nrxp = Frame::new(orig_local_id as u32, out_f_type, back_payload);
                                         if let Ok(raw) = RawCastAdapter::from_nrxp(mock_nrxp, ip, port, proto == LocalProtocol::Udp) {
                                             let _ = tx_to_tun.send(raw).await;
                                         }
@@ -240,12 +245,13 @@ impl ClientHandler {
                             let _ = muxer_inner.send_control(global_stream_id, f_type, payload).await;
                         }
                         FrameType::Data | FrameType::UdpData => {
-                            if let Some(id) = local_to_global.get(&local_socket_id).map(|r| *r) {
-                                let _ = muxer_inner.send_data_safe(id, payload, is_udp).await;
+                            if let Some(id) = local_to_global.get(&local_socket_id) {
+                                let _ = muxer_inner.send_data_safe(*id, payload, raw_frame.protocol == LocalProtocol::Udp).await;
                             }
                         }
                         FrameType::Close => {
-                            if let Some((_, global_stream_id)) = local_to_global.remove(&local_socket_id) {
+                            if let Some(kv) = local_to_global.remove(&local_socket_id) {
+                                let global_stream_id = kv.1;
                                 let _ = muxer_inner.send_control(global_stream_id, FrameType::Close, Bytes::new()).await;
                                 muxer_inner.remove_stream(global_stream_id);
                                 registry.remove(&global_stream_id);
@@ -260,7 +266,6 @@ impl ClientHandler {
         Ok(())
     }
 }
-
 pub struct ServerHandler {
     pub(crate) conn: Connection,
     pub(crate) session_manager: Arc<SessionManager>,

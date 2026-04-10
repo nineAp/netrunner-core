@@ -203,7 +203,6 @@ impl TunnelEngine {
                 error!(stream_id, error = %e, "Failed to write encrypted data to network");
                 e.to_string()
             })?;
-            tokio::task::yield_now().await;
         }
 
         debug!(stream_id, "Outbound packet sent successfully");
