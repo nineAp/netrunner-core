@@ -15,7 +15,7 @@ use std::{
     time::Instant as StdInstant,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::time::{Duration, sleep};
 use tun::{DeviceReader, DeviceWriter};
 
@@ -35,8 +35,8 @@ pub struct Engine {
     socket_set: SocketSet<'static>,
     manager: ConnectionManager,
     device: VirtTunDevice,
-    to_smoltcp_tx: UnboundedSender<TokenBuffer>,
-    from_smoltcp_rx: Option<UnboundedReceiver<TokenBuffer>>,
+    to_smoltcp_tx: Sender<TokenBuffer>,
+    from_smoltcp_rx: Option<Receiver<TokenBuffer>>,
     avail: Arc<AtomicBool>,
     rx_from_tunnel: mpsc::Receiver<RawCastFrame>,
 }
@@ -83,6 +83,7 @@ impl Engine {
 
         let from_smoltcp_rx = self.from_smoltcp_rx.take().expect("Engine started twice");
         Self::spawn_tun_writer(writer, from_smoltcp_rx);
+        
         loop {
             // 1. Сначала обрабатываем всё, что накопилось в стеке
             let mut repeat_poll = true;
@@ -122,16 +123,17 @@ impl Engine {
                     if let Some(token) = msg {
                         self.manager.try_create_socket_from_packet(&token, &mut self.socket_set);
 
-                        // Если Muxer вернул "BUSY", smoltcp не запишет этот пакет,
-                        // и mark_rx_available не сработает. Это ПРАВИЛЬНО.
-                        if self.to_smoltcp_tx.send(token).is_ok() {
+                        // 🔥 ФИКС: try_send вместо send.
+                        // Если Muxer/smoltcp вернул "BUSY", smoltcp не запишет этот пакет.
+                        // Очередь дропнет пакет, и ОС поймет, что нужно сбавить скорость TCP.
+                        if self.to_smoltcp_tx.try_send(token).is_ok() {
                             self.device.mark_rx_available();
                         }
 
                         let mut count = 0;
                         while let Ok(token) = tun_to_engine_rx.try_recv() {
                             self.manager.try_create_socket_from_packet(&token, &mut self.socket_set);
-                            if self.to_smoltcp_tx.send(token).is_ok() {
+                            if self.to_smoltcp_tx.try_send(token).is_ok() {
                                 self.device.mark_rx_available();
                             }
                             count += 1;
@@ -151,7 +153,7 @@ impl Engine {
 
     fn spawn_tun_reader(
         mut reader: DeviceReader,
-        to_engine: mpsc::Sender<TokenBuffer>, // 👈 ИЗМЕНЕНО ЗДЕСЬ
+        to_engine: mpsc::Sender<TokenBuffer>, 
         is_avail: Arc<AtomicBool>,
     ) {
         tokio::spawn(async move {
@@ -181,19 +183,24 @@ impl Engine {
                 token.extend_from_slice(&buf[..n]);
 
                 // 🚨 ИСПОЛЬЗУЕМ .await. Это создаст идеальный Backpressure!
-                // Если Engine занят, TUN просто перестанет читать из ОС телефона!
-                if to_engine.send(token).await.is_ok() {
-                    is_avail.store(true, Ordering::Release);
-                } else {
-                    break;
+                // Если Engine занят, TUN просто перестанет читать из ОС.
+                match to_engine.try_send(token) {
+                    Ok(_) => {
+                        is_avail.store(true, Ordering::Release);
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        // Пакет отброшен (Drop). Идеальное поведение для борьбы с Bufferbloat.
+                    }
+                    Err(_) => break, // Канал закрыт
                 }
             }
             warn!("TUN Reader task stopped");
         });
     }
+
     fn spawn_tun_writer(
         mut writer: DeviceWriter,
-        mut from_smoltcp: UnboundedReceiver<TokenBuffer>,
+        mut from_smoltcp: Receiver<TokenBuffer>,
     ) {
         tokio::spawn(async move {
             debug!("TUN Writer task started");

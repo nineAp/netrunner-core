@@ -35,27 +35,31 @@ pub struct NetworkConfig {
 }
 
 impl NetworkConfig {
+
     pub fn new(system_mtu: usize) -> Self {
         Self {
             mtu: system_mtu,
-            tcp_buffer_size: 8 * 1024,
+            tcp_buffer_size: 64 * 1024,  // Для чтения из физического сокета (нормально)
             udp_buffer_size: 64 * 1024,
 
-            tcp_chunk_size: 16 * 1024,
+            tcp_chunk_size: 4 * 1024,  // Оставляем 16 КБ
 
-            client_muxer_capacity: 32,
+            // 🔥 Зажимаем программные очереди (Убиваем Hidden Bloat)
+
+            client_muxer_capacity: 8,
             client_tun_capacity: 16,
             client_stream_capacity: 16,
             client_virtual_stream_capacity: 8,
 
-            server_muxer_capacity: 128,
+            server_muxer_capacity: 64,  // Кардинально режем
             server_stream_capacity: 32,
 
-            tcp_rx_heavy: 256 * 1024, //download
-            tcp_tx_heavy: 128 * 1024, //upload
+            // 🔥 Расширяем TCP окна под BBR (Разблокируем Gigabit на дальние дистанции)
+            tcp_rx_heavy: 64 * 1024, //64KB
+            tcp_tx_heavy: 1 * 1024 * 1024, // 1 MB
 
-            tcp_rx_light: 64 * 1024, //download
-            tcp_tx_light: 64 * 1024, //upload
+            tcp_rx_light: 16 * 1024,
+            tcp_tx_light: 64 * 1024,
 
             udp_buf_heavy: 256 * 1024,
             udp_meta_heavy: 512,

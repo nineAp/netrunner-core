@@ -87,21 +87,26 @@ impl SocketProvider for SmolSocketFactory {
     }
 
     fn reconfigure_tcp(&self, socket: &mut tcp::Socket, profile: TrafficProfile) {
+        // Выключаем Nagle везде, так как внутри Netrunner мы сами батчим данные в чанки (tcp_chunk_size),
+        // а BBR сам управляет плавностью отправки (Pacing). Nagle здесь будет только мешать.
+        socket.set_nagle_enabled(false);
+
         match profile {
-            TrafficProfile::Interactive => {
-                socket.set_nagle_enabled(false);
+            TrafficProfile::Interactive | TrafficProfile::Dns => {
+                // Для интерактивного трафика (SSH, RDP, DNS) нам нужна минимальная задержка.
+                // Отвечаем ACK'ами мгновенно.
                 socket.set_ack_delay(None);
             }
-            TrafficProfile::Bulk => {
-                socket.set_nagle_enabled(false);
-                socket.set_ack_delay(Some(Duration::from_millis(15)));
-            }
-            _ => {
-                socket.set_nagle_enabled(false);
-                socket.set_ack_delay(None);
+            TrafficProfile::Bulk | TrafficProfile::Default => {
+                // Для тяжелого трафика ставим крошечный delay (1 мс). 
+                // Это снизит нагрузку на CPU (будет меньше syscall-ов на отправку голых ACK),
+                // но при этом 1 мс не испортит расчеты RTT и RateSample для BBR.
+                socket.set_ack_delay(Some(Duration::from_millis(1)));
             }
         }
-        socket.set_congestion_control(CongestionControl::Cubic);
+        
+        // Включаем нашу ракету
+        socket.set_congestion_control(CongestionControl::Bbr);
     }
 
     fn create_udp(&self, profile: TrafficProfile) -> udp::Socket<'static> {

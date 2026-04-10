@@ -79,8 +79,9 @@ impl DerefMut for TokenBuffer {
 
 pub struct VirtTunDevice {
     capabilities: DeviceCapabilities,
-    rx_queue: mpsc::UnboundedReceiver<TokenBuffer>,
-    tx_queue: mpsc::UnboundedSender<TokenBuffer>,
+    // 🔥 ФИКС: Используем ограниченные каналы вместо Unbounded
+    rx_queue: mpsc::Receiver<TokenBuffer>,
+    tx_queue: mpsc::Sender<TokenBuffer>,
     rx_avail: Arc<AtomicBool>,
 
     rx_bytes: u64,
@@ -102,16 +103,16 @@ impl VirtTunDevice {
         capabilities: DeviceCapabilities,
     ) -> (
         Self,
-        mpsc::UnboundedSender<TokenBuffer>,
-        mpsc::UnboundedReceiver<TokenBuffer>,
+        mpsc::Sender<TokenBuffer>,
+        mpsc::Receiver<TokenBuffer>,
         Arc<AtomicBool>,
     ) {
-        let (to_smoltcp_tx, to_smoltcp_rx) = mpsc::unbounded_channel();
-        let (from_smoltcp_tx, from_smoltcp_rx) = mpsc::unbounded_channel();
+        // 🔥 ФИКС: Ограничиваем очередь физики до 128 пакетов
+        let (to_smoltcp_tx, to_smoltcp_rx) = mpsc::channel(128);
+        let (from_smoltcp_tx, from_smoltcp_rx) = mpsc::channel(128);
         let rx_avail = Arc::new(AtomicBool::new(false));
 
         let now = StdInstant::now();
-
         let device = Self {
             capabilities,
             rx_queue: to_smoltcp_rx,
@@ -131,7 +132,6 @@ impl VirtTunDevice {
 
             last_log_time: now,
         };
-
         (device, to_smoltcp_tx, from_smoltcp_rx, rx_avail)
     }
 
@@ -168,10 +168,8 @@ impl VirtTunDevice {
 
     fn check_and_log_stats(&mut self) {
         let now = StdInstant::now();
-
         if now.duration_since(self.last_log_time).as_secs() >= 5 {
             let stats = self.get_stats();
-
             info!(
                 "TunDevice Traffic: RX: {:.2} MB ({} pkts) | TX: {:.2} MB ({} pkts) | Speed: ↓{:.2} MB/s, ↑{:.2} MB/s",
                 stats.rx_bytes as f64 / 1_048_576.0,
@@ -181,7 +179,6 @@ impl VirtTunDevice {
                 stats.rx_speed_mb_s,
                 stats.tx_speed_mb_s
             );
-
             self.last_log_time = now;
         }
     }
@@ -193,7 +190,6 @@ impl Device for VirtTunDevice {
 
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         self.check_and_log_stats();
-
         if let Ok(buffer) = self.rx_queue.try_recv() {
             let len = buffer.len() as u64;
             self.rx_bytes += buffer.len() as u64;
@@ -201,7 +197,6 @@ impl Device for VirtTunDevice {
 
             GLOBAL_TX_BYTES.fetch_add(len as u64, Ordering::Relaxed);
             GLOBAL_TX_PACKETS.fetch_add(1, Ordering::Relaxed);
-
             let rx = Self::RxToken {
                 buffer,
                 phantom_device: PhantomData,
@@ -237,7 +232,6 @@ impl phy::RxToken for VirtRxToken<'_> {
 }
 
 pub struct VirtTxToken<'a>(&'a mut VirtTunDevice);
-
 impl phy::TxToken for VirtTxToken<'_> {
     fn consume<R, F>(self, len: usize, f: F) -> R
     where
@@ -256,8 +250,9 @@ impl phy::TxToken for VirtTxToken<'_> {
         GLOBAL_RX_BYTES.fetch_add(len as u64, Ordering::Relaxed);
         GLOBAL_RX_PACKETS.fetch_add(1, Ordering::Relaxed);
 
-        let _ = self.0.tx_queue.send(buffer);
-
+        // 🔥 ФИКС: Используем try_send. Если буфер полон (сеть тормозит), дропаем пакет!
+        // Это сигнализирует TCP-стеку об ограничении канала.
+        let _ = self.0.tx_queue.try_send(buffer);
         result
     }
 }

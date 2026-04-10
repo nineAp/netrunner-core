@@ -1,4 +1,5 @@
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::{Buf, Bytes};
+use std::collections::VecDeque;
 use netrunner_core::{
     net::{NetworkConfig, UDP_IDLE_TIMEOUT},
     rawcast::{LocalProtocol, RawCastFrame},
@@ -50,7 +51,8 @@ pub enum ConnectionState {
 pub struct TcpConnection {
     core: ConnectionCore<Bytes>,
     state: ConnectionState,
-    pending_data: BytesMut,
+    // 🔥 ФИКС: Используем очередь чанков, чтобы не копировать память
+    pending_data: VecDeque<Bytes>,
     handshake_rx: Option<oneshot::Receiver<()>>,
     chunk_buf: Vec<u8>,
     server_eof: bool,
@@ -72,7 +74,7 @@ impl TcpConnection {
         let conn = Self {
             core,
             state: ConnectionState::Handshaking,
-            pending_data: BytesMut::new(),
+            pending_data: VecDeque::new(),
             handshake_rx: Some(handshake_rx),
             chunk_buf: vec![0u8; NetworkConfig::global().tcp_chunk_size],
             server_eof: false,
@@ -163,13 +165,14 @@ impl TcpConnection {
 
         if !self.server_eof {
             loop {
-                if self.pending_data.len() >= socket.send_capacity() {
+                // Если буфер сокета заполнился, нет смысла выкачивать канал MPSC
+                if !socket.can_send() {
                     break;
                 }
 
                 match self.core.rx.try_recv() {
                     Ok(data) => {
-                        self.pending_data.extend_from_slice(&data);
+                        self.pending_data.push_back(data);
                     }
                     Err(mpsc::error::TryRecvError::Empty) => break,
                     Err(mpsc::error::TryRecvError::Disconnected) => {
@@ -181,14 +184,27 @@ impl TcpConnection {
             }
         }
 
-        if !self.pending_data.is_empty() && socket.can_send() {
-            match socket.send_slice(&self.pending_data) {
-                Ok(n) => {
-                    self.pending_data.advance(n);
+        // 🔥 ФИКС: Отправляем данные кусками без копирования памяти
+        while socket.can_send() {
+            if let Some(mut chunk) = self.pending_data.pop_front() {
+                match socket.send_slice(&chunk) {
+                    Ok(n) => {
+                        if n < chunk.len() {
+                            // Если сокет проглотил не всё, отрезаем отправленное,
+                            // а остаток возвращаем в начало очереди
+                            chunk.advance(n);
+                            self.pending_data.push_front(chunk);
+                            break; // Буфер сокета заполнен
+                        }
+                    }
+                    Err(e) => {
+                        debug!(%self.core.handle, "Smoltcp send error: {:?}", e);
+                        self.pending_data.push_front(chunk); // Возвращаем кусок обратно при ошибке
+                        break;
+                    }
                 }
-                Err(e) => {
-                    debug!(%self.core.handle, "Smoltcp send error: {:?}", e);
-                }
+            } else {
+                break; // Нет больше данных для отправки
             }
         }
 
