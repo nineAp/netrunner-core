@@ -2348,7 +2348,7 @@ checksum = "b7c388c1b5e93756d0c740965c41e8822f866621d41acbdf6336a6a168f8840c"
 [[package]]
 name = "smoltcp"
 version = "0.13.0"
-source = "git+ssh://git@github.com/nineAp/nxrp-smoltcp.git#e04c8d6a1f1e22202d569c46e2c584675b66c843"
+source = "git+ssh://git@github.com/nineAp/nxrp-smoltcp.git#0439741de707fd89ef0bdf704a29b37c3ec3c805"
 dependencies = [
  "bitflags 1.3.2",
  "byteorder",
