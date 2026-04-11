@@ -1,4 +1,5 @@
 use netrunner_core::net::NetworkConfig;
+use netrunner_logger::info;
 use smoltcp::{
     iface::SocketSet,
     socket::{
@@ -34,17 +35,17 @@ impl TrafficProfile {
 }
 
 pub trait SocketProvider: Send + Sync {
-    // Убрали <'static> у tcp::Socket
-    fn create_tcp(&self, profile: TrafficProfile) -> tcp::Socket; 
+    fn create_tcp(&self, profile: TrafficProfile) -> tcp::Socket;
     fn create_udp(&self, profile: TrafficProfile) -> udp::Socket<'static>;
-    fn create_icmp(&self) -> icmp::Socket<'static>;
-    
-    // Убрали <'static> у tcp::Socket
-    fn create_listening_tcp(&self, addr: Option<IpAddress>, port: u16) -> tcp::Socket; 
-    
+    fn create_icmp(&self, profile: TrafficProfile) -> icmp::Socket<'static>;
+
+    fn create_listening_tcp(&self, addr: Option<IpAddress>, port: u16) -> tcp::Socket;
     fn create_bound_udp(&self, addr: Option<IpAddress>, port: u16) -> udp::Socket<'static>;
     fn create_base_set(&self, n_icmp: usize) -> SocketSet<'static>;
     fn reconfigure_tcp(&self, socket: &mut tcp::Socket, profile: TrafficProfile);
+
+    // 🔥 НОВЫЙ МЕТОД: Логирование статистики всех сокетов в сете
+    fn log_stats(&self, sockets: &SocketSet);
 }
 
 pub struct SmolSocketFactory {
@@ -57,24 +58,25 @@ impl SmolSocketFactory {
     }
 
     fn alloc_buf(&self, size: usize) -> Vec<u8> {
-        // Убрали пул памяти, так как 1MB RX буферы раздуют оперативку (128MB+).
-        // Выделение памяти через vec! при старте сокета работает достаточно быстро.
         vec![0u8; size]
     }
 }
 
 impl SocketProvider for SmolSocketFactory {
-// Убрали <'static>
     fn create_tcp(&self, profile: TrafficProfile) -> tcp::Socket {
-        // 👈 Асимметричные буферы: RX большой (Download), TX маленький (Upload)
         let (rx_size, tx_size) = match profile {
             TrafficProfile::Bulk => (self.config.tcp_rx_heavy, self.config.tcp_tx_heavy),
             TrafficProfile::Interactive => (self.config.tcp_rx_light, self.config.tcp_tx_light),
             _ => (self.config.tcp_rx_light * 2, self.config.tcp_tx_light * 2),
         };
 
-        // 🔥 ИСПОЛЬЗУЕМ НАШИ НОВЫЕ ДИНАМИЧЕСКИЕ БУФЕРЫ 🔥
-        // Мы больше не аллоцируем векторы снаружи, буфер сам управляет памятью
+        info!(
+            "🚀 TCP Socket Created | Profile: {:?} | Initial RX: {} KB, TX: {} KB",
+            profile,
+            rx_size / 1024,
+            tx_size / 1024
+        );
+
         let rx_buffer = tcp::DynamicSocketBuffer::new(rx_size);
         let tx_buffer = tcp::DynamicSocketBuffer::new(tx_size);
         let mut socket = tcp::Socket::new(rx_buffer, tx_buffer);
@@ -87,26 +89,39 @@ impl SocketProvider for SmolSocketFactory {
     }
 
     fn reconfigure_tcp(&self, socket: &mut tcp::Socket, profile: TrafficProfile) {
-        // Выключаем Nagle везде, так как внутри Netrunner мы сами батчим данные в чанки (tcp_chunk_size),
-        // а BBR сам управляет плавностью отправки (Pacing). Nagle здесь будет только мешать.
         socket.set_nagle_enabled(false);
 
         match profile {
             TrafficProfile::Interactive | TrafficProfile::Dns => {
-                // Для интерактивного трафика (SSH, RDP, DNS) нам нужна минимальная задержка.
-                // Отвечаем ACK'ами мгновенно.
                 socket.set_ack_delay(None);
             }
             TrafficProfile::Bulk | TrafficProfile::Default => {
-                // Для тяжелого трафика ставим крошечный delay (1 мс). 
-                // Это снизит нагрузку на CPU (будет меньше syscall-ов на отправку голых ACK),
-                // но при этом 1 мс не испортит расчеты RTT и RateSample для BBR.
                 socket.set_ack_delay(Some(Duration::from_millis(1)));
             }
         }
-        
-        // Включаем нашу ракету
+
         socket.set_congestion_control(CongestionControl::Bbr);
+    }
+
+    fn log_stats(&self, sockets: &SocketSet) {
+        for (handle, socket) in sockets.iter() {
+            if let smoltcp::socket::Socket::Tcp(tcp_socket) = socket {
+                if tcp_socket.is_active() {
+                    // Извлекаем текущие емкости динамических буферов
+                    let rx_cap = tcp_socket.recv_capacity();
+                    let tx_cap = tcp_socket.send_capacity();
+                    let state = tcp_socket.state();
+
+                    info!(
+                        "📊 [TCP {}] Buffers: RX: {:>4} KB, TX: {:>4} KB | State: {:?}",
+                        handle,
+                        rx_cap / 1024,
+                        tx_cap / 1024,
+                        state
+                    );
+                }
+            }
+        }
     }
 
     fn create_udp(&self, profile: TrafficProfile) -> udp::Socket<'static> {
@@ -131,20 +146,20 @@ impl SocketProvider for SmolSocketFactory {
         )
     }
 
-    fn create_icmp(&self) -> icmp::Socket<'static> {
+    fn create_icmp(&self, _profile: TrafficProfile) -> icmp::Socket<'static> {
         icmp::Socket::new(
             icmp::PacketBuffer::new(vec![icmp::PacketMetadata::EMPTY; 4], vec![0; 512]),
             icmp::PacketBuffer::new(vec![icmp::PacketMetadata::EMPTY; 4], vec![0; 512]),
         )
     }
 
-   fn create_listening_tcp(&self, addr: Option<IpAddress>, port: u16) -> tcp::Socket {
+    fn create_listening_tcp(&self, addr: Option<IpAddress>, port: u16) -> tcp::Socket {
         let profile = TrafficProfile::guess_from_port(port, true);
         let mut socket = self.create_tcp(profile);
         let _ = socket.listen(IpListenEndpoint { addr, port });
         socket
     }
-    
+
     fn create_bound_udp(&self, addr: Option<IpAddress>, port: u16) -> udp::Socket<'static> {
         let profile = TrafficProfile::guess_from_port(port, false);
         let mut socket = self.create_udp(profile);
@@ -156,7 +171,7 @@ impl SocketProvider for SmolSocketFactory {
         let mut sockets = SocketSet::new(Vec::with_capacity(128));
         sockets.add(self.create_bound_udp(None, 53));
         for _ in 0..n_icmp {
-            sockets.add(self.create_icmp());
+            sockets.add(self.create_icmp(TrafficProfile::Default));
         }
         sockets
     }

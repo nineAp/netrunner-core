@@ -1,13 +1,20 @@
 use std::{net::Ipv4Addr, sync::Arc};
 
 use crate::{
-    crypto::{ChaChaCipher, SessionKeys}, net::{
-        FALLBACK_CONNECT_TIMEOUT, LEG_RECONNECT_DELAY, LEG_STAGGER_DELAY, MAX_TUNNEL_LEGS, NetworkConfig, SECURE_HANDSHAKE_TIMEOUT, STEALTH_FALLBACK_HOST, TLS_HELLO_TIMEOUT, TOPOLOGY_PRINT_INTERVAL, connection::{
+    crypto::{ChaChaCipher, SessionKeys},
+    net::{
+        connection::{
             engine::TunnelEngine,
             handler::{RemoteOpener, StreamHandler},
             muxer::Muxer,
-        }
-    }, nrxp::{Codec, ErrorAction, Frame, FrameType, TlsBridge}, rawcast::{LocalProtocol, RawCastAdapter, RawCastFrame}, tlseng::{BrowserProfile, ServerProfile}
+        },
+        NetworkConfig, FALLBACK_CONNECT_TIMEOUT, LEG_RECONNECT_DELAY, LEG_STAGGER_DELAY,
+        MAX_TUNNEL_LEGS, SECURE_HANDSHAKE_TIMEOUT, STEALTH_FALLBACK_HOST, TLS_HELLO_TIMEOUT,
+        TOPOLOGY_PRINT_INTERVAL,
+    },
+    nrxp::{Codec, ErrorAction, Frame, FrameType, TlsBridge},
+    rawcast::{LocalProtocol, RawCastAdapter, RawCastFrame},
+    tlseng::{BrowserProfile, ServerProfile},
 };
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
@@ -29,7 +36,9 @@ pub struct SessionManager {
 
 impl SessionManager {
     pub fn new() -> Self {
-        Self { sessions: DashMap::new() }
+        Self {
+            sessions: DashMap::new(),
+        }
     }
 
     pub fn generate_id() -> String {
@@ -69,12 +78,10 @@ impl Connection {
         Self {
             inbound,
             outbound,
-            read_buf: BytesMut::with_capacity(NetworkConfig::global().tcp_buffer_size),
+            read_buf: BytesMut::with_capacity(NetworkConfig::global().connection_buf_size),
         }
     }
 }
-
-type StreamContext = (u32, Ipv4Addr, u16, LocalProtocol);
 
 pub struct ClientHandler;
 impl ClientHandler {
@@ -84,24 +91,39 @@ impl ClientHandler {
         muxer: Arc<Muxer>,
         session_id: &str,
     ) -> Result<(), String> {
-        let leg_name = if leg_id % 2 == 0 { "TCP-Leg" } else { "UDP-Leg" };
-        
+        let leg_name = if leg_id % 2 == 0 {
+            "TCP-Leg"
+        } else {
+            "UDP-Leg"
+        };
+
         let mut addrs = tokio::net::lookup_host(remote_proxy_addr)
             .await
             .map_err(|e| format!("DNS resolution failed: {}", e))?;
-        let addr = addrs.next().ok_or_else(|| format!("No IPs found for {}", remote_proxy_addr))?;
+        let addr = addrs
+            .next()
+            .ok_or_else(|| format!("No IPs found for {}", remote_proxy_addr))?;
 
         // --- Шаг 1: Создание сырого сокета через socket2 ---
-        let domain = if addr.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 };
-        let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))
-            .map_err(|e| e.to_string())?;
+        let domain = if addr.is_ipv4() {
+            Domain::IPV4
+        } else {
+            Domain::IPV6
+        };
+        let socket =
+            Socket::new(domain, Type::STREAM, Some(Protocol::TCP)).map_err(|e| e.to_string())?;
 
         // --- Шаг 2: Настройка кроссплатформенных опций ---
         socket.set_nonblocking(true).map_err(|e| e.to_string())?;
         socket.set_nodelay(true).map_err(|e| e.to_string())?;
 
         // 🔥 Шаг 3: Установка TCP_NOTSENT_LOWAT через libc (Linux, Android, iOS, macOS)
-        #[cfg(any(target_os = "linux", target_os = "android", target_os = "ios", target_os = "macos"))]
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "ios",
+            target_os = "macos"
+        ))]
         unsafe {
             use std::os::fd::AsRawFd;
 
@@ -114,31 +136,45 @@ impl ClientHandler {
                 std::mem::size_of::<libc::c_int>() as libc::socklen_t,
             );
             if ret != 0 {
-                warn!("Could not set TCP_NOTSENT_LOWAT: {}", std::io::Error::last_os_error());
+                warn!(
+                    "Could not set TCP_NOTSENT_LOWAT: {}",
+                    std::io::Error::last_os_error()
+                );
             }
         }
 
         // --- Шаг 4: Подключение и конвертация в TcpStream для Tokio ---
-        let _ = socket.connect(&addr.into()); 
+        let _ = socket.connect(&addr.into());
         let std_stream: std::net::TcpStream = socket.into();
         let stream = TcpStream::from_std(std_stream).map_err(|e| e.to_string())?;
-        
+
         let mut conn = Connection::new(stream);
         let mut session_keys = SessionKeys::new(true);
-        let ch = TlsBridge::wrap_client_hello(&BrowserProfile::CHROME_131, "ubuntu.com", &session_keys);
+        let ch =
+            TlsBridge::wrap_client_hello(&BrowserProfile::CHROME_131, "ubuntu.com", &session_keys);
 
-        conn.outbound.write_all(&ch).await.map_err(|e| e.to_string())?;
+        conn.outbound
+            .write_all(&ch)
+            .await
+            .map_err(|e| e.to_string())?;
 
         loop {
             match TlsBridge::unpack_handshake(&mut conn.read_buf) {
                 Ok(Some(msg)) => {
-                    session_keys.update_keys(msg.random(), msg.extensions(), false)
+                    session_keys
+                        .update_keys(msg.random(), msg.extensions(), false)
                         .map_err(|e| format!("Keys update error: {}", e))?;
                     break;
                 }
                 Ok(None) => {
-                    let n = conn.inbound.read_buf(&mut conn.read_buf).await.map_err(|e| e.to_string())?;
-                    if n == 0 { return Err(format!("EOF on {}", leg_name)); }
+                    let n = conn
+                        .inbound
+                        .read_buf(&mut conn.read_buf)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    if n == 0 {
+                        return Err(format!("EOF on {}", leg_name));
+                    }
                 }
                 Err(e) => return Err(format!("TLS error on {}: {:?}", leg_name, e)),
             }
@@ -151,14 +187,18 @@ impl ClientHandler {
         let (rx_codec, mut tx_codec) = codec.split();
 
         let handshake_payload = Bytes::from(format!("{}:{}", session_id, leg_id));
-        let encrypted_handshake = tx_codec.encode_frame(0, FrameType::Handshake, handshake_payload)
+        let encrypted_handshake = tx_codec
+            .encode_frame(0, FrameType::Handshake, handshake_payload)
             .map_err(|e| format!("Failed to encrypt Handshake: {:?}", e))?;
-        conn.outbound.write_all(&encrypted_handshake).await.map_err(|e| e.to_string())?;
+        conn.outbound
+            .write_all(&encrypted_handshake)
+            .await
+            .map_err(|e| e.to_string())?;
 
         let (control_tx, control_rx) = mpsc::channel(NetworkConfig::global().client_muxer_capacity);
         let (data_tx, data_rx) = mpsc::channel(NetworkConfig::global().client_muxer_capacity);
         muxer.add_leg(leg_id, control_tx, data_tx);
-        
+
         let handler = Arc::new(StreamHandler::new(muxer.clone(), None));
         let engine = TunnelEngine {
             leg_id,
@@ -183,7 +223,8 @@ impl ClientHandler {
     ) -> Result<(), String> {
         let session_id = SessionManager::generate_id();
         let muxer = Arc::new(Muxer::new(true, session_id.clone()));
-        let registry: Arc<DashMap<u32, (u64, Ipv4Addr, u16, LocalProtocol)>> = Arc::new(DashMap::new());
+        let registry: Arc<DashMap<u32, (u64, Ipv4Addr, u16, LocalProtocol)>> =
+            Arc::new(DashMap::new());
         let local_to_global: Arc<DashMap<u64, u32>> = Arc::new(DashMap::new());
 
         for id in 0..MAX_TUNNEL_LEGS {
@@ -205,7 +246,9 @@ impl ClientHandler {
         tokio::spawn(async move {
             while let Some(m_stats) = m_weak.upgrade() {
                 tokio::time::sleep(TOPOLOGY_PRINT_INTERVAL).await;
-                if m_stats.active_legs_count() == 0 { break; }
+                if m_stats.active_legs_count() == 0 {
+                    break;
+                }
                 m_stats.perform_health_check().await;
                 m_stats.print_topology_tree();
             }
@@ -223,9 +266,18 @@ impl ClientHandler {
                         FrameType::Connect | FrameType::UdpConnect => {
                             let global_stream_id = muxer_inner.next_stream_id();
                             local_to_global.insert(local_socket_id, global_stream_id);
-                            registry.insert(global_stream_id, (local_socket_id, raw_frame.dst_ip, raw_frame.dst_port, raw_frame.protocol));
+                            registry.insert(
+                                global_stream_id,
+                                (
+                                    local_socket_id,
+                                    raw_frame.dst_ip,
+                                    raw_frame.dst_port,
+                                    raw_frame.protocol,
+                                ),
+                            );
 
-                            let (v_tx, mut v_rx) = mpsc::channel(NetworkConfig::global().client_stream_capacity);
+                            let (v_tx, mut v_rx) =
+                                mpsc::channel(NetworkConfig::global().client_stream_capacity);
                             muxer_inner.register_stream(global_stream_id, v_tx);
 
                             let tx_to_tun = tx_to_engine.clone();
@@ -234,25 +286,48 @@ impl ClientHandler {
                                 while let Some(back_payload) = v_rx.recv().await {
                                     if let Some(r) = reg.get(&global_stream_id) {
                                         let (orig_local_id, ip, port, proto) = *r;
-                                        let out_f_type = if proto == LocalProtocol::Udp { FrameType::UdpData } else { FrameType::Data };
-                                        let mock_nrxp = Frame::new(orig_local_id as u32, out_f_type, back_payload);
-                                        if let Ok(raw) = RawCastAdapter::from_nrxp(mock_nrxp, ip, port, proto == LocalProtocol::Udp) {
+                                        let out_f_type = if proto == LocalProtocol::Udp {
+                                            FrameType::UdpData
+                                        } else {
+                                            FrameType::Data
+                                        };
+                                        let mock_nrxp = Frame::new(
+                                            orig_local_id as u32,
+                                            out_f_type,
+                                            back_payload,
+                                        );
+                                        if let Ok(raw) = RawCastAdapter::from_nrxp(
+                                            mock_nrxp,
+                                            ip,
+                                            port,
+                                            proto == LocalProtocol::Udp,
+                                        ) {
                                             let _ = tx_to_tun.send(raw).await;
                                         }
                                     }
                                 }
                             });
-                            let _ = muxer_inner.send_control(global_stream_id, f_type, payload).await;
+                            let _ = muxer_inner
+                                .send_control(global_stream_id, f_type, payload)
+                                .await;
                         }
                         FrameType::Data | FrameType::UdpData => {
                             if let Some(id) = local_to_global.get(&local_socket_id) {
-                                let _ = muxer_inner.send_data_safe(*id, payload, raw_frame.protocol == LocalProtocol::Udp).await;
+                                let _ = muxer_inner
+                                    .send_data_safe(
+                                        *id,
+                                        payload,
+                                        raw_frame.protocol == LocalProtocol::Udp,
+                                    )
+                                    .await;
                             }
                         }
                         FrameType::Close => {
                             if let Some(kv) = local_to_global.remove(&local_socket_id) {
                                 let global_stream_id = kv.1;
-                                let _ = muxer_inner.send_control(global_stream_id, FrameType::Close, Bytes::new()).await;
+                                let _ = muxer_inner
+                                    .send_control(global_stream_id, FrameType::Close, Bytes::new())
+                                    .await;
                                 muxer_inner.remove_stream(global_stream_id);
                                 registry.remove(&global_stream_id);
                             }
@@ -273,12 +348,23 @@ pub struct ServerHandler {
 
 impl ServerHandler {
     pub fn new(connection: Connection) -> Self {
-        Self { conn: connection, session_manager: Arc::new(SessionManager::new()) }
+        Self {
+            conn: connection,
+            session_manager: Arc::new(SessionManager::new()),
+        }
     }
 
-    async fn handle_stealth_fallback(mut client_inbound: OwnedReadHalf, mut client_outbound: OwnedWriteHalf, initial_data: Bytes) {
+    async fn handle_stealth_fallback(
+        mut client_inbound: OwnedReadHalf,
+        mut client_outbound: OwnedWriteHalf,
+        initial_data: Bytes,
+    ) {
         info!(target = %STEALTH_FALLBACK_HOST, "Stealth fallback: bridging to Target");
-        let target_stream = tokio::time::timeout(FALLBACK_CONNECT_TIMEOUT, TcpStream::connect(STEALTH_FALLBACK_HOST)).await;
+        let target_stream = tokio::time::timeout(
+            FALLBACK_CONNECT_TIMEOUT,
+            TcpStream::connect(STEALTH_FALLBACK_HOST),
+        )
+        .await;
 
         if let Ok(Ok(target_server)) = target_stream {
             let (mut server_read, mut server_write) = target_server.into_split();
@@ -288,7 +374,8 @@ impl ServerHandler {
             let _ = tokio::io::copy_bidirectional(
                 &mut tokio::io::join(&mut client_inbound, &mut client_outbound),
                 &mut tokio::io::join(&mut server_read, &mut server_write),
-            ).await;
+            )
+            .await;
         }
     }
 }
@@ -298,7 +385,11 @@ impl TunnelHandler for ServerHandler {
     async fn run(self) -> Result<(), String> {
         info!("Acting as TLS Server with Stealth Fallback");
 
-        let Connection { mut inbound, mut outbound, mut read_buf } = self.conn;
+        let Connection {
+            mut inbound,
+            mut outbound,
+            mut read_buf,
+        } = self.conn;
         let mut session_keys = SessionKeys::new(false);
 
         // --- PHASE 1: TLS Hello & Protocol Identification ---
@@ -308,11 +399,16 @@ impl TunnelHandler for ServerHandler {
             match TlsBridge::unpack_handshake(&mut read_buf) {
                 Ok(Some(client_msg)) => {
                     info!("✅ Valid Netrunner ClientHello detected");
-                    match TlsBridge::wrap_server_hello(&client_msg, &mut session_keys, &ServerProfile::MODERN) {
+                    match TlsBridge::wrap_server_hello(
+                        &client_msg,
+                        &mut session_keys,
+                        &ServerProfile::MODERN,
+                    ) {
                         Ok(sh) => break sh,
                         Err(e) => {
                             if e.execute_strategy() == ErrorAction::Redirect {
-                                Self::handle_stealth_fallback(inbound, outbound, buf_snapshot).await;
+                                Self::handle_stealth_fallback(inbound, outbound, buf_snapshot)
+                                    .await;
                                 return Ok(());
                             }
                             return Err("ServerHello Generation Failed".into());
@@ -320,7 +416,9 @@ impl TunnelHandler for ServerHandler {
                     }
                 }
                 Ok(None) => {
-                    let res = tokio::time::timeout(TLS_HELLO_TIMEOUT, inbound.read_buf(&mut read_buf)).await;
+                    let res =
+                        tokio::time::timeout(TLS_HELLO_TIMEOUT, inbound.read_buf(&mut read_buf))
+                            .await;
                     match res {
                         Ok(Ok(0)) => return Err("Client closed".into()),
                         Ok(Ok(_)) => continue,
@@ -342,9 +440,12 @@ impl TunnelHandler for ServerHandler {
         };
 
         // --- PHASE 2: Send Server Hello ---
-        outbound.write_all(&hello).await.map_err(|e| e.to_string())?;
+        outbound
+            .write_all(&hello)
+            .await
+            .map_err(|e| e.to_string())?;
 
-// --- PHASE 3: Secure Handshake & Engine Startup ---
+        // --- PHASE 3: Secure Handshake & Engine Startup ---
         let (tx_key, tx_iv, rx_key, rx_iv) = session_keys.get_aead_parameters();
         let mut cipher = ChaChaCipher::new();
         cipher.set_keys(tx_key, tx_iv, rx_key, rx_iv);
@@ -357,11 +458,17 @@ impl TunnelHandler for ServerHandler {
             match rx_codec.decode_inbound(&mut read_buf) {
                 Ok(Some(frame)) => {
                     if frame.header.frame_type == FrameType::Handshake {
-                        let parts: Vec<&str> = std::str::from_utf8(&frame.payload).unwrap_or("").split(':').collect();
+                        let parts: Vec<&str> = std::str::from_utf8(&frame.payload)
+                            .unwrap_or("")
+                            .split(':')
+                            .collect();
                         if parts.len() == 2 {
                             let sid = parts[0].to_string();
                             let lid: u32 = parts[1].parse().unwrap_or(0);
-                            info!("🤝 Secure Handshake verified! Session: {}, Leg: {}", sid, lid);
+                            info!(
+                                "🤝 Secure Handshake verified! Session: {}, Leg: {}",
+                                sid, lid
+                            );
                             break (sid, lid);
                         }
                     }
@@ -369,11 +476,16 @@ impl TunnelHandler for ServerHandler {
                 }
                 Ok(None) => {
                     // Ждем новых данных из сети
-                    let n = tokio::time::timeout(SECURE_HANDSHAKE_TIMEOUT, inbound.read_buf(&mut read_buf)).await
-                        .map_err(|_| "Timeout waiting for Handshake")?.map_err(|e| e.to_string())?;
+                    let n = tokio::time::timeout(
+                        SECURE_HANDSHAKE_TIMEOUT,
+                        inbound.read_buf(&mut read_buf),
+                    )
+                    .await
+                    .map_err(|_| "Timeout waiting for Handshake")?
+                    .map_err(|e| e.to_string())?;
 
-                    if n == 0 { 
-                        return Err("Client closed connection before Handshake".into()); 
+                    if n == 0 {
+                        return Err("Client closed connection before Handshake".into());
                     }
                 }
                 Err(e) => {
@@ -390,7 +502,9 @@ impl TunnelHandler for ServerHandler {
         let (data_tx, data_rx) = mpsc::channel(NetworkConfig::global().server_muxer_capacity);
         muxer.add_leg(leg_id, control_tx, data_tx);
 
-        let opener = Arc::new(RemoteOpener { muxer: muxer.clone() });
+        let opener = Arc::new(RemoteOpener {
+            muxer: muxer.clone(),
+        });
         let handler = Arc::new(StreamHandler::new(muxer.clone(), Some(opener)));
 
         let engine = TunnelEngine {
@@ -408,7 +522,9 @@ impl TunnelHandler for ServerHandler {
 
         let res = engine.run().await;
         muxer.remove_leg(leg_id);
-        if muxer.active_legs_count() == 0 { self.session_manager.remove(&session_id); }
+        if muxer.active_legs_count() == 0 {
+            self.session_manager.remove(&session_id);
+        }
         res
     }
 }

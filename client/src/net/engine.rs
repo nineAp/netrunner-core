@@ -8,7 +8,6 @@ use smoltcp::{
     iface::{Config, Interface, SocketSet},
     phy::DeviceCapabilities,
 };
-use tokio::sync::mpsc::UnboundedReceiver;
 use std::net::Ipv4Addr;
 use std::sync::atomic::Ordering;
 use std::{
@@ -16,6 +15,7 @@ use std::{
     time::Instant as StdInstant,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::time::{Duration, sleep};
 use tun::{DeviceReader, DeviceWriter};
@@ -40,6 +40,7 @@ pub struct Engine {
     from_smoltcp_rx: Option<UnboundedReceiver<TokenBuffer>>,
     avail: Arc<AtomicBool>,
     rx_from_tunnel: mpsc::Receiver<RawCastFrame>,
+    factory: Arc<dyn SocketProvider>, // 🔥 Сохраняем фабрику для доступа к логам статистики
 }
 
 impl Engine {
@@ -69,6 +70,7 @@ impl Engine {
             avail,
             manager,
             rx_from_tunnel,
+            factory,
         }
     }
 
@@ -76,7 +78,6 @@ impl Engine {
         info!("Current routes: {:?}", self.interface.routes());
         let (writer, reader) = tun.split().expect("Failed to split TUN");
 
-        // 🚨 ПРАВИЛО 1: ОГРАНИЧИВАЕМ КАНАЛ ОТ TUN, чтобы ОС не затопила нас памятью!
         let (tun_to_engine_tx, mut tun_to_engine_rx) =
             mpsc::channel(NetworkConfig::global().client_tun_capacity);
 
@@ -84,7 +85,10 @@ impl Engine {
 
         let from_smoltcp_rx = self.from_smoltcp_rx.take().expect("Engine started twice");
         Self::spawn_tun_writer(writer, from_smoltcp_rx);
-        
+
+        // 🔥 Таймер для периодического вывода статистики буферов
+        let mut last_stats_log = StdInstant::now();
+
         loop {
             // 1. Сначала обрабатываем всё, что накопилось в стеке
             let mut repeat_poll = true;
@@ -92,8 +96,13 @@ impl Engine {
                 self.manager.process_sockets(&mut self.socket_set);
                 let poll_res = self.poll();
                 self.manager.cleanup(&mut self.socket_set);
-                // Если сокеты изменились, крутим еще раз, пока не вытолкнем всё
                 repeat_poll = matches!(poll_res, PollResult::SocketStateChanged);
+            }
+
+            // 🔥 Логируем состояние буферов раз в 5 секунд
+            if last_stats_log.elapsed() >= Duration::from_secs(5) {
+                self.factory.log_stats(&self.socket_set);
+                last_stats_log = StdInstant::now();
             }
 
             // 2. Считаем задержку
@@ -110,7 +119,6 @@ impl Engine {
                 msg = self.rx_from_tunnel.recv() => {
                     if let Some(frame) = msg {
                         let _ = self.manager.try_inject_inbound(frame);
-                        // Читаем по чуть-чуть (max 32), чтобы чаще делать poll()
                         let mut count = 0;
                         while let Ok(frame) = self.rx_from_tunnel.try_recv() {
                             let _ = self.manager.try_inject_inbound(frame);
@@ -124,15 +132,9 @@ impl Engine {
                     if let Some(token) = msg {
                         self.manager.try_create_socket_from_packet(&token, &mut self.socket_set);
 
-                        // 🔥 ФИКС 1: Используем .send().await. 
-                        // Мы не имеем права терять пакеты внутри системы.
-                        // Если smoltcp занят, TUN Reader просто подождет.
                         if self.to_smoltcp_tx.send(token).await.is_ok() {
                             self.device.mark_rx_available();
                         }
-
-                        // Пакетную обработку Ok(token) = try_recv лучше убрать или
-                        // тоже заменить на логику, которая не дропает данные.
                     } else { break; }
                 }
             }
@@ -144,36 +146,34 @@ impl Engine {
         self.interface
             .poll(now, &mut self.device, &mut self.socket_set)
     }
-    
+
     fn spawn_tun_reader(
         mut reader: DeviceReader,
-        to_engine: mpsc::Sender<TokenBuffer>, 
+        to_engine: mpsc::Sender<TokenBuffer>,
         is_avail: Arc<AtomicBool>,
     ) {
         tokio::spawn(async move {
             debug!("TUN Reader task started");
             let mut buf = [0u8; 65536];
             while let Ok(n) = reader.read(&mut buf).await {
-                if n == 0 { break; }
-                // ... (фильтрация IP) ...
-
+                if n == 0 {
+                    break;
+                }
                 let mut token = TokenBuffer::with_capacity(n);
                 token.extend_from_slice(&buf[..n]);
 
-                // 🔥 ФИКС 2: Возвращаем .send().await! 
-                // Это заставит ОС притормозить отправку пакетов, 
-                // если туннель перегружен. Пинг упадет, так как пакеты
-                // будут стоять в очереди ОС, а не дропаться.
                 if to_engine.send(token).await.is_ok() {
                     is_avail.store(true, Ordering::Release);
-                } else { break; }
+                } else {
+                    break;
+                }
             }
         });
     }
 
     fn spawn_tun_writer(
         mut writer: DeviceWriter,
-        mut from_smoltcp: UnboundedReceiver<TokenBuffer>, // 🔥 Обновили тип
+        mut from_smoltcp: UnboundedReceiver<TokenBuffer>,
     ) {
         tokio::spawn(async move {
             debug!("TUN Writer task started");
@@ -265,7 +265,6 @@ impl EngineConfig {
 pub struct EngineBuilder {
     config: EngineConfig,
     tun_device: Option<Tun>,
-
     socket_factory: Option<Arc<dyn SocketProvider>>,
 }
 
@@ -321,9 +320,7 @@ impl EngineBuilder {
 
         let factory = self.socket_factory.unwrap_or_else(|| {
             let config_owned = (*NetworkConfig::global()).clone();
-
             let config = Arc::new(config_owned);
-
             Arc::new(SmolSocketFactory::new(config))
         });
 

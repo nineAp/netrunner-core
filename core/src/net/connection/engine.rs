@@ -36,12 +36,11 @@ impl TunnelEngine {
         let outbound = self.outbound;
         let read_buf = self.read_buf;
 
-        // Распаковываем наши кодеки
         let mut rx_codec = self.rx_codec;
         let mut tx_codec = self.tx_codec;
 
-        let control_rx = self.control_rx;
-        let data_rx = self.data_rx;
+        let mut control_rx = self.control_rx;
+        let mut data_rx = self.data_rx;
         let handler = self.handler;
 
         let leg_id = self.leg_id;
@@ -78,7 +77,6 @@ impl TunnelEngine {
 
                         let mut frames = Vec::new();
 
-                        // Чтение из RxCodec без блокировок!
                         loop {
                             match rx_codec.decode_inbound(&mut read_buf) {
                                 Ok(Some(frame)) => frames.push(frame),
@@ -98,10 +96,15 @@ impl TunnelEngine {
                         }
 
                         for frame in frames {
-                            if frame.header.frame_type == FrameType::Heartbeat {
+                            // ИСПРАВЛЕНИЕ: Перехватываем PONG для замера RTT, но НЕ ДЕЛАЕМ continue,
+                            // чтобы фрейм дошел до хендлера (если нужно)
+                            if frame.header.frame_type == FrameType::Handshake && frame.payload.as_ref() == b"PONG" {
                                 muxer.record_pong(leg_id).await;
-                                continue;
+                            } else if frame.header.frame_type == FrameType::Heartbeat {
+                                // Хартбиты тоже можем использовать для RTT, если они двусторонние
+                                muxer.record_pong(leg_id).await;
                             }
+
                             handler.handle(frame).await;
                         }
                     }
@@ -112,8 +115,6 @@ impl TunnelEngine {
 
         let writer_handle = tokio::spawn(async move {
             let mut outbound = outbound;
-            let mut control_rx = control_rx;
-            let mut data_rx = data_rx;
             let mut heartbeat = tokio::time::interval(HEALTH_CHECK_INTERVAL);
 
             loop {
@@ -174,18 +175,10 @@ impl TunnelEngine {
 
         let mut packets = Vec::new();
 
-        if frame_type == FrameType::UdpData {
-            match tx_codec.encode_frame(stream_id, frame_type.clone(), data) {
-                Ok(pkt) => packets.push(pkt),
-                Err(e) => {
-                    error!(stream_id, error = ?e, "Encryption failed for UDP datagram");
-                    return Err(format!("Encryption error: {:?}", e));
-                }
-            }
-        } else {
+        // ИСПРАВЛЕНИЕ: Чанкуем ТОЛЬКО Data. Контрольные фреймы отправляем целиком.
+        if frame_type == FrameType::Data {
             while !data.is_empty() {
-                let chunk_size =
-                    std::cmp::min(data.len(), NetworkConfig::global().tcp_chunk_size);
+                let chunk_size = std::cmp::min(data.len(), NetworkConfig::global().tcp_chunk_size);
                 let chunk = data.split_to(chunk_size);
 
                 match tx_codec.encode_frame(stream_id, frame_type.clone(), chunk) {
@@ -194,6 +187,15 @@ impl TunnelEngine {
                         error!(stream_id, error = ?e, "Encryption failed for TCP chunk");
                         return Err(format!("Encryption error: {:?}", e));
                     }
+                }
+            }
+        } else {
+            // Для UdpData, Connect, Handshake, Heartbeat, Close чанкование запрещено
+            match tx_codec.encode_frame(stream_id, frame_type.clone(), data) {
+                Ok(pkt) => packets.push(pkt),
+                Err(e) => {
+                    error!(stream_id, error = ?e, "Encryption failed for control/udp frame");
+                    return Err(format!("Encryption error: {:?}", e));
                 }
             }
         }
@@ -205,7 +207,6 @@ impl TunnelEngine {
             })?;
         }
 
-        debug!(stream_id, "Outbound packet sent successfully");
         Ok(())
     }
 }

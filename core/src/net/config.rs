@@ -6,6 +6,7 @@ pub static GLOBAL_NET_CONFIG: OnceLock<NetworkConfig> = OnceLock::new();
 #[derive(Debug, Clone)]
 pub struct NetworkConfig {
     pub mtu: usize,
+    pub connection_buf_size: usize,
     pub tcp_buffer_size: usize,
     pub udp_buffer_size: usize,
 
@@ -35,31 +36,30 @@ pub struct NetworkConfig {
 }
 
 impl NetworkConfig {
-
     pub fn new(system_mtu: usize) -> Self {
         Self {
             mtu: system_mtu,
-            tcp_buffer_size: 64 * 1024,  // Для чтения из физического сокета (нормально)
+            connection_buf_size: 1024 * 1024 * 2,
+            tcp_buffer_size: 512 * 1024,
             udp_buffer_size: 64 * 1024,
 
-            tcp_chunk_size: 4 * 1024,  // Оставляем 16 КБ
+            tcp_chunk_size: system_mtu - 100,
 
             // 🔥 Зажимаем программные очереди (Убиваем Hidden Bloat)
-
             client_muxer_capacity: 8,
             client_tun_capacity: 16,
             client_stream_capacity: 16,
-            client_virtual_stream_capacity: 128,
+            client_virtual_stream_capacity: 32,
 
-            server_muxer_capacity: 64,  // Кардинально режем
+            server_muxer_capacity: 64, // Кардинально режем
             server_stream_capacity: 32,
 
             // 🔥 Расширяем TCP окна под BBR (Разблокируем Gigabit на дальние дистанции)
-            tcp_rx_heavy: 512 * 1024, //512
-            tcp_tx_heavy: 1 * 1024 * 1024, // 1 MB
+            tcp_rx_heavy: 256 * 1024, //512
+            tcp_tx_heavy: 256 * 1024, // 1 MB
 
-            tcp_rx_light: 16 * 1024,
-            tcp_tx_light: 64 * 1024,
+            tcp_rx_light: 32 * 1024,
+            tcp_tx_light: 32 * 1024,
 
             udp_buf_heavy: 256 * 1024,
             udp_meta_heavy: 512,

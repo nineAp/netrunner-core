@@ -39,7 +39,9 @@ impl RemoteOpener {
                         stream_id,
                         "❌ [Remote] Target connection failed: {}", target
                     );
-                    let _ = muxer.send_control(stream_id, FrameType::Close, Bytes::new());
+                    let _ = muxer
+                        .send_control(stream_id, FrameType::Close, Bytes::new())
+                        .await;
                 }
             }
             muxer.remove_stream(stream_id);
@@ -76,9 +78,6 @@ impl StreamHandler {
 
         match frame.header.frame_type {
             FrameType::Heartbeat => {
-                // Проверяем: если мы Opener (т.е. мы Сервер), то отвечаем.
-                // Если мы Клиент (opener == None), то мы сюда вообще не должны дойти
-                // (т.к. перехватили в TunnelEngine), но на всякий случай логируем.
                 if self.opener.is_some() {
                     trace!(stream_id, "💓 [Server] Ping received, sending Pong");
                     let _ = self
@@ -86,7 +85,23 @@ impl StreamHandler {
                         .send_control(stream_id, FrameType::Heartbeat, Bytes::new())
                         .await;
                 } else {
-                    trace!(stream_id, "💓 [Client] Pong received (captured by Engine)");
+                    trace!(stream_id, "💓 [Client] Pong received");
+                }
+            }
+
+            // ИСПРАВЛЕНИЕ: Добавлена обработка PING/PONG для Health Check
+            FrameType::Handshake => {
+                if frame.payload.as_ref() == b"PING" {
+                    trace!(
+                        stream_id,
+                        "🤝 [Tunnel] Health Check PING received, replying PONG"
+                    );
+                    let _ = self
+                        .muxer
+                        .send_control(stream_id, FrameType::Handshake, Bytes::from("PONG"))
+                        .await;
+                } else if frame.payload.as_ref() == b"PONG" {
+                    trace!(stream_id, "🤝 [Tunnel] Health Check PONG received");
                 }
             }
 
@@ -111,6 +126,7 @@ impl StreamHandler {
             _ => debug!(stream_id, "Unhandled frame: {:?}", frame.header.frame_type),
         }
     }
+
     async fn handle_conn_request(&self, stream_id: u32, payload: Bytes, is_udp: bool) {
         let target = String::from_utf8_lossy(&payload).to_string();
 
@@ -137,7 +153,8 @@ impl StreamHandler {
 
             let _ = self
                 .muxer
-                .send_control(stream_id, FrameType::Close, Bytes::new());
+                .send_control(stream_id, FrameType::Close, Bytes::new())
+                .await;
         }
     }
 }

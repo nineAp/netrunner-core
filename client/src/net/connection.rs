@@ -1,5 +1,4 @@
 use bytes::{Buf, Bytes};
-use std::collections::VecDeque;
 use netrunner_core::{
     net::{NetworkConfig, UDP_IDLE_TIMEOUT},
     rawcast::{LocalProtocol, RawCastFrame},
@@ -12,6 +11,7 @@ use smoltcp::{
         Ipv6Address,
     },
 };
+use std::collections::VecDeque;
 use tokio::sync::{mpsc, oneshot};
 
 use netrunner_logger::{debug, info};
@@ -165,9 +165,9 @@ impl TcpConnection {
 
         if !self.server_eof {
             loop {
-
                 let pending_size: usize = self.pending_data.iter().map(|b| b.len()).sum();
-                if pending_size >= 4 * NetworkConfig::global().mtu {
+                let max_pending = 128 * 1024;
+                if pending_size >= max_pending {
                     break;
                 }
 
