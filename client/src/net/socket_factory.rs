@@ -1,5 +1,5 @@
-use netrunner_core::net::NetworkConfig;
-use netrunner_logger::info;
+use netrunner_core::net::{MAX_SOCKETS, NetworkConfig};
+use netrunner_logger::{info, warn};
 use smoltcp::{
     iface::SocketSet,
     socket::{
@@ -45,7 +45,11 @@ pub trait SocketProvider: Send + Sync {
     fn reconfigure_tcp(&self, socket: &mut tcp::Socket, profile: TrafficProfile);
 
     // 🔥 НОВЫЙ МЕТОД: Логирование статистики всех сокетов в сете
-    fn log_stats(&self, sockets: &SocketSet);
+    fn log_stats(
+        &self,
+        sockets: &SocketSet,
+        get_app_pending: &dyn Fn(smoltcp::iface::SocketHandle) -> usize,
+    );
 }
 
 pub struct SmolSocketFactory {
@@ -103,22 +107,56 @@ impl SocketProvider for SmolSocketFactory {
         socket.set_congestion_control(CongestionControl::Bbr);
     }
 
-    fn log_stats(&self, sockets: &SocketSet) {
+    fn log_stats(
+        &self,
+        sockets: &SocketSet,
+        get_app_pending: &dyn Fn(smoltcp::iface::SocketHandle) -> usize,
+    ) {
         for (handle, socket) in sockets.iter() {
             if let smoltcp::socket::Socket::Tcp(tcp_socket) = socket {
                 if tcp_socket.is_active() {
-                    // Извлекаем текущие емкости динамических буферов
-                    let rx_cap = tcp_socket.recv_capacity();
-                    let tx_cap = tcp_socket.send_capacity();
+                    // 1. Статистика стека (facing the browser)
+                    let tcp_rx_len = tcp_socket.recv_queue(); // Данные от браузера к нам
+                    let tcp_rx_cap = tcp_socket.recv_capacity();
+
+                    let tcp_tx_len = tcp_socket.send_queue(); // Данные от нас к браузеру
+                    let tcp_tx_cap = tcp_socket.send_capacity();
+
+                    // 2. Статистика приложения (теневая очередь из туннеля)
+                    // Это данные, которые уже прилетели из Германии/Финляндии,
+                    // но еще не влезли в tcp_socket.send_slice()
+                    let app_pending_len = get_app_pending(handle);
+
                     let state = tcp_socket.state();
 
+                    // Выбираем иконку для статуса
+                    let status_icon = match state {
+                        tcp::State::Established => "✅",
+                        tcp::State::CloseWait => "⏳", // Сервер закрылся, мы дочищаем хвосты
+                        tcp::State::FinWait1 | tcp::State::FinWait2 => "👋",
+                        _ => "ℹ️ ",
+                    };
+
+                    // Логируем одной строкой для удобства чтения в Logcat
                     info!(
-                        "📊 [TCP {}] Buffers: RX: {:>4} KB, TX: {:>4} KB | State: {:?}",
+                        "📊 [TCP {}] {:<12} {} | RX_BR: {:>4}/{} KB | TX_BR: {:>4}/{} KB | APP_WAIT: {:>4} KB",
                         handle,
-                        rx_cap / 1024,
-                        tx_cap / 1024,
-                        state
+                        format!("{:?}", state),
+                        status_icon,
+                        tcp_rx_len / 1024,
+                        tcp_rx_cap / 1024, // Пришло от браузера
+                        tcp_tx_len / 1024,
+                        tcp_tx_cap / 1024,      // Ушло браузеру (из стека)
+                        app_pending_len / 1024  // Ждет входа в стек (из туннеля)
                     );
+
+                    // Если очередь приложения раздута — это красный флаг
+                    if app_pending_len > 1024 * 1024 {
+                        warn!(
+                            "⚠️ [TCP {}] Bufferbloat detected! Application queue is > 1MB",
+                            handle
+                        );
+                    }
                 }
             }
         }
@@ -168,7 +206,7 @@ impl SocketProvider for SmolSocketFactory {
     }
 
     fn create_base_set(&self, n_icmp: usize) -> SocketSet<'static> {
-        let mut sockets = SocketSet::new(Vec::with_capacity(128));
+        let mut sockets = SocketSet::new(Vec::with_capacity(MAX_SOCKETS));
         sockets.add(self.create_bound_udp(None, 53));
         for _ in 0..n_icmp {
             sockets.add(self.create_icmp(TrafficProfile::Default));

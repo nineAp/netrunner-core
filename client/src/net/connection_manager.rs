@@ -78,16 +78,15 @@ impl TargetResolver {
 pub struct ConnectionManager {
     tracker: SessionTracker,
     resolver: TargetResolver,
-    tx_to_tunnel: mpsc::Sender<RawCastFrame>,
+    tx_to_tunnel: mpsc::UnboundedSender<RawCastFrame>,
     factory: Arc<dyn SocketProvider>,
-    // 🔥 ТРЕКЕР ОЖИДАЮЩИХ СОЕДИНЕНИЙ: предотвращает SYN-шторм
     pending_connects: DashMap<FlowKey, Instant>,
 }
 
 impl ConnectionManager {
     pub fn new(
         dns_handler: DnsHandler,
-        tx_to_tunnel: mpsc::Sender<RawCastFrame>,
+        tx_to_tunnel: mpsc::UnboundedSender<RawCastFrame>, // 🔥 Unbounded
         factory: Arc<dyn SocketProvider>,
     ) -> Self {
         Self {
@@ -101,7 +100,6 @@ impl ConnectionManager {
 
     pub fn try_inject_inbound(&mut self, frame: RawCastFrame) -> Result<(), RawCastFrame> {
         if frame.event == RawCastEvent::Close {
-            info!("💀 [Stream {}] Received CLOSE from tunnel", frame.socket_id);
             self.tracker.close_tunnel_session(frame.socket_id);
             return Ok(());
         }
@@ -111,14 +109,12 @@ impl ConnectionManager {
         }
 
         if let Some(tx) = self.tracker.get_inbound_tx(frame.socket_id) {
-            tx.try_send(frame.payload.clone()).map_err(|e| {
-                if matches!(e, mpsc::error::TrySendError::Closed(_)) {
-                    self.tracker.close_tunnel_session(frame.socket_id);
-                }
-                frame
-            })
+            // 🔥 UnboundedSender::send не требует await и не возвращает Full
+            if let Err(_) = tx.send(frame.payload.clone()) {
+                self.tracker.close_tunnel_session(frame.socket_id);
+            }
+            Ok(())
         } else {
-            trace!("👻 [Stream {}] Orphan packet", frame.socket_id);
             Ok(())
         }
     }
@@ -229,21 +225,17 @@ impl ConnectionManager {
 
     fn intercept_tcp(&mut self, f: Flow, socket_set: &mut SocketSet) {
         let key = f.to_key();
-
-        // 🔥 ФИКС 1: Проверка в таблице ожидающих соединений
         if self.pending_connects.contains_key(&key) {
             return;
         }
 
         if !self.tracker.has_connection_from(f.src, f.src_p, socket_set) {
-            if socket_set.iter().count() >= 2048 {
+            if socket_set.iter().count() >= MAX_SOCKETS {
                 warn!("🔥 TCP Socket limit reached! Dropping SYN.");
                 return;
             }
 
-            // Помечаем поток как "в процессе создания"
             self.pending_connects.insert(key, Instant::now());
-
             let socket = self.factory.create_listening_tcp(Some(f.dst), f.dst_p);
             let handle = socket_set.add(socket);
             self.tracker.add_pending_tcp(handle);
@@ -266,10 +258,11 @@ impl ConnectionManager {
 
         let socket_id = self.tracker.next_id();
         let (dst_ip, target) = self.resolver.resolve_destination(f.dst, f.dst_p);
-
         let socket = self.factory.create_bound_udp(Some(f.dst), f.dst_p);
+
         if socket.is_open() {
             let handle = socket_set.add(socket);
+            // 🔥 Принимаем Unbounded части из конструктора
             let (conn, rx_smol, tx_smol) = UdpConnection::new(handle, f.src, f.src_p);
 
             self.tracker.register_udp(handle, socket_id, conn, tx_smol);
@@ -309,17 +302,16 @@ impl ConnectionManager {
             return;
         }
 
-        // Инициализация туннеля при успешном коннекте
         if state == tcp::State::Established && self.tracker.should_init_tcp(handle) {
             if let (Some(local), Some(remote)) = (socket.local_endpoint(), socket.remote_endpoint())
             {
-                // 🔥 ФИКС 2: Удаляем из pending при установке соединения
                 let key = (remote.addr, remote.port, local.addr, local.port);
                 self.pending_connects.remove(&key);
 
                 let socket_id = self.tracker.next_id();
                 let (dst_ip, target) = self.resolver.resolve_destination(local.addr, local.port);
 
+                // 🔥 Принимаем Unbounded части
                 let (conn, rx_smol, tx_smol, handshake_tx) = TcpConnection::new(handle);
                 self.tracker.register_tcp(handle, socket_id, conn, tx_smol);
 
@@ -335,30 +327,8 @@ impl ConnectionManager {
             }
         }
 
-        // Очистка мертвых сокетов
-        if state != tcp::State::Listen && !is_handshaking(state) {
-            if !socket.may_recv() && !socket.may_send() {
-                socket.abort();
-                self.tracker.queue_removal(handle);
-                return;
-            }
-        }
-
-        if self
-            .tracker
-            .check_pending_timeout(handle, TCP_HANDSHAKE_TIMEOUT)
-        {
-            // Если таймаут, нужно тоже попытаться очистить pending_connects (по возрасту в cleanup)
-            socket.abort();
-            self.tracker.queue_removal(handle);
-            return;
-        }
-
         if let Some(conn) = self.tracker.get_tcp_mut(handle) {
-            if !conn.tick(socket) {
-                socket.abort();
-                self.tracker.queue_removal(handle);
-            }
+            let _ = conn.tick(socket);
         }
     }
 
@@ -386,6 +356,10 @@ impl ConnectionManager {
 
         self.tracker.enforce_idle_timeouts(GLOBAL_IDLE_TIMEOUT);
         self.tracker.cleanup(socket_set);
+    }
+
+    pub fn get_buf_info(&self, handle: SocketHandle) -> usize {
+        self.tracker.get_app_buffer_info(handle)
     }
 }
 

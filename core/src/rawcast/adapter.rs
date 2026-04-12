@@ -21,43 +21,21 @@ impl RawCastAdapter {
                 } else {
                     Bytes::from(format!("{}:{}", raw.dst_ip, raw.dst_port))
                 };
-
-                debug!(
-                    "🧩 [Adapter TCP] Stream {}: Packing Connect target: {}",
-                    stream_id,
-                    String::from_utf8_lossy(&final_payload)
-                );
-
                 (FrameType::Connect, final_payload)
             }
-
             (LocalProtocol::Udp, RawCastEvent::Connect) => {
                 let final_payload = if !raw.payload.is_empty() {
                     raw.payload
                 } else {
                     Bytes::from(format!("{}:{}", raw.dst_ip, raw.dst_port))
                 };
-
-                debug!(
-                    "🧩 [Adapter UDP] Stream {}: Packing UdpConnect target: {}",
-                    stream_id,
-                    String::from_utf8_lossy(&final_payload)
-                );
-
                 (FrameType::UdpConnect, final_payload)
             }
-
             (LocalProtocol::Tcp, RawCastEvent::Data) => (FrameType::Data, raw.payload),
-
             (LocalProtocol::Udp, RawCastEvent::Data) => (FrameType::UdpData, raw.payload),
-
-            (_, RawCastEvent::Close) => {
-                trace!("🧩 [Adapter] Stream {}: Packing Close frame", stream_id);
-                (FrameType::Close, Bytes::new())
-            }
-
+            (_, RawCastEvent::Close) => (FrameType::Close, Bytes::new()),
             (LocalProtocol::Icmp, _) => {
-                return Err("ICMP protocol is not supported by NRXP core".into());
+                return Err("ICMP protocol is not supported by NRXP core".into())
             }
         };
 
@@ -78,30 +56,9 @@ impl RawCastAdapter {
         };
 
         let event = match nrxp_frame.header.frame_type {
-            FrameType::Connect | FrameType::UdpConnect => {
-                trace!(
-                    "🧩 [Adapter] Stream {}: Unpacked Connect Ack from server",
-                    socket_id
-                );
-                RawCastEvent::Connect
-            }
-
+            FrameType::Connect | FrameType::UdpConnect => RawCastEvent::Connect,
             FrameType::Data | FrameType::UdpData => RawCastEvent::Data,
-
-            FrameType::Close => {
-                trace!(
-                    "🧩 [Adapter] Stream {}: Unpacked Close signal from server",
-                    socket_id
-                );
-                RawCastEvent::Close
-            }
-
-            FrameType::Handshake => {
-                return Err(
-                    "Handshake frame detected. Muxer should consume it, not the Adapter.".into(),
-                );
-            }
-
+            FrameType::Close => RawCastEvent::Close,
             FrameType::Heartbeat => return Err("Heartbeat should be handled by muxer".into()),
         };
 

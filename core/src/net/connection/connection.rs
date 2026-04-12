@@ -6,7 +6,7 @@ use crate::{
         connection::{
             engine::TunnelEngine,
             handler::{RemoteOpener, StreamHandler},
-            muxer::Muxer,
+            muxer::{MuxMessage, Muxer},
         },
         NetworkConfig, FALLBACK_CONNECT_TIMEOUT, LEG_RECONNECT_DELAY, LEG_STAGGER_DELAY,
         MAX_TUNNEL_LEGS, SECURE_HANDSHAKE_TIMEOUT, STEALTH_FALLBACK_HOST, TLS_HELLO_TIMEOUT,
@@ -65,7 +65,6 @@ pub trait TunnelHandler {
     async fn run(self) -> Result<(), String>;
 }
 
-// ⚠️ Connection теперь содержит только транспорт, без Codec
 pub struct Connection {
     pub(crate) inbound: OwnedReadHalf,
     pub(crate) outbound: OwnedWriteHalf,
@@ -104,7 +103,6 @@ impl ClientHandler {
             .next()
             .ok_or_else(|| format!("No IPs found for {}", remote_proxy_addr))?;
 
-        // --- Шаг 1: Создание сырого сокета через socket2 ---
         let domain = if addr.is_ipv4() {
             Domain::IPV4
         } else {
@@ -113,11 +111,9 @@ impl ClientHandler {
         let socket =
             Socket::new(domain, Type::STREAM, Some(Protocol::TCP)).map_err(|e| e.to_string())?;
 
-        // --- Шаг 2: Настройка кроссплатформенных опций ---
         socket.set_nonblocking(true).map_err(|e| e.to_string())?;
         socket.set_nodelay(true).map_err(|e| e.to_string())?;
 
-        // 🔥 Шаг 3: Установка TCP_NOTSENT_LOWAT через libc (Linux, Android, iOS, macOS)
         #[cfg(any(
             target_os = "linux",
             target_os = "android",
@@ -126,24 +122,16 @@ impl ClientHandler {
         ))]
         unsafe {
             use std::os::fd::AsRawFd;
-
-            let lowat: libc::c_int = 16384; // 16 КБ
-            let ret = libc::setsockopt(
+            let lowat: libc::c_int = 16384;
+            let _ = libc::setsockopt(
                 socket.as_raw_fd(),
                 libc::IPPROTO_TCP,
                 libc::TCP_NOTSENT_LOWAT,
                 &lowat as *const _ as *const libc::c_void,
                 std::mem::size_of::<libc::c_int>() as libc::socklen_t,
             );
-            if ret != 0 {
-                warn!(
-                    "Could not set TCP_NOTSENT_LOWAT: {}",
-                    std::io::Error::last_os_error()
-                );
-            }
         }
 
-        // --- Шаг 4: Подключение и конвертация в TcpStream для Tokio ---
         let _ = socket.connect(&addr.into());
         let std_stream: std::net::TcpStream = socket.into();
         let stream = TcpStream::from_std(std_stream).map_err(|e| e.to_string())?;
@@ -186,17 +174,19 @@ impl ClientHandler {
         let codec = Codec::new(cipher, session_keys.get_auth_key());
         let (rx_codec, mut tx_codec) = codec.split();
 
-        let handshake_payload = Bytes::from(format!("{}:{}", session_id, leg_id));
-        let encrypted_handshake = tx_codec
-            .encode_frame(0, FrameType::Handshake, handshake_payload)
-            .map_err(|e| format!("Failed to encrypt Handshake: {:?}", e))?;
+        // 🔥 ФИКС: Используем Heartbeat для первой авторизации соединения
+        let auth_payload = Bytes::from(format!("{}:{}", session_id, leg_id));
+        let encrypted_auth = tx_codec
+            .encode_frame(0, FrameType::Heartbeat, auth_payload)
+            .map_err(|e| format!("Failed to encrypt Auth: {:?}", e))?;
+
         conn.outbound
-            .write_all(&encrypted_handshake)
+            .write_all(&encrypted_auth)
             .await
             .map_err(|e| e.to_string())?;
 
-        let (control_tx, control_rx) = mpsc::channel(NetworkConfig::global().client_muxer_capacity);
-        let (data_tx, data_rx) = mpsc::channel(NetworkConfig::global().client_muxer_capacity);
+        let (control_tx, control_rx) = mpsc::unbounded_channel::<MuxMessage>();
+        let (data_tx, data_rx) = mpsc::unbounded_channel::<MuxMessage>();
         muxer.add_leg(leg_id, control_tx, data_tx);
 
         let handler = Arc::new(StreamHandler::new(muxer.clone(), None));
@@ -218,8 +208,8 @@ impl ClientHandler {
 
     pub async fn connect(
         remote_proxy_addr: &str,
-        mut rx_from_engine: mpsc::Receiver<RawCastFrame>,
-        tx_to_engine: mpsc::Sender<RawCastFrame>,
+        mut rx_from_engine: mpsc::UnboundedReceiver<RawCastFrame>,
+        tx_to_engine: mpsc::UnboundedSender<RawCastFrame>,
     ) -> Result<(), String> {
         let session_id = SessionManager::generate_id();
         let muxer = Arc::new(Muxer::new(true, session_id.clone()));
@@ -276,8 +266,7 @@ impl ClientHandler {
                                 ),
                             );
 
-                            let (v_tx, mut v_rx) =
-                                mpsc::channel(NetworkConfig::global().client_stream_capacity);
+                            let (v_tx, mut v_rx) = mpsc::unbounded_channel::<Bytes>();
                             muxer_inner.register_stream(global_stream_id, v_tx);
 
                             let tx_to_tun = tx_to_engine.clone();
@@ -302,7 +291,7 @@ impl ClientHandler {
                                             port,
                                             proto == LocalProtocol::Udp,
                                         ) {
-                                            let _ = tx_to_tun.send(raw).await;
+                                            let _ = tx_to_tun.send(raw);
                                         }
                                     }
                                 }
@@ -341,6 +330,7 @@ impl ClientHandler {
         Ok(())
     }
 }
+
 pub struct ServerHandler {
     pub(crate) conn: Connection,
     pub(crate) session_manager: Arc<SessionManager>,
@@ -392,7 +382,6 @@ impl TunnelHandler for ServerHandler {
         } = self.conn;
         let mut session_keys = SessionKeys::new(false);
 
-        // --- PHASE 1: TLS Hello & Protocol Identification ---
         let hello = loop {
             let buf_snapshot = read_buf.clone().freeze();
 
@@ -430,8 +419,7 @@ impl TunnelHandler for ServerHandler {
                     }
                 }
                 Err(e) => {
-                    let strategy = e.execute_strategy();
-                    if strategy == ErrorAction::Redirect {
+                    if e.execute_strategy() == ErrorAction::Redirect {
                         Self::handle_stealth_fallback(inbound, outbound, buf_snapshot).await;
                     }
                     return Ok(());
@@ -439,13 +427,11 @@ impl TunnelHandler for ServerHandler {
             }
         };
 
-        // --- PHASE 2: Send Server Hello ---
         outbound
             .write_all(&hello)
             .await
             .map_err(|e| e.to_string())?;
 
-        // --- PHASE 3: Secure Handshake & Engine Startup ---
         let (tx_key, tx_iv, rx_key, rx_iv) = session_keys.get_aead_parameters();
         let mut cipher = ChaChaCipher::new();
         cipher.set_keys(tx_key, tx_iv, rx_key, rx_iv);
@@ -453,53 +439,45 @@ impl TunnelHandler for ServerHandler {
         let codec = Codec::new(cipher, session_keys.get_auth_key());
         let (mut rx_codec, tx_codec) = codec.split();
 
+        // 🔥 ФИКС: Ожидаем Heartbeat в качестве авторизационного фрейма!
         let (session_id, leg_id) = loop {
-            // ✅ ИСПРАВЛЕНИЕ: Теперь мы не игнорируем Err!
             match rx_codec.decode_inbound(&mut read_buf) {
                 Ok(Some(frame)) => {
-                    if frame.header.frame_type == FrameType::Handshake {
-                        let parts: Vec<&str> = std::str::from_utf8(&frame.payload)
-                            .unwrap_or("")
-                            .split(':')
-                            .collect();
-                        if parts.len() == 2 {
+                    if frame.header.frame_type == FrameType::Heartbeat {
+                        let payload_str = std::str::from_utf8(&frame.payload).unwrap_or("");
+                        let parts: Vec<&str> = payload_str.split(':').collect();
+                        if parts.len() == 2 && parts[1].parse::<u32>().is_ok() {
                             let sid = parts[0].to_string();
-                            let lid: u32 = parts[1].parse().unwrap_or(0);
-                            info!(
-                                "🤝 Secure Handshake verified! Session: {}, Leg: {}",
-                                sid, lid
-                            );
+                            let lid: u32 = parts[1].parse().unwrap();
+                            info!("🤝 Secure Auth verified! Session: {}, Leg: {}", sid, lid);
                             break (sid, lid);
                         }
                     }
-                    return Err("Expected Handshake frame".into());
+                    return Err("Expected Auth payload in first Heartbeat frame".into());
                 }
                 Ok(None) => {
-                    // Ждем новых данных из сети
                     let n = tokio::time::timeout(
                         SECURE_HANDSHAKE_TIMEOUT,
                         inbound.read_buf(&mut read_buf),
                     )
                     .await
-                    .map_err(|_| "Timeout waiting for Handshake")?
+                    .map_err(|_| "Timeout waiting for Auth")?
                     .map_err(|e| e.to_string())?;
-
                     if n == 0 {
-                        return Err("Client closed connection before Handshake".into());
+                        return Err("Client closed connection before Auth".into());
                     }
                 }
                 Err(e) => {
-                    // Если криптография сломалась, сразу рвем соединение и логируем
-                    error!("❌ Secure Handshake Failed: {:?}", e);
+                    error!("❌ Secure Auth Failed: {:?}", e);
                     return Err("Dropped by security strategy (Auth Phase)".into());
                 }
             }
         };
 
-        // --- PHASE 4: Engine Startup ---
         let muxer = self.session_manager.get_or_create(&session_id);
-        let (control_tx, control_rx) = mpsc::channel(NetworkConfig::global().server_muxer_capacity);
-        let (data_tx, data_rx) = mpsc::channel(NetworkConfig::global().server_muxer_capacity);
+        let (control_tx, control_rx) = mpsc::unbounded_channel::<MuxMessage>();
+        let (data_tx, data_rx) = mpsc::unbounded_channel::<MuxMessage>();
+
         muxer.add_leg(leg_id, control_tx, data_tx);
 
         let opener = Arc::new(RemoteOpener {

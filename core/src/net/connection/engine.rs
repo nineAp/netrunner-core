@@ -5,7 +5,7 @@ use netrunner_logger::{debug, error, info};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::tcp::{OwnedReadHalf, OwnedWriteHalf},
-    sync::mpsc::Receiver,
+    sync::mpsc::UnboundedReceiver,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -23,8 +23,8 @@ pub(crate) struct TunnelEngine {
     pub rx_codec: RxCodec,
     pub tx_codec: TxCodec,
     pub read_buf: BytesMut,
-    pub control_rx: Receiver<MuxMessage>,
-    pub data_rx: Receiver<MuxMessage>,
+    pub control_rx: UnboundedReceiver<MuxMessage>,
+    pub data_rx: UnboundedReceiver<MuxMessage>,
     pub handler: Arc<StreamHandler>,
     pub leg_id: u32,
     pub muxer: Arc<crate::net::connection::muxer::Muxer>,
@@ -82,9 +82,7 @@ impl TunnelEngine {
                                 Ok(Some(frame)) => frames.push(frame),
                                 Ok(None) => break,
                                 Err(e) => {
-                                    if e.action == ErrorAction::Wait {
-                                        break;
-                                    }
+                                    if e.action == ErrorAction::Wait { break; }
                                     if e.action == ErrorAction::Drop {
                                         error!("CRITICAL: Crypto tampering or sync lost. Hard dropping tunnel!");
                                         return Err("Crypto drop".into());
@@ -96,15 +94,13 @@ impl TunnelEngine {
                         }
 
                         for frame in frames {
-                            // ИСПРАВЛЕНИЕ: Перехватываем PONG для замера RTT, но НЕ ДЕЛАЕМ continue,
-                            // чтобы фрейм дошел до хендлера (если нужно)
-                            if frame.header.frame_type == FrameType::Handshake && frame.payload.as_ref() == b"PONG" {
-                                muxer.record_pong(leg_id).await;
-                            } else if frame.header.frame_type == FrameType::Heartbeat {
-                                // Хартбиты тоже можем использовать для RTT, если они двусторонние
-                                muxer.record_pong(leg_id).await;
+                            // Любой Heartbeat – это подтверждение жизни туннеля, обновляем пинг
+                            if frame.header.frame_type == FrameType::Heartbeat {
+                                let m = muxer.clone();
+                                tokio::spawn(async move {
+                                    m.record_pong(leg_id).await;
+                                });
                             }
-
                             handler.handle(frame).await;
                         }
                     }
@@ -120,32 +116,21 @@ impl TunnelEngine {
             loop {
                 tokio::select! {
                     biased;
-
-                    _ = token_writer.cancelled() => {
-                        info!("Writer Task: Shutdown signal received.");
-                        break;
-                    }
-
+                    _ = token_writer.cancelled() => break,
                     msg_opt = control_rx.recv() => {
                         if let Some(msg) = msg_opt {
                             Self::handle_outbound(&mut outbound, &mut tx_codec, msg).await?;
-                        } else {
-                            break;
-                        }
+                        } else { break; }
                     }
-
                     _ = heartbeat.tick() => {
                         muxer_pong.record_ping_sent(leg_id);
                         let msg = MuxMessage { stream_id: 0, frame_type: FrameType::Heartbeat, data: Bytes::new() };
                         Self::handle_outbound(&mut outbound, &mut tx_codec, msg).await?;
                     }
-
                     msg_opt = data_rx.recv() => {
                         if let Some(msg) = msg_opt {
                             Self::handle_outbound(&mut outbound, &mut tx_codec, msg).await?;
-                        } else {
-                            break;
-                        }
+                        } else { break; }
                     }
                 }
             }
@@ -160,7 +145,6 @@ impl TunnelEngine {
         if let Err(e) = &res {
             error!("TunnelEngine critical failure: {}", e);
         }
-
         res
     }
 
@@ -172,10 +156,8 @@ impl TunnelEngine {
         let mut data = msg.data;
         let stream_id = msg.stream_id;
         let frame_type = msg.frame_type;
-
         let mut packets = Vec::new();
 
-        // ИСПРАВЛЕНИЕ: Чанкуем ТОЛЬКО Data. Контрольные фреймы отправляем целиком.
         if frame_type == FrameType::Data {
             while !data.is_empty() {
                 let chunk_size = std::cmp::min(data.len(), NetworkConfig::global().tcp_chunk_size);
@@ -190,7 +172,6 @@ impl TunnelEngine {
                 }
             }
         } else {
-            // Для UdpData, Connect, Handshake, Heartbeat, Close чанкование запрещено
             match tx_codec.encode_frame(stream_id, frame_type.clone(), data) {
                 Ok(pkt) => packets.push(pkt),
                 Err(e) => {
@@ -206,7 +187,6 @@ impl TunnelEngine {
                 e.to_string()
             })?;
         }
-
         Ok(())
     }
 }

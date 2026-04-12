@@ -16,7 +16,7 @@ use std::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc::UnboundedReceiver;
-use tokio::sync::mpsc::{self, Receiver, Sender};
+use tokio::sync::mpsc::{self, UnboundedSender}; // 🔥 Добавили UnboundedSender
 use tokio::time::{Duration, sleep};
 use tun::{DeviceReader, DeviceWriter};
 
@@ -36,11 +36,11 @@ pub struct Engine {
     socket_set: SocketSet<'static>,
     manager: ConnectionManager,
     device: VirtTunDevice,
-    to_smoltcp_tx: Sender<TokenBuffer>,
+    to_smoltcp_tx: UnboundedSender<TokenBuffer>, // 🔥 Стало Unbounded
     from_smoltcp_rx: Option<UnboundedReceiver<TokenBuffer>>,
     avail: Arc<AtomicBool>,
-    rx_from_tunnel: mpsc::Receiver<RawCastFrame>,
-    factory: Arc<dyn SocketProvider>, // 🔥 Сохраняем фабрику для доступа к логам статистики
+    rx_from_tunnel: mpsc::UnboundedReceiver<RawCastFrame>, // 🔥 Стало Unbounded
+    factory: Arc<dyn SocketProvider>,
 }
 
 impl Engine {
@@ -48,12 +48,13 @@ impl Engine {
         config: Config,
         caps: DeviceCapabilities,
         dns_handler: DnsHandler,
-        tx_to_tunnel: mpsc::Sender<RawCastFrame>,
-        rx_from_tunnel: mpsc::Receiver<RawCastFrame>,
+        tx_to_tunnel: mpsc::UnboundedSender<RawCastFrame>, // 🔥 Стало Unbounded
+        rx_from_tunnel: mpsc::UnboundedReceiver<RawCastFrame>, // 🔥 Стало Unbounded
         factory: Arc<dyn SocketProvider>,
     ) -> Self {
         let now = Engine::current_time();
 
+        // VirtTunDevice::new возвращает UnboundedSender и UnboundedReceiver
         let (mut device, to_smoltcp_tx, from_smoltcp_rx, avail) = VirtTunDevice::new(caps);
         let interface = Interface::new(config, &mut device, now);
 
@@ -78,19 +79,17 @@ impl Engine {
         info!("Current routes: {:?}", self.interface.routes());
         let (writer, reader) = tun.split().expect("Failed to split TUN");
 
-        let (tun_to_engine_tx, mut tun_to_engine_rx) =
-            mpsc::channel(NetworkConfig::global().client_tun_capacity);
+        // TUN Reader теперь тоже Unbounded
+        let (tun_to_engine_tx, mut tun_to_engine_rx) = mpsc::unbounded_channel::<TokenBuffer>();
 
         Self::spawn_tun_reader(reader, tun_to_engine_tx, self.avail.clone());
 
         let from_smoltcp_rx = self.from_smoltcp_rx.take().expect("Engine started twice");
         Self::spawn_tun_writer(writer, from_smoltcp_rx);
 
-        // 🔥 Таймер для периодического вывода статистики буферов
         let mut last_stats_log = StdInstant::now();
 
         loop {
-            // 1. Сначала обрабатываем всё, что накопилось в стеке
             let mut repeat_poll = true;
             while repeat_poll {
                 self.manager.process_sockets(&mut self.socket_set);
@@ -99,13 +98,13 @@ impl Engine {
                 repeat_poll = matches!(poll_res, PollResult::SocketStateChanged);
             }
 
-            // 🔥 Логируем состояние буферов раз в 5 секунд
             if last_stats_log.elapsed() >= Duration::from_secs(5) {
-                self.factory.log_stats(&self.socket_set);
+                let manager_ref = &self.manager;
+                self.factory
+                    .log_stats(&self.socket_set, &|handle| manager_ref.get_buf_info(handle));
                 last_stats_log = StdInstant::now();
             }
 
-            // 2. Считаем задержку
             let delay = self
                 .interface
                 .poll_delay(Self::current_time(), &self.socket_set);
@@ -119,11 +118,12 @@ impl Engine {
                 msg = self.rx_from_tunnel.recv() => {
                     if let Some(frame) = msg {
                         let _ = self.manager.try_inject_inbound(frame);
+                        // Выгребаем пачку
                         let mut count = 0;
                         while let Ok(frame) = self.rx_from_tunnel.try_recv() {
                             let _ = self.manager.try_inject_inbound(frame);
                             count += 1;
-                            if count >= 32 { break; }
+                            if count >= 64 { break; }
                         }
                     } else { break; }
                 }
@@ -131,8 +131,8 @@ impl Engine {
                 msg = tun_to_engine_rx.recv() => {
                     if let Some(token) = msg {
                         self.manager.try_create_socket_from_packet(&token, &mut self.socket_set);
-
-                        if self.to_smoltcp_tx.send(token).await.is_ok() {
+                        // Отправка в Unbounded всегда мгновенная
+                        if self.to_smoltcp_tx.send(token).is_ok() {
                             self.device.mark_rx_available();
                         }
                     } else { break; }
@@ -149,7 +149,7 @@ impl Engine {
 
     fn spawn_tun_reader(
         mut reader: DeviceReader,
-        to_engine: mpsc::Sender<TokenBuffer>,
+        to_engine: mpsc::UnboundedSender<TokenBuffer>, // 🔥 Unbounded
         is_avail: Arc<AtomicBool>,
     ) {
         tokio::spawn(async move {
@@ -162,7 +162,7 @@ impl Engine {
                 let mut token = TokenBuffer::with_capacity(n);
                 token.extend_from_slice(&buf[..n]);
 
-                if to_engine.send(token).await.is_ok() {
+                if to_engine.send(token).is_ok() {
                     is_avail.store(true, Ordering::Release);
                 } else {
                     break;
@@ -303,11 +303,8 @@ impl EngineBuilder {
         caps.max_transmission_unit = self.config.mtu;
         caps.medium = smoltcp::phy::Medium::Ip;
 
-        let (tx_to_tunnel, rx_for_client_handler) =
-            mpsc::channel(NetworkConfig::global().client_tun_capacity);
-
-        let (tx_for_client_handler, rx_from_tunnel) =
-            mpsc::channel(NetworkConfig::global().client_tun_capacity);
+        let (tx_to_tunnel, rx_for_client_handler) = mpsc::unbounded_channel::<RawCastFrame>();
+        let (tx_for_client_handler, rx_from_tunnel) = mpsc::unbounded_channel::<RawCastFrame>();
 
         info!("Establishing secure tunnel to proxy server...");
         ClientHandler::connect(

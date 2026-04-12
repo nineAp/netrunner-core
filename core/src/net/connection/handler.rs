@@ -19,7 +19,12 @@ pub struct RemoteOpener {
 }
 
 impl RemoteOpener {
-    pub async fn open_tcp(&self, stream_id: u32, target: String, v_rx: mpsc::Receiver<Bytes>) {
+    pub async fn open_tcp(
+        &self,
+        stream_id: u32,
+        target: String,
+        v_rx: mpsc::UnboundedReceiver<Bytes>,
+    ) {
         let muxer = self.muxer.clone();
         tokio::spawn(async move {
             info!(stream_id, "🌐 [Remote] Connecting to {}", target);
@@ -48,7 +53,12 @@ impl RemoteOpener {
         });
     }
 
-    pub async fn open_udp(&self, stream_id: u32, target: String, v_rx: mpsc::Receiver<Bytes>) {
+    pub async fn open_udp(
+        &self,
+        stream_id: u32,
+        target: String,
+        v_rx: mpsc::UnboundedReceiver<Bytes>,
+    ) {
         let muxer = self.muxer.clone();
         tokio::spawn(async move {
             info!(stream_id, "🚀 [Remote] Binding UDP for {}", target);
@@ -78,30 +88,29 @@ impl StreamHandler {
 
         match frame.header.frame_type {
             FrameType::Heartbeat => {
-                if self.opener.is_some() {
-                    trace!(stream_id, "💓 [Server] Ping received, sending Pong");
+                let payload = frame.payload.as_ref();
+                if payload == b"PING" {
+                    trace!(stream_id, "🤝 [Tunnel] PING received, replying PONG");
                     let _ = self
                         .muxer
-                        .send_control(stream_id, FrameType::Heartbeat, Bytes::new())
+                        .send_control(stream_id, FrameType::Heartbeat, Bytes::from("PONG"))
                         .await;
+                } else if payload == b"PONG" {
+                    trace!(stream_id, "🤝 [Tunnel] PONG received");
+                    self.muxer.dispatch_to_local(stream_id, frame.payload).await;
                 } else {
-                    trace!(stream_id, "💓 [Client] Pong received");
-                }
-            }
-
-            // ИСПРАВЛЕНИЕ: Добавлена обработка PING/PONG для Health Check
-            FrameType::Handshake => {
-                if frame.payload.as_ref() == b"PING" {
-                    trace!(
-                        stream_id,
-                        "🤝 [Tunnel] Health Check PING received, replying PONG"
-                    );
-                    let _ = self
-                        .muxer
-                        .send_control(stream_id, FrameType::Handshake, Bytes::from("PONG"))
-                        .await;
-                } else if frame.payload.as_ref() == b"PONG" {
-                    trace!(stream_id, "🤝 [Tunnel] Health Check PONG received");
+                    if self.opener.is_some() {
+                        trace!(
+                            stream_id,
+                            "💓 [Server] Standard Heartbeat received, sending reply"
+                        );
+                        let _ = self
+                            .muxer
+                            .send_control(stream_id, FrameType::Heartbeat, Bytes::new())
+                            .await;
+                    } else {
+                        trace!(stream_id, "💓 [Client] Standard Heartbeat reply received");
+                    }
                 }
             }
 
@@ -122,8 +131,6 @@ impl StreamHandler {
                 debug!(stream_id, "🏁 [Tunnel] Peer closed stream");
                 self.muxer.remove_stream(stream_id);
             }
-
-            _ => debug!(stream_id, "Unhandled frame: {:?}", frame.header.frame_type),
         }
     }
 
@@ -131,13 +138,7 @@ impl StreamHandler {
         let target = String::from_utf8_lossy(&payload).to_string();
 
         if let Some(opener) = &self.opener {
-            let capacity = if is_udp {
-                NetworkConfig::global().server_stream_capacity
-            } else {
-                NetworkConfig::global().server_stream_capacity
-            };
-
-            let (v_tx, v_rx) = mpsc::channel(capacity);
+            let (v_tx, v_rx) = mpsc::unbounded_channel::<Bytes>();
             self.muxer.register_stream(stream_id, v_tx);
 
             if is_udp {
@@ -150,7 +151,6 @@ impl StreamHandler {
                 stream_id,
                 "⚠️ [Tunnel] Rejected incoming connection to {} (Client mode)", target
             );
-
             let _ = self
                 .muxer
                 .send_control(stream_id, FrameType::Close, Bytes::new())

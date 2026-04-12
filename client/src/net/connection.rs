@@ -6,6 +6,7 @@ use netrunner_core::{
 use smoltcp::{
     iface::SocketHandle,
     socket::{tcp, udp},
+    time::Duration,
     wire::{
         Icmpv4Message, Icmpv4Packet, Icmpv6Message, Icmpv6Packet, IpAddress, IpEndpoint,
         Ipv6Address,
@@ -18,17 +19,20 @@ use netrunner_logger::{debug, info};
 
 pub struct ConnectionCore<T> {
     pub handle: SocketHandle,
-    pub tx: mpsc::Sender<T>,
-    pub rx: mpsc::Receiver<Bytes>,
+    pub tx: mpsc::UnboundedSender<T>,       // 🔥 Полностью Unbounded
+    pub rx: mpsc::UnboundedReceiver<Bytes>, // 🔥 Полностью Unbounded
 }
 
 impl<T> ConnectionCore<T> {
     pub fn new(
         handle: SocketHandle,
-        capacity: usize,
-    ) -> (Self, mpsc::Receiver<T>, mpsc::Sender<Bytes>) {
-        let (tx_to_net, rx_from_smol) = mpsc::channel::<T>(capacity);
-        let (tx_to_smol, rx_from_net) = mpsc::channel::<Bytes>(capacity);
+    ) -> (
+        Self,
+        mpsc::UnboundedReceiver<T>,
+        mpsc::UnboundedSender<Bytes>,
+    ) {
+        let (tx_to_net, rx_from_smol) = mpsc::unbounded_channel::<T>();
+        let (tx_to_smol, rx_from_net) = mpsc::unbounded_channel::<Bytes>();
 
         let core = Self {
             handle,
@@ -51,7 +55,6 @@ pub enum ConnectionState {
 pub struct TcpConnection {
     core: ConnectionCore<Bytes>,
     state: ConnectionState,
-    // 🔥 ФИКС: Используем очередь чанков, чтобы не копировать память
     pending_data: VecDeque<Bytes>,
     handshake_rx: Option<oneshot::Receiver<()>>,
     chunk_buf: Vec<u8>,
@@ -63,12 +66,11 @@ impl TcpConnection {
         handle: SocketHandle,
     ) -> (
         Self,
-        mpsc::Receiver<Bytes>,
-        mpsc::Sender<Bytes>,
+        mpsc::UnboundedReceiver<Bytes>,
+        mpsc::UnboundedSender<Bytes>,
         oneshot::Sender<()>,
     ) {
-        let capacity = NetworkConfig::global().client_virtual_stream_capacity;
-        let (core, rx_from_smol, tx_to_smol) = ConnectionCore::new(handle, capacity);
+        let (core, rx_from_smol, tx_to_smol) = ConnectionCore::new(handle);
         let (handshake_tx, handshake_rx) = oneshot::channel();
 
         let conn = Self {
@@ -133,51 +135,36 @@ impl TcpConnection {
     }
 
     fn poll_and_process(&mut self, socket: &mut tcp::Socket) {
-        while socket.can_recv() {
-            let mut full = false;
+        let rtt = Duration::from_millis(250);
+        socket.set_tunnel_rtt(rtt);
 
+        while socket.can_recv() {
             if let Ok(n) = socket.peek_slice(&mut self.chunk_buf) {
                 if n == 0 {
                     break;
                 }
-
                 let chunk = Bytes::copy_from_slice(&self.chunk_buf[..n]);
-                match self.core.tx.try_send(chunk) {
-                    Ok(_) => {
-                        socket.recv_slice(&mut self.chunk_buf[..n]).unwrap();
-                    }
-                    Err(mpsc::error::TrySendError::Full(_)) => {
-                        full = true;
-                    }
-                    Err(_) => {
-                        self.server_eof = true;
-                        break;
-                    }
+
+                if self.core.tx.send(chunk).is_ok() {
+                    socket.recv_slice(&mut self.chunk_buf[..n]).unwrap();
+                } else {
+                    self.server_eof = true;
+                    break;
                 }
             } else {
-                break;
-            }
-
-            if full {
                 break;
             }
         }
 
         if !self.server_eof {
             loop {
-                let pending_size: usize = self.pending_data.iter().map(|b| b.len()).sum();
-                let max_pending = 128 * 1024;
-                if pending_size >= max_pending {
-                    break;
-                }
-
                 match self.core.rx.try_recv() {
                     Ok(data) => {
                         self.pending_data.push_back(data);
                     }
                     Err(mpsc::error::TryRecvError::Empty) => break,
                     Err(mpsc::error::TryRecvError::Disconnected) => {
-                        debug!(%self.core.handle, "Server sent EOF");
+                        debug!(%self.core.handle, "Tunnel channel closed (Server EOF)");
                         self.server_eof = true;
                         break;
                     }
@@ -185,33 +172,33 @@ impl TcpConnection {
             }
         }
 
-        // 🔥 ФИКС: Отправляем данные кусками без копирования памяти
         while socket.can_send() {
             if let Some(mut chunk) = self.pending_data.pop_front() {
                 match socket.send_slice(&chunk) {
                     Ok(n) => {
                         if n < chunk.len() {
-                            // Если сокет проглотил не всё, отрезаем отправленное,
-                            // а остаток возвращаем в начало очереди
                             chunk.advance(n);
                             self.pending_data.push_front(chunk);
-                            break; // Буфер сокета заполнен
+                            break;
                         }
                     }
                     Err(e) => {
                         debug!(%self.core.handle, "Smoltcp send error: {:?}", e);
-                        self.pending_data.push_front(chunk); // Возвращаем кусок обратно при ошибке
+                        self.pending_data.push_front(chunk);
                         break;
                     }
                 }
             } else {
-                break; // Нет больше данных для отправки
+                break;
             }
         }
 
-        if self.server_eof && self.pending_data.is_empty() && socket.may_send() {
-            debug!(%self.core.handle, "All data flushed after server EOF, sending FIN to browser");
-            socket.close();
+        if self.server_eof && self.pending_data.is_empty() {
+            let state = socket.state();
+            if state == tcp::State::Established || state == tcp::State::CloseWait {
+                debug!(%self.core.handle, "All data flushed after server EOF, sending FIN to browser");
+                socket.close();
+            }
         }
     }
 
@@ -220,15 +207,17 @@ impl TcpConnection {
         dst_ip: std::net::Ipv4Addr,
         dst_port: u16,
         target: String,
-        mut rx_smol: mpsc::Receiver<Bytes>,
+        mut rx_smol: mpsc::UnboundedReceiver<Bytes>,
         handshake_tx: oneshot::Sender<()>,
-        tx_tunnel: mpsc::Sender<RawCastFrame>,
+        // 🔥 ФИКС: Тип изменен на UnboundedSender
+        tx_tunnel: mpsc::UnboundedSender<RawCastFrame>,
     ) {
         tokio::spawn(async move {
             let mut frame = RawCastFrame::connect(LocalProtocol::Tcp, socket_id, dst_ip, dst_port);
             frame.payload = Bytes::from(target);
 
-            if tx_tunnel.send(frame).await.is_err() {
+            // send() на UnboundedSender не асинхронный и возвращает Result<(), T>
+            if tx_tunnel.send(frame).is_err() {
                 netrunner_logger::error!("❌ [TCP {}] Failed to send CONNECT to tunnel", socket_id);
                 return;
             }
@@ -244,20 +233,25 @@ impl TcpConnection {
                     data.to_vec(),
                 );
 
-                if tx_tunnel.send(data_frame).await.is_err() {
+                if tx_tunnel.send(data_frame).is_err() {
                     break;
                 }
             }
 
             let close_frame = RawCastFrame::close(LocalProtocol::Tcp, socket_id, dst_ip, dst_port);
-            let _ = tx_tunnel.send(close_frame).await;
+            let _ = tx_tunnel.send(close_frame);
 
             debug!("🏁 [TCP {}] Spawned task finished", socket_id);
         });
     }
+
+    pub fn app_pending_out_size(&self) -> usize {
+        self.pending_data.iter().map(|b| b.len()).sum()
+    }
 }
 
 pub type UdpPacketTarget = (Bytes, std::net::Ipv4Addr, u16);
+
 pub struct UdpConnection {
     core: ConnectionCore<UdpPacketTarget>,
     last_client_endpoint: Option<IpEndpoint>,
@@ -269,16 +263,17 @@ impl UdpConnection {
         handle: SocketHandle,
         client_addr: smoltcp::wire::IpAddress,
         client_port: u16,
-    ) -> (Self, mpsc::Receiver<UdpPacketTarget>, mpsc::Sender<Bytes>) {
-        let capacity = NetworkConfig::global().client_virtual_stream_capacity;
-        let (core, rx_from_smol, tx_to_smol) = ConnectionCore::new(handle, capacity);
-
+    ) -> (
+        Self,
+        mpsc::UnboundedReceiver<UdpPacketTarget>,
+        mpsc::UnboundedSender<Bytes>,
+    ) {
+        let (core, rx_from_smol, tx_to_smol) = ConnectionCore::new(handle);
         let conn = Self {
             core,
             last_client_endpoint: Some(IpEndpoint::new(client_addr, client_port)),
             last_activity: std::time::Instant::now(),
         };
-
         (conn, rx_from_smol, tx_to_smol)
     }
 
@@ -286,6 +281,7 @@ impl UdpConnection {
         self.last_client_endpoint
             .map_or(false, |ep| ep.port == port)
     }
+
     pub fn tick(&mut self, socket: &mut udp::Socket) -> bool {
         if self.last_activity.elapsed() > UDP_IDLE_TIMEOUT {
             socket.close();
@@ -296,12 +292,11 @@ impl UdpConnection {
             while let Ok((data, metadata)) = socket.recv() {
                 if let smoltcp::wire::IpAddress::Ipv4(ip) = metadata.endpoint.addr {
                     self.last_client_endpoint = Some(metadata.endpoint);
-
                     let target_ip = std::net::Ipv4Addr::from(ip);
                     let target_port = metadata.endpoint.port;
                     let payload = (Bytes::copy_from_slice(data), target_ip, target_port);
 
-                    if self.core.tx.try_send(payload).is_ok() {
+                    if self.core.tx.send(payload).is_ok() {
                         self.last_activity = std::time::Instant::now();
                     }
                 }
@@ -313,18 +308,15 @@ impl UdpConnection {
                 match self.core.rx.try_recv() {
                     Ok(data) => {
                         if let Err(e) = socket.send_slice(&data, client_endpoint) {
-                            debug!("Dropped UDP packet due to smoltcp error: {:?}", e);
+                            debug!("Dropped UDP packet: {:?}", e);
                         } else {
                             self.last_activity = std::time::Instant::now();
                         }
                     }
-                    Err(_) => {
-                        break;
-                    }
+                    Err(_) => break,
                 }
             }
         }
-
         true
     }
 
@@ -333,16 +325,16 @@ impl UdpConnection {
         dst_ip: std::net::Ipv4Addr,
         dst_port: u16,
         target: String,
-        mut rx_smol: mpsc::Receiver<UdpPacketTarget>,
-        tx_tunnel: mpsc::Sender<RawCastFrame>,
+        mut rx_smol: mpsc::UnboundedReceiver<UdpPacketTarget>,
+        // 🔥 ФИКС: Тип изменен на UnboundedSender
+        tx_tunnel: mpsc::UnboundedSender<RawCastFrame>,
     ) {
         tokio::spawn(async move {
             debug!("📡 [UDP {}] Task started for {}", socket_id, target);
-
             let mut frame = RawCastFrame::connect(LocalProtocol::Udp, socket_id, dst_ip, dst_port);
             frame.payload = Bytes::from(target);
 
-            if tx_tunnel.send(frame).await.is_err() {
+            if tx_tunnel.send(frame).is_err() {
                 netrunner_logger::error!("❌ [UDP {}] Failed to send CONNECT to tunnel", socket_id);
                 return;
             }
@@ -350,20 +342,19 @@ impl UdpConnection {
             while let Some((data, ip, port)) = rx_smol.recv().await {
                 let data_frame =
                     RawCastFrame::data(LocalProtocol::Udp, socket_id, ip, port, data.to_vec());
-
-                if tx_tunnel.send(data_frame).await.is_err() {
+                if tx_tunnel.send(data_frame).is_err() {
                     break;
                 }
             }
 
             let close_frame = RawCastFrame::close(LocalProtocol::Udp, socket_id, dst_ip, dst_port);
-            let _ = tx_tunnel.send(close_frame).await;
-
+            let _ = tx_tunnel.send(close_frame);
             info!("🛑 [UDP {}] Task stopped", socket_id);
         });
     }
 }
 
+// IcmpResponder оставляем как был (он не использует каналы)
 use smoltcp::socket::icmp;
 
 pub struct IcmpResponder;

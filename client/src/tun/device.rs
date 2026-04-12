@@ -79,8 +79,8 @@ impl DerefMut for TokenBuffer {
 
 pub struct VirtTunDevice {
     capabilities: DeviceCapabilities,
-    rx_queue: mpsc::Receiver<TokenBuffer>, // Входящие из TUN оставляем ограниченными (Backpressure)
-    tx_queue: mpsc::UnboundedSender<TokenBuffer>, // 🔥 ФИКС: Исходящие в TUN делаем БЕЗЛИМИТНЫМИ
+    rx_queue: mpsc::UnboundedReceiver<TokenBuffer>,
+    tx_queue: mpsc::UnboundedSender<TokenBuffer>,
     rx_avail: Arc<AtomicBool>,
 
     rx_bytes: u64,
@@ -102,12 +102,12 @@ impl VirtTunDevice {
         capabilities: DeviceCapabilities,
     ) -> (
         Self,
-        mpsc::Sender<TokenBuffer>,
+        mpsc::UnboundedSender<TokenBuffer>,
         mpsc::UnboundedReceiver<TokenBuffer>,
         Arc<AtomicBool>,
     ) {
-        let (to_smoltcp_tx, to_smoltcp_rx) = mpsc::channel(128);
-        let (from_smoltcp_tx, from_smoltcp_rx) = mpsc::unbounded_channel(); // 🔥 Безлимитный канал
+        let (to_smoltcp_tx, to_smoltcp_rx) = mpsc::unbounded_channel();
+        let (from_smoltcp_tx, from_smoltcp_rx) = mpsc::unbounded_channel();
         let rx_avail = Arc::new(AtomicBool::new(false));
 
         let now = StdInstant::now();

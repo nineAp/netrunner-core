@@ -7,7 +7,7 @@ use crate::nrxp::FrameType;
 use bytes::{Bytes, BytesMut};
 use netrunner_logger::{debug, error, info, warn};
 use tokio::net::UdpSocket;
-use tokio::sync::mpsc;
+use tokio::sync::mpsc; // Подтянет UnboundedReceiver
 use tokio::time::timeout;
 
 struct StreamGuard {
@@ -27,7 +27,7 @@ pub(crate) async fn run_tcp_bridge<R, W>(
     mut reader: R,
     mut writer: W,
     muxer: Arc<Muxer>,
-    mut v_rx: mpsc::Receiver<Bytes>,
+    mut v_rx: mpsc::UnboundedReceiver<Bytes>, // 🔥 Перешли на Unbounded
 ) where
     R: tokio::io::AsyncReadExt + Unpin,
     W: tokio::io::AsyncWriteExt + Unpin,
@@ -43,7 +43,7 @@ pub(crate) async fn run_tcp_bridge<R, W>(
         buf.reserve(NetworkConfig::global().tcp_buffer_size);
         let select_res = timeout(BRIDGE_IDLE_TIMEOUT, async {
             tokio::select! {
-
+                // 1. Читаем из реального сокета интернета -> шлем в туннель
                 res = reader.read_buf(&mut buf) => {
                     match res {
                         Ok(0) => {
@@ -57,6 +57,8 @@ pub(crate) async fn run_tcp_bridge<R, W>(
                                 data: buf.split().freeze(),
                             };
 
+                            // send_to_network теперь внутри использует UnboundedSender,
+                            // поэтому этот вызов больше никогда не заблокирует цикл из-за Full
                             if muxer.send_to_network(msg).await.is_err() {
                                 return Ok(false);
                             }
@@ -69,7 +71,7 @@ pub(crate) async fn run_tcp_bridge<R, W>(
                     }
                 }
 
-
+                // 2. Получаем из туннеля -> пишем в реальный сокет
                 maybe_data = v_rx.recv() => {
                     match maybe_data {
                         Some(data) => {
@@ -104,11 +106,14 @@ pub(crate) async fn run_tcp_bridge<R, W>(
         }
     }
 
-    let _ = muxer.send_to_network(MuxMessage {
-        stream_id,
-        frame_type: FrameType::Close,
-        data: Bytes::new(),
-    });
+    // Сообщаем другой стороне, что стрим закрыт
+    let _ = muxer
+        .send_to_network(MuxMessage {
+            stream_id,
+            frame_type: FrameType::Close,
+            data: Bytes::new(),
+        })
+        .await;
 
     tokio::time::sleep(Duration::from_millis(50)).await;
 }
@@ -117,7 +122,7 @@ pub(crate) async fn run_udp_bridge(
     stream_id: u32,
     socket: UdpSocket,
     muxer: Arc<Muxer>,
-    mut v_rx: mpsc::Receiver<Bytes>,
+    mut v_rx: mpsc::UnboundedReceiver<Bytes>, // 🔥 Перешли на Unbounded
 ) {
     let _guard = StreamGuard {
         stream_id,
@@ -132,11 +137,12 @@ pub(crate) async fn run_udp_bridge(
     loop {
         let select_res = timeout(BRIDGE_IDLE_TIMEOUT, async {
             tokio::select! {
-
+                // Из интернета в туннель
                 res = socket.recv(&mut buf) => {
                     match res {
                         Ok(n) if n > 0 => {
                             let data = Bytes::copy_from_slice(&buf[..n]);
+                            // Внутри muxer теперь тоже Unbounded
                             if let Err(e) = muxer.send_data_safe(stream_id, data, true).await {
                                 error!(stream_id, "UDP Failed to send to tunnel: {}", e);
                                 return Err(e);
@@ -151,7 +157,7 @@ pub(crate) async fn run_udp_bridge(
                     }
                 }
 
-
+                // Из туннеля в интернет
                 maybe_data = v_rx.recv() => {
                     match maybe_data {
                         Some(data) => {

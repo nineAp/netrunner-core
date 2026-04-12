@@ -10,17 +10,6 @@ pub struct NetworkConfig {
     pub tcp_buffer_size: usize,
     pub udp_buffer_size: usize,
 
-    // --- Очереди MPSC (Разделенные) ---
-    // Для Клиента (мобильный интернет)
-    pub client_muxer_capacity: usize,  // Подушка для 10 ног
-    pub client_tun_capacity: usize,    // Стык TUN <-> Engine
-    pub client_stream_capacity: usize, // Быстрый Backpressure для сокета
-    pub client_virtual_stream_capacity: usize,
-
-    // Для Сервера (Дата-центр)
-    pub server_muxer_capacity: usize, // Огромная очередь для входящего трафика
-    pub server_stream_capacity: usize, // Чтобы сервер не тормозил на отдачу
-
     pub tcp_chunk_size: usize,
 
     // Буферы сокетов smoltcp
@@ -44,16 +33,6 @@ impl NetworkConfig {
             udp_buffer_size: 64 * 1024,
 
             tcp_chunk_size: system_mtu - 100,
-
-            // 🔥 Зажимаем программные очереди (Убиваем Hidden Bloat)
-            client_muxer_capacity: 8,
-            client_tun_capacity: 16,
-            client_stream_capacity: 16,
-            client_virtual_stream_capacity: 32,
-
-            server_muxer_capacity: 64, // Кардинально режем
-            server_stream_capacity: 32,
-
             // 🔥 Расширяем TCP окна под BBR (Разблокируем Gigabit на дальние дистанции)
             tcp_rx_heavy: 256 * 1024, //512
             tcp_tx_heavy: 256 * 1024, // 1 MB

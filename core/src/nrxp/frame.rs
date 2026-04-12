@@ -1,8 +1,6 @@
-use bytes::{Buf, BufMut, Bytes, BytesMut};
-
-use rand::Rng;
-
 use crate::parser::Parser;
+use bytes::{Buf, BufMut, Bytes, BytesMut};
+use rand::Rng;
 
 struct Padding {
     pub len: u16,
@@ -33,8 +31,8 @@ pub(crate) enum FrameType {
     Heartbeat = 0x03,
     UdpConnect = 0x04,
     UdpData = 0x05,
-    Handshake = 0x06,
 }
+
 #[derive(Copy, Clone)]
 pub(crate) struct FrameHeader {
     pub(crate) _auth_tag: [u8; 16],
@@ -76,7 +74,6 @@ impl Frame {
 
     pub(crate) fn into_bytes(mut self, auth_key: &[u8; 16]) -> BytesMut {
         let generated_padding = Padding::generate_padding();
-
         self.header.padding_len = generated_padding.len;
 
         let total_size =
@@ -95,6 +92,7 @@ impl Frame {
         buf
     }
 }
+
 impl Parser for FrameHeader {
     type Error = String;
 
@@ -122,7 +120,6 @@ impl Parser for FrameHeader {
             0x03 => FrameType::Heartbeat,
             0x04 => FrameType::UdpConnect,
             0x05 => FrameType::UdpData,
-            0x06 => FrameType::Handshake,
             _ => FrameType::Close,
         };
 
@@ -149,14 +146,6 @@ impl Parser for Frame {
 
         let p_len = u16::from_be_bytes([bytes[21], bytes[22]]) as usize;
         let pad_len = u16::from_be_bytes([bytes[23], bytes[24]]) as usize;
-
-        netrunner_logger::debug!(
-            "CAN_PARSE: p_len={}, pad_len={}, total_needed={}, have={}",
-            p_len,
-            pad_len,
-            25 + p_len + pad_len,
-            bytes.len()
-        );
 
         bytes.len() >= (FRAME_HEADER_SIZE as usize + p_len + pad_len)
     }
