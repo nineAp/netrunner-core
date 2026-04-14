@@ -5,7 +5,7 @@ use netrunner_logger::{debug, error, info};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::tcp::{OwnedReadHalf, OwnedWriteHalf},
-    sync::mpsc::UnboundedReceiver,
+    sync::mpsc::Receiver,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -23,8 +23,8 @@ pub(crate) struct TunnelEngine {
     pub rx_codec: RxCodec,
     pub tx_codec: TxCodec,
     pub read_buf: BytesMut,
-    pub control_rx: UnboundedReceiver<MuxMessage>,
-    pub data_rx: UnboundedReceiver<MuxMessage>,
+    pub control_rx: Receiver<MuxMessage>,
+    pub data_rx: Receiver<MuxMessage>,
     pub handler: Arc<StreamHandler>,
     pub leg_id: u32,
     pub muxer: Arc<crate::net::connection::muxer::Muxer>,
@@ -94,7 +94,6 @@ impl TunnelEngine {
                         }
 
                         for frame in frames {
-                            // Любой Heartbeat – это подтверждение жизни туннеля, обновляем пинг
                             if frame.header.frame_type == FrameType::Heartbeat {
                                 let m = muxer.clone();
                                 tokio::spawn(async move {

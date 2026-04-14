@@ -4,7 +4,7 @@ use netrunner_logger::{debug, info, trace, warn};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::Sender;
 
 use crate::net::{HEALTH_CHECK_TIMEOUT, MAX_TUNNEL_LEGS, MUXER_POOL_SIZE};
 use crate::nrxp::FrameType;
@@ -24,8 +24,8 @@ pub struct StreamStats {
 
 #[derive(Clone)]
 struct MuxLeg {
-    control_tx: UnboundedSender<MuxMessage>,
-    data_tx: UnboundedSender<MuxMessage>,
+    control_tx: Sender<MuxMessage>,
+    data_tx: Sender<MuxMessage>,
     stats: Arc<LegStats>,
 }
 
@@ -52,6 +52,8 @@ impl IdGenerator {
     }
 }
 
+// 🔥 Клонируем сообщения для Retry-логики
+#[derive(Clone)]
 pub struct MuxMessage {
     pub stream_id: u32,
     pub frame_type: FrameType,
@@ -63,7 +65,7 @@ pub static GLOBAL_MIN_RTT: AtomicU32 = AtomicU32::new(250);
 #[derive(Clone)]
 pub struct Muxer {
     legs: Arc<DashMap<u32, MuxLeg>>,
-    streams: Arc<DashMap<u32, (UnboundedSender<Bytes>, Arc<StreamStats>)>>,
+    streams: Arc<DashMap<u32, (Sender<Bytes>, Arc<StreamStats>)>>,
     stream_bindings: Arc<DashMap<u32, u32>>,
     pending_pings: Arc<DashMap<u32, Instant>>,
     id_gen: Arc<IdGenerator>,
@@ -85,8 +87,8 @@ impl Muxer {
     pub fn add_leg(
         &self,
         leg_id: u32,
-        control_tx: UnboundedSender<MuxMessage>,
-        data_tx: UnboundedSender<MuxMessage>,
+        control_tx: Sender<MuxMessage>,
+        data_tx: Sender<MuxMessage>,
     ) {
         if self.legs.len() >= MAX_TUNNEL_LEGS as usize {
             warn!(leg_id, "MUXER: Max legs reached: {}", MAX_TUNNEL_LEGS);
@@ -106,19 +108,24 @@ impl Muxer {
 
     pub fn remove_leg(&self, leg_id: u32) {
         self.legs.remove(&leg_id);
-        self.stream_bindings.clear();
-        info!(leg_id, "MUXER: Leg removed, all streams re-balanced");
+        // Мы не чистим stream_bindings полностью,
+        // балансировщик сам переназначит мертвые привязки
+        info!(
+            leg_id,
+            "MUXER: Leg removed, streams will re-balance dynamically"
+        );
     }
 
     pub fn active_legs_count(&self) -> usize {
         self.legs.len()
     }
 
-    fn select_leg(&self, frame_type: &FrameType, stream_id: u32) -> Option<(u32, MuxLeg)> {
+    fn select_leg(&self, _frame_type: &FrameType, stream_id: u32) -> Option<(u32, MuxLeg)> {
         if self.legs.is_empty() {
             return None;
         }
 
+        // Если привязка есть и нога жива — используем её
         if let Some(leg_id_ref) = self.stream_bindings.get(&stream_id) {
             let leg_id = *leg_id_ref;
             if let Some(leg) = self.legs.get(&leg_id) {
@@ -126,22 +133,13 @@ impl Muxer {
             }
         }
 
-        let is_udp = matches!(frame_type, FrameType::UdpData | FrameType::UdpConnect);
-
+        // 🔥 ФИКС: Убрано разделение на TCP/UDP ноги.
+        // Все физические ноги у нас TCP, поэтому мы балансируем трафик по всем ногам!
         let mut candidates: Vec<(u32, MuxLeg)> = self
             .legs
             .iter()
             .map(|kv| (*kv.key(), kv.value().clone()))
-            .filter(|(id, _)| if is_udp { id % 2 != 0 } else { id % 2 == 0 })
             .collect();
-
-        if candidates.is_empty() {
-            candidates = self
-                .legs
-                .iter()
-                .map(|kv| (*kv.key(), kv.value().clone()))
-                .collect();
-        }
 
         candidates.sort_by(|(_, leg_a), (_, leg_b)| {
             let rtt_a = leg_a.stats.rtt_ms.load(Ordering::Relaxed) as f64;
@@ -156,6 +154,8 @@ impl Muxer {
 
         let pool_size = std::cmp::min(candidates.len(), MUXER_POOL_SIZE);
         let (selected_id, selected_leg) = candidates[stream_id as usize % pool_size].clone();
+
+        // Обновляем привязку
         self.stream_bindings.insert(stream_id, selected_id);
 
         Some((selected_id, selected_leg))
@@ -185,37 +185,46 @@ impl Muxer {
         }
     }
 
+    // 🔥 ФИКС: Добавлена логика повторной отправки (Retry) при обрыве связи!
     pub async fn send_to_network(&self, message: MuxMessage) -> Result<(), String> {
-        let stream_id = message.stream_id;
         let size = message.data.len() as u64;
+        let mut attempts = 0;
 
-        let (leg_id, leg) = self
-            .select_leg(&message.frame_type, stream_id)
-            .ok_or_else(|| "MUXER: No active legs available".to_string())?;
+        loop {
+            if attempts >= 3 {
+                return Err("MUXER: All attempts to send failed".to_string());
+            }
+            attempts += 1;
 
-        let target_tx = match message.frame_type {
-            FrameType::Connect
-            | FrameType::Close
-            | FrameType::UdpConnect
-            | FrameType::Heartbeat => leg.control_tx.clone(),
-            _ => leg.data_tx.clone(),
-        };
+            let (leg_id, leg) = match self.select_leg(&message.frame_type, message.stream_id) {
+                Some(l) => l,
+                None => return Err("MUXER: No active legs available".to_string()),
+            };
 
-        if target_tx.send(message).is_err() {
-            self.remove_leg(leg_id);
-            return Err(format!("MUXER: Leg {} died during send", leg_id));
+            let target_tx = match message.frame_type {
+                FrameType::Connect
+                | FrameType::Close
+                | FrameType::UdpConnect
+                | FrameType::Heartbeat => &leg.control_tx,
+                _ => &leg.data_tx,
+            };
+
+            if target_tx.send(message.clone()).await.is_err() {
+                // Нога умерла! Выкидываем её и пробуем отправить пакет в ДРУГУЮ ногу (continue)
+                self.remove_leg(leg_id);
+                continue;
+            }
+
+            leg.stats.tx_bytes.fetch_add(size, Ordering::Relaxed);
+            if let Some(stream_ref) = self.streams.get(&message.stream_id) {
+                stream_ref
+                    .value()
+                    .1
+                    .tx_bytes
+                    .fetch_add(size, Ordering::Relaxed);
+            }
+            return Ok(());
         }
-
-        leg.stats.tx_bytes.fetch_add(size, Ordering::Relaxed);
-        if let Some(stream_ref) = self.streams.get(&stream_id) {
-            stream_ref
-                .value()
-                .1
-                .tx_bytes
-                .fetch_add(size, Ordering::Relaxed);
-        }
-
-        Ok(())
     }
 
     pub async fn send_data_safe(
@@ -251,7 +260,7 @@ impl Muxer {
         .await
     }
 
-    pub fn register_stream(&self, stream_id: u32, tx: UnboundedSender<Bytes>) {
+    pub fn register_stream(&self, stream_id: u32, tx: Sender<Bytes>) {
         self.streams
             .insert(stream_id, (tx, Arc::new(StreamStats::default())));
     }
@@ -269,7 +278,7 @@ impl Muxer {
             .map(|s| (s.value().0.clone(), s.value().1.clone()));
         if let Some((tx, stats)) = stream_opt {
             let size = data.len() as u64;
-            if tx.send(data).is_err() {
+            if tx.send(data).await.is_err() {
                 self.remove_stream(stream_id);
             } else {
                 stats.rx_bytes.fetch_add(size, Ordering::Relaxed);
@@ -297,20 +306,19 @@ impl Muxer {
             let tx = leg.control_tx.clone();
 
             let probe_stream_id = self.id_gen.next();
-            let (probe_tx, mut probe_rx) = tokio::sync::mpsc::unbounded_channel();
+            let cap = crate::net::NetworkConfig::global().channel_capacity;
+            let (probe_tx, mut probe_rx) = tokio::sync::mpsc::channel(cap);
             self.register_stream(probe_stream_id, probe_tx);
 
             self.record_ping_sent(leg_id);
 
             let msg = MuxMessage {
                 stream_id: probe_stream_id,
-                frame_type: FrameType::Heartbeat, // 🔥 Теперь Heartbeat
+                frame_type: FrameType::Heartbeat,
                 data: Bytes::from("PING"),
             };
 
-            let start = std::time::Instant::now();
-
-            if tx.send(msg).is_err() {
+            if tx.send(msg).await.is_err() {
                 warn!(leg_id, "❌ MUXER: Leg channel dropped, killing leg");
                 self.remove_leg(leg_id);
                 self.remove_stream(probe_stream_id);
@@ -328,15 +336,6 @@ impl Muxer {
             }
             self.remove_stream(probe_stream_id);
         }
-    }
-
-    pub fn get_min_rtt(&self) -> u32 {
-        self.legs
-            .iter()
-            .map(|kv| kv.value().stats.rtt_ms.load(Ordering::Relaxed))
-            .filter(|&rtt| rtt > 0)
-            .min()
-            .unwrap_or(250) // Fallback
     }
 
     fn format_size(bytes: u64) -> String {

@@ -9,8 +9,10 @@ pub struct NetworkConfig {
     pub connection_buf_size: usize,
     pub tcp_buffer_size: usize,
     pub udp_buffer_size: usize,
-
     pub tcp_chunk_size: usize,
+
+    // 🔥 Единый конфиг для всех каналов Tokio
+    pub channel_capacity: usize,
 
     // Буферы сокетов smoltcp
     pub tcp_rx_heavy: usize,
@@ -28,14 +30,17 @@ impl NetworkConfig {
     pub fn new(system_mtu: usize) -> Self {
         Self {
             mtu: system_mtu,
-            connection_buf_size: 1024 * 1024 * 2,
-            tcp_buffer_size: 512 * 1024,
+            connection_buf_size: 1024 * 1024 * 4,
+            tcp_buffer_size: 1024 * 1024,
             udp_buffer_size: 64 * 1024,
-
             tcp_chunk_size: system_mtu - 100,
-            // 🔥 Расширяем TCP окна под BBR (Разблокируем Gigabit на дальние дистанции)
-            tcp_rx_heavy: 256 * 1024, //512
-            tcp_tx_heavy: 256 * 1024, // 1 MB
+
+            // 🔥 Канал расширен для сглаживания микро-обрывов связи
+            channel_capacity: 2048,
+
+            // Расширяем TCP окна под BBR
+            tcp_rx_heavy: 256 * 1024,
+            tcp_tx_heavy: 256 * 1024,
 
             tcp_rx_light: 32 * 1024,
             tcp_tx_light: 32 * 1024,

@@ -17,8 +17,7 @@ pub struct SessionTracker {
     last_activity: HashMap<SocketHandle, StdInstant>,
     active_tcp: HashMap<SocketHandle, TcpConnection>,
     active_udp: HashMap<SocketHandle, UdpConnection>,
-    // 🔥 Теперь храним UnboundedSender
-    inbound_tx: HashMap<u64, mpsc::UnboundedSender<Bytes>>,
+    inbound_tx: HashMap<u64, mpsc::Sender<Bytes>>, // 🔥 Bounded
     handle_to_id: HashMap<SocketHandle, u64>,
 
     id_to_handle: HashMap<u64, SocketHandle>,
@@ -57,7 +56,7 @@ impl SessionTracker {
         handle: SocketHandle,
         id: u64,
         conn: TcpConnection,
-        tx: mpsc::UnboundedSender<Bytes>, // 🔥 Unbounded
+        tx: mpsc::Sender<Bytes>,
     ) {
         self.pending_tcp.remove(&handle);
         self.handle_to_id.insert(handle, id);
@@ -72,7 +71,7 @@ impl SessionTracker {
         handle: SocketHandle,
         id: u64,
         conn: UdpConnection,
-        tx: mpsc::UnboundedSender<Bytes>, // 🔥 Unbounded
+        tx: mpsc::Sender<Bytes>,
     ) {
         self.handle_to_id.insert(handle, id);
         self.id_to_handle.insert(id, handle);
@@ -123,7 +122,7 @@ impl SessionTracker {
         self.last_activity.insert(handle, StdInstant::now());
     }
 
-    pub fn get_inbound_tx(&self, id: u64) -> Option<&mpsc::UnboundedSender<Bytes>> {
+    pub fn get_inbound_tx(&self, id: u64) -> Option<&mpsc::Sender<Bytes>> {
         self.inbound_tx.get(&id)
     }
 

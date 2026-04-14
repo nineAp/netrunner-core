@@ -19,20 +19,15 @@ use netrunner_logger::{debug, info};
 
 pub struct ConnectionCore<T> {
     pub handle: SocketHandle,
-    pub tx: mpsc::UnboundedSender<T>,       // 🔥 Полностью Unbounded
-    pub rx: mpsc::UnboundedReceiver<Bytes>, // 🔥 Полностью Unbounded
+    pub tx: mpsc::Sender<T>,
+    pub rx: mpsc::Receiver<Bytes>,
 }
 
 impl<T> ConnectionCore<T> {
-    pub fn new(
-        handle: SocketHandle,
-    ) -> (
-        Self,
-        mpsc::UnboundedReceiver<T>,
-        mpsc::UnboundedSender<Bytes>,
-    ) {
-        let (tx_to_net, rx_from_smol) = mpsc::unbounded_channel::<T>();
-        let (tx_to_smol, rx_from_net) = mpsc::unbounded_channel::<Bytes>();
+    pub fn new(handle: SocketHandle) -> (Self, mpsc::Receiver<T>, mpsc::Sender<Bytes>) {
+        let cap = NetworkConfig::global().channel_capacity;
+        let (tx_to_net, rx_from_smol) = mpsc::channel::<T>(cap);
+        let (tx_to_smol, rx_from_net) = mpsc::channel::<Bytes>(cap);
 
         let core = Self {
             handle,
@@ -56,6 +51,7 @@ pub struct TcpConnection {
     core: ConnectionCore<Bytes>,
     state: ConnectionState,
     pending_data: VecDeque<Bytes>,
+    pending_bytes: usize,
     handshake_rx: Option<oneshot::Receiver<()>>,
     chunk_buf: Vec<u8>,
     server_eof: bool,
@@ -66,8 +62,8 @@ impl TcpConnection {
         handle: SocketHandle,
     ) -> (
         Self,
-        mpsc::UnboundedReceiver<Bytes>,
-        mpsc::UnboundedSender<Bytes>,
+        mpsc::Receiver<Bytes>,
+        mpsc::Sender<Bytes>,
         oneshot::Sender<()>,
     ) {
         let (core, rx_from_smol, tx_to_smol) = ConnectionCore::new(handle);
@@ -77,6 +73,7 @@ impl TcpConnection {
             core,
             state: ConnectionState::Handshaking,
             pending_data: VecDeque::new(),
+            pending_bytes: 0,
             handshake_rx: Some(handshake_rx),
             chunk_buf: vec![0u8; NetworkConfig::global().tcp_chunk_size],
             server_eof: false,
@@ -139,7 +136,8 @@ impl TcpConnection {
         let rtt = Duration::from_millis(current_rtt as u64);
         socket.set_tunnel_rtt(rtt);
 
-        if self.app_pending_out_size() < 512 * 1024 {
+        // Читаем из браузера в Туннель
+        if self.core.tx.capacity() > 0 {
             while socket.can_recv() {
                 if let Ok(n) = socket.peek_slice(&mut self.chunk_buf) {
                     if n == 0 {
@@ -147,11 +145,17 @@ impl TcpConnection {
                     }
                     let chunk = Bytes::copy_from_slice(&self.chunk_buf[..n]);
 
-                    if self.core.tx.send(chunk).is_ok() {
-                        socket.recv_slice(&mut self.chunk_buf[..n]).unwrap();
-                    } else {
-                        self.server_eof = true;
-                        break;
+                    match self.core.tx.try_send(chunk) {
+                        Ok(_) => {
+                            socket.recv_slice(&mut self.chunk_buf[..n]).unwrap();
+                        }
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            break;
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            self.server_eof = true;
+                            break;
+                        }
                     }
                 } else {
                     break;
@@ -159,10 +163,15 @@ impl TcpConnection {
             }
         }
 
+        // Читаем из Туннеля в браузер
         if !self.server_eof {
-            loop {
+            // 🔥 РЕАЛЬНЫЙ BACKPRESSURE:
+            // Читаем из канала, ТОЛЬКО если в очереди < 4 МБ данных.
+            // Если больше - оставляем лежать в канале Tokio, пока smoltcp не освободится!
+            while self.pending_bytes < 4 * 1024 * 1024 {
                 match self.core.rx.try_recv() {
                     Ok(data) => {
+                        self.pending_bytes += data.len();
                         self.pending_data.push_back(data);
                     }
                     Err(mpsc::error::TryRecvError::Empty) => break,
@@ -179,6 +188,7 @@ impl TcpConnection {
             if let Some(mut chunk) = self.pending_data.pop_front() {
                 match socket.send_slice(&chunk) {
                     Ok(n) => {
+                        self.pending_bytes -= n;
                         if n < chunk.len() {
                             chunk.advance(n);
                             self.pending_data.push_front(chunk);
@@ -205,22 +215,24 @@ impl TcpConnection {
         }
     }
 
+    pub fn app_pending_out_size(&self) -> usize {
+        self.pending_bytes
+    }
+
     pub fn spawn(
         socket_id: u64,
         dst_ip: std::net::Ipv4Addr,
         dst_port: u16,
         target: String,
-        mut rx_smol: mpsc::UnboundedReceiver<Bytes>,
+        mut rx_smol: mpsc::Receiver<Bytes>,
         handshake_tx: oneshot::Sender<()>,
-        // 🔥 ФИКС: Тип изменен на UnboundedSender
-        tx_tunnel: mpsc::UnboundedSender<RawCastFrame>,
+        tx_tunnel: mpsc::Sender<RawCastFrame>,
     ) {
         tokio::spawn(async move {
             let mut frame = RawCastFrame::connect(LocalProtocol::Tcp, socket_id, dst_ip, dst_port);
             frame.payload = Bytes::from(target);
 
-            // send() на UnboundedSender не асинхронный и возвращает Result<(), T>
-            if tx_tunnel.send(frame).is_err() {
+            if tx_tunnel.send(frame).await.is_err() {
                 netrunner_logger::error!("❌ [TCP {}] Failed to send CONNECT to tunnel", socket_id);
                 return;
             }
@@ -236,20 +248,16 @@ impl TcpConnection {
                     data.to_vec(),
                 );
 
-                if tx_tunnel.send(data_frame).is_err() {
+                if tx_tunnel.send(data_frame).await.is_err() {
                     break;
                 }
             }
 
             let close_frame = RawCastFrame::close(LocalProtocol::Tcp, socket_id, dst_ip, dst_port);
-            let _ = tx_tunnel.send(close_frame);
+            let _ = tx_tunnel.send(close_frame).await;
 
             debug!("🏁 [TCP {}] Spawned task finished", socket_id);
         });
-    }
-
-    pub fn app_pending_out_size(&self) -> usize {
-        self.pending_data.iter().map(|b| b.len()).sum()
     }
 }
 
@@ -266,11 +274,7 @@ impl UdpConnection {
         handle: SocketHandle,
         client_addr: smoltcp::wire::IpAddress,
         client_port: u16,
-    ) -> (
-        Self,
-        mpsc::UnboundedReceiver<UdpPacketTarget>,
-        mpsc::UnboundedSender<Bytes>,
-    ) {
+    ) -> (Self, mpsc::Receiver<UdpPacketTarget>, mpsc::Sender<Bytes>) {
         let (core, rx_from_smol, tx_to_smol) = ConnectionCore::new(handle);
         let conn = Self {
             core,
@@ -299,7 +303,7 @@ impl UdpConnection {
                     let target_port = metadata.endpoint.port;
                     let payload = (Bytes::copy_from_slice(data), target_ip, target_port);
 
-                    if self.core.tx.send(payload).is_ok() {
+                    if self.core.tx.try_send(payload).is_ok() {
                         self.last_activity = std::time::Instant::now();
                     }
                 }
@@ -328,16 +332,15 @@ impl UdpConnection {
         dst_ip: std::net::Ipv4Addr,
         dst_port: u16,
         target: String,
-        mut rx_smol: mpsc::UnboundedReceiver<UdpPacketTarget>,
-        // 🔥 ФИКС: Тип изменен на UnboundedSender
-        tx_tunnel: mpsc::UnboundedSender<RawCastFrame>,
+        mut rx_smol: mpsc::Receiver<UdpPacketTarget>,
+        tx_tunnel: mpsc::Sender<RawCastFrame>,
     ) {
         tokio::spawn(async move {
             debug!("📡 [UDP {}] Task started for {}", socket_id, target);
             let mut frame = RawCastFrame::connect(LocalProtocol::Udp, socket_id, dst_ip, dst_port);
             frame.payload = Bytes::from(target);
 
-            if tx_tunnel.send(frame).is_err() {
+            if tx_tunnel.send(frame).await.is_err() {
                 netrunner_logger::error!("❌ [UDP {}] Failed to send CONNECT to tunnel", socket_id);
                 return;
             }
@@ -345,19 +348,18 @@ impl UdpConnection {
             while let Some((data, ip, port)) = rx_smol.recv().await {
                 let data_frame =
                     RawCastFrame::data(LocalProtocol::Udp, socket_id, ip, port, data.to_vec());
-                if tx_tunnel.send(data_frame).is_err() {
+                if tx_tunnel.send(data_frame).await.is_err() {
                     break;
                 }
             }
 
             let close_frame = RawCastFrame::close(LocalProtocol::Udp, socket_id, dst_ip, dst_port);
-            let _ = tx_tunnel.send(close_frame);
+            let _ = tx_tunnel.send(close_frame).await;
             info!("🛑 [UDP {}] Task stopped", socket_id);
         });
     }
 }
 
-// IcmpResponder оставляем как был (он не использует каналы)
 use smoltcp::socket::icmp;
 
 pub struct IcmpResponder;

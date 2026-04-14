@@ -13,7 +13,7 @@ use smoltcp::{
     wire::{IpAddress, IpListenEndpoint, IpProtocol, Ipv4Packet, Ipv6Packet, TcpPacket, UdpPacket},
 };
 use std::sync::Arc;
-use std::time::Instant; // Используем DashMap для потокобезопасного трекинга
+use std::time::Instant;
 
 use tokio::sync::mpsc;
 
@@ -24,7 +24,6 @@ use crate::net::{
     socket_factory::SocketProvider,
 };
 
-// Ключ для идентификации уникального потока (4-tuple)
 type FlowKey = (IpAddress, u16, IpAddress, u16);
 
 struct Flow {
@@ -78,7 +77,7 @@ impl TargetResolver {
 pub struct ConnectionManager {
     tracker: SessionTracker,
     resolver: TargetResolver,
-    tx_to_tunnel: mpsc::UnboundedSender<RawCastFrame>,
+    tx_to_tunnel: mpsc::Sender<RawCastFrame>, // 🔥 Bounded
     factory: Arc<dyn SocketProvider>,
     pending_connects: DashMap<FlowKey, Instant>,
 }
@@ -86,7 +85,7 @@ pub struct ConnectionManager {
 impl ConnectionManager {
     pub fn new(
         dns_handler: DnsHandler,
-        tx_to_tunnel: mpsc::UnboundedSender<RawCastFrame>, // 🔥 Unbounded
+        tx_to_tunnel: mpsc::Sender<RawCastFrame>,
         factory: Arc<dyn SocketProvider>,
     ) -> Self {
         Self {
@@ -109,9 +108,15 @@ impl ConnectionManager {
         }
 
         if let Some(tx) = self.tracker.get_inbound_tx(frame.socket_id) {
-            // 🔥 UnboundedSender::send не требует await и не возвращает Full
-            if let Err(_) = tx.send(frame.payload.clone()) {
-                self.tracker.close_tunnel_session(frame.socket_id);
+            // 🔥 Защита от переполнения: Если очередь Bounded канала полна,
+            // мы тихо удаляем пакет. Очередь освободится, и TCP/BBR сделает свое дело (надежная доставка).
+            // Нельзя закрывать соединение!
+            if let Err(e) = tx.try_send(frame.payload.clone()) {
+                if let mpsc::error::TrySendError::Closed(_) = e {
+                    self.tracker.close_tunnel_session(frame.socket_id);
+                } else {
+                    // Backpressure in action: drop the packet, TCP will handle it
+                }
             }
             Ok(())
         } else {
@@ -174,7 +179,6 @@ impl ConnectionManager {
                 if let Ok(p) = TcpPacket::new_checked(ip.payload()) {
                     flow.src_p = p.src_port();
                     flow.dst_p = p.dst_port();
-                    // Игнорируем пакеты, если это не SYN (новое соединение)
                     if p.syn() && !p.ack() {
                         self.intercept_tcp(flow, socket_set);
                     }
@@ -262,7 +266,6 @@ impl ConnectionManager {
 
         if socket.is_open() {
             let handle = socket_set.add(socket);
-            // 🔥 Принимаем Unbounded части из конструктора
             let (conn, rx_smol, tx_smol) = UdpConnection::new(handle, f.src, f.src_p);
 
             self.tracker.register_udp(handle, socket_id, conn, tx_smol);
@@ -278,11 +281,9 @@ impl ConnectionManager {
     }
 
     pub fn process_sockets(&mut self, socket_set: &mut SocketSet) {
-        // Собираем хендлы, чтобы избежать конфликтов заимствования (borrow checker)
         let handles: Vec<SocketHandle> = socket_set.iter().map(|(h, _)| h).collect();
 
         for handle in handles {
-            // 🔥 ИСПРАВЛЕНИЕ: get_mut возвращает &mut Socket, а не Option<&mut Socket>
             let socket = socket_set.get_mut(handle);
 
             match socket {
@@ -311,7 +312,6 @@ impl ConnectionManager {
                 let socket_id = self.tracker.next_id();
                 let (dst_ip, target) = self.resolver.resolve_destination(local.addr, local.port);
 
-                // 🔥 Принимаем Unbounded части
                 let (conn, rx_smol, tx_smol, handshake_tx) = TcpConnection::new(handle);
                 self.tracker.register_tcp(handle, socket_id, conn, tx_smol);
 
@@ -350,7 +350,6 @@ impl ConnectionManager {
     }
 
     pub fn cleanup(&mut self, socket_set: &mut SocketSet) {
-        // 🔥 ФИКС 3: Очистка зависших pending_connects (например, если SYN потерялся)
         self.pending_connects
             .retain(|_, timestamp| timestamp.elapsed() < TCP_HANDSHAKE_TIMEOUT);
 
@@ -361,8 +360,4 @@ impl ConnectionManager {
     pub fn get_buf_info(&self, handle: SocketHandle) -> usize {
         self.tracker.get_app_buffer_info(handle)
     }
-}
-
-fn is_handshaking(state: tcp::State) -> bool {
-    matches!(state, tcp::State::SynSent | tcp::State::SynReceived)
 }

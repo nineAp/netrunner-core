@@ -19,12 +19,7 @@ pub struct RemoteOpener {
 }
 
 impl RemoteOpener {
-    pub async fn open_tcp(
-        &self,
-        stream_id: u32,
-        target: String,
-        v_rx: mpsc::UnboundedReceiver<Bytes>,
-    ) {
+    pub async fn open_tcp(&self, stream_id: u32, target: String, v_rx: mpsc::Receiver<Bytes>) {
         let muxer = self.muxer.clone();
         tokio::spawn(async move {
             info!(stream_id, "🌐 [Remote] Connecting to {}", target);
@@ -53,12 +48,7 @@ impl RemoteOpener {
         });
     }
 
-    pub async fn open_udp(
-        &self,
-        stream_id: u32,
-        target: String,
-        v_rx: mpsc::UnboundedReceiver<Bytes>,
-    ) {
+    pub async fn open_udp(&self, stream_id: u32, target: String, v_rx: mpsc::Receiver<Bytes>) {
         let muxer = self.muxer.clone();
         tokio::spawn(async move {
             info!(stream_id, "🚀 [Remote] Binding UDP for {}", target);
@@ -138,7 +128,8 @@ impl StreamHandler {
         let target = String::from_utf8_lossy(&payload).to_string();
 
         if let Some(opener) = &self.opener {
-            let (v_tx, v_rx) = mpsc::unbounded_channel::<Bytes>();
+            let cap = NetworkConfig::global().channel_capacity;
+            let (v_tx, v_rx) = mpsc::channel::<Bytes>(cap);
             self.muxer.register_stream(stream_id, v_tx);
 
             if is_udp {

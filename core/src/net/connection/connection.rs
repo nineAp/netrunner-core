@@ -90,11 +90,7 @@ impl ClientHandler {
         muxer: Arc<Muxer>,
         session_id: &str,
     ) -> Result<(), String> {
-        let leg_name = if leg_id % 2 == 0 {
-            "TCP-Leg"
-        } else {
-            "UDP-Leg"
-        };
+        let leg_name = format!("TCP-Leg-{}", leg_id);
 
         let mut addrs = tokio::net::lookup_host(remote_proxy_addr)
             .await
@@ -174,7 +170,6 @@ impl ClientHandler {
         let codec = Codec::new(cipher, session_keys.get_auth_key());
         let (rx_codec, mut tx_codec) = codec.split();
 
-        // 🔥 ФИКС: Используем Heartbeat для первой авторизации соединения
         let auth_payload = Bytes::from(format!("{}:{}", session_id, leg_id));
         let encrypted_auth = tx_codec
             .encode_frame(0, FrameType::Heartbeat, auth_payload)
@@ -185,8 +180,9 @@ impl ClientHandler {
             .await
             .map_err(|e| e.to_string())?;
 
-        let (control_tx, control_rx) = mpsc::unbounded_channel::<MuxMessage>();
-        let (data_tx, data_rx) = mpsc::unbounded_channel::<MuxMessage>();
+        let cap = NetworkConfig::global().channel_capacity;
+        let (control_tx, control_rx) = mpsc::channel::<MuxMessage>(cap);
+        let (data_tx, data_rx) = mpsc::channel::<MuxMessage>(cap);
         muxer.add_leg(leg_id, control_tx, data_tx);
 
         let handler = Arc::new(StreamHandler::new(muxer.clone(), None));
@@ -208,8 +204,8 @@ impl ClientHandler {
 
     pub async fn connect(
         remote_proxy_addr: &str,
-        mut rx_from_engine: mpsc::UnboundedReceiver<RawCastFrame>,
-        tx_to_engine: mpsc::UnboundedSender<RawCastFrame>,
+        mut rx_from_engine: mpsc::Receiver<RawCastFrame>,
+        tx_to_engine: mpsc::Sender<RawCastFrame>,
     ) -> Result<(), String> {
         let session_id = SessionManager::generate_id();
         let muxer = Arc::new(Muxer::new(true, session_id.clone()));
@@ -266,7 +262,8 @@ impl ClientHandler {
                                 ),
                             );
 
-                            let (v_tx, mut v_rx) = mpsc::unbounded_channel::<Bytes>();
+                            let cap = NetworkConfig::global().channel_capacity;
+                            let (v_tx, mut v_rx) = mpsc::channel::<Bytes>(cap);
                             muxer_inner.register_stream(global_stream_id, v_tx);
 
                             let tx_to_tun = tx_to_engine.clone();
@@ -291,7 +288,7 @@ impl ClientHandler {
                                             port,
                                             proto == LocalProtocol::Udp,
                                         ) {
-                                            let _ = tx_to_tun.send(raw);
+                                            let _ = tx_to_tun.send(raw).await;
                                         }
                                     }
                                 }
@@ -330,7 +327,6 @@ impl ClientHandler {
         Ok(())
     }
 }
-
 pub struct ServerHandler {
     pub(crate) conn: Connection,
     pub(crate) session_manager: Arc<SessionManager>,
@@ -358,14 +354,23 @@ impl ServerHandler {
 
         if let Ok(Ok(target_server)) = target_stream {
             let (mut server_read, mut server_write) = target_server.into_split();
+
+            // Отправляем всё, что уже успели прочитать от клиента
             if !initial_data.is_empty() {
-                let _ = server_write.write_all(&initial_data).await;
+                if server_write.write_all(&initial_data).await.is_err() {
+                    return;
+                }
             }
-            let _ = tokio::io::copy_bidirectional(
-                &mut tokio::io::join(&mut client_inbound, &mut client_outbound),
-                &mut tokio::io::join(&mut server_read, &mut server_write),
-            )
-            .await;
+
+            // 🔥 ПРАВИЛЬНЫЙ способ связать 4 половинки сокетов в Tokio
+            let client_to_server = tokio::io::copy(&mut client_inbound, &mut server_write);
+            let server_to_client = tokio::io::copy(&mut server_read, &mut client_outbound);
+
+            // Ждем, пока любое из направлений не закроется
+            let _ = tokio::join!(client_to_server, server_to_client);
+            debug!("Stealth fallback connection closed.");
+        } else {
+            warn!("Failed to connect to fallback host.");
         }
     }
 }
@@ -382,25 +387,26 @@ impl TunnelHandler for ServerHandler {
         } = self.conn;
         let mut session_keys = SessionKeys::new(false);
 
+        // --- ФАЗА 1: ПЕРВЫЙ ПАКЕТ И АВТОРИЗАЦИЯ ---
         let hello = loop {
             let buf_snapshot = read_buf.clone().freeze();
 
             match TlsBridge::unpack_handshake(&mut read_buf) {
                 Ok(Some(client_msg)) => {
-                    info!("✅ Valid Netrunner ClientHello detected");
                     match TlsBridge::wrap_server_hello(
                         &client_msg,
                         &mut session_keys,
                         &ServerProfile::MODERN,
                     ) {
-                        Ok(sh) => break sh,
+                        Ok(sh) => {
+                            info!("✅ Valid Netrunner ClientHello detected");
+                            break sh;
+                        }
                         Err(e) => {
-                            if e.execute_strategy() == ErrorAction::Redirect {
-                                Self::handle_stealth_fallback(inbound, outbound, buf_snapshot)
-                                    .await;
-                                return Ok(());
-                            }
-                            return Err("ServerHello Generation Failed".into());
+                            // 🔥 ФИКС: ЛЮБАЯ ошибка (включая неверный Auth Tag) ведет на донора!
+                            warn!("❌ Unauthorized/Invalid ClientHello. Triggering Stealth Fallback. Reason: {:?}", e.stage);
+                            Self::handle_stealth_fallback(inbound, outbound, buf_snapshot).await;
+                            return Ok(());
                         }
                     }
                 }
@@ -418,10 +424,10 @@ impl TunnelHandler for ServerHandler {
                         }
                     }
                 }
-                Err(e) => {
-                    if e.execute_strategy() == ErrorAction::Redirect {
-                        Self::handle_stealth_fallback(inbound, outbound, buf_snapshot).await;
-                    }
+                Err(_) => {
+                    // 🔥 ФИКС: Мусор или сканер протоколов (не TLS) -> ведет на донора
+                    warn!("❌ Handshake parse failed (Not a valid TLS probe). Triggering Stealth Fallback.");
+                    Self::handle_stealth_fallback(inbound, outbound, buf_snapshot).await;
                     return Ok(());
                 }
             }
@@ -439,7 +445,6 @@ impl TunnelHandler for ServerHandler {
         let codec = Codec::new(cipher, session_keys.get_auth_key());
         let (mut rx_codec, tx_codec) = codec.split();
 
-        // 🔥 ФИКС: Ожидаем Heartbeat в качестве авторизационного фрейма!
         let (session_id, leg_id) = loop {
             match rx_codec.decode_inbound(&mut read_buf) {
                 Ok(Some(frame)) => {
@@ -475,8 +480,9 @@ impl TunnelHandler for ServerHandler {
         };
 
         let muxer = self.session_manager.get_or_create(&session_id);
-        let (control_tx, control_rx) = mpsc::unbounded_channel::<MuxMessage>();
-        let (data_tx, data_rx) = mpsc::unbounded_channel::<MuxMessage>();
+        let cap = NetworkConfig::global().channel_capacity;
+        let (control_tx, control_rx) = mpsc::channel::<MuxMessage>(cap);
+        let (data_tx, data_rx) = mpsc::channel::<MuxMessage>(cap);
 
         muxer.add_leg(leg_id, control_tx, data_tx);
 
