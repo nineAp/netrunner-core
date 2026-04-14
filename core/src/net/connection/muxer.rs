@@ -58,6 +58,8 @@ pub struct MuxMessage {
     pub data: Bytes,
 }
 
+pub static GLOBAL_MIN_RTT: AtomicU32 = AtomicU32::new(250);
+
 #[derive(Clone)]
 pub struct Muxer {
     legs: Arc<DashMap<u32, MuxLeg>>,
@@ -169,6 +171,16 @@ impl Muxer {
             if let Some(leg) = self.legs.get(&leg_id) {
                 leg.stats.rtt_ms.store(rtt, Ordering::Relaxed);
                 trace!(leg_id, rtt, "💓 [Muxer] RTT updated for leg");
+
+                let min_rtt = self
+                    .legs
+                    .iter()
+                    .map(|kv| kv.value().stats.rtt_ms.load(Ordering::Relaxed))
+                    .filter(|&r| r > 0)
+                    .min()
+                    .unwrap_or(250);
+
+                GLOBAL_MIN_RTT.store(min_rtt, Ordering::Relaxed);
             }
         }
     }
@@ -316,6 +328,15 @@ impl Muxer {
             }
             self.remove_stream(probe_stream_id);
         }
+    }
+
+    pub fn get_min_rtt(&self) -> u32 {
+        self.legs
+            .iter()
+            .map(|kv| kv.value().stats.rtt_ms.load(Ordering::Relaxed))
+            .filter(|&rtt| rtt > 0)
+            .min()
+            .unwrap_or(250) // Fallback
     }
 
     fn format_size(bytes: u64) -> String {

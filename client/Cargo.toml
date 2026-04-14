@@ -20,7 +20,7 @@ smoltcp = { git = "ssh://git@github.com/nineAp/nxrp-smoltcp.git", default-featur
     "socket-udp",
     "socket-tcp",
     "socket-tcp-cubic",
-    "socket-tcp-bbr", # <--- Добавили нашу новую фичу для BBR!
+    "socket-tcp-bbr",
 ] }
 tokio = { version = "1.36", features = ["full"] }
 bytes = "1.5"

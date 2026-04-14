@@ -1,6 +1,6 @@
 use bytes::{Buf, Bytes};
 use netrunner_core::{
-    net::{NetworkConfig, UDP_IDLE_TIMEOUT},
+    net::{GLOBAL_MIN_RTT, NetworkConfig, UDP_IDLE_TIMEOUT},
     rawcast::{LocalProtocol, RawCastFrame},
 };
 use smoltcp::{
@@ -12,7 +12,7 @@ use smoltcp::{
         Ipv6Address,
     },
 };
-use std::collections::VecDeque;
+use std::{collections::VecDeque, sync::atomic::Ordering};
 use tokio::sync::{mpsc, oneshot};
 
 use netrunner_logger::{debug, info};
@@ -135,24 +135,27 @@ impl TcpConnection {
     }
 
     fn poll_and_process(&mut self, socket: &mut tcp::Socket) {
-        let rtt = Duration::from_millis(250);
+        let current_rtt = GLOBAL_MIN_RTT.load(Ordering::Relaxed);
+        let rtt = Duration::from_millis(current_rtt as u64);
         socket.set_tunnel_rtt(rtt);
 
-        while socket.can_recv() {
-            if let Ok(n) = socket.peek_slice(&mut self.chunk_buf) {
-                if n == 0 {
-                    break;
-                }
-                let chunk = Bytes::copy_from_slice(&self.chunk_buf[..n]);
+        if self.app_pending_out_size() < 512 * 1024 {
+            while socket.can_recv() {
+                if let Ok(n) = socket.peek_slice(&mut self.chunk_buf) {
+                    if n == 0 {
+                        break;
+                    }
+                    let chunk = Bytes::copy_from_slice(&self.chunk_buf[..n]);
 
-                if self.core.tx.send(chunk).is_ok() {
-                    socket.recv_slice(&mut self.chunk_buf[..n]).unwrap();
+                    if self.core.tx.send(chunk).is_ok() {
+                        socket.recv_slice(&mut self.chunk_buf[..n]).unwrap();
+                    } else {
+                        self.server_eof = true;
+                        break;
+                    }
                 } else {
-                    self.server_eof = true;
                     break;
                 }
-            } else {
-                break;
             }
         }
 
