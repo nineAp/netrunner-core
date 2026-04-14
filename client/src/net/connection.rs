@@ -16,7 +16,6 @@ use std::{collections::VecDeque, sync::atomic::Ordering};
 use tokio::sync::{mpsc, oneshot};
 
 use netrunner_logger::{debug, info};
-
 pub struct ConnectionCore<T> {
     pub handle: SocketHandle,
     pub tx: mpsc::Sender<T>,
@@ -165,10 +164,9 @@ impl TcpConnection {
 
         // Читаем из Туннеля в браузер
         if !self.server_eof {
-            // 🔥 РЕАЛЬНЫЙ BACKPRESSURE:
-            // Читаем из канала, ТОЛЬКО если в очереди < 4 МБ данных.
-            // Если больше - оставляем лежать в канале Tokio, пока smoltcp не освободится!
-            while self.pending_bytes < 4 * 1024 * 1024 {
+            // 🔥 ФИКС БУФЕРБЛОАТА НА LTE: Ограничиваем локальный буфер ровно до 1 МБ!
+            // Это сбросит пинг на мобилках с 4500 мс до нормальных значений
+            while self.pending_bytes < 1024 * 1024 {
                 match self.core.rx.try_recv() {
                     Ok(data) => {
                         self.pending_bytes += data.len();
@@ -184,6 +182,7 @@ impl TcpConnection {
             }
         }
 
+        // Отправляем из очереди в smoltcp
         while socket.can_send() {
             if let Some(mut chunk) = self.pending_data.pop_front() {
                 match socket.send_slice(&chunk) {
@@ -260,7 +259,7 @@ impl TcpConnection {
         });
     }
 }
-
+// ... остальной код (UdpConnection и IcmpResponder без изменений) ...
 pub type UdpPacketTarget = (Bytes, std::net::Ipv4Addr, u16);
 
 pub struct UdpConnection {

@@ -52,7 +52,6 @@ impl IdGenerator {
     }
 }
 
-// 🔥 Клонируем сообщения для Retry-логики
 #[derive(Clone)]
 pub struct MuxMessage {
     pub stream_id: u32,
@@ -108,8 +107,6 @@ impl Muxer {
 
     pub fn remove_leg(&self, leg_id: u32) {
         self.legs.remove(&leg_id);
-        // Мы не чистим stream_bindings полностью,
-        // балансировщик сам переназначит мертвые привязки
         info!(
             leg_id,
             "MUXER: Leg removed, streams will re-balance dynamically"
@@ -125,7 +122,6 @@ impl Muxer {
             return None;
         }
 
-        // Если привязка есть и нога жива — используем её
         if let Some(leg_id_ref) = self.stream_bindings.get(&stream_id) {
             let leg_id = *leg_id_ref;
             if let Some(leg) = self.legs.get(&leg_id) {
@@ -133,8 +129,6 @@ impl Muxer {
             }
         }
 
-        // 🔥 ФИКС: Убрано разделение на TCP/UDP ноги.
-        // Все физические ноги у нас TCP, поэтому мы балансируем трафик по всем ногам!
         let mut candidates: Vec<(u32, MuxLeg)> = self
             .legs
             .iter()
@@ -155,7 +149,6 @@ impl Muxer {
         let pool_size = std::cmp::min(candidates.len(), MUXER_POOL_SIZE);
         let (selected_id, selected_leg) = candidates[stream_id as usize % pool_size].clone();
 
-        // Обновляем привязку
         self.stream_bindings.insert(stream_id, selected_id);
 
         Some((selected_id, selected_leg))
@@ -185,7 +178,6 @@ impl Muxer {
         }
     }
 
-    // 🔥 ФИКС: Добавлена логика повторной отправки (Retry) при обрыве связи!
     pub async fn send_to_network(&self, message: MuxMessage) -> Result<(), String> {
         let size = message.data.len() as u64;
         let mut attempts = 0;
@@ -209,21 +201,42 @@ impl Muxer {
                 _ => &leg.data_tx,
             };
 
-            if target_tx.send(message.clone()).await.is_err() {
-                // Нога умерла! Выкидываем её и пробуем отправить пакет в ДРУГУЮ ногу (continue)
-                self.remove_leg(leg_id);
-                continue;
+            // 🔥 ФИКС: Если канал данных забит, дропаем пакет, чтобы не ломать туннель
+            match target_tx.try_send(message.clone()) {
+                Ok(_) => {
+                    leg.stats.tx_bytes.fetch_add(size, Ordering::Relaxed);
+                    if let Some(stream_ref) = self.streams.get(&message.stream_id) {
+                        stream_ref
+                            .value()
+                            .1
+                            .tx_bytes
+                            .fetch_add(size, Ordering::Relaxed);
+                    }
+                    return Ok(());
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    if matches!(message.frame_type, FrameType::Data | FrameType::UdpData) {
+                        // Канал данных физически забит (слабый интернет). СБРАСЫВАЕМ пакет.
+                        // TCP smoltcp на клиенте не получит ACK и сделает ретрансмиссию.
+                        trace!(
+                            message.stream_id,
+                            "Physical TX full! Dropped packet to prevent deadlock."
+                        );
+                        return Ok(());
+                    } else {
+                        // Контрольные фреймы (Connect, Close, Ping) обязательны к доставке.
+                        if target_tx.send(message.clone()).await.is_err() {
+                            self.remove_leg(leg_id);
+                            continue;
+                        }
+                        return Ok(());
+                    }
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    self.remove_leg(leg_id);
+                    continue;
+                }
             }
-
-            leg.stats.tx_bytes.fetch_add(size, Ordering::Relaxed);
-            if let Some(stream_ref) = self.streams.get(&message.stream_id) {
-                stream_ref
-                    .value()
-                    .1
-                    .tx_bytes
-                    .fetch_add(size, Ordering::Relaxed);
-            }
-            return Ok(());
         }
     }
 
@@ -268,7 +281,6 @@ impl Muxer {
     pub fn remove_stream(&self, stream_id: u32) {
         self.streams.remove(&stream_id);
         self.stream_bindings.remove(&stream_id);
-        trace!(stream_id, "MUXER: Stream and bindings removed");
     }
 
     pub async fn dispatch_to_local(&self, stream_id: u32, data: Bytes) {
@@ -276,12 +288,26 @@ impl Muxer {
             .streams
             .get(&stream_id)
             .map(|s| (s.value().0.clone(), s.value().1.clone()));
+
         if let Some((tx, stats)) = stream_opt {
             let size = data.len() as u64;
-            if tx.send(data).await.is_err() {
-                self.remove_stream(stream_id);
-            } else {
-                stats.rx_bytes.fetch_add(size, Ordering::Relaxed);
+
+            // 🔥 ФИКС: Используем try_send вместо await!
+            // Если локальный сокет тупит, а очередь полна (2MB), мы сбрасываем пакет.
+            // Внешний сервер увидит потерю пакета и замедлит передачу.
+            match tx.try_send(data) {
+                Ok(_) => {
+                    stats.rx_bytes.fetch_add(size, Ordering::Relaxed);
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    trace!(
+                        stream_id,
+                        "Local RX queue full. Dropped packet for inner-TCP backpressure."
+                    );
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    self.remove_stream(stream_id);
+                }
             }
         }
     }
@@ -326,9 +352,7 @@ impl Muxer {
             }
 
             match tokio::time::timeout(HEALTH_CHECK_TIMEOUT, probe_rx.recv()).await {
-                Ok(Some(_)) => {
-                    debug!(leg_id, "✅ Leg Health Check OK");
-                }
+                Ok(Some(_)) => debug!(leg_id, "✅ Leg Health Check OK"),
                 _ => {
                     warn!(leg_id, "❌ Leg Health Check Timeout - Evicting leg");
                     self.remove_leg(leg_id);

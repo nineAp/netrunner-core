@@ -16,11 +16,10 @@ use crate::{
     rawcast::{LocalProtocol, RawCastAdapter, RawCastFrame},
     tlseng::{BrowserProfile, ServerProfile},
 };
-use bytes::{Bytes, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use dashmap::DashMap;
 use netrunner_logger::{debug, error, info, warn};
 use rand::Rng;
-use socket2::{Domain, Protocol, Socket, Type};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{
@@ -95,20 +94,21 @@ impl ClientHandler {
         let mut addrs = tokio::net::lookup_host(remote_proxy_addr)
             .await
             .map_err(|e| format!("DNS resolution failed: {}", e))?;
+
         let addr = addrs
             .next()
             .ok_or_else(|| format!("No IPs found for {}", remote_proxy_addr))?;
 
-        let domain = if addr.is_ipv4() {
-            Domain::IPV4
+        // 🔥 ФИКС: Используем Tokio TcpSocket вместо socket2.
+        // Это позволяет корректно отменять подключение при зависании ОС.
+        let socket = if addr.is_ipv4() {
+            tokio::net::TcpSocket::new_v4()
         } else {
-            Domain::IPV6
-        };
-        let socket =
-            Socket::new(domain, Type::STREAM, Some(Protocol::TCP)).map_err(|e| e.to_string())?;
+            tokio::net::TcpSocket::new_v6()
+        }
+        .map_err(|e| e.to_string())?;
 
-        socket.set_nonblocking(true).map_err(|e| e.to_string())?;
-        socket.set_nodelay(true).map_err(|e| e.to_string())?;
+        socket.set_nodelay(true).unwrap_or_default();
 
         #[cfg(any(
             target_os = "linux",
@@ -117,7 +117,7 @@ impl ClientHandler {
             target_os = "macos"
         ))]
         unsafe {
-            use std::os::fd::AsRawFd;
+            use std::os::unix::io::AsRawFd;
             let lowat: libc::c_int = 16384;
             let _ = libc::setsockopt(
                 socket.as_raw_fd(),
@@ -128,9 +128,12 @@ impl ClientHandler {
             );
         }
 
-        let _ = socket.connect(&addr.into());
-        let std_stream: std::net::TcpStream = socket.into();
-        let stream = TcpStream::from_std(std_stream).map_err(|e| e.to_string())?;
+        // 🔥 ФИКС: Добавляем Timeout на подключение (5 секунд)!
+        // Если при смене сети пакеты идут в никуда, мы быстро прерываем попытку и пробуем снова.
+        let stream = tokio::time::timeout(std::time::Duration::from_secs(5), socket.connect(addr))
+            .await
+            .map_err(|_| "Connection timed out (Network changed?)".to_string())?
+            .map_err(|e| e.to_string())?;
 
         let mut conn = Connection::new(stream);
         let mut session_keys = SessionKeys::new(true);
@@ -151,13 +154,18 @@ impl ClientHandler {
                     break;
                 }
                 Ok(None) => {
-                    let n = conn
-                        .inbound
-                        .read_buf(&mut conn.read_buf)
-                        .await
-                        .map_err(|e| e.to_string())?;
-                    if n == 0 {
-                        return Err(format!("EOF on {}", leg_name));
+                    // Также добавляем Timeout на чтение ответа от сервера
+                    let res = tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        conn.inbound.read_buf(&mut conn.read_buf),
+                    )
+                    .await;
+
+                    match res {
+                        Ok(Ok(0)) => return Err(format!("EOF on {}", leg_name)),
+                        Ok(Ok(_)) => continue,
+                        Ok(Err(e)) => return Err(format!("Read error: {}", e)),
+                        Err(_) => return Err("Handshake read timeout".into()),
                     }
                 }
                 Err(e) => return Err(format!("TLS error on {}: {:?}", leg_name, e)),
@@ -221,7 +229,7 @@ impl ClientHandler {
                 tokio::time::sleep(LEG_STAGGER_DELAY * id).await;
                 loop {
                     if let Err(e) = Self::establish_leg(&addr, id, m.clone(), &sid).await {
-                        error!("Leg {} disconnected: {}. Reconnecting in 3s...", id, e);
+                        error!("Leg {} disconnected: {}. Reconnecting in 2s...", id, e);
                         tokio::time::sleep(LEG_RECONNECT_DELAY).await;
                     }
                 }
