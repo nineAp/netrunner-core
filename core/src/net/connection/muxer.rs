@@ -89,7 +89,7 @@ impl Muxer {
         control_tx: Sender<MuxMessage>,
         data_tx: Sender<MuxMessage>,
     ) {
-        if self.legs.len() >= MAX_TUNNEL_LEGS as usize {
+        if self.legs.len() >= MAX_TUNNEL_LEGS as usize && !self.legs.contains_key(&leg_id) {
             warn!(leg_id, "MUXER: Max legs reached: {}", MAX_TUNNEL_LEGS);
             return;
         }
@@ -105,12 +105,30 @@ impl Muxer {
         info!(leg_id, "MUXER: Leg registered (Total: {})", self.legs.len());
     }
 
-    pub fn remove_leg(&self, leg_id: u32) {
-        self.legs.remove(&leg_id);
-        info!(
-            leg_id,
-            "MUXER: Leg removed, streams will re-balance dynamically"
-        );
+    // 🔥 ФИКС: Умное удаление ноги. Мы проверяем, не была ли эта нога уже перезаписана
+    // более новым подключением (чтобы не удалить живую ногу по ошибке)
+    pub fn remove_leg(&self, leg_id: u32, tx: &Sender<MuxMessage>) {
+        let should_remove = if let Some(leg) = self.legs.get(&leg_id) {
+            leg.control_tx.same_channel(tx)
+        } else {
+            false
+        };
+
+        if should_remove {
+            self.legs.remove(&leg_id);
+            info!(leg_id, "MUXER: Leg removed safely, streams will re-balance");
+        } else {
+            trace!(
+                leg_id,
+                "MUXER: Leg removal skipped (already removed or replaced by a new connection)"
+            );
+        }
+    }
+
+    pub fn remove_all_legs(&self) {
+        warn!("🚨 MUXER: Emergency reset! Removing all legs due to network change.");
+        self.legs.clear();
+        self.stream_bindings.clear();
     }
 
     pub fn active_legs_count(&self) -> usize {
@@ -201,9 +219,13 @@ impl Muxer {
                 _ => &leg.data_tx,
             };
 
-            // 🔥 ФИКС: Если канал данных забит, дропаем пакет, чтобы не ломать туннель
-            match target_tx.try_send(message.clone()) {
-                Ok(_) => {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                target_tx.send(message.clone()),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {
                     leg.stats.tx_bytes.fetch_add(size, Ordering::Relaxed);
                     if let Some(stream_ref) = self.streams.get(&message.stream_id) {
                         stream_ref
@@ -214,26 +236,16 @@ impl Muxer {
                     }
                     return Ok(());
                 }
-                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                    if matches!(message.frame_type, FrameType::Data | FrameType::UdpData) {
-                        // Канал данных физически забит (слабый интернет). СБРАСЫВАЕМ пакет.
-                        // TCP smoltcp на клиенте не получит ACK и сделает ретрансмиссию.
-                        trace!(
-                            message.stream_id,
-                            "Physical TX full! Dropped packet to prevent deadlock."
-                        );
-                        return Ok(());
-                    } else {
-                        // Контрольные фреймы (Connect, Close, Ping) обязательны к доставке.
-                        if target_tx.send(message.clone()).await.is_err() {
-                            self.remove_leg(leg_id);
-                            continue;
-                        }
-                        return Ok(());
-                    }
+                Ok(Err(_)) => {
+                    self.remove_leg(leg_id, &leg.control_tx);
+                    continue;
                 }
-                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                    self.remove_leg(leg_id);
+                Err(_) => {
+                    warn!(
+                        message.stream_id,
+                        "Physical TX full for 2s! Leg {} is dead. Evicting.", leg_id
+                    );
+                    self.remove_leg(leg_id, &leg.control_tx);
                     continue;
                 }
             }
@@ -291,10 +303,6 @@ impl Muxer {
 
         if let Some((tx, stats)) = stream_opt {
             let size = data.len() as u64;
-
-            // 🔥 ФИКС: Используем try_send вместо await!
-            // Если локальный сокет тупит, а очередь полна (2MB), мы сбрасываем пакет.
-            // Внешний сервер увидит потерю пакета и замедлит передачу.
             match tx.try_send(data) {
                 Ok(_) => {
                     stats.rx_bytes.fetch_add(size, Ordering::Relaxed);
@@ -332,8 +340,7 @@ impl Muxer {
             let tx = leg.control_tx.clone();
 
             let probe_stream_id = self.id_gen.next();
-            let cap = crate::net::NetworkConfig::global().channel_capacity;
-            let (probe_tx, mut probe_rx) = tokio::sync::mpsc::channel(cap);
+            let (probe_tx, mut probe_rx) = tokio::sync::mpsc::channel(10);
             self.register_stream(probe_stream_id, probe_tx);
 
             self.record_ping_sent(leg_id);
@@ -344,18 +351,20 @@ impl Muxer {
                 data: Bytes::from("PING"),
             };
 
-            if tx.send(msg).await.is_err() {
-                warn!(leg_id, "❌ MUXER: Leg channel dropped, killing leg");
-                self.remove_leg(leg_id);
+            if tx.try_send(msg).is_err() {
+                warn!(leg_id, "❌ MUXER: Leg channel overflow/blocked, evicting");
+                self.remove_leg(leg_id, &tx);
                 self.remove_stream(probe_stream_id);
                 continue;
             }
 
-            match tokio::time::timeout(HEALTH_CHECK_TIMEOUT, probe_rx.recv()).await {
-                Ok(Some(_)) => debug!(leg_id, "✅ Leg Health Check OK"),
+            match tokio::time::timeout(crate::net::HEALTH_CHECK_TIMEOUT, probe_rx.recv()).await {
+                Ok(Some(_)) => {
+                    trace!(leg_id, "✅ Leg Health Check OK");
+                }
                 _ => {
-                    warn!(leg_id, "❌ Leg Health Check Timeout - Evicting leg");
-                    self.remove_leg(leg_id);
+                    warn!(leg_id, "❌ Leg Health Check FAIL/Timeout - Evicting");
+                    self.remove_leg(leg_id, &tx);
                 }
             }
             self.remove_stream(probe_stream_id);

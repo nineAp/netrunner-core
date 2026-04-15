@@ -1,6 +1,6 @@
 use netrunner_core::net::ClientHandler;
 use netrunner_core::net::NetworkConfig;
-use netrunner_core::rawcast::RawCastFrame;
+use netrunner_core::rawcast::{RawCastEvent, RawCastFrame};
 use smoltcp::iface::PollResult;
 use smoltcp::time::Instant;
 use smoltcp::wire::{IpAddress, IpCidr};
@@ -38,7 +38,7 @@ pub struct Engine {
     to_smoltcp_tx: UnboundedSender<TokenBuffer>,
     from_smoltcp_rx: Option<UnboundedReceiver<TokenBuffer>>,
     avail: Arc<AtomicBool>,
-    rx_from_tunnel: Receiver<RawCastFrame>, // 🔥 Bounded
+    rx_from_tunnel: Option<Receiver<RawCastFrame>>, // 🔥 Теперь Option, чтобы отдать его в таску
     factory: Arc<dyn SocketProvider>,
 }
 
@@ -47,8 +47,8 @@ impl Engine {
         config: Config,
         caps: DeviceCapabilities,
         dns_handler: DnsHandler,
-        tx_to_tunnel: Sender<RawCastFrame>,     // 🔥 Bounded
-        rx_from_tunnel: Receiver<RawCastFrame>, // 🔥 Bounded
+        tx_to_tunnel: Sender<RawCastFrame>,
+        rx_from_tunnel: Receiver<RawCastFrame>,
         factory: Arc<dyn SocketProvider>,
     ) -> Self {
         let now = Engine::current_time();
@@ -57,7 +57,6 @@ impl Engine {
         let interface = Interface::new(config, &mut device, now);
 
         let socket_set = ConnectionManager::setup_sockets(factory.as_ref(), 2);
-
         let manager = ConnectionManager::new(dns_handler, tx_to_tunnel, factory.clone());
 
         Self {
@@ -68,7 +67,7 @@ impl Engine {
             from_smoltcp_rx: Some(from_smoltcp_rx),
             avail,
             manager,
-            rx_from_tunnel,
+            rx_from_tunnel: Some(rx_from_tunnel),
             factory,
         }
     }
@@ -85,6 +84,27 @@ impl Engine {
         Self::spawn_tun_writer(writer, from_smoltcp_rx);
 
         let mut last_stats_log = StdInstant::now();
+
+        // 🔥 ФИКС: Выносим чтение из туннеля в отдельную изолированную задачу!
+        // Это позволяет использовать `.await` при отправке данных в локальный сокет smoltcp.
+        // Если локальный сокет забит, эта задача мягко "засыпает", создавая идеальный Backpressure,
+        // при этом НЕ БЛОКИРУЯ основной цикл обработки интерфейсов Engine.
+        let inbound_map = self.manager.tracker.inbound_tx.clone();
+        let mut rx_tunnel = self.rx_from_tunnel.take().unwrap();
+
+        tokio::spawn(async move {
+            while let Some(frame) = rx_tunnel.recv().await {
+                if frame.event == RawCastEvent::Close {
+                    inbound_map.remove(&frame.socket_id);
+                } else if frame.event == RawCastEvent::Data {
+                    if let Some(tx) = inbound_map.get(&frame.socket_id) {
+                        // ZERO DROP, PERFECT BACKPRESSURE.
+                        // Ожидаем, пока локальный сокет не освободит место.
+                        let _ = tx.send(frame.payload).await;
+                    }
+                }
+            }
+        });
 
         loop {
             let mut repeat_poll = true;
@@ -109,20 +129,9 @@ impl Engine {
                 .map(|d| std::cmp::min(Duration::from_micros(d.micros()), Duration::from_millis(5)))
                 .unwrap_or(Duration::from_millis(5));
 
+            // Основной цикл теперь занимается ТОЛЬКО прогонкой данных: TUN <-> smoltcp
             tokio::select! {
                 _ = sleep(sleep_time) => {}
-
-                msg = self.rx_from_tunnel.recv() => {
-                    if let Some(frame) = msg {
-                        let _ = self.manager.try_inject_inbound(frame);
-                        let mut count = 0;
-                        while let Ok(frame) = self.rx_from_tunnel.try_recv() {
-                            let _ = self.manager.try_inject_inbound(frame);
-                            count += 1;
-                            if count >= 64 { break; }
-                        }
-                    } else { break; }
-                }
 
                 msg = tun_to_engine_rx.recv() => {
                     if let Some(token) = msg {
@@ -142,6 +151,7 @@ impl Engine {
             .poll(now, &mut self.device, &mut self.socket_set)
     }
 
+    // ... [Остальные методы spawn_tun_reader, spawn_tun_writer и set_route остаются без изменений] ...
     fn spawn_tun_reader(
         mut reader: DeviceReader,
         to_engine: mpsc::UnboundedSender<TokenBuffer>,

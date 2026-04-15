@@ -4,11 +4,13 @@ use std::{
 };
 
 use bytes::Bytes;
+use dashmap::DashMap;
 use smoltcp::{
     iface::{SocketHandle, SocketSet},
     socket::Socket,
     wire::IpAddress,
 };
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use crate::net::connection::{TcpConnection, UdpConnection};
@@ -17,7 +19,7 @@ pub struct SessionTracker {
     last_activity: HashMap<SocketHandle, StdInstant>,
     active_tcp: HashMap<SocketHandle, TcpConnection>,
     active_udp: HashMap<SocketHandle, UdpConnection>,
-    inbound_tx: HashMap<u64, mpsc::Sender<Bytes>>, // 🔥 Bounded
+    pub inbound_tx: Arc<DashMap<u64, mpsc::Sender<Bytes>>>, // 🔥 Теперь Arc<DashMap>
     handle_to_id: HashMap<SocketHandle, u64>,
 
     id_to_handle: HashMap<u64, SocketHandle>,
@@ -32,7 +34,7 @@ impl SessionTracker {
             last_activity: HashMap::new(),
             active_tcp: HashMap::new(),
             active_udp: HashMap::new(),
-            inbound_tx: HashMap::new(),
+            inbound_tx: Arc::new(DashMap::new()),
             handle_to_id: HashMap::new(),
             id_to_handle: HashMap::new(),
             pending_tcp: HashMap::new(),
@@ -120,10 +122,6 @@ impl SessionTracker {
 
     pub fn update_activity(&mut self, handle: SocketHandle) {
         self.last_activity.insert(handle, StdInstant::now());
-    }
-
-    pub fn get_inbound_tx(&self, id: u64) -> Option<&mpsc::Sender<Bytes>> {
-        self.inbound_tx.get(&id)
     }
 
     pub fn close_tunnel_session(&mut self, id: u64) {

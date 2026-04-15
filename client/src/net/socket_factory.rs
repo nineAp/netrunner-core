@@ -95,14 +95,7 @@ impl SocketProvider for SmolSocketFactory {
     fn reconfigure_tcp(&self, socket: &mut tcp::Socket, profile: TrafficProfile) {
         socket.set_nagle_enabled(false);
 
-        match profile {
-            TrafficProfile::Interactive | TrafficProfile::Dns => {
-                socket.set_ack_delay(None);
-            }
-            TrafficProfile::Bulk | TrafficProfile::Default => {
-                socket.set_ack_delay(Some(Duration::from_millis(1)));
-            }
-        }
+        socket.set_ack_delay(Some(Duration::from_millis(50)));
 
         socket.set_congestion_control(CongestionControl::Bbr);
     }

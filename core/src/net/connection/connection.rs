@@ -83,6 +83,12 @@ impl Connection {
 
 pub struct ClientHandler;
 impl ClientHandler {
+    fn get_local_ip() -> Option<std::net::IpAddr> {
+        let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+        socket.connect("8.8.8.8:80").ok()?;
+        socket.local_addr().ok().map(|a| a.ip())
+    }
+
     async fn establish_leg(
         remote_proxy_addr: &str,
         leg_id: u32,
@@ -91,49 +97,25 @@ impl ClientHandler {
     ) -> Result<(), String> {
         let leg_name = format!("TCP-Leg-{}", leg_id);
 
-        let mut addrs = tokio::net::lookup_host(remote_proxy_addr)
+        let addrs_future = tokio::net::lookup_host(remote_proxy_addr);
+        let mut addrs = tokio::time::timeout(std::time::Duration::from_secs(3), addrs_future)
             .await
+            .map_err(|_| "DNS Lookup Timeout".to_string())?
             .map_err(|e| format!("DNS resolution failed: {}", e))?;
 
         let addr = addrs
             .next()
             .ok_or_else(|| format!("No IPs found for {}", remote_proxy_addr))?;
 
-        // 🔥 ФИКС: Используем Tokio TcpSocket вместо socket2.
-        // Это позволяет корректно отменять подключение при зависании ОС.
-        let socket = if addr.is_ipv4() {
-            tokio::net::TcpSocket::new_v4()
-        } else {
-            tokio::net::TcpSocket::new_v6()
-        }
+        let stream = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::net::TcpStream::connect(addr),
+        )
+        .await
+        .map_err(|_| "Connection timeout".to_string())?
         .map_err(|e| e.to_string())?;
 
-        socket.set_nodelay(true).unwrap_or_default();
-
-        #[cfg(any(
-            target_os = "linux",
-            target_os = "android",
-            target_os = "ios",
-            target_os = "macos"
-        ))]
-        unsafe {
-            use std::os::unix::io::AsRawFd;
-            let lowat: libc::c_int = 16384;
-            let _ = libc::setsockopt(
-                socket.as_raw_fd(),
-                libc::IPPROTO_TCP,
-                libc::TCP_NOTSENT_LOWAT,
-                &lowat as *const _ as *const libc::c_void,
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            );
-        }
-
-        // 🔥 ФИКС: Добавляем Timeout на подключение (5 секунд)!
-        // Если при смене сети пакеты идут в никуда, мы быстро прерываем попытку и пробуем снова.
-        let stream = tokio::time::timeout(std::time::Duration::from_secs(5), socket.connect(addr))
-            .await
-            .map_err(|_| "Connection timed out (Network changed?)".to_string())?
-            .map_err(|e| e.to_string())?;
+        stream.set_nodelay(true).unwrap_or_default();
 
         let mut conn = Connection::new(stream);
         let mut session_keys = SessionKeys::new(true);
@@ -154,7 +136,6 @@ impl ClientHandler {
                     break;
                 }
                 Ok(None) => {
-                    // Также добавляем Timeout на чтение ответа от сервера
                     let res = tokio::time::timeout(
                         std::time::Duration::from_secs(5),
                         conn.inbound.read_buf(&mut conn.read_buf),
@@ -191,6 +172,9 @@ impl ClientHandler {
         let cap = NetworkConfig::global().channel_capacity;
         let (control_tx, control_rx) = mpsc::channel::<MuxMessage>(cap);
         let (data_tx, data_rx) = mpsc::channel::<MuxMessage>(cap);
+
+        // Клонируем Sender до передачи в add_leg, чтобы использовать для remove_leg
+        let control_tx_clone = control_tx.clone();
         muxer.add_leg(leg_id, control_tx, data_tx);
 
         let handler = Arc::new(StreamHandler::new(muxer.clone(), None));
@@ -206,7 +190,14 @@ impl ClientHandler {
             handler,
             muxer: muxer.clone(),
         };
-        engine.run().await.map_err(|e| e.to_string())?;
+
+        let run_result = engine.run().await;
+
+        // 🔥 ФИКС: Гарантированно вычищаем ногу по завершению работы,
+        // используя безопасный same_channel чек
+        muxer.remove_leg(leg_id, &control_tx_clone);
+
+        run_result.map_err(|e| e.to_string())?;
         Err(format!("{} Engine stopped", leg_name))
     }
 
@@ -220,6 +211,26 @@ impl ClientHandler {
         let registry: Arc<DashMap<u32, (u64, Ipv4Addr, u16, LocalProtocol)>> =
             Arc::new(DashMap::new());
         let local_to_global: Arc<DashMap<u64, u32>> = Arc::new(DashMap::new());
+
+        let watcher_muxer = muxer.clone();
+        tokio::spawn(async move {
+            let mut last_ip = Self::get_local_ip();
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+            loop {
+                interval.tick().await;
+                let current_ip = Self::get_local_ip();
+                // 🔥 ФИКС: Trigger also if we completely lost network (current_ip == None)
+                if current_ip != last_ip {
+                    netrunner_logger::warn!(
+                        "🌐 Network Change Detected: {:?} -> {:?}",
+                        last_ip,
+                        current_ip
+                    );
+                    watcher_muxer.remove_all_legs();
+                    last_ip = current_ip;
+                }
+            }
+        });
 
         for id in 0..MAX_TUNNEL_LEGS {
             let addr = remote_proxy_addr.to_string();
@@ -241,7 +252,7 @@ impl ClientHandler {
             while let Some(m_stats) = m_weak.upgrade() {
                 tokio::time::sleep(TOPOLOGY_PRINT_INTERVAL).await;
                 if m_stats.active_legs_count() == 0 {
-                    break;
+                    continue;
                 }
                 m_stats.perform_health_check().await;
                 m_stats.print_topology_tree();
@@ -335,6 +346,7 @@ impl ClientHandler {
         Ok(())
     }
 }
+
 pub struct ServerHandler {
     pub(crate) conn: Connection,
     pub(crate) session_manager: Arc<SessionManager>,
@@ -363,18 +375,15 @@ impl ServerHandler {
         if let Ok(Ok(target_server)) = target_stream {
             let (mut server_read, mut server_write) = target_server.into_split();
 
-            // Отправляем всё, что уже успели прочитать от клиента
             if !initial_data.is_empty() {
                 if server_write.write_all(&initial_data).await.is_err() {
                     return;
                 }
             }
 
-            // 🔥 ПРАВИЛЬНЫЙ способ связать 4 половинки сокетов в Tokio
             let client_to_server = tokio::io::copy(&mut client_inbound, &mut server_write);
             let server_to_client = tokio::io::copy(&mut server_read, &mut client_outbound);
 
-            // Ждем, пока любое из направлений не закроется
             let _ = tokio::join!(client_to_server, server_to_client);
             debug!("Stealth fallback connection closed.");
         } else {
@@ -395,7 +404,6 @@ impl TunnelHandler for ServerHandler {
         } = self.conn;
         let mut session_keys = SessionKeys::new(false);
 
-        // --- ФАЗА 1: ПЕРВЫЙ ПАКЕТ И АВТОРИЗАЦИЯ ---
         let hello = loop {
             let buf_snapshot = read_buf.clone().freeze();
 
@@ -411,7 +419,6 @@ impl TunnelHandler for ServerHandler {
                             break sh;
                         }
                         Err(e) => {
-                            // 🔥 ФИКС: ЛЮБАЯ ошибка (включая неверный Auth Tag) ведет на донора!
                             warn!("❌ Unauthorized/Invalid ClientHello. Triggering Stealth Fallback. Reason: {:?}", e.stage);
                             Self::handle_stealth_fallback(inbound, outbound, buf_snapshot).await;
                             return Ok(());
@@ -433,7 +440,6 @@ impl TunnelHandler for ServerHandler {
                     }
                 }
                 Err(_) => {
-                    // 🔥 ФИКС: Мусор или сканер протоколов (не TLS) -> ведет на донора
                     warn!("❌ Handshake parse failed (Not a valid TLS probe). Triggering Stealth Fallback.");
                     Self::handle_stealth_fallback(inbound, outbound, buf_snapshot).await;
                     return Ok(());
@@ -492,6 +498,7 @@ impl TunnelHandler for ServerHandler {
         let (control_tx, control_rx) = mpsc::channel::<MuxMessage>(cap);
         let (data_tx, data_rx) = mpsc::channel::<MuxMessage>(cap);
 
+        let control_tx_clone = control_tx.clone();
         muxer.add_leg(leg_id, control_tx, data_tx);
 
         let opener = Arc::new(RemoteOpener {
@@ -513,7 +520,10 @@ impl TunnelHandler for ServerHandler {
         };
 
         let res = engine.run().await;
-        muxer.remove_leg(leg_id);
+
+        // 🔥 ФИКС: Безопасное удаление ноги и на сервере
+        muxer.remove_leg(leg_id, &control_tx_clone);
+
         if muxer.active_legs_count() == 0 {
             self.session_manager.remove(&session_id);
         }

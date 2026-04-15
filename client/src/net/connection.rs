@@ -132,11 +132,11 @@ impl TcpConnection {
 
     fn poll_and_process(&mut self, socket: &mut tcp::Socket) {
         let current_rtt = GLOBAL_MIN_RTT.load(Ordering::Relaxed);
-        let rtt = Duration::from_millis(current_rtt as u64);
+        let rtt = smoltcp::time::Duration::from_millis(current_rtt as u64);
         socket.set_tunnel_rtt(rtt);
 
         // Читаем из браузера в Туннель
-        if self.core.tx.capacity() > 0 {
+        if self.core.tx.capacity() > 200 {
             while socket.can_recv() {
                 if let Ok(n) = socket.peek_slice(&mut self.chunk_buf) {
                     if n == 0 {
@@ -164,9 +164,20 @@ impl TcpConnection {
 
         // Читаем из Туннеля в браузер
         if !self.server_eof {
-            // 🔥 ФИКС БУФЕРБЛОАТА НА LTE: Ограничиваем локальный буфер ровно до 1 МБ!
-            // Это сбросит пинг на мобилках с 4500 мс до нормальных значений
-            while self.pending_bytes < 1024 * 1024 {
+            // 🔥 ДИНАМИЧЕСКИЙ BACKPRESSURE (Auto-Scaling Buffer)
+            // В зависимости от текущего пинга всей системы, мы разрешаем
+            // локальному сокету буферизовать разное количество данных.
+            let dynamic_limit = if current_rtt < 50 {
+                2 * 1024 * 1024 // 2 MB: Отличный Wi-Fi, качаем на максимум
+            } else if current_rtt < 150 {
+                1024 * 1024 // 1 MB: Хороший LTE
+            } else if current_rtt < 300 {
+                256 * 1024 // 256 KB: Загруженный 3G/LTE, начинаем зажимать
+            } else {
+                128 * 1024 // 128 KB: Сеть умирает (или сменилась вышка), спасаем пинг
+            };
+
+            while self.pending_bytes < dynamic_limit {
                 match self.core.rx.try_recv() {
                     Ok(data) => {
                         self.pending_bytes += data.len();
@@ -213,7 +224,6 @@ impl TcpConnection {
             }
         }
     }
-
     pub fn app_pending_out_size(&self) -> usize {
         self.pending_bytes
     }

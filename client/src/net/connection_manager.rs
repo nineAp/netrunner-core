@@ -75,9 +75,9 @@ impl TargetResolver {
 }
 
 pub struct ConnectionManager {
-    tracker: SessionTracker,
+    pub tracker: SessionTracker, // 🔥 Теперь pub для Engine
     resolver: TargetResolver,
-    tx_to_tunnel: mpsc::Sender<RawCastFrame>, // 🔥 Bounded
+    tx_to_tunnel: mpsc::Sender<RawCastFrame>,
     factory: Arc<dyn SocketProvider>,
     pending_connects: DashMap<FlowKey, Instant>,
 }
@@ -94,33 +94,6 @@ impl ConnectionManager {
             tx_to_tunnel,
             factory,
             pending_connects: DashMap::new(),
-        }
-    }
-
-    pub fn try_inject_inbound(&mut self, frame: RawCastFrame) -> Result<(), RawCastFrame> {
-        if frame.event == RawCastEvent::Close {
-            self.tracker.close_tunnel_session(frame.socket_id);
-            return Ok(());
-        }
-
-        if frame.event != RawCastEvent::Data {
-            return Ok(());
-        }
-
-        if let Some(tx) = self.tracker.get_inbound_tx(frame.socket_id) {
-            // 🔥 Защита от переполнения: Если очередь Bounded канала полна,
-            // мы тихо удаляем пакет. Очередь освободится, и TCP/BBR сделает свое дело (надежная доставка).
-            // Нельзя закрывать соединение!
-            if let Err(e) = tx.try_send(frame.payload.clone()) {
-                if let mpsc::error::TrySendError::Closed(_) = e {
-                    self.tracker.close_tunnel_session(frame.socket_id);
-                } else {
-                    // Backpressure in action: drop the packet, TCP will handle it
-                }
-            }
-            Ok(())
-        } else {
-            Ok(())
         }
     }
 

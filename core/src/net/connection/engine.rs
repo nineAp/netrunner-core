@@ -181,10 +181,14 @@ impl TunnelEngine {
         }
 
         for pkt in packets {
-            outbound.write_all(&pkt).await.map_err(|e| {
-                error!(stream_id, error = %e, "Failed to write encrypted data to network");
-                e.to_string()
-            })?;
+            // 🔥 ФИКС: Увеличен таймаут до 10 секунд (Mobile RRC Transitions)
+            let write_future = outbound.write_all(&pkt);
+            if let Err(_) =
+                tokio::time::timeout(std::time::Duration::from_secs(10), write_future).await
+            {
+                error!(stream_id, "🔥 Physical leg STUCK on write. Killing leg.");
+                return Err("Leg write timeout".into());
+            }
         }
         Ok(())
     }
