@@ -4,9 +4,9 @@ use netrunner_core::{
         DNS_PORT, GLOBAL_IDLE_TIMEOUT, HTTPS_PORT, MAX_SOCKETS, NETBIOS_PORTS,
         TCP_HANDSHAKE_TIMEOUT,
     },
-    rawcast::{RawCastEvent, RawCastFrame},
+    rawcast::RawCastFrame,
 };
-use netrunner_logger::{info, trace, warn};
+use netrunner_logger::warn;
 use smoltcp::{
     iface::{SocketHandle, SocketSet},
     socket::{Socket, tcp, udp},

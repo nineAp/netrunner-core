@@ -1,5 +1,8 @@
-use netrunner_core::net::{Connection, NetworkConfig, ServerHandler, TunnelHandler};
+use netrunner_core::net::{
+    Connection, NetworkConfig, ServerHandler, SessionManager, TunnelHandler,
+};
 use netrunner_logger::{error, info};
+use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
@@ -18,6 +21,9 @@ impl Network {
 
         NetworkConfig::init_global(1380);
 
+        // 🔥 CRITICAL FIX: Create ONE global session manager for multiplexing
+        let session_manager = Arc::new(SessionManager::new());
+
         info!("🌐 Netrunner Server: Listening on {}", addr);
         let listener = TcpListener::bind(&addr).await.expect("Server bind failed");
 
@@ -31,11 +37,10 @@ impl Network {
                     if let Ok((stream, client_addr)) = res {
                         info!("🔌 Connection from {}", client_addr);
 
-
                         let conn = Connection::new(stream);
 
-
-                        let handler = ServerHandler::new(conn);
+                        // Pass the Arc clone down to the ServerHandler
+                        let handler = ServerHandler::new(conn, session_manager.clone());
 
                         tokio::spawn(async move {
                             if let Err(e) = handler.run().await {

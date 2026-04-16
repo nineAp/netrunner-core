@@ -85,10 +85,6 @@ impl Engine {
 
         let mut last_stats_log = StdInstant::now();
 
-        // 🔥 ФИКС: Выносим чтение из туннеля в отдельную изолированную задачу!
-        // Это позволяет использовать `.await` при отправке данных в локальный сокет smoltcp.
-        // Если локальный сокет забит, эта задача мягко "засыпает", создавая идеальный Backpressure,
-        // при этом НЕ БЛОКИРУЯ основной цикл обработки интерфейсов Engine.
         let inbound_map = self.manager.tracker.inbound_tx.clone();
         let mut rx_tunnel = self.rx_from_tunnel.take().unwrap();
 
@@ -97,9 +93,13 @@ impl Engine {
                 if frame.event == RawCastEvent::Close {
                     inbound_map.remove(&frame.socket_id);
                 } else if frame.event == RawCastEvent::Data {
-                    if let Some(tx) = inbound_map.get(&frame.socket_id) {
-                        // ZERO DROP, PERFECT BACKPRESSURE.
-                        // Ожидаем, пока локальный сокет не освободит место.
+                    // 1. Берем лок, клонируем Sender, СРАЗУ отпускаем лок (конец scope `tx_opt`)
+                    let tx_opt = inbound_map
+                        .get(&frame.socket_id)
+                        .map(|ref_tx| ref_tx.clone());
+
+                    // 2. Теперь спокойно ждем (Backpressure), не блокируя остальную систему
+                    if let Some(tx) = tx_opt {
                         let _ = tx.send(frame.payload).await;
                     }
                 }

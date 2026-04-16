@@ -136,83 +136,64 @@ impl TcpConnection {
         socket.set_tunnel_rtt(rtt);
 
         // Читаем из браузера в Туннель
-        if self.core.tx.capacity() > 200 {
-            while socket.can_recv() {
-                if let Ok(n) = socket.peek_slice(&mut self.chunk_buf) {
-                    if n == 0 {
-                        break;
-                    }
-                    let chunk = Bytes::copy_from_slice(&self.chunk_buf[..n]);
-
-                    match self.core.tx.try_send(chunk) {
-                        Ok(_) => {
-                            socket.recv_slice(&mut self.chunk_buf[..n]).unwrap();
-                        }
-                        Err(mpsc::error::TrySendError::Full(_)) => {
-                            break;
-                        }
-                        Err(mpsc::error::TrySendError::Closed(_)) => {
-                            self.server_eof = true;
-                            break;
-                        }
-                    }
-                } else {
+        while socket.can_recv() && self.core.tx.capacity() > 0 {
+            if let Ok(n) = socket.peek_slice(&mut self.chunk_buf) {
+                if n == 0 {
                     break;
                 }
-            }
-        }
+                let chunk = Bytes::copy_from_slice(&self.chunk_buf[..n]);
 
-        // Читаем из Туннеля в браузер
-        if !self.server_eof {
-            // 🔥 ДИНАМИЧЕСКИЙ BACKPRESSURE (Auto-Scaling Buffer)
-            // В зависимости от текущего пинга всей системы, мы разрешаем
-            // локальному сокету буферизовать разное количество данных.
-            let dynamic_limit = if current_rtt < 50 {
-                2 * 1024 * 1024 // 2 MB: Отличный Wi-Fi, качаем на максимум
-            } else if current_rtt < 150 {
-                1024 * 1024 // 1 MB: Хороший LTE
-            } else if current_rtt < 300 {
-                256 * 1024 // 256 KB: Загруженный 3G/LTE, начинаем зажимать
-            } else {
-                128 * 1024 // 128 KB: Сеть умирает (или сменилась вышка), спасаем пинг
-            };
-
-            while self.pending_bytes < dynamic_limit {
-                match self.core.rx.try_recv() {
-                    Ok(data) => {
-                        self.pending_bytes += data.len();
-                        self.pending_data.push_back(data);
+                match self.core.tx.try_send(chunk) {
+                    Ok(_) => {
+                        socket.recv_slice(&mut self.chunk_buf[..n]).unwrap();
                     }
-                    Err(mpsc::error::TryRecvError::Empty) => break,
-                    Err(mpsc::error::TryRecvError::Disconnected) => {
-                        debug!(%self.core.handle, "Tunnel channel closed (Server EOF)");
-                        self.server_eof = true;
+                    Err(mpsc::error::TrySendError::Full(_)) => {
                         break;
                     }
-                }
-            }
-        }
-
-        // Отправляем из очереди в smoltcp
-        while socket.can_send() {
-            if let Some(mut chunk) = self.pending_data.pop_front() {
-                match socket.send_slice(&chunk) {
-                    Ok(n) => {
-                        self.pending_bytes -= n;
-                        if n < chunk.len() {
-                            chunk.advance(n);
-                            self.pending_data.push_front(chunk);
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        debug!(%self.core.handle, "Smoltcp send error: {:?}", e);
-                        self.pending_data.push_front(chunk);
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        self.server_eof = true;
                         break;
                     }
                 }
             } else {
                 break;
+            }
+        }
+
+        if !self.server_eof {
+            while socket.can_send() {
+                // Если есть недоотправленный кусок - берем его первым
+                if let Some(mut chunk) = self.pending_data.pop_front() {
+                    match socket.send_slice(&chunk) {
+                        Ok(n) => {
+                            self.pending_bytes -= n;
+                            if n < chunk.len() {
+                                chunk.advance(n);
+                                self.pending_data.push_front(chunk);
+                                break; // Сокет заполнился
+                            }
+                        }
+                        Err(e) => {
+                            debug!(%self.core.handle, "Smoltcp send error: {:?}", e);
+                            self.pending_data.push_front(chunk);
+                            break;
+                        }
+                    }
+                } else {
+                    // Очередь пуста, пытаемся прочитать из канала туннеля
+                    match self.core.rx.try_recv() {
+                        Ok(data) => {
+                            self.pending_bytes += data.len();
+                            self.pending_data.push_back(data);
+                        }
+                        Err(mpsc::error::TryRecvError::Empty) => break,
+                        Err(mpsc::error::TryRecvError::Disconnected) => {
+                            debug!(%self.core.handle, "Tunnel channel closed (Server EOF)");
+                            self.server_eof = true;
+                            break;
+                        }
+                    }
+                }
             }
         }
 
@@ -224,6 +205,7 @@ impl TcpConnection {
             }
         }
     }
+
     pub fn app_pending_out_size(&self) -> usize {
         self.pending_bytes
     }
@@ -269,7 +251,7 @@ impl TcpConnection {
         });
     }
 }
-// ... остальной код (UdpConnection и IcmpResponder без изменений) ...
+
 pub type UdpPacketTarget = (Bytes, std::net::Ipv4Addr, u16);
 
 pub struct UdpConnection {

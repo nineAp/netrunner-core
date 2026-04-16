@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use dashmap::DashMap;
-use netrunner_logger::{debug, info, trace, warn};
+use netrunner_logger::{info, trace, warn};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -54,9 +54,9 @@ impl IdGenerator {
 
 #[derive(Clone)]
 pub struct MuxMessage {
-    pub stream_id: u32,
-    pub frame_type: FrameType,
-    pub data: Bytes,
+    pub(crate) stream_id: u32,
+    pub(crate) frame_type: FrameType,
+    pub(crate) data: Bytes,
 }
 
 pub static GLOBAL_MIN_RTT: AtomicU32 = AtomicU32::new(250);
@@ -102,11 +102,13 @@ impl Muxer {
                 stats: Arc::new(LegStats::default()),
             },
         );
-        info!(leg_id, "MUXER: Leg registered (Total: {})", self.legs.len());
+        info!(
+            leg_id,
+            "MUXER: Physical TCP+TLS leg registered (Total: {})",
+            self.legs.len()
+        );
     }
 
-    // 🔥 ФИКС: Умное удаление ноги. Мы проверяем, не была ли эта нога уже перезаписана
-    // более новым подключением (чтобы не удалить живую ногу по ошибке)
     pub fn remove_leg(&self, leg_id: u32, tx: &Sender<MuxMessage>) {
         let should_remove = if let Some(leg) = self.legs.get(&leg_id) {
             leg.control_tx.same_channel(tx)
@@ -116,7 +118,10 @@ impl Muxer {
 
         if should_remove {
             self.legs.remove(&leg_id);
-            info!(leg_id, "MUXER: Leg removed safely, streams will re-balance");
+            info!(
+                leg_id,
+                "MUXER: TCP leg removed safely, streams will re-balance"
+            );
         } else {
             trace!(
                 leg_id,
@@ -126,7 +131,7 @@ impl Muxer {
     }
 
     pub fn remove_all_legs(&self) {
-        warn!("🚨 MUXER: Emergency reset! Removing all legs due to network change.");
+        warn!("🚨 MUXER: Emergency reset! Removing all physical legs due to network change.");
         self.legs.clear();
         self.stream_bindings.clear();
     }
@@ -181,7 +186,7 @@ impl Muxer {
             let rtt = start_time.elapsed().as_millis() as u32;
             if let Some(leg) = self.legs.get(&leg_id) {
                 leg.stats.rtt_ms.store(rtt, Ordering::Relaxed);
-                trace!(leg_id, rtt, "💓 [Muxer] RTT updated for leg");
+                trace!(leg_id, rtt, "💓 [Muxer] RTT updated for physical leg");
 
                 let min_rtt = self
                     .legs
@@ -208,7 +213,7 @@ impl Muxer {
 
             let (leg_id, leg) = match self.select_leg(&message.frame_type, message.stream_id) {
                 Some(l) => l,
-                None => return Err("MUXER: No active legs available".to_string()),
+                None => return Err("MUXER: No active physical legs available".to_string()),
             };
 
             let target_tx = match message.frame_type {
@@ -220,7 +225,7 @@ impl Muxer {
             };
 
             match tokio::time::timeout(
-                std::time::Duration::from_secs(2),
+                std::time::Duration::from_secs(10),
                 target_tx.send(message.clone()),
             )
             .await
@@ -243,7 +248,7 @@ impl Muxer {
                 Err(_) => {
                     warn!(
                         message.stream_id,
-                        "Physical TX full for 2s! Leg {} is dead. Evicting.", leg_id
+                        "Physical TCP TX full for 10s! Leg {} is dead. Evicting.", leg_id
                     );
                     self.remove_leg(leg_id, &leg.control_tx);
                     continue;
@@ -271,7 +276,7 @@ impl Muxer {
         .await
     }
 
-    pub async fn send_control(
+    pub(crate) async fn send_control(
         &self,
         stream_id: u32,
         f_type: FrameType,
@@ -303,17 +308,16 @@ impl Muxer {
 
         if let Some((tx, stats)) = stream_opt {
             let size = data.len() as u64;
-            match tx.try_send(data) {
+
+            // 🔥 КЛЮЧЕВОЙ ФИКС: Используем .send().await
+            // Мы больше не выбрасываем пакеты! Мы ждем, пока освободится очередь.
+            // Это создает естественный TCP Backpressure на стороне сервера.
+            match tx.send(data).await {
                 Ok(_) => {
                     stats.rx_bytes.fetch_add(size, Ordering::Relaxed);
                 }
-                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                    trace!(
-                        stream_id,
-                        "Local RX queue full. Dropped packet for inner-TCP backpressure."
-                    );
-                }
-                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                Err(_) => {
+                    // Канал закрыт (клиент отвалился)
                     self.remove_stream(stream_id);
                 }
             }
@@ -360,10 +364,10 @@ impl Muxer {
 
             match tokio::time::timeout(crate::net::HEALTH_CHECK_TIMEOUT, probe_rx.recv()).await {
                 Ok(Some(_)) => {
-                    trace!(leg_id, "✅ Leg Health Check OK");
+                    trace!(leg_id, "✅ TCP Leg Health Check OK");
                 }
                 _ => {
-                    warn!(leg_id, "❌ Leg Health Check FAIL/Timeout - Evicting");
+                    warn!(leg_id, "❌ TCP Leg Health Check FAIL/Timeout - Evicting");
                     self.remove_leg(leg_id, &tx);
                 }
             }
@@ -407,7 +411,6 @@ impl Muxer {
             total_tx += tx;
             total_rx += rx;
 
-            let leg_type = if id % 2 == 0 { "TCP" } else { "UDP" };
             let rtt_str = if rtt == 0 {
                 "N/A".to_string()
             } else {
@@ -415,9 +418,8 @@ impl Muxer {
             };
 
             legs_info.push(format!(
-                "   ├─ Leg {} ({}) ─ ⇡ {:<9} | ⇣ {:<9} [RTT: {}]",
+                "   ├─ Leg {} (TCP+TLS) ─ ⇡ {:<9} | ⇣ {:<9} [RTT: {}]",
                 id,
-                leg_type,
                 Self::format_size(tx),
                 Self::format_size(rx),
                 rtt_str
@@ -430,7 +432,7 @@ impl Muxer {
             Self::format_size(total_rx)
         ));
         out.push_str(&format!(
-            "├─ 🦵 Physical Legs (Active: {})\n",
+            "├─ 🦵 Physical Connections (Active: {})\n",
             legs_info.len()
         ));
 
@@ -444,7 +446,7 @@ impl Muxer {
 
         let streams_count = self.streams.len();
         out.push_str(&format!(
-            "└─ 🔀 Virtual Streams (Active: {})\n",
+            "└─ 🔀 Virtual Streams (TCP/UDP multiplexed: {})\n",
             streams_count
         ));
 

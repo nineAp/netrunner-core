@@ -12,11 +12,11 @@ use crate::{
         MAX_TUNNEL_LEGS, SECURE_HANDSHAKE_TIMEOUT, STEALTH_FALLBACK_HOST, TLS_HELLO_TIMEOUT,
         TOPOLOGY_PRINT_INTERVAL,
     },
-    nrxp::{Codec, ErrorAction, Frame, FrameType, TlsBridge},
+    nrxp::{Codec, Frame, FrameType, TlsBridge},
     rawcast::{LocalProtocol, RawCastAdapter, RawCastFrame},
     tlseng::{BrowserProfile, ServerProfile},
 };
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use netrunner_logger::{debug, error, info, warn};
 use rand::Rng;
@@ -173,7 +173,6 @@ impl ClientHandler {
         let (control_tx, control_rx) = mpsc::channel::<MuxMessage>(cap);
         let (data_tx, data_rx) = mpsc::channel::<MuxMessage>(cap);
 
-        // Клонируем Sender до передачи в add_leg, чтобы использовать для remove_leg
         let control_tx_clone = control_tx.clone();
         muxer.add_leg(leg_id, control_tx, data_tx);
 
@@ -193,8 +192,6 @@ impl ClientHandler {
 
         let run_result = engine.run().await;
 
-        // 🔥 ФИКС: Гарантированно вычищаем ногу по завершению работы,
-        // используя безопасный same_channel чек
         muxer.remove_leg(leg_id, &control_tx_clone);
 
         run_result.map_err(|e| e.to_string())?;
@@ -219,7 +216,6 @@ impl ClientHandler {
             loop {
                 interval.tick().await;
                 let current_ip = Self::get_local_ip();
-                // 🔥 ФИКС: Trigger also if we completely lost network (current_ip == None)
                 if current_ip != last_ip {
                     netrunner_logger::warn!(
                         "🌐 Network Change Detected: {:?} -> {:?}",
@@ -287,10 +283,13 @@ impl ClientHandler {
 
                             let tx_to_tun = tx_to_engine.clone();
                             let reg = registry.clone();
+                            let l2g = local_to_global.clone(); // 🔥 Клонируем для очистки
+
                             tokio::spawn(async move {
                                 while let Some(back_payload) = v_rx.recv().await {
-                                    if let Some(r) = reg.get(&global_stream_id) {
-                                        let (orig_local_id, ip, port, proto) = *r;
+                                    let route_info = reg.get(&global_stream_id).map(|r| *r);
+
+                                    if let Some((orig_local_id, ip, port, proto)) = route_info {
                                         let out_f_type = if proto == LocalProtocol::Udp {
                                             FrameType::UdpData
                                         } else {
@@ -311,16 +310,31 @@ impl ClientHandler {
                                         }
                                     }
                                 }
+
+                                // 🔥 ФИКС УТЕЧКИ ПАМЯТИ: Сборщик мусора
+                                // Если цикл завершился (Muxer удалил v_tx), стираем мертвые сессии
+                                if let Some((_, (orig_local_id, _, _, _))) =
+                                    reg.remove(&global_stream_id)
+                                {
+                                    l2g.remove(&orig_local_id);
+                                    debug!(
+                                        global_stream_id,
+                                        "🧹 Garbage Collector: Cleaned up dead registry stream"
+                                    );
+                                }
                             });
+
                             let _ = muxer_inner
                                 .send_control(global_stream_id, f_type, payload)
                                 .await;
                         }
                         FrameType::Data | FrameType::UdpData => {
-                            if let Some(id) = local_to_global.get(&local_socket_id) {
+                            let global_id = local_to_global.get(&local_socket_id).map(|id| *id);
+
+                            if let Some(id) = global_id {
                                 let _ = muxer_inner
                                     .send_data_safe(
-                                        *id,
+                                        id,
                                         payload,
                                         raw_frame.protocol == LocalProtocol::Udp,
                                     )
@@ -353,10 +367,10 @@ pub struct ServerHandler {
 }
 
 impl ServerHandler {
-    pub fn new(connection: Connection) -> Self {
+    pub fn new(connection: Connection, session_manager: Arc<SessionManager>) -> Self {
         Self {
             conn: connection,
-            session_manager: Arc::new(SessionManager::new()),
+            session_manager,
         }
     }
 
@@ -521,7 +535,6 @@ impl TunnelHandler for ServerHandler {
 
         let res = engine.run().await;
 
-        // 🔥 ФИКС: Безопасное удаление ноги и на сервере
         muxer.remove_leg(leg_id, &control_tx_clone);
 
         if muxer.active_legs_count() == 0 {

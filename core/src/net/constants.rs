@@ -10,7 +10,7 @@ pub const GLOBAL_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 // 🔥 ФИКС: Ускоряем обнаружение мертвой сети при переключении Wi-Fi -> LTE
 pub const HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(3); // Было 7
-pub const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(4); // Было 10
+pub const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(10); // Было 10
 pub const LEG_RECONNECT_DELAY: Duration = Duration::from_secs(2); // Было 3
 pub const BRIDGE_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 

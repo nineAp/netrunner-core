@@ -21,7 +21,6 @@ impl Drop for StreamGuard {
         self.muxer.remove_stream(self.stream_id);
     }
 }
-
 pub(crate) async fn run_tcp_bridge<R, W>(
     stream_id: u32,
     mut reader: R,
@@ -36,86 +35,52 @@ pub(crate) async fn run_tcp_bridge<R, W>(
         stream_id,
         muxer: muxer.clone(),
     };
+    let buf_size = NetworkConfig::global().tcp_buffer_size;
 
-    let mut buf = BytesMut::with_capacity(NetworkConfig::global().tcp_buffer_size);
+    // Создаем отдельный канал для упорядоченной отправки в туннель
+    let (tx_to_mux, mut rx_from_bridge) = mpsc::channel::<Bytes>(16);
 
-    loop {
-        buf.reserve(NetworkConfig::global().tcp_buffer_size);
-        let select_res = timeout(BRIDGE_IDLE_TIMEOUT, async {
-            tokio::select! {
-                res = reader.read_buf(&mut buf) => {
-                    match res {
-                        Ok(0) => {
-                            debug!(stream_id, "TCP Socket reached EOF");
-                            return Ok(false);
-                        }
-                        Ok(_) => {
-                            let msg = MuxMessage {
-                                stream_id,
-                                frame_type: FrameType::Data,
-                                data: buf.split().freeze(),
-                            };
-
-                            if muxer.send_to_network(msg).await.is_err() {
-                                // 🔥 ФИКС: Если нет живых ног туннеля — просто дропаем пакет!
-                                // Мы НЕ закрываем мост (return Ok(false)), 
-                                // TCP-стек на клиенте сам сделает ретрансмиссию
-                                warn!(stream_id, "All tunnel legs dead. Dropping packet. TCP will retransmit.");
-                            }
-                            Ok(true)
-                        }
-                        Err(e) => {
-                            error!(stream_id, error = %e, "TCP Socket read error");
-                            Err(e.to_string())
-                        }
-                    }
-                }
-
-                maybe_data = v_rx.recv() => {
-                    match maybe_data {
-                        Some(data) => {
-                            if data.is_empty() { return Ok(true); }
-                            if let Err(e) = writer.write_all(&data).await {
-                                error!(stream_id, error = %e, "TCP Socket write error");
-                                return Err(e.to_string());
-                            }
-                            Ok(true)
-                        }
-                        None => {
-                            debug!(stream_id, "Virtual channel closed (Muxer removed stream)");
-                            Ok(false)
-                        }
-                    }
-                }
-            }
-        })
-        .await;
-
-        match select_res {
-            Ok(Ok(true)) => continue,
-            Ok(Ok(false)) => break,
-            Ok(Err(e)) => {
-                debug!(stream_id, "Bridge closing due to error: {}", e);
-                break;
-            }
-            Err(_) => {
-                warn!(stream_id, "TCP Bridge IDLE timeout reached. Evicting task.");
+    // Задача-отправщик: гарантирует порядок и не блокирует основной цикл моста
+    let m_clone = muxer.clone();
+    tokio::spawn(async move {
+        while let Some(data) = rx_from_bridge.recv().await {
+            if let Err(_) = m_clone.send_data_safe(stream_id, data, false).await {
                 break;
             }
         }
+    });
+
+    let mut buf = BytesMut::with_capacity(buf_size);
+    loop {
+        if buf.capacity() < 16384 {
+            buf.reserve(buf_size);
+        }
+
+        tokio::select! {
+            // Читаем из Интернета -> В очередь отправки (Upload)
+            res = reader.read_buf(&mut buf) => {
+                match res {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        let data = buf.split().freeze();
+                        if tx_to_mux.send(data).await.is_err() { break; }
+                    }
+                    Err(_) => break,
+                }
+            }
+            // Читаем из Туннеля -> В Интернет (Download)
+            maybe_data = v_rx.recv() => {
+                match maybe_data {
+                    Some(data) => {
+                        if data.is_empty() { continue; }
+                        if writer.write_all(&data).await.is_err() { break; }
+                    }
+                    None => break,
+                }
+            }
+        }
     }
-
-    let _ = muxer
-        .send_to_network(MuxMessage {
-            stream_id,
-            frame_type: FrameType::Close,
-            data: Bytes::new(),
-        })
-        .await;
-
-    tokio::time::sleep(Duration::from_millis(50)).await;
 }
-
 pub(crate) async fn run_udp_bridge(
     stream_id: u32,
     socket: UdpSocket,

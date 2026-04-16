@@ -56,6 +56,11 @@ impl TunnelEngine {
             let mut inbound = inbound;
 
             loop {
+                if read_buf.is_empty() {
+                    read_buf.clear();
+                }
+                read_buf.reserve(16384);
+
                 tokio::select! {
                     _ = token_reader.cancelled() => {
                         info!("Reader Task: Shutdown signal received.");
@@ -141,6 +146,8 @@ impl TunnelEngine {
             res = writer_handle => res.unwrap_or_else(|e| Err(format!("Writer panic: {}", e))),
         };
 
+        token.cancel();
+
         if let Err(e) = &res {
             error!("TunnelEngine critical failure: {}", e);
         }
@@ -181,7 +188,6 @@ impl TunnelEngine {
         }
 
         for pkt in packets {
-            // 🔥 ФИКС: Увеличен таймаут до 10 секунд (Mobile RRC Transitions)
             let write_future = outbound.write_all(&pkt);
             if let Err(_) =
                 tokio::time::timeout(std::time::Duration::from_secs(10), write_future).await
