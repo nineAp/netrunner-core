@@ -23,7 +23,7 @@ pub const AUTH_TIME_STEP: u64 = 60;
 pub const AUTH_WINDOW_SIZE: u64 = 2;
 
 pub const LEG_STAGGER_DELAY: Duration = Duration::from_millis(1000); // Чуть ускорили старт
-pub const TOPOLOGY_PRINT_INTERVAL: Duration = Duration::from_secs(15);
+pub const TOPOLOGY_PRINT_INTERVAL: Duration = Duration::from_secs(10);
 
 pub const STEALTH_FALLBACK_HOST: &str = "ubuntu.com:443";
 pub const FALLBACK_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);

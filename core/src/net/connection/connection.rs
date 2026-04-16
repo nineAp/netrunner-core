@@ -57,6 +57,22 @@ impl SessionManager {
             info!("🧹 Session {} completely closed and cleaned up", session_id);
         }
     }
+
+    pub fn print_all_sessions(&self) {
+        if self.sessions.is_empty() {
+            return;
+        }
+
+        info!("📊 --- SERVER GLOBAL SESSIONS REPORT ---");
+        for entry in self.sessions.iter() {
+            let session_id = entry.key();
+            let muxer = entry.value();
+
+            // Вызываем уже существующий метод печати дерева у Muxer
+            muxer.print_topology_tree();
+        }
+        info!("📊 ---------------------------------------");
+    }
 }
 
 #[async_trait::async_trait]

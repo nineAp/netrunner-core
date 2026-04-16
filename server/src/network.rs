@@ -1,5 +1,6 @@
 use netrunner_core::net::{
     Connection, NetworkConfig, ServerHandler, SessionManager, TunnelHandler,
+    TOPOLOGY_PRINT_INTERVAL,
 };
 use netrunner_logger::{error, info};
 use std::sync::Arc;
@@ -23,6 +24,14 @@ impl Network {
 
         // 🔥 CRITICAL FIX: Create ONE global session manager for multiplexing
         let session_manager = Arc::new(SessionManager::new());
+
+        let sm_clone = session_manager.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(TOPOLOGY_PRINT_INTERVAL).await;
+                sm_clone.print_all_sessions();
+            }
+        });
 
         info!("🌐 Netrunner Server: Listening on {}", addr);
         let listener = TcpListener::bind(&addr).await.expect("Server bind failed");
