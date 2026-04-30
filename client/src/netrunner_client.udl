@@ -14,7 +14,7 @@ interface SessionManager {
         string remote_address, 
         i32? tun_fd, 
         string cache_path,
-        bool killswitch_enabled,
+        boolean killswitch_enabled,
         sequence<string> excluded_apps,
         sequence<string> excluded_domains
     );
