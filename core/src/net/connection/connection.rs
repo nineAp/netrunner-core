@@ -233,12 +233,16 @@ impl ClientHandler {
                 interval.tick().await;
                 let current_ip = Self::get_local_ip();
                 if current_ip != last_ip {
-                    netrunner_logger::warn!(
-                        "🌐 Network Change Detected: {:?} -> {:?}",
-                        last_ip,
-                        current_ip
-                    );
-                    watcher_muxer.remove_all_legs();
+                    // ФИКС: Сбрасываем туннели только при реальном переходе (например, Wi-Fi на LTE)
+                    // Игнорируем кратковременную потерю сети (None), TCP сам справится с задержкой
+                    if current_ip.is_some() && last_ip.is_some() {
+                        netrunner_logger::warn!(
+                            "🌐 Network Change Detected: {:?} -> {:?}",
+                            last_ip,
+                            current_ip
+                        );
+                        watcher_muxer.remove_all_legs();
+                    }
                     last_ip = current_ip;
                 }
             }
@@ -554,7 +558,15 @@ impl TunnelHandler for ServerHandler {
         muxer.remove_leg(leg_id, &control_tx_clone);
 
         if muxer.active_legs_count() == 0 {
-            self.session_manager.remove(&session_id);
+            let sm = self.session_manager.clone();
+            let sid = session_id.clone();
+            let m = muxer.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+                if m.active_legs_count() == 0 {
+                    sm.remove(&sid);
+                }
+            });
         }
         res
     }
