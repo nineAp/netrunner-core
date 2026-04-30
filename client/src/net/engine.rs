@@ -236,6 +236,10 @@ pub struct EngineConfig {
     pub any_ip: bool,
     pub transparent_mode: bool,
     pub default_gateway: Ipv4Addr,
+    // Новые поля
+    pub killswitch_enabled: bool,
+    pub excluded_apps: Vec<String>,
+    pub excluded_domains: Vec<String>,
 }
 
 impl EngineConfig {
@@ -248,6 +252,9 @@ impl EngineConfig {
             any_ip: true,
             transparent_mode: true,
             default_gateway: Ipv4Addr::new(10, 0, 0, 2),
+            killswitch_enabled: true,
+            excluded_apps: Vec::new(),
+            excluded_domains: Vec::new(),
         }
     }
 
@@ -263,6 +270,21 @@ impl EngineConfig {
 
     pub fn disable_routing(mut self) -> Self {
         self.setup_routing = false;
+        self
+    }
+
+    pub fn with_killswitch(mut self, enabled: bool) -> Self {
+        self.killswitch_enabled = enabled;
+        self
+    }
+
+    pub fn with_excluded_apps(mut self, apps: Vec<String>) -> Self {
+        self.excluded_apps = apps;
+        self
+    }
+
+    pub fn with_excluded_domains(mut self, domains: Vec<String>) -> Self {
+        self.excluded_domains = domains;
         self
     }
 }
@@ -287,20 +309,35 @@ impl EngineBuilder {
         self
     }
 
+    // client/src/net/engine.rs
+
     pub async fn build(self) -> Result<(Engine, Tun), String> {
         let tun = self.tun_device.ok_or("TUN device is required")?;
 
         info!("Initializing Engine with config: {:?}", self.config);
 
-        let mut dns_handler = DnsHandler::new(&self.config.cache_path);
+        // 1. Обновляем DnsHandler: теперь он знает про список исключенных доменов
+        let mut dns_handler = DnsHandler::new(
+            &self.config.cache_path,
+            self.config.excluded_domains.clone(),
+        );
+
         if let Err(e) = dns_handler.init().await {
             error!("Failed to initialize DNS blocklist: {}", e);
         }
 
+        // 2. Обновляем настройку роутинга: передаем флаг Killswitch и список приложений
         if self.config.setup_routing {
-            info!("Applying platform routing rules...");
-            setup_platform_routing(&self.config.remote_address)
-                .map_err(|e| format!("Routing setup failed: {}", e))?;
+            info!(
+                "Applying platform routing rules (Killswitch: {})...",
+                self.config.killswitch_enabled
+            );
+            setup_platform_routing(
+                &self.config.remote_address,
+                self.config.killswitch_enabled, // Новый параметр
+                &self.config.excluded_apps,     // Новый параметр
+            )
+            .map_err(|e| format!("Routing setup failed: {}", e))?;
         }
 
         let smol_config = Config::new(smoltcp::wire::HardwareAddress::Ip);
@@ -308,7 +345,6 @@ impl EngineBuilder {
         caps.max_transmission_unit = self.config.mtu;
         caps.medium = smoltcp::phy::Medium::Ip;
 
-        // 🔥 Используем Bounded каналы для Tunnel <-> Engine
         let cap = NetworkConfig::global().channel_capacity;
         let (tx_to_tunnel, rx_for_client_handler) = mpsc::channel::<RawCastFrame>(cap);
         let (tx_for_client_handler, rx_from_tunnel) = mpsc::channel::<RawCastFrame>(cap);
@@ -328,6 +364,46 @@ impl EngineBuilder {
             Arc::new(SmolSocketFactory::new(config))
         });
 
+        // 3. Динамический резолвинг исключенных доменов.
+        // Чтобы Split-Tunneling работал, ОС должна знать, что к реальным IP этих доменов
+        // нужно идти через физический шлюз, а не через TUN.
+        let excluded_domains = self.config.excluded_domains.clone();
+        if !excluded_domains.is_empty() {
+            tokio::spawn(async move {
+                // Определяем физический шлюз (например, 192.168.1.1)
+                #[cfg(target_os = "linux")]
+                let phys_gw = crate::tun::routing::get_default_gateway_linux()
+                    .unwrap_or_else(|| "192.168.1.1".into());
+                #[cfg(not(target_os = "linux"))]
+                let phys_gw = "192.168.1.1";
+
+                for domain in excluded_domains {
+                    // Резолвим домен средствами ОС (через системный DNS, не наш)
+                    if let Ok(addrs) = tokio::net::lookup_host(format!("{}:443", domain)).await {
+                        for addr in addrs {
+                            if let std::net::IpAddr::V4(ipv4) = addr.ip() {
+                                debug!(
+                                    "Adding exception route for domain {} -> IP {}",
+                                    domain, ipv4
+                                );
+                                // Прописываем маршрут в ОС мимо туннеля
+                                #[cfg(target_os = "linux")]
+                                let _ = crate::tun::routing::run_cmd_ext(
+                                    &format!("ip route add {} via {}", ipv4, phys_gw),
+                                    true,
+                                );
+                                #[cfg(target_os = "windows")]
+                                let _ = crate::tun::routing::run_cmd_ext(
+                                    &format!("route add {} mask 255.255.255.255 {}", ipv4, phys_gw),
+                                    true,
+                                );
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
         let mut engine = Engine::new(
             smol_config,
             caps,
@@ -346,8 +422,8 @@ impl EngineBuilder {
         engine.activate();
 
         info!(
-            "Engine successfully built. Stack IP: {}",
-            self.config.default_gateway
+            "Engine successfully built. Stack IP: {} | Killswitch: {}",
+            self.config.default_gateway, self.config.killswitch_enabled
         );
 
         Ok((engine, tun))

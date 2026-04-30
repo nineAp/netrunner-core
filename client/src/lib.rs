@@ -75,6 +75,9 @@ impl SessionManager {
         remote_address: String,
         tun_fd: Option<i32>,
         cache_dir: String,
+        killswitch_enabled: bool,
+        excluded_apps: Vec<String>,
+        excluded_domains: Vec<String>,
     ) -> Arc<Session> {
         netrunner_logger::Logger::init(None);
         netrunner_logger::Logger::global().set_level("info");
@@ -86,7 +89,11 @@ impl SessionManager {
         let addr: std::net::SocketAddr = remote_address.parse().expect("Invalid address format");
         let remote_proxy_ip = addr.ip().to_string();
 
-        let mut config = EngineConfig::new(&remote_address).with_cache_path(&cache_dir);
+        let mut config = EngineConfig::new(&remote_address)
+            .with_cache_path(&cache_dir)
+            .with_killswitch(killswitch_enabled)
+            .with_excluded_apps(excluded_apps)
+            .with_excluded_domains(excluded_domains);
 
         #[cfg(any(target_os = "android", target_os = "ios"))]
         {

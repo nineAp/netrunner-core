@@ -63,10 +63,11 @@ pub struct DnsHandler {
     block_list: HashSet<String>,
     forbidden_suffixes: Vec<String>,
     cache_path: String,
+    excluded_domains: HashSet<String>, // Добавлено
 }
 
 impl DnsHandler {
-    pub fn new(cache_dir: &str) -> Self {
+    pub fn new(cache_dir: &str, excluded: Vec<String>) -> Self {
         Self {
             block_list: HashSet::new(),
             forbidden_suffixes: vec![".lan", ".local", ".home", ".arpa"]
@@ -74,6 +75,7 @@ impl DnsHandler {
                 .map(String::from)
                 .collect(),
             cache_path: format!("{}/hosts_cache.txt", cache_dir),
+            excluded_domains: excluded.into_iter().map(|d| d.to_lowercase()).collect(),
         }
     }
 
@@ -161,6 +163,13 @@ impl DnsHandler {
             .set_message_type(MessageType::Response)
             .set_recursion_available(true)
             .add_query(query.clone());
+
+        if self.excluded_domains.iter().any(|ext| name.ends_with(ext)) {
+            netrunner_logger::info!("Bypassing DNS for excluded domain: {}", name);
+            // Отвечаем ServFail (или Refused). Это заставит ОС сделать фолбэк на реальный DNS провайдера.
+            res.set_response_code(ResponseCode::ServFail);
+            return res.to_vec().ok();
+        }
 
         if self.forbidden_suffixes.iter().any(|s| name.ends_with(s))
             || self.block_list.contains(&name)

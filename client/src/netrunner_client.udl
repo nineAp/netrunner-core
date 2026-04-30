@@ -9,8 +9,15 @@ dictionary VpnTrafficStats {
 
 interface SessionManager {
     constructor();
-    Session spawn_session(string remote_address, i32? tun_fd, string cache_path);
-    
+    // Добавлены параметры для Killswitch и исключений
+    Session spawn_session(
+        string remote_address, 
+        i32? tun_fd, 
+        string cache_path,
+        bool killswitch_enabled,
+        sequence<string> excluded_apps,
+        sequence<string> excluded_domains
+    );
     VpnTrafficStats get_traffic_stats();
 };
 

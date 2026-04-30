@@ -54,7 +54,21 @@ fn get_default_gateway() -> Option<String> {
         .map(|s| s.to_string())
 }
 
-pub fn setup_platform_routing(remote_address: &str) -> io::Result<()> {
+#[cfg(target_os = "linux")]
+fn get_default_gateway_linux() -> Option<String> {
+    let output = Command::new("ip")
+        .args(["route", "show", "default"])
+        .output()
+        .ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout.split_whitespace().nth(2).map(|s| s.to_string())
+}
+
+pub fn setup_platform_routing(
+    remote_address: &str,
+    killswitch: bool,
+    excluded_apps: &[String],
+) -> io::Result<()> {
     let proxy_ip = remote_address.split(':').next().unwrap_or(remote_address);
 
     #[cfg(target_os = "linux")]
@@ -79,6 +93,52 @@ pub fn setup_platform_routing(remote_address: &str) -> io::Result<()> {
             false,
         )?;
 
+        // 1. Исключения для приложений (Split-Tunneling)
+        // Ожидается, что для Linux в excluded_apps передаются UID пользователей
+        for uid_str in excluded_apps {
+            if let Ok(uid) = uid_str.parse::<u32>() {
+                netrunner_logger::info!("Bypassing TUN for UID: {}", uid);
+                // Пропускаем трафик этого UID мимо нашего роутинга
+                run_cmd_ext(
+                    &format!("nft add rule ip netrunner output meta skuid {} accept", uid),
+                    false,
+                )?;
+            }
+        }
+
+        // 2. Базовая маркировка трафика для отправки в TUN
+        let mark_rule = format!(
+            "nft add rule ip netrunner output ip daddr != {} oifname != \"netr0\" mark set 0x1",
+            proxy_ip
+        );
+        run_cmd_ext(&mark_rule, false)?;
+
+        // 3. KILLSWITCH
+        if killswitch {
+            netrunner_logger::info!("🔒 Killswitch ENABLED (Linux)");
+            // Исключения для локальной сети (крайне важно для сохранения доступа к роутеру)
+            let lan_bypass = "nft add rule ip netrunner output ip daddr { 127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 } accept";
+            run_cmd_ext(lan_bypass, false)?;
+
+            // Разрешаем трафик до самого прокси-сервера
+            run_cmd_ext(
+                &format!(
+                    "nft add rule ip netrunner output ip daddr {} accept",
+                    proxy_ip
+                ),
+                false,
+            )?;
+
+            // Разрешаем трафик, который УЖЕ внутри туннеля
+            run_cmd_ext(
+                "nft add rule ip netrunner output oifname \"netr0\" accept",
+                false,
+            )?;
+
+            // Блокируем всё остальное (Утечки)
+            run_cmd_ext("nft add rule ip netrunner output drop", false)?;
+        }
+
         let mark_rule = format!(
             "nft add rule ip netrunner output ip daddr != {} oifname != \"netr0\" mark set 0x1",
             proxy_ip
@@ -100,23 +160,19 @@ pub fn setup_platform_routing(remote_address: &str) -> io::Result<()> {
     #[cfg(target_os = "windows")]
     {
         let gateway = get_default_gateway().unwrap_or_else(|| "192.168.1.1".to_string());
-
-        let _ = run_cmd_ext(
-            "netsh interface ipv4 set address name=\"netr0\" static 10.0.0.1 255.255.255.0 none",
-            true,
-        );
-
         let tun_idx = get_adapter_index("netr0")
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Interface netr0 not found"))?;
 
-        let _ = run_cmd_ext(
+        // Сохраняем доступ к прокси через физический шлюз
+        run_cmd_ext(
             &format!(
                 "route add {} mask 255.255.255.255 {} metric 1",
                 proxy_ip, gateway
             ),
             true,
-        );
+        )?;
 
+        // Направляем весь трафик в TUN
         run_cmd_ext(
             &format!(
                 "route add 0.0.0.0 mask 128.0.0.0 10.0.0.2 if {} metric 5",
@@ -132,15 +188,16 @@ pub fn setup_platform_routing(remote_address: &str) -> io::Result<()> {
             true,
         )?;
 
-        let _ = run_cmd_ext(
-            "netsh interface ipv4 set dnsservers name=\"netr0\" static 10.0.0.2 primary",
-            true,
-        );
-
-        info!(
-            "Windows: Routing configured on idx {} via 10.0.0.2",
-            tun_idx
-        );
+        // KILLSWITCH: Удаляем дефолтный физический маршрут
+        if killswitch {
+            netrunner_logger::info!(
+                "🔒 Killswitch ENABLED (Windows). Deleting default physical route."
+            );
+            run_cmd_ext(
+                &format!("route delete 0.0.0.0 mask 0.0.0.0 {}", gateway),
+                true,
+            )?;
+        }
     }
 
     #[cfg(any(target_os = "android", target_os = "ios"))]
@@ -173,6 +230,15 @@ pub fn reset_platform_routing(_proxy_ip: Option<&str>) -> io::Result<()> {
             "netsh interface ipv4 set dnsservers name=\"netr0\" source=dhcp",
             true,
         );
+
+        if was_killswitch {
+            netrunner_logger::info!(
+                "Restoring physical default route (DHCP renew needed or manual restore)"
+            );
+            // Windows не всегда сама возвращает default route после `route delete`.
+            // Оптимальный хак: дернуть DHCP.
+            let _ = run_cmd_ext("ipconfig /renew", true);
+        }
 
         info!("Windows routing reset complete.");
     }
