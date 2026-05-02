@@ -253,21 +253,26 @@ impl ConnectionManager {
         }
     }
 
-    pub fn process_sockets(&mut self, socket_set: &mut SocketSet) {
+    pub fn process_sockets(&mut self, socket_set: &mut SocketSet, now: smoltcp::time::Instant) {
         let handles: Vec<SocketHandle> = socket_set.iter().map(|(h, _)| h).collect();
 
         for handle in handles {
             let socket = socket_set.get_mut(handle);
-
             match socket {
-                Socket::Tcp(s) => self.handle_tcp(handle, s),
-                Socket::Udp(s) => self.handle_udp(handle, s),
-                Socket::Icmp(s) => IcmpResponder::handle(s),
+                Socket::Tcp(s) => self.handle_tcp(handle, s, now), // Пробрасываем в TCP
+                Socket::Udp(s) => self.handle_udp(handle, s, now), // Пробрасываем в UDP
+                Socket::Icmp(s) => IcmpResponder::handle(s, now),  // Пробрасываем в ICMP
             }
         }
     }
 
-    fn handle_tcp(&mut self, handle: SocketHandle, socket: &mut tcp::Socket) {
+    // Добавляем аргумент 'now' в сигнатуру
+    fn handle_tcp(
+        &mut self,
+        handle: SocketHandle,
+        socket: &mut tcp::Socket,
+        now: smoltcp::time::Instant,
+    ) {
         self.tracker.update_activity(handle);
         let state = socket.state();
 
@@ -301,14 +306,21 @@ impl ConnectionManager {
         }
 
         if let Some(conn) = self.tracker.get_tcp_mut(handle) {
-            let _ = conn.tick(socket);
+            // Передаем 'now' в метод tick для обработки очередей и RTT
+            let _ = conn.tick(socket, now);
         }
     }
 
-    fn handle_udp(&mut self, handle: SocketHandle, socket: &mut udp::Socket) {
+    fn handle_udp(
+        &mut self,
+        handle: SocketHandle,
+        socket: &mut udp::Socket,
+        now: smoltcp::time::Instant,
+    ) {
         self.tracker.update_activity(handle);
         if socket.endpoint().port == 53 {
-            while let Ok((data, meta)) = socket.recv() {
+            // Передаем время в вызов recv для DNS-сокета
+            while let Ok((data, meta)) = socket.recv(now) {
                 if let Some(res) = self.resolver.process_dns_query(data) {
                     let _ = socket.send_slice(&res, meta);
                 }
@@ -316,7 +328,8 @@ impl ConnectionManager {
             return;
         }
         if let Some(conn) = self.tracker.get_udp_mut(handle) {
-            if !conn.tick(socket) {
+            // Передаем время в tick
+            if !conn.tick(socket, now) {
                 self.tracker.queue_removal(handle);
             }
         }

@@ -80,7 +80,7 @@ impl TcpConnection {
         (conn, rx_from_smol, tx_to_smol, handshake_tx)
     }
 
-    pub fn tick(&mut self, socket: &mut tcp::Socket) -> bool {
+    pub fn tick(&mut self, socket: &mut tcp::Socket, timestamp: smoltcp::time::Instant) -> bool {
         match self.state {
             ConnectionState::Handshaking => {
                 if let Some(rx) = &mut self.handshake_rx {
@@ -103,7 +103,7 @@ impl TcpConnection {
             }
 
             ConnectionState::Active => {
-                self.poll_and_process(socket);
+                self.poll_and_process(socket, timestamp);
 
                 if matches!(socket.state(), tcp::State::Closed | tcp::State::TimeWait) {
                     debug!(%self.core.handle, "TCP Socket is finished, state -> Closed");
@@ -129,14 +129,14 @@ impl TcpConnection {
         true
     }
 
-    fn poll_and_process(&mut self, socket: &mut tcp::Socket) {
+    fn poll_and_process(&mut self, socket: &mut tcp::Socket, timestamp: smoltcp::time::Instant) {
         let current_rtt = GLOBAL_MIN_RTT.load(Ordering::Relaxed);
         let rtt = smoltcp::time::Duration::from_millis(current_rtt as u64);
         socket.set_tunnel_rtt(rtt);
 
         // Читаем из браузера в Туннель
         while socket.can_recv() && self.core.tx.capacity() > 0 {
-            if let Ok(n) = socket.peek_slice(&mut self.chunk_buf) {
+            if let Ok(n) = socket.peek_slice(&mut self.chunk_buf, timestamp) {
                 if n == 0 {
                     break;
                 }
@@ -283,14 +283,14 @@ impl UdpConnection {
             .map_or(false, |ep| ep.port == port)
     }
 
-    pub fn tick(&mut self, socket: &mut udp::Socket) -> bool {
+    pub fn tick(&mut self, socket: &mut udp::Socket, timestamp: smoltcp::time::Instant) -> bool {
         if self.last_activity.elapsed() > UDP_IDLE_TIMEOUT {
             socket.close();
             return false;
         }
 
         if socket.can_recv() {
-            while let Ok((data, metadata)) = socket.recv() {
+            while let Ok((data, metadata)) = socket.recv(timestamp) {
                 if let smoltcp::wire::IpAddress::Ipv4(ip) = metadata.endpoint.addr {
                     self.last_client_endpoint = Some(metadata.endpoint);
                     let target_ip = std::net::Ipv4Addr::from(ip);
@@ -363,12 +363,12 @@ use smoltcp::socket::icmp;
 pub struct IcmpResponder;
 
 impl IcmpResponder {
-    pub fn handle(socket: &mut icmp::Socket) {
+    pub fn handle(socket: &mut icmp::Socket, timestamp: smoltcp::time::Instant) {
         if !socket.can_recv() {
             return;
         }
 
-        let result = socket.recv();
+        let result = socket.recv(timestamp);
 
         if let Ok((data, src_addr)) = result {
             let payload = data.to_vec();

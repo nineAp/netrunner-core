@@ -108,8 +108,9 @@ impl Engine {
 
         loop {
             let mut repeat_poll = true;
+            let now = Self::current_time();
             while repeat_poll {
-                self.manager.process_sockets(&mut self.socket_set);
+                self.manager.process_sockets(&mut self.socket_set, now);
                 let poll_res = self.poll();
                 self.manager.cleanup(&mut self.socket_set);
                 repeat_poll = matches!(poll_res, PollResult::SocketStateChanged);
