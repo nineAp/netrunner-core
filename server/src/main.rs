@@ -15,7 +15,7 @@ struct Args {
 }
 
 fn main() {
-    Logger::init("./logs".into());
+    Logger::init("./logs".into(), true);
     Logger::global().set_level("info");
     let args = Args::parse();
     let net = Network::new(args.host, args.port);

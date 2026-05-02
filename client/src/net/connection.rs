@@ -6,7 +6,6 @@ use netrunner_core::{
 use smoltcp::{
     iface::SocketHandle,
     socket::{tcp, udp},
-    time::Duration,
     wire::{
         Icmpv4Message, Icmpv4Packet, Icmpv6Message, Icmpv6Packet, IpAddress, IpEndpoint,
         Ipv6Address,
@@ -15,7 +14,7 @@ use smoltcp::{
 use std::{collections::VecDeque, sync::atomic::Ordering};
 use tokio::sync::{mpsc, oneshot};
 
-use netrunner_logger::{debug, info};
+use netrunner_logger::{debug, info, instrument};
 pub struct ConnectionCore<T> {
     pub handle: SocketHandle,
     pub tx: mpsc::Sender<T>,
@@ -210,6 +209,10 @@ impl TcpConnection {
         self.pending_bytes
     }
 
+    #[instrument(skip(rx_smol, handshake_tx, tx_tunnel), fields(
+        socket_id = socket_id, 
+        dst = %target
+    ))]
     pub fn spawn(
         socket_id: u64,
         dst_ip: std::net::Ipv4Addr,
@@ -318,6 +321,10 @@ impl UdpConnection {
         true
     }
 
+    #[instrument(skip(rx_smol, tx_tunnel), fields(
+        socket_id = socket_id, 
+        dst = %target
+    ))]
     pub fn spawn(
         socket_id: u64,
         dst_ip: std::net::Ipv4Addr,

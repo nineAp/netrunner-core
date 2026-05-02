@@ -1581,6 +1581,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
+ "tracing",
  "tun",
  "uniffi",
  "wintun",
@@ -1605,6 +1606,7 @@ dependencies = [
  "socket2 0.5.10",
  "tokio",
  "tokio-util",
+ "tracing",
  "x25519-dalek",
 ]
 
@@ -1613,6 +1615,7 @@ name = "netrunner-logger"
 version = "0.1.0"
 dependencies = [
  "log",
+ "regex",
  "tracing",
  "tracing-android",
  "tracing-appender",
@@ -1628,6 +1631,7 @@ dependencies = [
  "netrunner-logger",
  "tokio",
  "tokio-util",
+ "tracing",
 ]
 
 [[package]]
@@ -1974,6 +1978,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed2bf2547551a7053d6fdfafda3f938979645c44812fbfcda098faae3f1a362d"
 dependencies = [
  "bitflags 2.11.0",
+]
+
+[[package]]
+name = "regex"
+version = "1.12.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e10754a14b9137dd7b1e3e5b0493cc9171fdd105e0ab477f51b72e7f3ac0e276"
+dependencies = [
+ "aho-corasick",
+ "memchr",
+ "regex-automata",
+ "regex-syntax",
 ]
 
 [[package]]
@@ -2797,6 +2813,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tracing-serde"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "704b1aeb7be0d0a84fc9828cae51dab5970fee5088f83d1dd7ee6f6246fc6ff1"
+dependencies = [
+ "serde",
+ "tracing-core",
+]
+
+[[package]]
 name = "tracing-subscriber"
 version = "0.3.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2806,12 +2832,15 @@ dependencies = [
  "nu-ansi-term",
  "once_cell",
  "regex-automata",
+ "serde",
+ "serde_json",
  "sharded-slab",
  "smallvec",
  "thread_local",
  "tracing",
  "tracing-core",
  "tracing-log",
+ "tracing-serde",
 ]
 
 [[package]]

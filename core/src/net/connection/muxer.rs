@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use dashmap::DashMap;
-use netrunner_logger::{info, trace, warn};
+use netrunner_logger::{AppError, ERR_INFRA_TIMEOUT, info, instrument, trace, warn};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -201,19 +201,24 @@ impl Muxer {
         }
     }
 
-    pub async fn send_to_network(&self, message: MuxMessage) -> Result<(), String> {
+    #[instrument(skip(self, message), fields(
+    session_id = %self.session_id, 
+    stream_id = message.stream_id,
+    frame = ?message.frame_type
+    ))]
+    pub async fn send_to_network(&self, message: MuxMessage) -> Result<(), AppError>{
         let size = message.data.len() as u64;
         let mut attempts = 0;
 
         loop {
             if attempts >= 3 {
-                return Err("MUXER: All attempts to send failed".to_string());
+                return Err(AppError::new(ERR_INFRA_TIMEOUT, "Сбой передачи данных", "MUXER: All attempts to send failed"));
             }
             attempts += 1;
 
             let (leg_id, leg) = match self.select_leg(&message.frame_type, message.stream_id) {
                 Some(l) => l,
-                None => return Err("MUXER: No active physical legs available".to_string()),
+                None => return Err(AppError::new(ERR_INFRA_TIMEOUT, "Нет связи с сервером", "MUXER: No active physical legs available")),
             };
 
             let target_tx = match message.frame_type {
@@ -262,7 +267,7 @@ impl Muxer {
         stream_id: u32,
         data: Bytes,
         is_udp: bool,
-    ) -> Result<(), String> {
+    ) -> Result<(), AppError> {
         let frame_type = if is_udp {
             FrameType::UdpData
         } else {
@@ -281,7 +286,7 @@ impl Muxer {
         stream_id: u32,
         f_type: FrameType,
         data: Bytes,
-    ) -> Result<(), String> {
+    ) -> Result<(), AppError>{
         self.send_to_network(MuxMessage {
             stream_id,
             frame_type: f_type,
@@ -300,6 +305,7 @@ impl Muxer {
         self.stream_bindings.remove(&stream_id);
     }
 
+    #[instrument(skip(self, data), fields(session_id = %self.session_id, stream_id = stream_id))]
     pub async fn dispatch_to_local(&self, stream_id: u32, data: Bytes) {
         let stream_opt = self
             .streams

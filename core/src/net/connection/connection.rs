@@ -18,7 +18,9 @@ use crate::{
 };
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
-use netrunner_logger::{debug, error, info, warn};
+use netrunner_logger::{
+    debug, error, info, warn, AppError, ERR_AUTH_FAILED, ERR_INFRA_TIMEOUT, ERR_NET_TLS_TAMPER,
+};
 use rand::Rng;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -77,7 +79,7 @@ impl SessionManager {
 
 #[async_trait::async_trait]
 pub trait TunnelHandler {
-    async fn run(self) -> Result<(), String>;
+    async fn run(self) -> Result<(), AppError>;
 }
 
 pub struct Connection {
@@ -110,26 +112,38 @@ impl ClientHandler {
         leg_id: u32,
         muxer: Arc<Muxer>,
         session_id: &str,
-    ) -> Result<(), String> {
+    ) -> Result<(), AppError> {
         let leg_name = format!("TCP-Leg-{}", leg_id);
 
         let addrs_future = tokio::net::lookup_host(remote_proxy_addr);
         let mut addrs = tokio::time::timeout(std::time::Duration::from_secs(3), addrs_future)
             .await
-            .map_err(|_| "DNS Lookup Timeout".to_string())?
-            .map_err(|e| format!("DNS resolution failed: {}", e))?;
+            .map_err(|_| {
+                AppError::new(ERR_INFRA_TIMEOUT, "Сервер недоступен", "DNS Lookup Timeout")
+            })?
+            .map_err(|e| AppError::new(ERR_INFRA_TIMEOUT, "Ошибка DNS", e.to_string()))?;
 
-        let addr = addrs
-            .next()
-            .ok_or_else(|| format!("No IPs found for {}", remote_proxy_addr))?;
+        let addr = addrs.next().ok_or_else(|| {
+            AppError::new(
+                ERR_INFRA_TIMEOUT,
+                "Ошибка сети",
+                format!("No IPs found for {}", remote_proxy_addr),
+            )
+        })?;
 
         let stream = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             tokio::net::TcpStream::connect(addr),
         )
         .await
-        .map_err(|_| "Connection timeout".to_string())?
-        .map_err(|e| e.to_string())?;
+        .map_err(|_| {
+            AppError::new(
+                ERR_INFRA_TIMEOUT,
+                "Таймаут подключения",
+                "Connection timeout",
+            )
+        })?
+        .map_err(|e| AppError::new(ERR_INFRA_TIMEOUT, "Сбой сокета", e.to_string()))?;
 
         stream.set_nodelay(true).unwrap_or_default();
 
@@ -141,14 +155,12 @@ impl ClientHandler {
         conn.outbound
             .write_all(&ch)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| AppError::new(ERR_INFRA_TIMEOUT, "Сбой сети", e.to_string()))?;
 
         loop {
             match TlsBridge::unpack_handshake(&mut conn.read_buf) {
                 Ok(Some(msg)) => {
-                    session_keys
-                        .update_keys(msg.random(), msg.extensions(), false)
-                        .map_err(|e| format!("Keys update error: {}", e))?;
+                    session_keys.update_keys(msg.random(), msg.extensions(), false)?;
                     break;
                 }
                 Ok(None) => {
@@ -157,15 +169,38 @@ impl ClientHandler {
                         conn.inbound.read_buf(&mut conn.read_buf),
                     )
                     .await;
-
                     match res {
-                        Ok(Ok(0)) => return Err(format!("EOF on {}", leg_name)),
+                        Ok(Ok(0)) => {
+                            return Err(AppError::new(
+                                ERR_INFRA_TIMEOUT,
+                                "Разрыв соединения",
+                                format!("EOF on {}", leg_name),
+                            ))
+                        }
                         Ok(Ok(_)) => continue,
-                        Ok(Err(e)) => return Err(format!("Read error: {}", e)),
-                        Err(_) => return Err("Handshake read timeout".into()),
+                        Ok(Err(e)) => {
+                            return Err(AppError::new(
+                                ERR_INFRA_TIMEOUT,
+                                "Ошибка чтения",
+                                e.to_string(),
+                            ))
+                        }
+                        Err(_) => {
+                            return Err(AppError::new(
+                                ERR_INFRA_TIMEOUT,
+                                "Таймаут handshake",
+                                "Handshake read timeout",
+                            ))
+                        }
                     }
                 }
-                Err(e) => return Err(format!("TLS error on {}: {:?}", leg_name, e)),
+                Err(e) => {
+                    return Err(AppError::new(
+                        ERR_NET_TLS_TAMPER,
+                        "Ошибка TLS",
+                        format!("TLS error on {}: {:?}", leg_name, e.stage),
+                    ))
+                }
             }
         }
 
@@ -178,12 +213,18 @@ impl ClientHandler {
         let auth_payload = Bytes::from(format!("{}:{}", session_id, leg_id));
         let encrypted_auth = tx_codec
             .encode_frame(0, FrameType::Heartbeat, auth_payload)
-            .map_err(|e| format!("Failed to encrypt Auth: {:?}", e))?;
+            .map_err(|e| {
+                AppError::new(
+                    ERR_NET_TLS_TAMPER,
+                    "Сбой шифрования",
+                    format!("Failed to encrypt Auth: {:?}", e),
+                )
+            })?;
 
         conn.outbound
             .write_all(&encrypted_auth)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| AppError::new(ERR_INFRA_TIMEOUT, "Сбой отправки", e.to_string()))?;
 
         let cap = NetworkConfig::global().channel_capacity;
         let (control_tx, control_rx) = mpsc::channel::<MuxMessage>(cap);
@@ -207,18 +248,21 @@ impl ClientHandler {
         };
 
         let run_result = engine.run().await;
-
         muxer.remove_leg(leg_id, &control_tx_clone);
 
-        run_result.map_err(|e| e.to_string())?;
-        Err(format!("{} Engine stopped", leg_name))
+        run_result?;
+        Err(AppError::new(
+            ERR_INFRA_TIMEOUT,
+            "Движок остановлен",
+            format!("{} Engine stopped", leg_name),
+        ))
     }
 
     pub async fn connect(
         remote_proxy_addr: &str,
         mut rx_from_engine: mpsc::Receiver<RawCastFrame>,
         tx_to_engine: mpsc::Sender<RawCastFrame>,
-    ) -> Result<(), String> {
+    ) -> Result<(), AppError> {
         let session_id = SessionManager::generate_id();
         let muxer = Arc::new(Muxer::new(true, session_id.clone()));
         let registry: Arc<DashMap<u32, (u64, Ipv4Addr, u16, LocalProtocol)>> =
@@ -428,7 +472,7 @@ impl ServerHandler {
 
 #[async_trait::async_trait]
 impl TunnelHandler for ServerHandler {
-    async fn run(self) -> Result<(), String> {
+    async fn run(self) -> Result<(), AppError> {
         info!("Acting as TLS Server with Stealth Fallback");
 
         let Connection {
@@ -464,7 +508,13 @@ impl TunnelHandler for ServerHandler {
                         tokio::time::timeout(TLS_HELLO_TIMEOUT, inbound.read_buf(&mut read_buf))
                             .await;
                     match res {
-                        Ok(Ok(0)) => return Err("Client closed".into()),
+                        Ok(Ok(0)) => {
+                            return Err(AppError::new(
+                                ERR_INFRA_TIMEOUT,
+                                "Клиент отключился",
+                                "Client closed connection",
+                            ))
+                        }
                         Ok(Ok(_)) => continue,
                         _ => {
                             warn!("⏰ TLS_HELLO_TIMEOUT reached. Triggering fallback...");
@@ -484,7 +534,7 @@ impl TunnelHandler for ServerHandler {
         outbound
             .write_all(&hello)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| AppError::new(ERR_INFRA_TIMEOUT, "Ошибка отправки", e.to_string()))?;
 
         let (tx_key, tx_iv, rx_key, rx_iv) = session_keys.get_aead_parameters();
         let mut cipher = ChaChaCipher::new();
@@ -506,7 +556,11 @@ impl TunnelHandler for ServerHandler {
                             break (sid, lid);
                         }
                     }
-                    return Err("Expected Auth payload in first Heartbeat frame".into());
+                    return Err(AppError::new(
+                        ERR_AUTH_FAILED,
+                        "Ошибка авторизации",
+                        "Expected Auth payload in first Heartbeat frame",
+                    ));
                 }
                 Ok(None) => {
                     let n = tokio::time::timeout(
@@ -514,15 +568,31 @@ impl TunnelHandler for ServerHandler {
                         inbound.read_buf(&mut read_buf),
                     )
                     .await
-                    .map_err(|_| "Timeout waiting for Auth")?
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|_| {
+                        AppError::new(
+                            ERR_INFRA_TIMEOUT,
+                            "Таймаут авторизации",
+                            "Timeout waiting for Auth",
+                        )
+                    })?
+                    .map_err(|e| {
+                        AppError::new(ERR_INFRA_TIMEOUT, "Ошибка сокета", e.to_string())
+                    })?;
                     if n == 0 {
-                        return Err("Client closed connection before Auth".into());
+                        return Err(AppError::new(
+                            ERR_AUTH_FAILED,
+                            "Отказ",
+                            "Client closed connection before Auth",
+                        ));
                     }
                 }
                 Err(e) => {
-                    error!("❌ Secure Auth Failed: {:?}", e);
-                    return Err("Dropped by security strategy (Auth Phase)".into());
+                    error!("❌ Secure Auth Failed: {:?}", e.stage);
+                    return Err(AppError::new(
+                        ERR_AUTH_FAILED,
+                        "Доступ запрещен",
+                        "Dropped by security strategy (Auth Phase)",
+                    ));
                 }
             }
         };

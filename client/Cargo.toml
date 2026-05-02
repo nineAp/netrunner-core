@@ -38,6 +38,7 @@ dashmap = "6.1.0"
 anyhow = "1.0"
 
 netrunner-logger = { path = "../tools/log" }
+tracing = "0.1"
 
 [build-dependencies]
 uniffi = { version = "0.31.0", features = ["build"] }

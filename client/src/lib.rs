@@ -79,7 +79,7 @@ impl SessionManager {
         excluded_apps: Vec<String>,
         excluded_domains: Vec<String>,
     ) -> Arc<Session> {
-        netrunner_logger::Logger::init(None);
+        netrunner_logger::Logger::init(None, false);
         netrunner_logger::Logger::global().set_level("info");
 
         let runtime = get_runtime();

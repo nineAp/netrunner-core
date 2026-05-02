@@ -21,3 +21,4 @@ dashmap = "6.1.0"
 socket2 = { version = "0.5", features = ["all"] }
 libc = "0.2"
 netrunner-logger = { path = "../tools/log" }
+tracing = "0.1"

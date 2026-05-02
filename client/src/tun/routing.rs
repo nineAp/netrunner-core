@@ -2,7 +2,7 @@ use netrunner_logger::{error, info};
 use std::io;
 use std::process::Command;
 
-fn run_cmd_ext(full_cmd: &str, ignore_errors: bool) -> io::Result<()> {
+pub fn run_cmd_ext(full_cmd: &str, ignore_errors: bool) -> io::Result<()> {
     let parts = shlex::split(full_cmd)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid syntax"))?;
 
@@ -55,7 +55,7 @@ fn get_default_gateway() -> Option<String> {
 }
 
 #[cfg(target_os = "linux")]
-fn get_default_gateway_linux() -> Option<String> {
+pub fn get_default_gateway_linux() -> Option<String> {
     let output = Command::new("ip")
         .args(["route", "show", "default"])
         .output()

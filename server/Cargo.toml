@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 netrunner-core = { path = "../core" }
 netrunner-logger = { path = "../tools/log" }
+tracing = "0.1"
 tokio = { version = "1.36", features = ["full"] }
 clap = { version = "4.4", features = ["derive"] }
 tokio-util = { version = "0.7", features = ["rt"] }

@@ -378,7 +378,6 @@ impl EngineBuilder {
                 let phys_gw = "192.168.1.1";
 
                 for domain in excluded_domains {
-                    // Резолвим домен средствами ОС (через системный DNS, не наш)
                     if let Ok(addrs) = tokio::net::lookup_host(format!("{}:443", domain)).await {
                         for addr in addrs {
                             if let std::net::IpAddr::V4(ipv4) = addr.ip() {
@@ -386,7 +385,6 @@ impl EngineBuilder {
                                     "Adding exception route for domain {} -> IP {}",
                                     domain, ipv4
                                 );
-                                // Прописываем маршрут в ОС мимо туннеля
                                 #[cfg(target_os = "linux")]
                                 let _ = crate::tun::routing::run_cmd_ext(
                                     &format!("ip route add {} via {}", ipv4, phys_gw),

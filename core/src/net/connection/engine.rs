@@ -1,13 +1,14 @@
 use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
-use netrunner_logger::{debug, error, info};
+use netrunner_logger::{debug, error, info, AppError, ERR_INFRA_TIMEOUT, ERR_NET_TLS_TAMPER};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::tcp::{OwnedReadHalf, OwnedWriteHalf},
     sync::mpsc::Receiver,
 };
 use tokio_util::sync::CancellationToken;
+use tracing::instrument;
 
 use crate::{
     net::{
@@ -31,7 +32,8 @@ pub(crate) struct TunnelEngine {
 }
 
 impl TunnelEngine {
-    pub async fn run(self) -> Result<(), String> {
+    #[instrument(skip_all, fields(leg_id = self.leg_id))]
+    pub async fn run(self) -> Result<(), AppError> {
         let inbound = self.inbound;
         let outbound = self.outbound;
         let read_buf = self.read_buf;
@@ -67,7 +69,13 @@ impl TunnelEngine {
                         break;
                     }
                     res = inbound.read_buf(&mut read_buf) => {
-                        let n = res.map_err(|e| e.to_string())?;
+                        let n = res.map_err(|e| {
+                            netrunner_logger::AppError::new(
+                                netrunner_logger::ERR_INFRA_TIMEOUT,
+                                "Сбой сети",
+                                e.to_string(),
+                            )
+                        })?;
 
                         if n == 0 {
                             if read_buf.is_empty() {
@@ -75,7 +83,11 @@ impl TunnelEngine {
                             } else {
                                 error!("Connection abruptly closed by peer (Incomplete frame: {} bytes left)", read_buf.len());
                             }
-                            return Err::<(), String>("EOF".into());
+                            return Err(netrunner_logger::AppError::new(
+                                netrunner_logger::ERR_INFRA_TIMEOUT,
+                                "Соединение разорвано",
+                                "EOF occurred during read",
+                            ));
                         }
 
                         muxer.record_leg_rx(leg_id, n as u64);
@@ -90,10 +102,18 @@ impl TunnelEngine {
                                     if e.action == ErrorAction::Wait { break; }
                                     if e.action == ErrorAction::Drop {
                                         error!("CRITICAL: Crypto tampering or sync lost. Hard dropping tunnel!");
-                                        return Err("Crypto drop".into());
+                                        return Err(netrunner_logger::AppError::new(
+                                            netrunner_logger::ERR_NET_TLS_TAMPER,
+                                            "Критическая ошибка шифрования",
+                                            "Crypto drop",
+                                        ));
                                     }
-                                    error!(error = ?e, "Codec inbound failed");
-                                    return Err(format!("Codec error: {:?}", e));
+                                error!(error = ?e, "Codec inbound failed");
+                                    return Err(netrunner_logger::AppError::new(
+                                        netrunner_logger::ERR_NET_TLS_TAMPER,
+                                        "Ошибка декодирования",
+                                        format!("Codec error: {:?}", e),
+                                    ));
                                 }
                             }
                         }
@@ -110,7 +130,7 @@ impl TunnelEngine {
                     }
                 }
             }
-            Ok::<(), String>(())
+            Ok::<(), AppError>(())
         });
 
         let writer_handle = tokio::spawn(async move {
@@ -138,12 +158,20 @@ impl TunnelEngine {
                     }
                 }
             }
-            Ok::<(), String>(())
+            Ok::<(), AppError>(())
         });
 
-        let res = tokio::select! {
-            res = reader_handle => res.unwrap_or_else(|e| Err(format!("Reader panic: {}", e))),
-            res = writer_handle => res.unwrap_or_else(|e| Err(format!("Writer panic: {}", e))),
+        let res: Result<(), netrunner_logger::AppError> = tokio::select! {
+            res = reader_handle => res.unwrap_or_else(|e| Err(netrunner_logger::AppError::new(
+                netrunner_logger::ERR_SYS_PANIC,
+                "Сбой",
+                format!("Reader panic: {}", e)
+            ))),
+            res = writer_handle => res.unwrap_or_else(|e| Err(netrunner_logger::AppError::new(
+                netrunner_logger::ERR_SYS_PANIC,
+                "Сбой",
+                format!("Writer panic: {}", e)
+            ))),
         };
 
         token.cancel();
@@ -158,7 +186,7 @@ impl TunnelEngine {
         outbound: &mut OwnedWriteHalf,
         tx_codec: &mut TxCodec,
         msg: MuxMessage,
-    ) -> Result<(), String> {
+    ) -> Result<(), AppError> {
         let mut data = msg.data;
         let stream_id = msg.stream_id;
         let frame_type = msg.frame_type;
@@ -173,7 +201,11 @@ impl TunnelEngine {
                     Ok(pkt) => packets.push(pkt),
                     Err(e) => {
                         error!(stream_id, error = ?e, "Encryption failed for TCP chunk");
-                        return Err(format!("Encryption error: {:?}", e));
+                        return Err(netrunner_logger::AppError::new(
+                            netrunner_logger::ERR_NET_TLS_TAMPER,
+                            "Ошибка шифрования пакета",
+                            format!("Encryption error: {:?}", e),
+                        ));
                     }
                 }
             }
@@ -182,7 +214,11 @@ impl TunnelEngine {
                 Ok(pkt) => packets.push(pkt),
                 Err(e) => {
                     error!(stream_id, error = ?e, "Encryption failed for control/udp frame");
-                    return Err(format!("Encryption error: {:?}", e));
+                    return Err(netrunner_logger::AppError::new(
+                        netrunner_logger::ERR_NET_TLS_TAMPER,
+                        "Ошибка шифрования пакета",
+                        format!("Encryption error: {:?}", e),
+                    ));
                 }
             }
         }
@@ -193,7 +229,11 @@ impl TunnelEngine {
                 tokio::time::timeout(std::time::Duration::from_secs(10), write_future).await
             {
                 error!(stream_id, "🔥 Physical leg STUCK on write. Killing leg.");
-                return Err("Leg write timeout".into());
+                return Err(AppError::new(
+                    ERR_INFRA_TIMEOUT,
+                    "Таймаут отправки",
+                    "Physical leg STUCK on write",
+                ));
             }
         }
         Ok(())

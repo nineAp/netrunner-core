@@ -2,7 +2,7 @@ use netrunner_core::net::{
     Connection, NetworkConfig, ServerHandler, SessionManager, TunnelHandler,
     TOPOLOGY_PRINT_INTERVAL,
 };
-use netrunner_logger::{error, info};
+use netrunner_logger::{error, info, instrument};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
@@ -44,17 +44,21 @@ impl Network {
                 }
                 res = listener.accept() => {
                     if let Ok((stream, client_addr)) = res {
-                        info!("🔌 Connection from {}", client_addr);
+                        let span = tracing::info_span!("client_conn", ip = %client_addr);
 
                         let conn = Connection::new(stream);
 
                         // Pass the Arc clone down to the ServerHandler
                         let handler = ServerHandler::new(conn, session_manager.clone());
 
-                        tokio::spawn(async move {
-                            if let Err(e) = handler.run().await {
-                                error!(client = %client_addr, error = %e, "⚠️ Server handler error");
-                            }
+                    tokio::spawn(async move {
+                                // "Входим" в этот Span. Все логи внутри handler.run() привяжутся к этому IP.
+                        let _enter = span.enter();
+
+                        info!("🔌 New physical connection accepted");
+                        if let Err(e) = handler.run().await {
+                            error!(error = %e, "⚠️ Server handler terminated with error");
+                        }
                         });
                     }
                 }

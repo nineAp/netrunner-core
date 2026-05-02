@@ -1,3 +1,4 @@
+use netrunner_logger::{AppError, ERR_NET_TLS_TAMPER};
 use x25519_dalek::PublicKey;
 
 use crate::{
@@ -87,7 +88,7 @@ impl SessionKeys {
         salt: [u8; 32],
         extensions: &ExtensionStack,
         is_server: bool,
-    ) -> Result<([u8; 32], [u8; 12], [u8; 32], [u8; 12]), String> {
+    ) -> Result<([u8; 32], [u8; 12], [u8; 32], [u8; 12]), AppError> {
         self.salt.set_remote_salt(salt);
 
         netrunner_logger::debug!(
@@ -104,14 +105,14 @@ impl SessionKeys {
 
             if is_server {
                 if dh_data.len() < 38 {
-                    return Err(format!(
-                        "Client KeyShare too short: {} bytes",
-                        dh_data.len()
+                    return Err(AppError::new(
+                        ERR_NET_TLS_TAMPER,
+                        "Ошибка маскировки",
+                        format!("Client KeyShare too short: {}", dh_data.len()),
                     ));
                 }
 
                 let mut found = false;
-
                 for i in 2..=(dh_data.len() - 34) {
                     if dh_data[i..i + 4] == [0x00, 0x1d, 0x00, 0x20] {
                         key_bytes.copy_from_slice(&dh_data[i + 4..i + 36]);
@@ -121,30 +122,39 @@ impl SessionKeys {
                 }
 
                 if !found {
-                    return Err("Could not find x25519 key in ClientHello".into());
+                    return Err(AppError::new(
+                        ERR_NET_TLS_TAMPER,
+                        "Ошибка маскировки",
+                        "Could not find x25519 key in ClientHello",
+                    ));
                 }
             } else {
                 if dh_data.len() < 36 {
-                    return Err("Server KeyShare too short".into());
+                    return Err(AppError::new(
+                        ERR_NET_TLS_TAMPER,
+                        "Ошибка маскировки",
+                        "Server KeyShare too short",
+                    ));
                 }
                 key_bytes.copy_from_slice(&dh_data[4..36]);
             }
 
             if key_bytes.iter().all(|&x| x == 0) {
-                return Err("Extracted remote public key is all ZEROS!".into());
+                return Err(AppError::new(
+                    ERR_NET_TLS_TAMPER,
+                    "Ошибка шифрования",
+                    "Extracted remote public key is all ZEROS!",
+                ));
             }
 
             let public_key = PublicKey::from(key_bytes);
-
-            netrunner_logger::debug!(
-                remote_pub = %hex::encode(&key_bytes[..4]),
-                role = if is_server { "Server" } else { "Client" },
-                "Key exchange successful, deriving material..."
-            );
-
             self.generate_keys(&public_key, is_server)
         } else {
-            Err("No KeyShare extension found in handshake".into())
+            Err(AppError::new(
+                ERR_NET_TLS_TAMPER,
+                "Ошибка маскировки",
+                "No KeyShare extension found in handshake",
+            ))
         }
     }
 
@@ -152,20 +162,25 @@ impl SessionKeys {
         &mut self,
         public_key: &PublicKey,
         is_server: bool,
-    ) -> Result<([u8; 32], [u8; 12], [u8; 32], [u8; 12]), String> {
+    ) -> Result<([u8; 32], [u8; 12], [u8; 32], [u8; 12]), AppError> {
         let shared_key = self
             .ecdh
             .get_shared(public_key)
-            .ok_or_else(|| "No shared secret".to_string())?;
+            .ok_or_else(|| AppError::new(ERR_NET_TLS_TAMPER, "Сбой", "No shared secret"))?;
 
         let hkdf = HKDF::extract_key(&self.salt.get_total(), &shared_key);
 
-        let c_key = HKDF::expand_key::<32>(&hkdf, b"client_aead").map_err(|e| e.to_string())?;
-        let c_iv = HKDF::expand_key::<12>(&hkdf, b"client_iv").map_err(|e| e.to_string())?;
-        let s_key = HKDF::expand_key::<32>(&hkdf, b"server_aead").map_err(|e| e.to_string())?;
-        let s_iv = HKDF::expand_key::<12>(&hkdf, b"server_iv").map_err(|e| e.to_string())?;
+        let c_key = HKDF::expand_key::<32>(&hkdf, b"client_aead")
+            .map_err(|e| AppError::new(ERR_NET_TLS_TAMPER, "Ошибка ключей", e))?;
+        let c_iv = HKDF::expand_key::<12>(&hkdf, b"client_iv")
+            .map_err(|e| AppError::new(ERR_NET_TLS_TAMPER, "Ошибка ключей", e))?;
+        let s_key = HKDF::expand_key::<32>(&hkdf, b"server_aead")
+            .map_err(|e| AppError::new(ERR_NET_TLS_TAMPER, "Ошибка ключей", e))?;
+        let s_iv = HKDF::expand_key::<12>(&hkdf, b"server_iv")
+            .map_err(|e| AppError::new(ERR_NET_TLS_TAMPER, "Ошибка ключей", e))?;
 
-        self.auth_key = HKDF::expand_key::<32>(&hkdf, b"auth_key").map_err(|e| e.to_string())?;
+        self.auth_key = HKDF::expand_key::<32>(&hkdf, b"auth_key")
+            .map_err(|e| AppError::new(ERR_NET_TLS_TAMPER, "Ошибка ключей", e))?;
 
         let keys = if is_server {
             (s_key, s_iv, c_key, c_iv)
@@ -194,7 +209,7 @@ impl SessionKeys {
 // 2. DATA PHASE (Авторизация Кодека)
 // ==========================================
 
-/// Легковесная структура, которая передается в RxCodec и TxCodec 
+/// Легковесная структура, которая передается в RxCodec и TxCodec
 /// после завершения Handshake.
 #[derive(Clone, Copy)]
 pub struct SessionAuth {
