@@ -129,12 +129,12 @@ impl TcpConnection {
         true
     }
 
-    fn poll_and_process(&mut self, socket: &mut tcp::Socket, timestamp: smoltcp::time::Instant) {
+fn poll_and_process(&mut self, socket: &mut tcp::Socket, timestamp: smoltcp::time::Instant) {
         let current_rtt = GLOBAL_MIN_RTT.load(Ordering::Relaxed);
         let rtt = smoltcp::time::Duration::from_millis(current_rtt as u64);
         socket.set_tunnel_rtt(rtt);
 
-        // Читаем из браузера в Туннель
+        // 1. Читаем из браузера -> в Туннель (Upload)
         while socket.can_recv() && self.core.tx.capacity() > 0 {
             if let Ok(n) = socket.peek_slice(&mut self.chunk_buf, timestamp) {
                 if n == 0 {
@@ -146,9 +146,7 @@ impl TcpConnection {
                     Ok(_) => {
                         socket.recv_slice(&mut self.chunk_buf[..n]).unwrap();
                     }
-                    Err(mpsc::error::TrySendError::Full(_)) => {
-                        break;
-                    }
+                    Err(mpsc::error::TrySendError::Full(_)) => break,
                     Err(mpsc::error::TrySendError::Closed(_)) => {
                         self.server_eof = true;
                         break;
@@ -160,51 +158,60 @@ impl TcpConnection {
         }
 
         if !self.server_eof {
-            while socket.can_send() {
-                // Если есть недоотправленный кусок - берем его первым
-                if let Some(mut chunk) = self.pending_data.pop_front() {
-                    match socket.send_slice(&chunk) {
-                        Ok(n) => {
-                            self.pending_bytes -= n;
-                            if n < chunk.len() {
-                                chunk.advance(n);
-                                self.pending_data.push_front(chunk);
-                                break; // Сокет заполнился
-                            }
-                        }
-                        Err(e) => {
-                            debug!(%self.core.handle, "Smoltcp send error: {:?}", e);
-                            self.pending_data.push_front(chunk);
-                            break;
-                        }
+            loop {
+                if self.pending_bytes > 256 * 1024 {
+                    netrunner_logger::warn!(%self.core.handle, "Local stream buffer >8MB! Force closing to save tunnel.");
+                    self.server_eof = true;
+                    socket.close();
+                    break;
+                }
+
+                match self.core.rx.try_recv() {
+                    Ok(data) => {
+                        self.pending_bytes += data.len();
+                        self.pending_data.push_back(data);
                     }
-                } else {
-                    // Очередь пуста, пытаемся прочитать из канала туннеля
-                    match self.core.rx.try_recv() {
-                        Ok(data) => {
-                            self.pending_bytes += data.len();
-                            self.pending_data.push_back(data);
-                        }
-                        Err(mpsc::error::TryRecvError::Empty) => break,
-                        Err(mpsc::error::TryRecvError::Disconnected) => {
-                            debug!(%self.core.handle, "Tunnel channel closed (Server EOF)");
-                            self.server_eof = true;
-                            break;
-                        }
+                    Err(mpsc::error::TryRecvError::Empty) => break,
+                    Err(mpsc::error::TryRecvError::Disconnected) => {
+                        netrunner_logger::debug!(%self.core.handle, "Tunnel channel closed (Server EOF)");
+                        self.server_eof = true;
+                        break;
                     }
                 }
+            }
+        }
+
+        // 3. Отправляем в smoltcp то, что накопилось (если браузер готов принять)
+        while socket.can_send() {
+            if let Some(mut chunk) = self.pending_data.pop_front() {
+                match socket.send_slice(&chunk) {
+                    Ok(n) => {
+                        self.pending_bytes -= n;
+                        if n < chunk.len() {
+                            chunk.advance(n);
+                            self.pending_data.push_front(chunk);
+                            break; // Сокет браузера переполнен, ждем следующего тика
+                        }
+                    }
+                    Err(e) => {
+                        netrunner_logger::debug!(%self.core.handle, "Smoltcp send error: {:?}", e);
+                        self.pending_data.push_front(chunk);
+                        break;
+                    }
+                }
+            } else {
+                break;
             }
         }
 
         if self.server_eof && self.pending_data.is_empty() {
             let state = socket.state();
             if state == tcp::State::Established || state == tcp::State::CloseWait {
-                debug!(%self.core.handle, "All data flushed after server EOF, sending FIN to browser");
+                netrunner_logger::debug!(%self.core.handle, "All data flushed, sending FIN to browser");
                 socket.close();
             }
         }
     }
-
     pub fn app_pending_out_size(&self) -> usize {
         self.pending_bytes
     }

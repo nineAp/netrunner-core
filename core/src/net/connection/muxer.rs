@@ -31,7 +31,12 @@ struct MuxLeg {
 
 impl MuxLeg {
     fn congestion_factor(&self) -> f64 {
-        0.0
+        // СТАЛО: Вычисляем реальную нагрузку на канал
+        let max = self.data_tx.max_capacity();
+        let current_capacity = self.data_tx.capacity();
+        let filled = max.saturating_sub(current_capacity);
+        
+        (filled as f64) / (max as f64) // Возвращает от 0.0 (пусто) до 1.0 (забито наглухо)
     }
 }
 
@@ -307,25 +312,18 @@ impl Muxer {
 
     #[instrument(skip(self, data), fields(session_id = %self.session_id, stream_id = stream_id))]
     pub async fn dispatch_to_local(&self, stream_id: u32, data: Bytes) {
-        let stream_opt = self
-            .streams
-            .get(&stream_id)
-            .map(|s| (s.value().0.clone(), s.value().1.clone()));
+        let stream_opt = self.streams.get(&stream_id).map(|s| (s.value().0.clone(), s.value().1.clone()));
 
         if let Some((tx, stats)) = stream_opt {
             let size = data.len() as u64;
-
-            // 🔥 КЛЮЧЕВОЙ ФИКС: Используем .send().await
-            // Мы больше не выбрасываем пакеты! Мы ждем, пока освободится очередь.
-            // Это создает естественный TCP Backpressure на стороне сервера.
-            match tx.send(data).await {
-                Ok(_) => {
-                    stats.rx_bytes.fetch_add(size, Ordering::Relaxed);
-                }
-                Err(_) => {
-                    // Канал закрыт (клиент отвалился)
+            match tx.try_send(data) {
+                Ok(_) => { stats.rx_bytes.fetch_add(size, Ordering::Relaxed); }
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    // 🔥 Защита от зависания всего VPN! Если стрим застрял - убиваем его.
+                    netrunner_logger::error!(stream_id, "Stream buffer full! Killing stream to save tunnel.");
                     self.remove_stream(stream_id);
                 }
+                Err(_) => { self.remove_stream(stream_id); }
             }
         }
     }
@@ -344,34 +342,26 @@ impl Muxer {
         let leg_ids: Vec<u32> = self.legs.iter().map(|kv| *kv.key()).collect();
 
         for leg_id in leg_ids {
-            let Some(leg) = self.legs.get(&leg_id) else {
-                continue;
-            };
-            let tx = leg.control_tx.clone();
+            // 🔥 ФИКС DEADLOCK'А: Изолируем блокировку DashMap
+            let tx = {
+                let Some(leg) = self.legs.get(&leg_id) else { continue; };
+                leg.control_tx.clone()
+            }; // <-- Лок отпущен! Теперь можно делать .await
 
             let probe_stream_id = self.id_gen.next();
             let (probe_tx, mut probe_rx) = tokio::sync::mpsc::channel(10);
             self.register_stream(probe_stream_id, probe_tx);
-
             self.record_ping_sent(leg_id);
 
-            let msg = MuxMessage {
-                stream_id: probe_stream_id,
-                frame_type: FrameType::Heartbeat,
-                data: Bytes::from("PING"),
-            };
-
+            let msg = MuxMessage { stream_id: probe_stream_id, frame_type: FrameType::Heartbeat, data: Bytes::from("PING") };
             if tx.try_send(msg).is_err() {
-                warn!(leg_id, "❌ MUXER: Leg channel overflow/blocked, evicting");
                 self.remove_leg(leg_id, &tx);
                 self.remove_stream(probe_stream_id);
                 continue;
             }
 
             match tokio::time::timeout(crate::net::HEALTH_CHECK_TIMEOUT, probe_rx.recv()).await {
-                Ok(Some(_)) => {
-                    trace!(leg_id, "✅ TCP Leg Health Check OK");
-                }
+                Ok(Some(_)) => trace!(leg_id, "✅ TCP Leg Health Check OK"),
                 _ => {
                     warn!(leg_id, "❌ TCP Leg Health Check FAIL/Timeout - Evicting");
                     self.remove_leg(leg_id, &tx);

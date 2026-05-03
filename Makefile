@@ -65,6 +65,12 @@ build-android:
 		--no-format \
 		--out-dir gen
 
+	@echo "--- [Android] Синхронизация библиотек в проект ---"
+	@mkdir -p $(ANDROID_PROJECT_LIBS)
+	# Используем rsync локально: это безопаснее и быстрее, чем cp -r
+	# Удалит в jniLibs всё, чего нет в gen, чтобы билд был чистым
+	rsync -av "$(ANDROID_BUILD_SRC)/" "$(ANDROID_PROJECT_LIBS)/"
+
 build-server:
 	@echo "--- Сборка сервера (Release) ---"
 	cargo build --bin netrunner-server --release 

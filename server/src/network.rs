@@ -29,10 +29,23 @@ impl Network {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(TOPOLOGY_PRINT_INTERVAL).await;
+
+                let mut active_muxers = Vec::new();
+                for entry in sm_clone.get_session().iter() {
+                    active_muxers.push(entry.value().clone());
+                }
+                for muxer in active_muxers {
+                    if muxer.active_legs_count() > 0 {
+                        let m = muxer.clone();
+                        tokio::spawn(async move {
+                            m.perform_health_check().await;
+                        });
+                    }
+                }
+
                 sm_clone.print_all_sessions();
             }
         });
-
         info!("🌐 Netrunner Server: Listening on {}", addr);
         let listener = TcpListener::bind(&addr).await.expect("Server bind failed");
 

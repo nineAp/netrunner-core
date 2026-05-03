@@ -47,6 +47,10 @@ impl SessionManager {
         format!("{:016x}{:016x}", rng.next_u64(), rng.next_u64())
     }
 
+    pub fn get_session(&self) -> &DashMap<String, Arc<Muxer>> {
+        &self.sessions
+    }
+
     pub fn get_or_create(&self, session_id: &str) -> Arc<Muxer> {
         self.sessions
             .entry(session_id.to_string())

@@ -88,6 +88,9 @@ impl Engine {
         let inbound_map = self.manager.tracker.inbound_tx.clone();
         let mut rx_tunnel = self.rx_from_tunnel.take().unwrap();
 
+        let tunnel_waker = Arc::new(tokio::sync::Notify::new());
+        let waker_clone = tunnel_waker.clone();
+
         tokio::spawn(async move {
             while let Some(frame) = rx_tunnel.recv().await {
                 if frame.event == RawCastEvent::Close {
@@ -98,9 +101,12 @@ impl Engine {
                         .get(&frame.socket_id)
                         .map(|ref_tx| ref_tx.clone());
 
-                    // 2. Теперь спокойно ждем (Backpressure), не блокируя остальную систему
+                    // 2. Спокойно ждем (Backpressure), не блокируя остальную систему
                     if let Some(tx) = tx_opt {
-                        let _ = tx.send(frame.payload).await;
+                        if tx.send(frame.payload).await.is_ok() {
+                            // 🔥 2. БУДИМ ОСНОВНОЙ ЦИКЛ! Данные готовы к выдаче в TUN!
+                            waker_clone.notify_one();
+                        }
                     }
                 }
             }
@@ -126,6 +132,8 @@ impl Engine {
             let delay = self
                 .interface
                 .poll_delay(Self::current_time(), &self.socket_set);
+
+            // Можно смело ставить 5ms, так как Waker разбудит нас раньше, если нужно
             let sleep_time = delay
                 .map(|d| std::cmp::min(Duration::from_micros(d.micros()), Duration::from_millis(5)))
                 .unwrap_or(Duration::from_millis(5));
@@ -133,6 +141,12 @@ impl Engine {
             // Основной цикл теперь занимается ТОЛЬКО прогонкой данных: TUN <-> smoltcp
             tokio::select! {
                 _ = sleep(sleep_time) => {}
+
+                // 🔥 3. ЛОВИМ ПРОБУЖДЕНИЕ ОТ ТУННЕЛЯ
+                _ = tunnel_waker.notified() => {
+                    // Цикл пойдет на новую итерацию, вызовет self.poll()
+                    // и мгновенно вытащит данные из канала в TUN-интерфейс
+                }
 
                 msg = tun_to_engine_rx.recv() => {
                     if let Some(token) = msg {
@@ -152,7 +166,6 @@ impl Engine {
             .poll(now, &mut self.device, &mut self.socket_set)
     }
 
-    // ... [Остальные методы spawn_tun_reader, spawn_tun_writer и set_route остаются без изменений] ...
     fn spawn_tun_reader(
         mut reader: DeviceReader,
         to_engine: mpsc::UnboundedSender<TokenBuffer>,

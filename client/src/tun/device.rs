@@ -4,7 +4,7 @@ use std::{
     ops::{Deref, DerefMut},
     sync::{
         Arc, LazyLock, Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::Instant as StdInstant,
 };
@@ -230,6 +230,7 @@ impl phy::RxToken for VirtRxToken<'_> {
 }
 
 pub struct VirtTxToken<'a>(&'a mut VirtTunDevice);
+
 impl phy::TxToken for VirtTxToken<'_> {
     fn consume<R, F>(self, len: usize, f: F) -> R
     where
@@ -248,7 +249,7 @@ impl phy::TxToken for VirtTxToken<'_> {
         GLOBAL_RX_BYTES.fetch_add(len as u64, Ordering::Relaxed);
         GLOBAL_RX_PACKETS.fetch_add(1, Ordering::Relaxed);
 
-        // 🔥 ФИКС: Отправляем в безлимитный канал. Никаких дропов внутри локальной машины!
+        // Просто шлем, `smoltcp` сам регулирует объемы своими внутренними окнами
         let _ = self.0.tx_queue.send(buffer);
         result
     }
