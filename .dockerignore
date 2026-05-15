@@ -1,0 +1,12 @@
+target/debug/
+target/package/
+target/.fingerprint/
+target/build/
+target/deps/
+
+*.log
+*.xml
+hosts_cache.txt
+repomix-output.xml
+things.txt
+.git/
