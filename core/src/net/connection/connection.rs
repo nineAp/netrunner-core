@@ -73,8 +73,6 @@ impl SessionManager {
         for entry in self.sessions.iter() {
             let session_id = entry.key();
             let muxer = entry.value();
-
-            // Вызываем уже существующий метод печати дерева у Muxer
             muxer.print_topology_tree();
         }
         info!("📊 ---------------------------------------");
@@ -109,6 +107,102 @@ impl ClientHandler {
         let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
         socket.connect("8.8.8.8:80").ok()?;
         socket.local_addr().ok().map(|a| a.ip())
+    }
+
+    pub async fn perform_handshake(
+        mut stream: tokio::net::TcpStream,
+        session_id: &str,
+        leg_id: u32,
+    ) -> Result<
+        (
+            OwnedReadHalf,
+            OwnedWriteHalf,
+            crate::nrxp::RxCodec,
+            crate::nrxp::TxCodec,
+        ),
+        AppError,
+    > {
+        stream.set_nodelay(true).unwrap_or_default();
+        let mut conn = Connection::new(stream);
+        let mut session_keys = SessionKeys::new(true);
+        let ch =
+            TlsBridge::wrap_client_hello(&BrowserProfile::CHROME_131, "ubuntu.com", &session_keys);
+
+        conn.outbound
+            .write_all(&ch)
+            .await
+            .map_err(|e| AppError::new(ERR_INFRA_TIMEOUT, "Сбой сети", e.to_string()))?;
+
+        loop {
+            match TlsBridge::unpack_handshake(&mut conn.read_buf) {
+                Ok(Some(msg)) => {
+                    session_keys.update_keys(msg.random(), msg.extensions(), false)?;
+                    break;
+                }
+                Ok(None) => {
+                    let res = tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        conn.inbound.read_buf(&mut conn.read_buf),
+                    )
+                    .await;
+                    match res {
+                        Ok(Ok(0)) => {
+                            return Err(AppError::new(
+                                ERR_INFRA_TIMEOUT,
+                                "Разрыв соединения",
+                                format!("EOF on handshake"),
+                            ))
+                        }
+                        Ok(Ok(_)) => continue,
+                        Ok(Err(e)) => {
+                            return Err(AppError::new(
+                                ERR_INFRA_TIMEOUT,
+                                "Ошибка чтения",
+                                e.to_string(),
+                            ))
+                        }
+                        Err(_) => {
+                            return Err(AppError::new(
+                                ERR_INFRA_TIMEOUT,
+                                "Таймаут handshake",
+                                "Handshake read timeout",
+                            ))
+                        }
+                    }
+                }
+                Err(e) => {
+                    return Err(AppError::new(
+                        ERR_NET_TLS_TAMPER,
+                        "Ошибка TLS",
+                        format!("TLS error: {:?}", e.stage),
+                    ))
+                }
+            }
+        }
+
+        let (tx_key, tx_iv, rx_key, rx_iv) = session_keys.get_aead_parameters();
+        let mut cipher = ChaChaCipher::new();
+        cipher.set_keys(tx_key, tx_iv, rx_key, rx_iv);
+        let codec = Codec::new(cipher, session_keys.get_auth_key());
+        let (rx_codec, mut tx_codec) = codec.split();
+
+        let auth_payload = Bytes::from(format!("{}:{}", session_id, leg_id));
+        let encrypted_auth = tx_codec
+            .encode_frame(0, FrameType::Heartbeat, auth_payload)
+            .map_err(|e| {
+                AppError::new(
+                    ERR_NET_TLS_TAMPER,
+                    "Сбой шифрования",
+                    format!("Failed to encrypt Auth: {:?}", e),
+                )
+            })?;
+
+        conn.outbound
+            .write_all(&encrypted_auth)
+            .await
+            .map_err(|e| AppError::new(ERR_INFRA_TIMEOUT, "Сбой отправки", e.to_string()))?;
+
+        Ok((conn.inbound, conn.outbound, rx_codec, tx_codec))
     }
 
     async fn establish_leg(
@@ -149,86 +243,8 @@ impl ClientHandler {
         })?
         .map_err(|e| AppError::new(ERR_INFRA_TIMEOUT, "Сбой сокета", e.to_string()))?;
 
-        stream.set_nodelay(true).unwrap_or_default();
-
-        let mut conn = Connection::new(stream);
-        let mut session_keys = SessionKeys::new(true);
-        let ch =
-            TlsBridge::wrap_client_hello(&BrowserProfile::CHROME_131, "ubuntu.com", &session_keys);
-
-        conn.outbound
-            .write_all(&ch)
-            .await
-            .map_err(|e| AppError::new(ERR_INFRA_TIMEOUT, "Сбой сети", e.to_string()))?;
-
-        loop {
-            match TlsBridge::unpack_handshake(&mut conn.read_buf) {
-                Ok(Some(msg)) => {
-                    session_keys.update_keys(msg.random(), msg.extensions(), false)?;
-                    break;
-                }
-                Ok(None) => {
-                    let res = tokio::time::timeout(
-                        std::time::Duration::from_secs(5),
-                        conn.inbound.read_buf(&mut conn.read_buf),
-                    )
-                    .await;
-                    match res {
-                        Ok(Ok(0)) => {
-                            return Err(AppError::new(
-                                ERR_INFRA_TIMEOUT,
-                                "Разрыв соединения",
-                                format!("EOF on {}", leg_name),
-                            ))
-                        }
-                        Ok(Ok(_)) => continue,
-                        Ok(Err(e)) => {
-                            return Err(AppError::new(
-                                ERR_INFRA_TIMEOUT,
-                                "Ошибка чтения",
-                                e.to_string(),
-                            ))
-                        }
-                        Err(_) => {
-                            return Err(AppError::new(
-                                ERR_INFRA_TIMEOUT,
-                                "Таймаут handshake",
-                                "Handshake read timeout",
-                            ))
-                        }
-                    }
-                }
-                Err(e) => {
-                    return Err(AppError::new(
-                        ERR_NET_TLS_TAMPER,
-                        "Ошибка TLS",
-                        format!("TLS error on {}: {:?}", leg_name, e.stage),
-                    ))
-                }
-            }
-        }
-
-        let (tx_key, tx_iv, rx_key, rx_iv) = session_keys.get_aead_parameters();
-        let mut cipher = ChaChaCipher::new();
-        cipher.set_keys(tx_key, tx_iv, rx_key, rx_iv);
-        let codec = Codec::new(cipher, session_keys.get_auth_key());
-        let (rx_codec, mut tx_codec) = codec.split();
-
-        let auth_payload = Bytes::from(format!("{}:{}", session_id, leg_id));
-        let encrypted_auth = tx_codec
-            .encode_frame(0, FrameType::Heartbeat, auth_payload)
-            .map_err(|e| {
-                AppError::new(
-                    ERR_NET_TLS_TAMPER,
-                    "Сбой шифрования",
-                    format!("Failed to encrypt Auth: {:?}", e),
-                )
-            })?;
-
-        conn.outbound
-            .write_all(&encrypted_auth)
-            .await
-            .map_err(|e| AppError::new(ERR_INFRA_TIMEOUT, "Сбой отправки", e.to_string()))?;
+        let (inbound, outbound, rx_codec, tx_codec) =
+            Self::perform_handshake(stream, session_id, leg_id).await?;
 
         let cap = NetworkConfig::global().channel_capacity;
         let (control_tx, control_rx) = mpsc::channel::<MuxMessage>(cap);
@@ -240,15 +256,19 @@ impl ClientHandler {
         let handler = Arc::new(StreamHandler::new(muxer.clone(), None));
         let engine = TunnelEngine {
             leg_id,
-            inbound: conn.inbound,
-            outbound: conn.outbound,
-            rx_codec,
-            tx_codec,
-            read_buf: conn.read_buf,
-            control_rx,
-            data_rx,
+            inbound: Some(inbound),
+            outbound: Some(outbound),
+            // 💡 ИЗМЕНЕНО: Передаем кодеки без Arc<Mutex>
+            rx_codec: Some(rx_codec),
+            tx_codec: Some(tx_codec),
+            read_buf: BytesMut::with_capacity(NetworkConfig::global().connection_buf_size),
+            control_rx: Some(control_rx),
+            data_rx: Some(data_rx),
             handler,
             muxer: muxer.clone(),
+            remote_addr: remote_proxy_addr.to_string(),
+            session_id: session_id.to_string(),
+            leg_status: crate::net::connection::engine::LegStatus::Active,
         };
 
         let run_result = engine.run().await;
@@ -272,6 +292,7 @@ impl ClientHandler {
         let registry: Arc<DashMap<u32, (u64, Ipv4Addr, u16, LocalProtocol)>> =
             Arc::new(DashMap::new());
         let local_to_global: Arc<DashMap<u64, u32>> = Arc::new(DashMap::new());
+        let local_to_upload_tx: Arc<DashMap<u64, mpsc::Sender<Bytes>>> = Arc::new(DashMap::new());
 
         let watcher_muxer = muxer.clone();
         tokio::spawn(async move {
@@ -281,8 +302,6 @@ impl ClientHandler {
                 interval.tick().await;
                 let current_ip = Self::get_local_ip();
                 if current_ip != last_ip {
-                    // ФИКС: Сбрасываем туннели только при реальном переходе (например, Wi-Fi на LTE)
-                    // Игнорируем кратковременную потерю сети (None), TCP сам справится с задержкой
                     if current_ip.is_some() && last_ip.is_some() {
                         netrunner_logger::warn!(
                             "🌐 Network Change Detected: {:?} -> {:?}",
@@ -346,12 +365,14 @@ impl ClientHandler {
                             );
 
                             let cap = NetworkConfig::global().channel_capacity;
+
                             let (v_tx, mut v_rx) = mpsc::channel::<Bytes>(cap);
                             muxer_inner.register_stream(global_stream_id, v_tx);
 
                             let tx_to_tun = tx_to_engine.clone();
                             let reg = registry.clone();
-                            let l2g = local_to_global.clone(); // 🔥 Клонируем для очистки
+                            let l2g = local_to_global.clone();
+                            let up_tx_map = local_to_upload_tx.clone();
 
                             tokio::spawn(async move {
                                 while let Some(back_payload) = v_rx.recv().await {
@@ -379,12 +400,11 @@ impl ClientHandler {
                                     }
                                 }
 
-                                // 🔥 ФИКС УТЕЧКИ ПАМЯТИ: Сборщик мусора
-                                // Если цикл завершился (Muxer удалил v_tx), стираем мертвые сессии
                                 if let Some((_, (orig_local_id, _, _, _))) =
                                     reg.remove(&global_stream_id)
                                 {
                                     l2g.remove(&orig_local_id);
+                                    up_tx_map.remove(&orig_local_id);
                                     debug!(
                                         global_stream_id,
                                         "🧹 Garbage Collector: Cleaned up dead registry stream"
@@ -392,31 +412,54 @@ impl ClientHandler {
                                 }
                             });
 
-                            let _ = muxer_inner
-                                .send_control(global_stream_id, f_type, payload)
-                                .await;
+                            let (up_tx, mut up_rx) = mpsc::channel::<Bytes>(cap);
+                            local_to_upload_tx.insert(local_socket_id, up_tx);
+
+                            let m_clone = muxer_inner.clone();
+                            let is_udp = raw_frame.protocol == LocalProtocol::Udp;
+
+                            tokio::spawn(async move {
+                                let _ = m_clone
+                                    .send_control(global_stream_id, f_type, payload)
+                                    .await;
+
+                                while let Some(data_payload) = up_rx.recv().await {
+                                    let _ = m_clone
+                                        .send_data_safe(global_stream_id, data_payload, is_udp)
+                                        .await;
+                                }
+                            });
                         }
                         FrameType::Data | FrameType::UdpData => {
-                            let global_id = local_to_global.get(&local_socket_id).map(|id| *id);
-
-                            if let Some(id) = global_id {
-                                let _ = muxer_inner
-                                    .send_data_safe(
-                                        id,
-                                        payload,
-                                        raw_frame.protocol == LocalProtocol::Udp,
-                                    )
-                                    .await;
+                            if let Some(up_tx) = local_to_upload_tx.get(&local_socket_id) {
+                                if let Err(mpsc::error::TrySendError::Full(_)) =
+                                    up_tx.try_send(payload)
+                                {
+                                    netrunner_logger::trace!(
+                                        local_socket_id,
+                                        "⚠️ Upload stream buffer full, dropping frame (TCP will retransmit)"
+                                    );
+                                }
                             }
                         }
                         FrameType::Close => {
                             if let Some(kv) = local_to_global.remove(&local_socket_id) {
                                 let global_stream_id = kv.1;
-                                let _ = muxer_inner
-                                    .send_control(global_stream_id, FrameType::Close, Bytes::new())
-                                    .await;
-                                muxer_inner.remove_stream(global_stream_id);
+
+                                let m_clone = muxer_inner.clone();
+                                tokio::spawn(async move {
+                                    let _ = m_clone
+                                        .send_control(
+                                            global_stream_id,
+                                            FrameType::Close,
+                                            Bytes::new(),
+                                        )
+                                        .await;
+                                    m_clone.remove_stream(global_stream_id);
+                                });
+
                                 registry.remove(&global_stream_id);
+                                local_to_upload_tx.remove(&local_socket_id);
                             }
                         }
                         _ => {}
@@ -614,17 +657,23 @@ impl TunnelHandler for ServerHandler {
         });
         let handler = Arc::new(StreamHandler::new(muxer.clone(), Some(opener)));
 
+        let log_session_id = session_id.clone();
+
         let engine = TunnelEngine {
             leg_id,
-            inbound,
-            outbound,
-            rx_codec,
-            tx_codec,
+            inbound: Some(inbound),
+            outbound: Some(outbound),
+            // 💡 ИЗМЕНЕНО: Передаем кодеки без Arc<Mutex>
+            rx_codec: Some(rx_codec),
+            tx_codec: Some(tx_codec),
             read_buf,
-            control_rx,
-            data_rx,
+            control_rx: Some(control_rx),
+            data_rx: Some(data_rx),
             handler,
             muxer: muxer.clone(),
+            remote_addr: String::new(),
+            session_id,
+            leg_status: crate::net::connection::engine::LegStatus::Active,
         };
 
         let res = engine.run().await;
@@ -633,7 +682,7 @@ impl TunnelHandler for ServerHandler {
 
         if muxer.active_legs_count() == 0 {
             let sm = self.session_manager.clone();
-            let sid = session_id.clone();
+            let sid = log_session_id;
             let m = muxer.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_secs(120)).await;

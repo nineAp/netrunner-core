@@ -2,7 +2,7 @@ use netrunner_core::net::{
     Connection, NetworkConfig, ServerHandler, SessionManager, TunnelHandler,
     TOPOLOGY_PRINT_INTERVAL,
 };
-use netrunner_logger::{error, info, instrument};
+use netrunner_logger::{error, info};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
@@ -20,7 +20,7 @@ impl Network {
     pub async fn run(&self, token: CancellationToken) {
         let addr = format!("{}:{}", self.host, self.port);
 
-        NetworkConfig::init_global(1380);
+        NetworkConfig::init_global(1450);
 
         // 🔥 CRITICAL FIX: Create ONE global session manager for multiplexing
         let session_manager = Arc::new(SessionManager::new());

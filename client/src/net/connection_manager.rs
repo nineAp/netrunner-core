@@ -6,7 +6,7 @@ use netrunner_core::{
     },
     rawcast::RawCastFrame,
 };
-use netrunner_logger::warn;
+use netrunner_logger::{debug, warn};
 use smoltcp::{
     iface::{SocketHandle, SocketSet},
     socket::{Socket, tcp, udp},
@@ -15,7 +15,7 @@ use smoltcp::{
 use std::sync::Arc;
 use std::time::Instant;
 
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
 
 use crate::net::{
     connection::{IcmpResponder, TcpConnection, UdpConnection},
@@ -75,11 +75,13 @@ impl TargetResolver {
 }
 
 pub struct ConnectionManager {
-    pub tracker: SessionTracker, // 🔥 Теперь pub для Engine
+    pub tracker: SessionTracker,
     resolver: TargetResolver,
     tx_to_tunnel: mpsc::Sender<RawCastFrame>,
     factory: Arc<dyn SocketProvider>,
     pending_connects: DashMap<FlowKey, Instant>,
+    connection_limiter: Arc<Semaphore>,
+    active_handles_cache: Vec<SocketHandle>,
 }
 
 impl ConnectionManager {
@@ -94,6 +96,9 @@ impl ConnectionManager {
             tx_to_tunnel,
             factory,
             pending_connects: DashMap::new(),
+            // 🔥 ИСПРАВЛЕНИЕ: Семафор должен соответствовать лимиту сокетов
+            connection_limiter: Arc::new(Semaphore::new(MAX_SOCKETS)),
+            active_handles_cache: Vec::with_capacity(MAX_SOCKETS),
         }
     }
 
@@ -207,15 +212,29 @@ impl ConnectionManager {
         }
 
         if !self.tracker.has_connection_from(f.src, f.src_p, socket_set) {
+            // 🔥 ИСПРАВЛЕНИЕ: Проверяем лимит и очищаем место ДО запроса к семафору
             if socket_set.iter().count() >= MAX_SOCKETS {
-                warn!("🔥 TCP Socket limit reached! Dropping SYN.");
-                return;
+                if !self.tracker.evict_oldest_socket(socket_set) {
+                    warn!("🔥 TCP Socket limit reached and eviction failed! Dropping SYN.");
+                    return;
+                }
             }
+
+            let permit = match self.connection_limiter.clone().try_acquire_owned() {
+                Ok(p) => p,
+                Err(_) => {
+                    // Страховка: если лимит сработал, динамически добавляем слот,
+                    // чтобы не блокировать браузер
+                    self.connection_limiter.add_permits(1);
+                    self.connection_limiter.clone().try_acquire_owned().unwrap()
+                }
+            };
 
             self.pending_connects.insert(key, Instant::now());
             let socket = self.factory.create_listening_tcp(Some(f.dst), f.dst_p);
             let handle = socket_set.add(socket);
-            self.tracker.add_pending_tcp(handle);
+
+            self.tracker.add_pending_tcp(handle, permit);
         }
     }
 
@@ -229,8 +248,10 @@ impl ConnectionManager {
         }
 
         if socket_set.iter().count() >= MAX_SOCKETS {
-            warn!("🔥 UDP Socket limit reached! Dropping packet.");
-            return;
+            if !self.tracker.evict_oldest_socket(socket_set) {
+                warn!("🔥 UDP Socket limit reached and eviction failed! Dropping packet.");
+                return;
+            }
         }
 
         let socket_id = self.tracker.next_id();
@@ -239,9 +260,10 @@ impl ConnectionManager {
 
         if socket.is_open() {
             let handle = socket_set.add(socket);
-            let (conn, rx_smol, tx_smol) = UdpConnection::new(handle, f.src, f.src_p);
+            let (conn, rx_smol, tx_smol, is_saturated) = UdpConnection::new(handle, f.src, f.src_p);
 
-            self.tracker.register_udp(handle, socket_id, conn, tx_smol);
+            self.tracker
+                .register_udp(handle, socket_id, conn, tx_smol, is_saturated);
             UdpConnection::spawn(
                 socket_id,
                 dst_ip,
@@ -254,26 +276,30 @@ impl ConnectionManager {
     }
 
     pub fn process_sockets(&mut self, socket_set: &mut SocketSet, now: smoltcp::time::Instant) {
-        let handles: Vec<SocketHandle> = socket_set.iter().map(|(h, _)| h).collect();
+        self.active_handles_cache.clear();
+        for (h, _) in socket_set.iter() {
+            self.active_handles_cache.push(h);
+        }
 
-        for handle in handles {
+        let len = self.active_handles_cache.len();
+        for i in 0..len {
+            let handle = self.active_handles_cache[i];
             let socket = socket_set.get_mut(handle);
             match socket {
-                Socket::Tcp(s) => self.handle_tcp(handle, s, now), // Пробрасываем в TCP
-                Socket::Udp(s) => self.handle_udp(handle, s, now), // Пробрасываем в UDP
-                Socket::Icmp(s) => IcmpResponder::handle(s, now),  // Пробрасываем в ICMP
+                Socket::Tcp(s) => self.handle_tcp(handle, s, now),
+                Socket::Udp(s) => self.handle_udp(handle, s, now),
+                Socket::Icmp(s) => IcmpResponder::handle(s, now),
             }
         }
     }
 
-    // Добавляем аргумент 'now' в сигнатуру
     fn handle_tcp(
         &mut self,
         handle: SocketHandle,
         socket: &mut tcp::Socket,
         now: smoltcp::time::Instant,
     ) {
-        self.tracker.update_activity(handle);
+        // 🔥 ИСПРАВЛЕНИЕ: Убрали update_activity. Теперь LRU работает как честный FIFO
         let state = socket.state();
 
         if state == tcp::State::Closed || state == tcp::State::TimeWait {
@@ -287,11 +313,18 @@ impl ConnectionManager {
                 let key = (remote.addr, remote.port, local.addr, local.port);
                 self.pending_connects.remove(&key);
 
+                let permit = self
+                    .tracker
+                    .pop_pending_permit(handle)
+                    .expect("Permit must exist for pending TCP connection");
+
                 let socket_id = self.tracker.next_id();
                 let (dst_ip, target) = self.resolver.resolve_destination(local.addr, local.port);
 
-                let (conn, rx_smol, tx_smol, handshake_tx) = TcpConnection::new(handle);
-                self.tracker.register_tcp(handle, socket_id, conn, tx_smol);
+                let (conn, rx_smol, tx_smol, handshake_tx, is_saturated) =
+                    TcpConnection::new(handle, permit);
+                self.tracker
+                    .register_tcp(handle, socket_id, conn, tx_smol, is_saturated);
 
                 TcpConnection::spawn(
                     socket_id,
@@ -304,9 +337,7 @@ impl ConnectionManager {
                 );
             }
         }
-
         if let Some(conn) = self.tracker.get_tcp_mut(handle) {
-            // Передаем 'now' в метод tick для обработки очередей и RTT
             let _ = conn.tick(socket, now);
         }
     }
@@ -317,9 +348,8 @@ impl ConnectionManager {
         socket: &mut udp::Socket,
         now: smoltcp::time::Instant,
     ) {
-        self.tracker.update_activity(handle);
+        // 🔥 ИСПРАВЛЕНИЕ: Убрали update_activity.
         if socket.endpoint().port == 53 {
-            // Передаем время в вызов recv для DNS-сокета
             while let Ok((data, meta)) = socket.recv(now) {
                 if let Some(res) = self.resolver.process_dns_query(data) {
                     let _ = socket.send_slice(&res, meta);
@@ -328,7 +358,6 @@ impl ConnectionManager {
             return;
         }
         if let Some(conn) = self.tracker.get_udp_mut(handle) {
-            // Передаем время в tick
             if !conn.tick(socket, now) {
                 self.tracker.queue_removal(handle);
             }

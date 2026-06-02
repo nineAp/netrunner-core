@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use netrunner_core::net::ClientHandler;
 use netrunner_core::net::NetworkConfig;
 use netrunner_core::rawcast::{RawCastEvent, RawCastFrame};
@@ -38,7 +39,7 @@ pub struct Engine {
     to_smoltcp_tx: UnboundedSender<TokenBuffer>,
     from_smoltcp_rx: Option<UnboundedReceiver<TokenBuffer>>,
     avail: Arc<AtomicBool>,
-    rx_from_tunnel: Option<Receiver<RawCastFrame>>, // 🔥 Теперь Option, чтобы отдать его в таску
+    rx_from_tunnel: Option<Receiver<RawCastFrame>>,
     factory: Arc<dyn SocketProvider>,
 }
 
@@ -88,24 +89,43 @@ impl Engine {
         let inbound_map = self.manager.tracker.inbound_tx.clone();
         let mut rx_tunnel = self.rx_from_tunnel.take().unwrap();
 
-        let tunnel_waker = Arc::new(tokio::sync::Notify::new());
-        let waker_clone = tunnel_waker.clone();
-
         tokio::spawn(async move {
+            let mut local_cache: std::collections::HashMap<
+                u64,
+                (mpsc::Sender<Bytes>, Arc<AtomicBool>),
+            > = std::collections::HashMap::new();
+
             while let Some(frame) = rx_tunnel.recv().await {
                 if frame.event == RawCastEvent::Close {
+                    local_cache.remove(&frame.socket_id);
                     inbound_map.remove(&frame.socket_id);
                 } else if frame.event == RawCastEvent::Data {
-                    // 1. Берем лок, клонируем Sender, СРАЗУ отпускаем лок (конец scope `tx_opt`)
-                    let tx_opt = inbound_map
-                        .get(&frame.socket_id)
-                        .map(|ref_tx| ref_tx.clone());
+                    let tx_opt: Option<(mpsc::Sender<Bytes>, Arc<AtomicBool>)> =
+                        if let Some(cached) = local_cache.get(&frame.socket_id) {
+                            Some(cached.clone())
+                        } else if let Some(ref_tx) = inbound_map.get(&frame.socket_id) {
+                            let val = ref_tx.value().clone();
+                            local_cache.insert(frame.socket_id, val.clone());
+                            Some(val)
+                        } else {
+                            None
+                        };
 
-                    // 2. Спокойно ждем (Backpressure), не блокируя остальную систему
-                    if let Some(tx) = tx_opt {
-                        if tx.send(frame.payload).await.is_ok() {
-                            // 🔥 2. БУДИМ ОСНОВНОЙ ЦИКЛ! Данные готовы к выдаче в TUN!
-                            waker_clone.notify_one();
+                    if let Some((tx, is_saturated)) = tx_opt {
+                        // Pressure-Aware drop (нулевая нагрузка на ОС)
+                        if is_saturated.load(Ordering::Relaxed) {
+                            continue;
+                        }
+
+                        match tx.try_send(frame.payload) {
+                            Ok(_) => {}
+                            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                netrunner_logger::trace!(
+                                    "⚠️ Local socket {} buffer suddenly full. Dropping frame.",
+                                    frame.socket_id
+                                );
+                            }
+                            Err(_) => {}
                         }
                     }
                 }
@@ -113,13 +133,21 @@ impl Engine {
         });
 
         loop {
+            let mut work_done = false;
             let mut repeat_poll = true;
             let now = Self::current_time();
+
+            // 1. Опрашиваем сокеты до тех пор, пока есть движение данных
             while repeat_poll {
                 self.manager.process_sockets(&mut self.socket_set, now);
                 let poll_res = self.poll();
                 self.manager.cleanup(&mut self.socket_set);
-                repeat_poll = matches!(poll_res, PollResult::SocketStateChanged);
+                if matches!(poll_res, PollResult::SocketStateChanged) {
+                    work_done = true;
+                    repeat_poll = true;
+                } else {
+                    repeat_poll = false;
+                }
             }
 
             if last_stats_log.elapsed() >= Duration::from_secs(5) {
@@ -129,32 +157,51 @@ impl Engine {
                 last_stats_log = StdInstant::now();
             }
 
-            let delay = self
-                .interface
-                .poll_delay(Self::current_time(), &self.socket_set);
-
-            // Можно смело ставить 5ms, так как Waker разбудит нас раньше, если нужно
-            let sleep_time = delay
-                .map(|d| std::cmp::min(Duration::from_micros(d.micros()), Duration::from_millis(5)))
-                .unwrap_or(Duration::from_millis(5));
-
-            // Основной цикл теперь занимается ТОЛЬКО прогонкой данных: TUN <-> smoltcp
-            tokio::select! {
-                _ = sleep(sleep_time) => {}
-
-                // 🔥 3. ЛОВИМ ПРОБУЖДЕНИЕ ОТ ТУННЕЛЯ
-                _ = tunnel_waker.notified() => {
-                    // Цикл пойдет на новую итерацию, вызовет self.poll()
-                    // и мгновенно вытащит данные из канала в TUN-интерфейс
+            // 2. БАТЧИНГ: Выгребаем все доступные пакеты из TUN без блокировки
+            let mut packets_processed = 0;
+            while let Ok(token) = tun_to_engine_rx.try_recv() {
+                self.manager
+                    .try_create_socket_from_packet(&token, &mut self.socket_set);
+                if self.to_smoltcp_tx.send(token).is_ok() {
+                    self.device.mark_rx_available();
                 }
+                work_done = true;
+                packets_processed += 1;
+                // Предотвращаем starvation: если пакетов слишком много, даем другим потокам подышать
+                if packets_processed > 250 {
+                    break;
+                }
+            }
 
-                msg = tun_to_engine_rx.recv() => {
-                    if let Some(token) = msg {
-                        self.manager.try_create_socket_from_packet(&token, &mut self.socket_set);
-                        if self.to_smoltcp_tx.send(token).is_ok() {
-                            self.device.mark_rx_available();
+            // 3. АДАПТИВНЫЙ ТАЙМИНГ
+            if work_done {
+                // Если мы обработали пакеты или сокеты сдвинулись - НЕ СПИМ.
+                // Уступаем квант времени другим задачам и моментально возвращаемся в цикл.
+                tokio::task::yield_now().await;
+            } else {
+                // Мы отдыхаем только если сеть полностью простаивает
+                let delay = self
+                    .interface
+                    .poll_delay(Self::current_time(), &self.socket_set);
+
+                let sleep_time = delay
+                    .map(|d| {
+                        std::cmp::min(Duration::from_micros(d.micros()), Duration::from_millis(5))
+                    })
+                    .unwrap_or(Duration::from_millis(5));
+
+                tokio::select! {
+                    _ = sleep(sleep_time) => {}
+                    msg = tun_to_engine_rx.recv() => {
+                        if let Some(token) = msg {
+                            self.manager.try_create_socket_from_packet(&token, &mut self.socket_set);
+                            if self.to_smoltcp_tx.send(token).is_ok() {
+                                self.device.mark_rx_available();
+                            }
+                        } else {
+                            break;
                         }
-                    } else { break; }
+                    }
                 }
             }
         }
@@ -250,7 +297,6 @@ pub struct EngineConfig {
     pub any_ip: bool,
     pub transparent_mode: bool,
     pub default_gateway: Ipv4Addr,
-    // Новые поля
     pub killswitch_enabled: bool,
     pub excluded_apps: Vec<String>,
     pub excluded_domains: Vec<String>,
@@ -323,14 +369,11 @@ impl EngineBuilder {
         self
     }
 
-    // client/src/net/engine.rs
-
     pub async fn build(self) -> Result<(Engine, Tun), String> {
         let tun = self.tun_device.ok_or("TUN device is required")?;
 
         info!("Initializing Engine with config: {:?}", self.config);
 
-        // 1. Обновляем DnsHandler: теперь он знает про список исключенных доменов
         let mut dns_handler = DnsHandler::new(
             &self.config.cache_path,
             self.config.excluded_domains.clone(),
@@ -340,7 +383,6 @@ impl EngineBuilder {
             error!("Failed to initialize DNS blocklist: {}", e);
         }
 
-        // 2. Обновляем настройку роутинга: передаем флаг Killswitch и список приложений
         if self.config.setup_routing {
             info!(
                 "Applying platform routing rules (Killswitch: {})...",
@@ -348,8 +390,8 @@ impl EngineBuilder {
             );
             setup_platform_routing(
                 &self.config.remote_address,
-                self.config.killswitch_enabled, // Новый параметр
-                &self.config.excluded_apps,     // Новый параметр
+                self.config.killswitch_enabled,
+                &self.config.excluded_apps,
             )
             .map_err(|e| format!("Routing setup failed: {}", e))?;
         }
@@ -378,13 +420,9 @@ impl EngineBuilder {
             Arc::new(SmolSocketFactory::new(config))
         });
 
-        // 3. Динамический резолвинг исключенных доменов.
-        // Чтобы Split-Tunneling работал, ОС должна знать, что к реальным IP этих доменов
-        // нужно идти через физический шлюз, а не через TUN.
         let excluded_domains = self.config.excluded_domains.clone();
         if !excluded_domains.is_empty() {
             tokio::spawn(async move {
-                // Определяем физический шлюз (например, 192.168.1.1)
                 #[cfg(target_os = "linux")]
                 let phys_gw = crate::tun::routing::get_default_gateway_linux()
                     .unwrap_or_else(|| "192.168.1.1".into());

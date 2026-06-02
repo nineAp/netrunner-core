@@ -1,7 +1,7 @@
 use std::time::Duration;
 
-pub const MAX_SOCKETS: usize = 2048;
-pub const MAX_TUNNEL_LEGS: u32 = 6;
+pub const MAX_SOCKETS: usize = 64;
+pub const MAX_TUNNEL_LEGS: u32 = 4;
 pub const MUXER_POOL_SIZE: usize = 3;
 
 pub const TCP_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);

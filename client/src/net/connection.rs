@@ -11,29 +11,32 @@ use smoltcp::{
         Ipv6Address,
     },
 };
-use std::{collections::VecDeque, sync::atomic::Ordering};
-use tokio::sync::{mpsc, oneshot};
+use std::{collections::VecDeque, sync::{Arc, atomic::{AtomicBool, Ordering}}};
+use tokio::sync::{OwnedSemaphorePermit, mpsc, oneshot};
 
 use netrunner_logger::{debug, info, instrument};
 pub struct ConnectionCore<T> {
     pub handle: SocketHandle,
     pub tx: mpsc::Sender<T>,
     pub rx: mpsc::Receiver<Bytes>,
+    pub is_saturated: Arc<AtomicBool>,
 }
 
 impl<T> ConnectionCore<T> {
-    pub fn new(handle: SocketHandle) -> (Self, mpsc::Receiver<T>, mpsc::Sender<Bytes>) {
+    pub fn new(handle: SocketHandle) -> (Self, mpsc::Receiver<T>, mpsc::Sender<Bytes>, Arc<AtomicBool>) {
         let cap = NetworkConfig::global().channel_capacity;
         let (tx_to_net, rx_from_smol) = mpsc::channel::<T>(cap);
         let (tx_to_smol, rx_from_net) = mpsc::channel::<Bytes>(cap);
+        let is_saturated = Arc::new(AtomicBool::new(false));
 
         let core = Self {
             handle,
             tx: tx_to_net,
             rx: rx_from_net,
+            is_saturated: is_saturated.clone(),
         };
 
-        (core, rx_from_smol, tx_to_smol)
+        (core, rx_from_smol, tx_to_smol, is_saturated)
     }
 }
 
@@ -53,31 +56,44 @@ pub struct TcpConnection {
     handshake_rx: Option<oneshot::Receiver<()>>,
     chunk_buf: Vec<u8>,
     server_eof: bool,
+    permit: Option<OwnedSemaphorePermit>,
+
+    total_up_bytes: u64,
+    total_down_bytes: u64,
+    rx_congested: bool,
+    tx_congested: bool, 
 }
 
 impl TcpConnection {
     pub fn new(
         handle: SocketHandle,
+        permit: tokio::sync::OwnedSemaphorePermit,
     ) -> (
         Self,
         mpsc::Receiver<Bytes>,
         mpsc::Sender<Bytes>,
         oneshot::Sender<()>,
+        Arc<AtomicBool>
     ) {
-        let (core, rx_from_smol, tx_to_smol) = ConnectionCore::new(handle);
+        let (core, rx_from_smol, tx_to_smol, is_saturated) = ConnectionCore::new(handle);
         let (handshake_tx, handshake_rx) = oneshot::channel();
 
         let conn = Self {
             core,
             state: ConnectionState::Handshaking,
+            permit: Some(permit),
             pending_data: VecDeque::new(),
             pending_bytes: 0,
             handshake_rx: Some(handshake_rx),
             chunk_buf: vec![0u8; NetworkConfig::global().tcp_chunk_size],
             server_eof: false,
+            total_up_bytes: 0,
+            total_down_bytes: 0,
+            rx_congested: false,
+            tx_congested: false,
         };
 
-        (conn, rx_from_smol, tx_to_smol, handshake_tx)
+        (conn, rx_from_smol, tx_to_smol, handshake_tx, is_saturated)
     }
 
     pub fn tick(&mut self, socket: &mut tcp::Socket, timestamp: smoltcp::time::Instant) -> bool {
@@ -87,6 +103,7 @@ impl TcpConnection {
                     match rx.try_recv() {
                         Ok(_) => {
                             debug!(%self.core.handle, "TCP Handshake successful, State -> Active");
+                            self.permit.take();
                             self.state = ConnectionState::Established;
                             self.handshake_rx = None;
                             return true;
@@ -106,7 +123,12 @@ impl TcpConnection {
                 self.poll_and_process(socket, timestamp);
 
                 if matches!(socket.state(), tcp::State::Closed | tcp::State::TimeWait) {
-                    debug!(%self.core.handle, "TCP Socket is finished, state -> Closed");
+                    info!(
+                        %self.core.handle, 
+                        UP = %self.total_up_bytes, 
+                        DOWN = %self.total_down_bytes, 
+                        "🏁 TCP Socket finished and closed"
+                    );
                     self.state = ConnectionState::Closed;
                     return false;
                 }
@@ -129,7 +151,7 @@ impl TcpConnection {
         true
     }
 
-fn poll_and_process(&mut self, socket: &mut tcp::Socket, timestamp: smoltcp::time::Instant) {
+    fn poll_and_process(&mut self, socket: &mut tcp::Socket, timestamp: smoltcp::time::Instant) {
         let current_rtt = GLOBAL_MIN_RTT.load(Ordering::Relaxed);
         let rtt = smoltcp::time::Duration::from_millis(current_rtt as u64);
         socket.set_tunnel_rtt(rtt);
@@ -137,43 +159,61 @@ fn poll_and_process(&mut self, socket: &mut tcp::Socket, timestamp: smoltcp::tim
         // 1. Читаем из браузера -> в Туннель (Upload)
         while socket.can_recv() && self.core.tx.capacity() > 0 {
             if let Ok(n) = socket.peek_slice(&mut self.chunk_buf, timestamp) {
-                if n == 0 {
-                    break;
-                }
+                if n == 0 { break; }
                 let chunk = Bytes::copy_from_slice(&self.chunk_buf[..n]);
 
                 match self.core.tx.try_send(chunk) {
                     Ok(_) => {
                         socket.recv_slice(&mut self.chunk_buf[..n]).unwrap();
+                        self.total_up_bytes += n as u64; // Учет Upload
+                        
+                        // Если была перегрузка, а теперь прошло — пишем радостный лог
+                        if self.tx_congested {
+                            netrunner_logger::debug!(%self.core.handle, "🟢 Upload channel cleared. Resuming read from browser.");
+                            self.tx_congested = false;
+                        }
                     }
-                    Err(mpsc::error::TrySendError::Full(_)) => break,
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        if !self.tx_congested {
+                            netrunner_logger::debug!(%self.core.handle, "🟡 Upload Congestion: Channel to Muxer is full. Pausing read from browser.");
+                            self.tx_congested = true;
+                        }
+                        continue;
+                    }
                     Err(mpsc::error::TrySendError::Closed(_)) => {
                         self.server_eof = true;
                         break;
                     }
                 }
-            } else {
-                break;
-            }
+            } else { break; }
         }
 
+        // 2. Читаем из Туннеля -> в Браузер (Download)
         if !self.server_eof {
             loop {
-                if self.pending_bytes > 256 * 1024 {
-                    netrunner_logger::warn!(%self.core.handle, "Local stream buffer >8MB! Force closing to save tunnel.");
-                    self.server_eof = true;
-                    socket.close();
+                if self.pending_bytes > 1024 * 1024 { 
+                    if !self.rx_congested {
+                        netrunner_logger::warn!(%self.core.handle, "🟡 Download Congestion: App buffer high. Pausing tunnel read.");
+                        self.rx_congested = true;
+                        self.core.is_saturated.store(true, Ordering::Release); // 🔥 ОПОВЕЩАЕМ ENGINE
+                    }
                     break;
+                } 
+                // Нижний порог (512 КБ)
+                else if self.rx_congested && self.pending_bytes < 512 * 1024 {
+                    netrunner_logger::debug!(%self.core.handle, "🟢 Download buffer relieved. Resuming tunnel read.");
+                    self.rx_congested = false;
+                    self.core.is_saturated.store(false, Ordering::Release); // 🔥 ДАЕМ ДОБРО ENGINE
                 }
 
                 match self.core.rx.try_recv() {
                     Ok(data) => {
                         self.pending_bytes += data.len();
+                        self.total_down_bytes += data.len() as u64; // Учет Download
                         self.pending_data.push_back(data);
                     }
                     Err(mpsc::error::TryRecvError::Empty) => break,
                     Err(mpsc::error::TryRecvError::Disconnected) => {
-                        netrunner_logger::debug!(%self.core.handle, "Tunnel channel closed (Server EOF)");
                         self.server_eof = true;
                         break;
                     }
@@ -181,7 +221,7 @@ fn poll_and_process(&mut self, socket: &mut tcp::Socket, timestamp: smoltcp::tim
             }
         }
 
-        // 3. Отправляем в smoltcp то, что накопилось (если браузер готов принять)
+        // 3. Отправляем в smoltcp то, что накопилось (оставляем как было)
         while socket.can_send() {
             if let Some(mut chunk) = self.pending_data.pop_front() {
                 match socket.send_slice(&chunk) {
@@ -190,7 +230,7 @@ fn poll_and_process(&mut self, socket: &mut tcp::Socket, timestamp: smoltcp::tim
                         if n < chunk.len() {
                             chunk.advance(n);
                             self.pending_data.push_front(chunk);
-                            break; // Сокет браузера переполнен, ждем следующего тика
+                            break; 
                         }
                     }
                     Err(e) => {
@@ -199,9 +239,7 @@ fn poll_and_process(&mut self, socket: &mut tcp::Socket, timestamp: smoltcp::tim
                         break;
                     }
                 }
-            } else {
-                break;
-            }
+            } else { break; }
         }
 
         if self.server_eof && self.pending_data.is_empty() {
@@ -212,6 +250,7 @@ fn poll_and_process(&mut self, socket: &mut tcp::Socket, timestamp: smoltcp::tim
             }
         }
     }
+
     pub fn app_pending_out_size(&self) -> usize {
         self.pending_bytes
     }
@@ -275,14 +314,14 @@ impl UdpConnection {
         handle: SocketHandle,
         client_addr: smoltcp::wire::IpAddress,
         client_port: u16,
-    ) -> (Self, mpsc::Receiver<UdpPacketTarget>, mpsc::Sender<Bytes>) {
-        let (core, rx_from_smol, tx_to_smol) = ConnectionCore::new(handle);
+    ) -> (Self, mpsc::Receiver<UdpPacketTarget>, mpsc::Sender<Bytes>, Arc<AtomicBool>) {
+        let (core, rx_from_smol, tx_to_smol, is_saturated) = ConnectionCore::new(handle);
         let conn = Self {
             core,
             last_client_endpoint: Some(IpEndpoint::new(client_addr, client_port)),
             last_activity: std::time::Instant::now(),
         };
-        (conn, rx_from_smol, tx_to_smol)
+        (conn, rx_from_smol, tx_to_smol, is_saturated)
     }
 
     pub fn has_client(&self, port: u16) -> bool {

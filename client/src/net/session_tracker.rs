@@ -11,7 +11,7 @@ use smoltcp::{
     wire::IpAddress,
 };
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{OwnedSemaphorePermit, mpsc};
 
 use crate::net::connection::{TcpConnection, UdpConnection};
 
@@ -19,11 +19,11 @@ pub struct SessionTracker {
     last_activity: HashMap<SocketHandle, StdInstant>,
     active_tcp: HashMap<SocketHandle, TcpConnection>,
     active_udp: HashMap<SocketHandle, UdpConnection>,
-    pub inbound_tx: Arc<DashMap<u64, mpsc::Sender<Bytes>>>, // 🔥 Теперь Arc<DashMap>
+    pub inbound_tx: Arc<DashMap<u64, (mpsc::Sender<Bytes>, Arc<std::sync::atomic::AtomicBool>)>>,
     handle_to_id: HashMap<SocketHandle, u64>,
 
     id_to_handle: HashMap<u64, SocketHandle>,
-    pending_tcp: HashMap<SocketHandle, StdInstant>,
+    pending_tcp: HashMap<SocketHandle, (StdInstant, OwnedSemaphorePermit)>,
     to_remove: Vec<SocketHandle>,
     next_socket_id: u64,
 }
@@ -49,8 +49,13 @@ impl SessionTracker {
         id
     }
 
-    pub fn add_pending_tcp(&mut self, handle: SocketHandle) {
-        self.pending_tcp.insert(handle, StdInstant::now());
+    pub fn add_pending_tcp(&mut self, handle: SocketHandle, permit: OwnedSemaphorePermit) {
+        self.pending_tcp.insert(handle, (StdInstant::now(), permit));
+        self.last_activity.insert(handle, StdInstant::now());
+    }
+
+    pub fn pop_pending_permit(&mut self, handle: SocketHandle) -> Option<OwnedSemaphorePermit> {
+        self.pending_tcp.remove(&handle).map(|(_, permit)| permit)
     }
 
     pub fn register_tcp(
@@ -59,13 +64,12 @@ impl SessionTracker {
         id: u64,
         conn: TcpConnection,
         tx: mpsc::Sender<Bytes>,
+        is_saturated: Arc<std::sync::atomic::AtomicBool>,
     ) {
-        self.pending_tcp.remove(&handle);
         self.handle_to_id.insert(handle, id);
         self.id_to_handle.insert(id, handle);
         self.active_tcp.insert(handle, conn);
-        self.inbound_tx.insert(id, tx);
-        self.last_activity.insert(handle, StdInstant::now());
+        self.inbound_tx.insert(id, (tx, is_saturated));
     }
 
     pub fn register_udp(
@@ -74,11 +78,12 @@ impl SessionTracker {
         id: u64,
         conn: UdpConnection,
         tx: mpsc::Sender<Bytes>,
+        is_saturated: Arc<std::sync::atomic::AtomicBool>,
     ) {
         self.handle_to_id.insert(handle, id);
         self.id_to_handle.insert(id, handle);
         self.active_udp.insert(handle, conn);
-        self.inbound_tx.insert(id, tx);
+        self.inbound_tx.insert(id, (tx, is_saturated));
         self.last_activity.insert(handle, StdInstant::now());
     }
 
@@ -106,12 +111,6 @@ impl SessionTracker {
         self.pending_tcp.contains_key(&handle) && !self.active_tcp.contains_key(&handle)
     }
 
-    pub fn check_pending_timeout(&self, handle: SocketHandle, timeout: Duration) -> bool {
-        self.pending_tcp
-            .get(&handle)
-            .map_or(false, |t| t.elapsed() > timeout)
-    }
-
     pub fn get_tcp_mut(&mut self, handle: SocketHandle) -> Option<&mut TcpConnection> {
         self.active_tcp.get_mut(&handle)
     }
@@ -122,14 +121,6 @@ impl SessionTracker {
 
     pub fn update_activity(&mut self, handle: SocketHandle) {
         self.last_activity.insert(handle, StdInstant::now());
-    }
-
-    pub fn close_tunnel_session(&mut self, id: u64) {
-        self.inbound_tx.remove(&id);
-
-        if let Some(handle) = self.id_to_handle.remove(&id) {
-            self.queue_removal(handle);
-        }
     }
 
     pub fn queue_removal(&mut self, handle: SocketHandle) {
@@ -154,10 +145,56 @@ impl SessionTracker {
         }
     }
 
+    pub fn evict_oldest_socket(&mut self, socket_set: &mut SocketSet) -> bool {
+        let mut victim = None;
+
+        for (handle, socket) in socket_set.iter() {
+            if let smoltcp::socket::Socket::Tcp(tcp_socket) = socket {
+                let state = tcp_socket.state();
+                if matches!(
+                    state,
+                    smoltcp::socket::tcp::State::Closed
+                        | smoltcp::socket::tcp::State::TimeWait
+                        | smoltcp::socket::tcp::State::CloseWait
+                        | smoltcp::socket::tcp::State::FinWait1
+                        | smoltcp::socket::tcp::State::FinWait2
+                ) {
+                    victim = Some(handle);
+                    break;
+                }
+            }
+        }
+
+        if victim.is_none() {
+            // 🔥 ИСПРАВЛЕНИЕ: Защищаем системные (слушающие) сокеты от удаления
+            victim = self
+                .last_activity
+                .iter()
+                .filter(|(h, _)| {
+                    self.active_tcp.contains_key(h)
+                        || self.active_udp.contains_key(h)
+                        || self.pending_tcp.contains_key(h)
+                })
+                .min_by_key(|&(_, &time)| time)
+                .map(|(&handle, _)| handle);
+        }
+
+        if let Some(handle) = victim {
+            netrunner_logger::info!(
+                "🔪 LRU Eviction: Force closing socket {:?} to free up a slot",
+                handle
+            );
+            self.queue_removal(handle);
+            self.cleanup(socket_set);
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn cleanup(&mut self, socket_set: &mut SocketSet) {
         for handle in self.to_remove.drain(..) {
             socket_set.remove(handle);
-
             self.active_tcp.remove(&handle);
             self.active_udp.remove(&handle);
             self.pending_tcp.remove(&handle);

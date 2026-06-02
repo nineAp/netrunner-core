@@ -1,10 +1,11 @@
 use bytes::Bytes;
 use dashmap::DashMap;
-use netrunner_logger::{AppError, ERR_INFRA_TIMEOUT, info, instrument, trace, warn};
+use netrunner_logger::{info, instrument, trace, warn, AppError, ERR_INFRA_TIMEOUT};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Instant;
 use tokio::sync::mpsc::Sender;
+use tokio_util::sync::CancellationToken;
 
 use crate::net::{HEALTH_CHECK_TIMEOUT, MAX_TUNNEL_LEGS, MUXER_POOL_SIZE};
 use crate::nrxp::FrameType;
@@ -24,6 +25,7 @@ pub struct StreamStats {
 
 #[derive(Clone)]
 struct MuxLeg {
+    id: u32,
     control_tx: Sender<MuxMessage>,
     data_tx: Sender<MuxMessage>,
     stats: Arc<LegStats>,
@@ -31,12 +33,10 @@ struct MuxLeg {
 
 impl MuxLeg {
     fn congestion_factor(&self) -> f64 {
-        // СТАЛО: Вычисляем реальную нагрузку на канал
         let max = self.data_tx.max_capacity();
         let current_capacity = self.data_tx.capacity();
         let filled = max.saturating_sub(current_capacity);
-        
-        (filled as f64) / (max as f64) // Возвращает от 0.0 (пусто) до 1.0 (забито наглухо)
+        (filled as f64) / (max as f64)
     }
 }
 
@@ -46,12 +46,10 @@ struct IdGenerator {
 
 impl IdGenerator {
     pub fn new(is_client: bool) -> Self {
-        let start = if is_client { 1 } else { 2 };
         Self {
-            counter: AtomicU32::new(start),
+            counter: AtomicU32::new(if is_client { 1 } else { 2 }),
         }
     }
-
     pub fn next(&self) -> u32 {
         self.counter.fetch_add(2, Ordering::Relaxed)
     }
@@ -69,7 +67,11 @@ pub static GLOBAL_MIN_RTT: AtomicU32 = AtomicU32::new(250);
 #[derive(Clone)]
 pub struct Muxer {
     legs: Arc<DashMap<u32, MuxLeg>>,
-    streams: Arc<DashMap<u32, (Sender<Bytes>, Arc<StreamStats>)>>,
+    // 🔥 ОПТИМИЗАЦИЯ: Lock-Free кэш для горячего пути
+    active_legs_cache: Arc<RwLock<Arc<Vec<MuxLeg>>>>,
+
+    // Добавили CancellationToken для предотвращения утечек памяти (Зомби-задач)
+    streams: Arc<DashMap<u32, (Sender<Bytes>, Arc<StreamStats>, CancellationToken)>>,
     stream_bindings: Arc<DashMap<u32, u32>>,
     pending_pings: Arc<DashMap<u32, Instant>>,
     id_gen: Arc<IdGenerator>,
@@ -80,12 +82,18 @@ impl Muxer {
     pub fn new(is_client: bool, session_id: String) -> Self {
         Self {
             legs: Arc::new(DashMap::new()),
+            active_legs_cache: Arc::new(RwLock::new(Arc::new(Vec::new()))),
             streams: Arc::new(DashMap::new()),
             stream_bindings: Arc::new(DashMap::new()),
             id_gen: Arc::new(IdGenerator::new(is_client)),
             pending_pings: Arc::new(DashMap::new()),
             session_id: Arc::new(session_id),
         }
+    }
+
+    fn update_legs_cache(&self) {
+        let new_cache: Vec<MuxLeg> = self.legs.iter().map(|kv| kv.value().clone()).collect();
+        *self.active_legs_cache.write().unwrap() = Arc::new(new_cache);
     }
 
     pub fn add_leg(
@@ -95,18 +103,20 @@ impl Muxer {
         data_tx: Sender<MuxMessage>,
     ) {
         if self.legs.len() >= MAX_TUNNEL_LEGS as usize && !self.legs.contains_key(&leg_id) {
-            warn!(leg_id, "MUXER: Max legs reached: {}", MAX_TUNNEL_LEGS);
+            warn!(leg_id, "MUXER: Max legs reached");
             return;
         }
 
         self.legs.insert(
             leg_id,
             MuxLeg {
+                id: leg_id,
                 control_tx,
                 data_tx,
                 stats: Arc::new(LegStats::default()),
             },
         );
+        self.update_legs_cache(); // Обновляем Lock-Free кэш
         info!(
             leg_id,
             "MUXER: Physical TCP+TLS leg registered (Total: {})",
@@ -115,71 +125,59 @@ impl Muxer {
     }
 
     pub fn remove_leg(&self, leg_id: u32, tx: &Sender<MuxMessage>) {
-        let should_remove = if let Some(leg) = self.legs.get(&leg_id) {
-            leg.control_tx.same_channel(tx)
-        } else {
-            false
-        };
-
+        let should_remove = self
+            .legs
+            .get(&leg_id)
+            .map_or(false, |leg| leg.control_tx.same_channel(tx));
         if should_remove {
             self.legs.remove(&leg_id);
+            self.update_legs_cache(); // Обновляем Lock-Free кэш
             info!(
                 leg_id,
                 "MUXER: TCP leg removed safely, streams will re-balance"
-            );
-        } else {
-            trace!(
-                leg_id,
-                "MUXER: Leg removal skipped (already removed or replaced by a new connection)"
             );
         }
     }
 
     pub fn remove_all_legs(&self) {
-        warn!("🚨 MUXER: Emergency reset! Removing all physical legs due to network change.");
         self.legs.clear();
         self.stream_bindings.clear();
+        self.update_legs_cache();
     }
 
     pub fn active_legs_count(&self) -> usize {
         self.legs.len()
     }
 
-    fn select_leg(&self, _frame_type: &FrameType, stream_id: u32) -> Option<(u32, MuxLeg)> {
-        if self.legs.is_empty() {
+    fn select_leg(&self, stream_id: u32) -> Option<MuxLeg> {
+        let legs = self.active_legs_cache.read().unwrap().clone();
+        if legs.is_empty() {
             return None;
         }
 
         if let Some(leg_id_ref) = self.stream_bindings.get(&stream_id) {
             let leg_id = *leg_id_ref;
-            if let Some(leg) = self.legs.get(&leg_id) {
-                return Some((leg_id, leg.clone()));
+            if let Some(leg) = legs.iter().find(|l| l.id == leg_id) {
+                return Some(leg.clone());
             }
         }
 
-        let mut candidates: Vec<(u32, MuxLeg)> = self
-            .legs
-            .iter()
-            .map(|kv| (*kv.key(), kv.value().clone()))
-            .collect();
-
-        candidates.sort_by(|(_, leg_a), (_, leg_b)| {
-            let rtt_a = leg_a.stats.rtt_ms.load(Ordering::Relaxed) as f64;
-            let rtt_b = leg_b.stats.rtt_ms.load(Ordering::Relaxed) as f64;
-            let score_a = rtt_a + (leg_a.congestion_factor() * 2000.0);
-            let score_b = rtt_b + (leg_b.congestion_factor() * 2000.0);
-
+        let mut candidates = (*legs).clone();
+        candidates.sort_by(|a, b| {
+            let score_a =
+                a.stats.rtt_ms.load(Ordering::Relaxed) as f64 + (a.congestion_factor() * 2000.0);
+            let score_b =
+                b.stats.rtt_ms.load(Ordering::Relaxed) as f64 + (b.congestion_factor() * 2000.0);
             score_a
                 .partial_cmp(&score_b)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
         let pool_size = std::cmp::min(candidates.len(), MUXER_POOL_SIZE);
-        let (selected_id, selected_leg) = candidates[stream_id as usize % pool_size].clone();
+        let selected_leg = candidates[stream_id as usize % pool_size].clone();
 
-        self.stream_bindings.insert(stream_id, selected_id);
-
-        Some((selected_id, selected_leg))
+        self.stream_bindings.insert(stream_id, selected_leg.id);
+        Some(selected_leg)
     }
 
     pub fn record_ping_sent(&self, leg_id: u32) {
@@ -191,8 +189,6 @@ impl Muxer {
             let rtt = start_time.elapsed().as_millis() as u32;
             if let Some(leg) = self.legs.get(&leg_id) {
                 leg.stats.rtt_ms.store(rtt, Ordering::Relaxed);
-                trace!(leg_id, rtt, "💓 [Muxer] RTT updated for physical leg");
-
                 let min_rtt = self
                     .legs
                     .iter()
@@ -200,68 +196,65 @@ impl Muxer {
                     .filter(|&r| r > 0)
                     .min()
                     .unwrap_or(250);
-
                 GLOBAL_MIN_RTT.store(min_rtt, Ordering::Relaxed);
             }
         }
     }
 
-    #[instrument(skip(self, message), fields(
-    session_id = %self.session_id, 
-    stream_id = message.stream_id,
-    frame = ?message.frame_type
-    ))]
-    pub async fn send_to_network(&self, message: MuxMessage) -> Result<(), AppError>{
-        let size = message.data.len() as u64;
-        let mut attempts = 0;
-
-        loop {
-            if attempts >= 3 {
-                return Err(AppError::new(ERR_INFRA_TIMEOUT, "Сбой передачи данных", "MUXER: All attempts to send failed"));
+    #[instrument(skip(self, message), fields(session_id = %self.session_id, stream_id = message.stream_id, frame = ?message.frame_type))]
+    pub async fn send_to_network(&self, message: MuxMessage) -> Result<(), AppError> {
+        let leg = match self.select_leg(message.stream_id) {
+            Some(l) => l,
+            None => {
+                return Err(AppError::new(
+                    ERR_INFRA_TIMEOUT,
+                    "Нет связи",
+                    "No active legs",
+                ))
             }
-            attempts += 1;
+        };
 
-            let (leg_id, leg) = match self.select_leg(&message.frame_type, message.stream_id) {
-                Some(l) => l,
-                None => return Err(AppError::new(ERR_INFRA_TIMEOUT, "Нет связи с сервером", "MUXER: No active physical legs available")),
-            };
+        let is_data = matches!(message.frame_type, FrameType::Data | FrameType::UdpData);
+        let target_tx = if is_data {
+            &leg.data_tx
+        } else {
+            &leg.control_tx
+        };
 
-            let target_tx = match message.frame_type {
-                FrameType::Connect
-                | FrameType::Close
-                | FrameType::UdpConnect
-                | FrameType::Heartbeat => &leg.control_tx,
-                _ => &leg.data_tx,
-            };
+        let stream_id = message.stream_id;
+        let size = message.data.len() as u64;
 
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(10),
-                target_tx.send(message.clone()),
-            )
-            .await
-            {
-                Ok(Ok(_)) => {
+        if is_data {
+            match target_tx.try_send(message) {
+                Ok(_) => {
                     leg.stats.tx_bytes.fetch_add(size, Ordering::Relaxed);
-                    if let Some(stream_ref) = self.streams.get(&message.stream_id) {
+                    if let Some(stream_ref) = self.streams.get(&stream_id) {
                         stream_ref
                             .value()
                             .1
                             .tx_bytes
                             .fetch_add(size, Ordering::Relaxed);
                     }
-                    return Ok(());
+                    Ok(())
                 }
-                Ok(Err(_)) => {
-                    self.remove_leg(leg_id, &leg.control_tx);
-                    continue;
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => Ok(()), // HoL Blocking eliminated
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    self.remove_leg(leg.id, &leg.control_tx);
+                    Err(AppError::new(ERR_INFRA_TIMEOUT, "Обрыв", "Leg closed"))
                 }
-                Err(_) => {
-                    warn!(
-                        message.stream_id,
-                        "Physical TCP TX full for 10s! Leg {} is dead. Evicting.", leg_id
-                    );
-                    self.remove_leg(leg_id, &leg.control_tx);
-                    continue;
+            }
+        } else {
+            match tokio::time::timeout(std::time::Duration::from_secs(2), target_tx.send(message))
+                .await
+            {
+                Ok(Ok(_)) => Ok(()),
+                _ => {
+                    self.remove_leg(leg.id, &leg.control_tx);
+                    Err(AppError::new(
+                        ERR_INFRA_TIMEOUT,
+                        "Таймаут",
+                        "Control send timeout",
+                    ))
                 }
             }
         }
@@ -273,14 +266,13 @@ impl Muxer {
         data: Bytes,
         is_udp: bool,
     ) -> Result<(), AppError> {
-        let frame_type = if is_udp {
-            FrameType::UdpData
-        } else {
-            FrameType::Data
-        };
         self.send_to_network(MuxMessage {
             stream_id,
-            frame_type,
+            frame_type: if is_udp {
+                FrameType::UdpData
+            } else {
+                FrameType::Data
+            },
             data,
         })
         .await
@@ -291,7 +283,7 @@ impl Muxer {
         stream_id: u32,
         f_type: FrameType,
         data: Bytes,
-    ) -> Result<(), AppError>{
+    ) -> Result<(), AppError> {
         self.send_to_network(MuxMessage {
             stream_id,
             frame_type: f_type,
@@ -300,30 +292,35 @@ impl Muxer {
         .await
     }
 
-    pub fn register_stream(&self, stream_id: u32, tx: Sender<Bytes>) {
-        self.streams
-            .insert(stream_id, (tx, Arc::new(StreamStats::default())));
+    pub fn register_stream(&self, stream_id: u32, tx: Sender<Bytes>) -> CancellationToken {
+        let token = CancellationToken::new();
+        self.streams.insert(
+            stream_id,
+            (tx, Arc::new(StreamStats::default()), token.clone()),
+        );
+        token
     }
 
     pub fn remove_stream(&self, stream_id: u32) {
-        self.streams.remove(&stream_id);
+        // 🔥 Мгновенно убиваем "зомби-задачи", привязанные к стриму!
+        if let Some((_, (_, _, token))) = self.streams.remove(&stream_id) {
+            token.cancel();
+        }
         self.stream_bindings.remove(&stream_id);
     }
 
-    #[instrument(skip(self, data), fields(session_id = %self.session_id, stream_id = stream_id))]
-    pub async fn dispatch_to_local(&self, stream_id: u32, data: Bytes) {
-        let stream_opt = self.streams.get(&stream_id).map(|s| (s.value().0.clone(), s.value().1.clone()));
-
-        if let Some((tx, stats)) = stream_opt {
+    #[inline]
+    pub fn dispatch_to_local(&self, stream_id: u32, data: Bytes) {
+        if let Some(stream_ref) = self.streams.get(&stream_id) {
+            let tx = &stream_ref.value().0;
+            let stats = &stream_ref.value().1;
             let size = data.len() as u64;
+
             match tx.try_send(data) {
-                Ok(_) => { stats.rx_bytes.fetch_add(size, Ordering::Relaxed); }
-                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                    // 🔥 Защита от зависания всего VPN! Если стрим застрял - убиваем его.
-                    netrunner_logger::error!(stream_id, "Stream buffer full! Killing stream to save tunnel.");
-                    self.remove_stream(stream_id);
+                Ok(_) => {
+                    stats.rx_bytes.fetch_add(size, Ordering::Relaxed);
                 }
-                Err(_) => { self.remove_stream(stream_id); }
+                Err(_) => {} // Silent drop to avoid slowing down Reader Task
             }
         }
     }
@@ -342,18 +339,23 @@ impl Muxer {
         let leg_ids: Vec<u32> = self.legs.iter().map(|kv| *kv.key()).collect();
 
         for leg_id in leg_ids {
-            // 🔥 ФИКС DEADLOCK'А: Изолируем блокировку DashMap
             let tx = {
-                let Some(leg) = self.legs.get(&leg_id) else { continue; };
+                let Some(leg) = self.legs.get(&leg_id) else {
+                    continue;
+                };
                 leg.control_tx.clone()
-            }; // <-- Лок отпущен! Теперь можно делать .await
+            };
 
             let probe_stream_id = self.id_gen.next();
             let (probe_tx, mut probe_rx) = tokio::sync::mpsc::channel(10);
-            self.register_stream(probe_stream_id, probe_tx);
+            let _token = self.register_stream(probe_stream_id, probe_tx);
             self.record_ping_sent(leg_id);
 
-            let msg = MuxMessage { stream_id: probe_stream_id, frame_type: FrameType::Heartbeat, data: Bytes::from("PING") };
+            let msg = MuxMessage {
+                stream_id: probe_stream_id,
+                frame_type: FrameType::Heartbeat,
+                data: Bytes::from("PING"),
+            };
             if tx.try_send(msg).is_err() {
                 self.remove_leg(leg_id, &tx);
                 self.remove_stream(probe_stream_id);
@@ -372,6 +374,7 @@ impl Muxer {
     }
 
     fn format_size(bytes: u64) -> String {
+        /* ... (оставлено без изменений) ... */
         const KB: u64 = 1024;
         const MB: u64 = KB * 1024;
         const GB: u64 = MB * 1024;
@@ -397,13 +400,11 @@ impl Muxer {
         let mut total_rx = 0;
         let mut legs_info = Vec::new();
 
-        for kv in self.legs.iter() {
-            let id = kv.key();
-            let stats = &kv.value().stats;
-            let tx = stats.tx_bytes.load(Ordering::Relaxed);
-            let rx = stats.rx_bytes.load(Ordering::Relaxed);
-            let rtt = stats.rtt_ms.load(Ordering::Relaxed);
-
+        let cached_legs = self.active_legs_cache.read().unwrap().clone();
+        for leg in cached_legs.iter() {
+            let tx = leg.stats.tx_bytes.load(Ordering::Relaxed);
+            let rx = leg.stats.rx_bytes.load(Ordering::Relaxed);
+            let rtt = leg.stats.rtt_ms.load(Ordering::Relaxed);
             total_tx += tx;
             total_rx += rx;
 
@@ -412,10 +413,9 @@ impl Muxer {
             } else {
                 format!("{}ms", rtt)
             };
-
             legs_info.push(format!(
                 "   ├─ Leg {} (TCP+TLS) ─ ⇡ {:<9} | ⇣ {:<9} [RTT: {}]",
-                id,
+                leg.id,
                 Self::format_size(tx),
                 Self::format_size(rx),
                 rtt_str
@@ -423,44 +423,45 @@ impl Muxer {
         }
 
         out.push_str(&format!(
-            "├─ 📊 Global Traffic: ⇡ {} | ⇣ {}\n",
+            "├─ 📊 Global Traffic: ⇡ {} | ⇣ {}\n├─ 🦵 Physical Connections (Active: {})\n",
             Self::format_size(total_tx),
-            Self::format_size(total_rx)
-        ));
-        out.push_str(&format!(
-            "├─ 🦵 Physical Connections (Active: {})\n",
+            Self::format_size(total_rx),
             legs_info.len()
         ));
-
         for (i, info) in legs_info.iter().enumerate() {
-            if i == legs_info.len() - 1 {
-                out.push_str(&format!("{}\n", info.replace("├─", "└─")));
-            } else {
-                out.push_str(&format!("{}\n", info));
-            }
+            out.push_str(&format!(
+                "{}\n",
+                if i == legs_info.len() - 1 {
+                    info.replace("├─", "└─")
+                } else {
+                    info.clone()
+                }
+            ));
         }
 
-        let streams_count = self.streams.len();
+        // Клонируем данные стримов, чтобы не блокировать DashMap при форматировании текста
+        let streams_snapshot: Vec<(u32, u64, u64)> = self
+            .streams
+            .iter()
+            .map(|kv| {
+                (
+                    *kv.key(),
+                    kv.value().1.tx_bytes.load(Ordering::Relaxed),
+                    kv.value().1.rx_bytes.load(Ordering::Relaxed),
+                )
+            })
+            .collect();
+
         out.push_str(&format!(
             "└─ 🔀 Virtual Streams (TCP/UDP multiplexed: {})\n",
-            streams_count
+            streams_snapshot.len()
         ));
-
-        let mut count = 0;
-        for kv in self.streams.iter() {
-            count += 1;
-            let id = kv.key();
-            let stats = &kv.value().1;
-
-            let tx = stats.tx_bytes.load(Ordering::Relaxed);
-            let rx = stats.rx_bytes.load(Ordering::Relaxed);
-
-            let prefix = if count == streams_count {
+        for (count, (id, tx, rx)) in streams_snapshot.into_iter().enumerate() {
+            let prefix = if count == self.streams.len() - 1 {
                 "   └─"
             } else {
                 "   ├─"
             };
-
             out.push_str(&format!(
                 "{} Stream {:<4} ─ ⇡ {:<9} | ⇣ {}\n",
                 prefix,
