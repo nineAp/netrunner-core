@@ -1,9 +1,10 @@
-use bytes::{Bytes, BytesMut};
 use crate::crypto::{AeadPacker, ChaChaCipher, ChaChaStream, SessionAuth};
 use crate::nrxp::bridge::TlsBridge;
 use crate::nrxp::errors::{ErrorAction, ErrorStage, TlsError};
 use crate::nrxp::frame::{Frame, FrameType};
 use crate::parser::Parser;
+use bytes::{Bytes, BytesMut};
+use netrunner_logger::trace;
 
 pub struct TxCodec {
     crypto: ChaChaStream,
@@ -15,7 +16,7 @@ impl TxCodec {
         Self { crypto, auth }
     }
 
-    pub fn encode_frame(
+    pub(crate) fn encode_frame(
         &mut self,
         stream_id: u32,
         frame_type: FrameType,
@@ -23,14 +24,22 @@ impl TxCodec {
     ) -> Result<Bytes, TlsError> {
         let tag = self.auth.generate_current_tag();
         let frame = Frame::new(stream_id, frame_type, payload);
+
+        // frame_bytes — это BytesMut. Выделяем и формируем заголовок.
         let mut frame_bytes = frame.into_bytes(&tag);
 
-        let encrypted_payload = self.crypto.encrypt(&mut frame_bytes).map_err(|e| {
+        // Шифруем In-Place. Массив frame_bytes мутирует и вырастает на 16 байт тега AEAD.
+        self.crypto.encrypt(&mut frame_bytes).map_err(|e| {
             netrunner_logger::error!("Encryption failed: {:?}", e);
-            TlsError::new(ErrorStage::Tls("Encryption failed"), ErrorAction::Drop, Bytes::new())
+            TlsError::new(
+                ErrorStage::Tls("Encryption failed"),
+                ErrorAction::Drop,
+                Bytes::new(),
+            )
         })?;
 
-        Ok(TlsBridge::pack_app_data(encrypted_payload))
+        // Только в самом конце замораживаем буфер (Zero-Copy операция) для отправки
+        Ok(TlsBridge::pack_app_data(frame_bytes.freeze()))
     }
 }
 
@@ -42,43 +51,44 @@ pub struct RxCodec {
 
 impl RxCodec {
     pub fn new(crypto: ChaChaStream, auth: SessionAuth, staging: BytesMut) -> Self {
-        Self { crypto, auth, staging }
+        Self {
+            crypto,
+            auth,
+            staging,
+        }
     }
-
-    pub fn decode_inbound(&mut self, buffer: &mut BytesMut) -> Result<Option<Frame>, TlsError> {
+    pub(crate) fn decode_inbound(
+        &mut self,
+        buffer: &mut BytesMut,
+    ) -> Result<Option<Frame>, TlsError> {
+        // Пытаемся распарсить из того, что уже в staging
         if !self.staging.is_empty() {
             if let Some(frame) = self.try_parse_frame()? {
                 return Ok(Some(frame));
             }
         }
 
-        while let Some(app_data) = TlsBridge::unpack_app_data(buffer).map_err(|e| {
-            self.staging.clear();
-            e
-        })? {
-            let mut data_to_decrypt = BytesMut::from(app_data.payload);
-            
-            let decrypted = self.crypto.decrypt(&mut data_to_decrypt).map_err(|e| {
-                self.staging.clear();
-                let bad_data = Bytes::copy_from_slice(&data_to_decrypt[..data_to_decrypt.len().min(32)]);
-                TlsError::new(ErrorStage::Tls("AEAD Decrypt Failed"), ErrorAction::Drop, bad_data)
-            })?;
+        // Подкачиваем новые данные из TLS Record
+        while let Some(app_data) = TlsBridge::unpack_app_data(buffer).map_err(|e| e)? {
+            let start_idx = self.staging.len();
+            self.staging.extend_from_slice(&app_data.payload);
 
-            if decrypted.len() < 16 {
+            let mut data_to_decrypt = self.staging.split_off(start_idx);
+
+            // Шифрование In-Place
+            if let Err(_) = self.crypto.decrypt(&mut data_to_decrypt) {
+                // Сбрасываем только при ошибке крипто-аутентификации (tampering)
                 self.staging.clear();
-                return Err(TlsError::new(ErrorStage::Tls("Packet too short"), ErrorAction::Drop, Bytes::new()));
+                return Err(TlsError::new(
+                    ErrorStage::Tls("AEAD Decrypt Failed"),
+                    ErrorAction::Drop,
+                    Bytes::new(),
+                ));
             }
 
-            let mut received_tag = [0u8; 16];
-            received_tag.copy_from_slice(&decrypted[..16]);
+            self.staging.unsplit(data_to_decrypt);
 
-            if !self.auth.verify_tag(&received_tag) {
-                self.staging.clear();
-                return Err(TlsError::new(ErrorStage::Tls("Auth mismatch"), ErrorAction::Drop, Bytes::new()));
-            }
-
-            self.staging.extend_from_slice(&decrypted);
-
+            // ИСПРАВЛЕНО: try_parse_frame теперь не сбрасывает буфер при ошибке парсинга
             if let Some(frame) = self.try_parse_frame()? {
                 return Ok(Some(frame));
             }
@@ -91,9 +101,12 @@ impl RxCodec {
         match Frame::parse(&mut self.staging) {
             Ok(Some(frame)) => Ok(Some(frame)),
             Ok(None) => Ok(None),
-            Err(_) => {
-                self.staging.clear();
-                Err(TlsError::new(ErrorStage::Tls("Parse error"), ErrorAction::Drop, Bytes::new()))
+            Err(e) => {
+                // ИСПРАВЛЕНО: Убрали self.staging.clear().
+                // Если парсинг не удался (например, неполный заголовок),
+                // мы оставляем staging как есть и ждем новых данных.
+                trace!("Frame parse incomplete or waiting for more data: {}", e);
+                Ok(None)
             }
         }
     }
@@ -105,7 +118,6 @@ pub struct Codec {
 }
 
 impl Codec {
-    // УБРАЛИ staging из аргументов
     pub fn new(cipher: ChaChaCipher, auth_key: [u8; 32]) -> Self {
         let (rx_stream, tx_stream) = cipher.split();
         let auth = SessionAuth::new(auth_key);

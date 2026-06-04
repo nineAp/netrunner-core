@@ -1,11 +1,11 @@
 use std::time::Duration;
 
-pub const MAX_SOCKETS: usize = 64;
+pub const MAX_SOCKETS: usize = 256;
 pub const MAX_TUNNEL_LEGS: u32 = 4;
 pub const MUXER_POOL_SIZE: usize = 3;
 
 pub const TCP_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
-pub const UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+pub const UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
 pub const GLOBAL_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 // 🔥 ФИКС: Ускоряем обнаружение мертвой сети при переключении Wi-Fi -> LTE

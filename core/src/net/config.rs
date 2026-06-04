@@ -30,30 +30,24 @@ impl NetworkConfig {
     pub fn new(system_mtu: usize) -> Self {
         Self {
             mtu: system_mtu,
-            // Для сервера 64KB ок, для клиента поднимем до 256KB, чтобы не тормозить чтение с TUN
-            connection_buf_size: 256 * 1024,
+            connection_buf_size: 128 * 1024, // Уменьшили с 256KB
+            tcp_buffer_size: 128 * 1024,     // Уменьшили с 256KB
+            udp_buffer_size: 64 * 1024,      // Уменьшили со 128KB
+            tcp_chunk_size: 1024 * 1024 * 64,
 
-            // 256KB — это золотая середина. Позволяет держать ~10Мбит на стрим при пинге 200мс.
-            tcp_buffer_size: 256 * 1024,
-            udp_buffer_size: 128 * 1024,
-            tcp_chunk_size: system_mtu - 100,
+            channel_capacity: 512,
 
-            // Емкость каналов: 512 пакетов (~700КБ).
-            // Этого достаточно, чтобы сгладить лаги радио-эфира на телефоне.
-            channel_capacity: 8192,
+            // Окна smoltcp (уменьшаем, чтобы не создавать огромные очереди)
+            tcp_rx_heavy: 128 * 1024,
+            tcp_tx_heavy: 128 * 1024,
 
-            // Окна smoltcp (важно для Download)
-            // Увеличиваем до 512KB для тяжелых профилей
-            tcp_rx_heavy: 256 * 1024,
-            tcp_tx_heavy: 256 * 1024,
+            tcp_rx_light: 32 * 1024, // Уменьшили с 64KB
+            tcp_tx_light: 32 * 1024,
 
-            tcp_rx_light: 64 * 1024,
-            tcp_tx_light: 64 * 1024,
-
-            udp_buf_heavy: 256 * 1024,
-            udp_meta_heavy: 1024, // Больше метаданных для мелких UDP пакетов
-            udp_buf_light: 32 * 1024,
-            udp_meta_light: 64,
+            udp_buf_heavy: 128 * 1024,
+            udp_meta_heavy: 512,
+            udp_buf_light: 16 * 1024,
+            udp_meta_light: 32,
         }
     }
 

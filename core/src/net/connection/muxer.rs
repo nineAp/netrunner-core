@@ -150,11 +150,13 @@ impl Muxer {
     }
 
     fn select_leg(&self, stream_id: u32) -> Option<MuxLeg> {
+        // 1. Читаем кэш (это Arc, поэтому clone здесь — это просто инкремент счетчика, не копирование данных)
         let legs = self.active_legs_cache.read().unwrap().clone();
         if legs.is_empty() {
             return None;
         }
 
+        // 2. Если поток уже привязан к леге, используем её (Sticky Connection)
         if let Some(leg_id_ref) = self.stream_bindings.get(&stream_id) {
             let leg_id = *leg_id_ref;
             if let Some(leg) = legs.iter().find(|l| l.id == leg_id) {
@@ -162,22 +164,31 @@ impl Muxer {
             }
         }
 
-        let mut candidates = (*legs).clone();
-        candidates.sort_by(|a, b| {
-            let score_a =
-                a.stats.rtt_ms.load(Ordering::Relaxed) as f64 + (a.congestion_factor() * 2000.0);
-            let score_b =
-                b.stats.rtt_ms.load(Ordering::Relaxed) as f64 + (b.congestion_factor() * 2000.0);
-            score_a
-                .partial_cmp(&score_b)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        // 3. O(N) поиск лучшей леги без сортировки всего вектора
+        // Мы берем подмножество (pool) и сразу ищем в нем минимум
+        let pool_size = std::cmp::min(legs.len(), MUXER_POOL_SIZE);
 
-        let pool_size = std::cmp::min(candidates.len(), MUXER_POOL_SIZE);
-        let selected_leg = candidates[stream_id as usize % pool_size].clone();
+        // Используем min_by, чтобы найти лучший вариант за один проход
+        let selected_leg = legs
+            .iter()
+            .take(pool_size) // Берем только пул
+            .min_by(|a, b| {
+                let score_a = a.stats.rtt_ms.load(Ordering::Relaxed) as f64
+                    + (a.congestion_factor() * 2000.0);
+                let score_b = b.stats.rtt_ms.load(Ordering::Relaxed) as f64
+                    + (b.congestion_factor() * 2000.0);
+                score_a
+                    .partial_cmp(&score_b)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .cloned();
 
-        self.stream_bindings.insert(stream_id, selected_leg.id);
-        Some(selected_leg)
+        if let Some(leg) = selected_leg {
+            self.stream_bindings.insert(stream_id, leg.id);
+            return Some(leg);
+        }
+
+        None
     }
 
     pub fn record_ping_sent(&self, leg_id: u32) {
@@ -215,17 +226,12 @@ impl Muxer {
         };
 
         let is_data = matches!(message.frame_type, FrameType::Data | FrameType::UdpData);
-        let target_tx = if is_data {
-            &leg.data_tx
-        } else {
-            &leg.control_tx
-        };
-
         let stream_id = message.stream_id;
         let size = message.data.len() as u64;
 
         if is_data {
-            match target_tx.try_send(message) {
+            // 💡 ДАННЫЕ: Используем .send().await для создания Backpressure
+            match leg.data_tx.send(message).await {
                 Ok(_) => {
                     leg.stats.tx_bytes.fetch_add(size, Ordering::Relaxed);
                     if let Some(stream_ref) = self.streams.get(&stream_id) {
@@ -237,24 +243,37 @@ impl Muxer {
                     }
                     Ok(())
                 }
-                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => Ok(()), // HoL Blocking eliminated
-                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                Err(_) => {
                     self.remove_leg(leg.id, &leg.control_tx);
                     Err(AppError::new(ERR_INFRA_TIMEOUT, "Обрыв", "Leg closed"))
                 }
             }
         } else {
-            match tokio::time::timeout(std::time::Duration::from_secs(2), target_tx.send(message))
-                .await
-            {
-                Ok(Ok(_)) => Ok(()),
-                _ => {
+            // 💡 КОНТРОЛЬ: Используем .try_send() для мгновенной приоритетной отправки (Non-blocking)
+            match leg.control_tx.try_send(message) {
+                Ok(_) => {
+                    leg.stats.tx_bytes.fetch_add(size, Ordering::Relaxed);
+                    if let Some(stream_ref) = self.streams.get(&stream_id) {
+                        stream_ref
+                            .value()
+                            .1
+                            .tx_bytes
+                            .fetch_add(size, Ordering::Relaxed);
+                    }
+                    Ok(())
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    // Канал контроля не должен забиваться. Если это произошло, пакет сбрасывается,
+                    // чтобы предотвратить зависание критических задач.
+                    netrunner_logger::warn!(
+                        stream_id,
+                        "Control queue FULL! Dropping control frame to avoid deadlock."
+                    );
+                    Ok(())
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                     self.remove_leg(leg.id, &leg.control_tx);
-                    Err(AppError::new(
-                        ERR_INFRA_TIMEOUT,
-                        "Таймаут",
-                        "Control send timeout",
-                    ))
+                    Err(AppError::new(ERR_INFRA_TIMEOUT, "Обрыв", "Leg closed"))
                 }
             }
         }
@@ -311,16 +330,18 @@ impl Muxer {
 
     #[inline]
     pub fn dispatch_to_local(&self, stream_id: u32, data: Bytes) {
-        if let Some(stream_ref) = self.streams.get(&stream_id) {
-            let tx = &stream_ref.value().0;
-            let stats = &stream_ref.value().1;
-            let size = data.len() as u64;
+        // Вычисляем размер здесь, так как переменная size не была определена
+        let size = data.len() as u64;
 
-            match tx.try_send(data) {
-                Ok(_) => {
-                    stats.rx_bytes.fetch_add(size, Ordering::Relaxed);
-                }
-                Err(_) => {} // Silent drop to avoid slowing down Reader Task
+        let tx_and_stats = self.streams.get(&stream_id).map(|s| {
+            let val = s.value();
+            (val.0.clone(), val.1.clone()) // Клонируем Arc и Sender
+        });
+
+        if let Some((tx, stats)) = tx_and_stats {
+            // Используем .try_send() для неблокирующей доставки в локальный поток
+            if tx.try_send(data).is_ok() {
+                stats.rx_bytes.fetch_add(size, Ordering::Relaxed);
             }
         }
     }

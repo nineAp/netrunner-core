@@ -68,6 +68,16 @@ impl TunnelEngine {
                 || self.rx_codec.is_none()
                 || self.tx_codec.is_none()
             {
+                // 💡 ИСПРАВЛЕНИЕ 2: Если это Сервер (remote_addr пуст), он НЕ должен делать реконнект.
+                // Мертвая лега должна просто завершиться и удалиться из памяти.
+                if self.remote_addr.is_empty() {
+                    info!(
+                        "Server leg {} dropped, shutting down engine task",
+                        self.leg_id
+                    );
+                    return Ok(());
+                }
+
                 self.leg_status = LegStatus::Reconnecting;
                 match self.attempt_reconnect().await {
                     Ok((new_in, new_out, new_rx, new_tx)) => {
@@ -91,7 +101,6 @@ impl TunnelEngine {
             let outbound = self.outbound.take().unwrap();
             let read_buf = std::mem::take(&mut self.read_buf);
 
-            // 💡 ИЗМЕНЕНО: Извлекаем кодеки и каналы из структуры во владение
             let mut rx_codec = self.rx_codec.take().unwrap();
             let mut tx_codec = self.tx_codec.take().unwrap();
             let mut control_rx = self.control_rx.take().expect("control_rx is missing");
@@ -106,11 +115,10 @@ impl TunnelEngine {
             let token_reader = token.clone();
             let token_writer = token.clone();
 
-            // ЧИТАЮЩАЯ ЗАДАЧА
+            // ЧИТАЮЩАЯ ЗАДАЧА (Остается без изменений)
             let mut reader_handle = tokio::spawn(async move {
                 let mut read_buf = read_buf;
                 let mut inbound = inbound;
-
                 const MAX_BUFFER_SIZE: usize = 1024 * 1024; // 1 MB
 
                 loop {
@@ -119,7 +127,7 @@ impl TunnelEngine {
                         return Err(AppError::new(
                             ERR_INFRA_TIMEOUT,
                             "Переполнение буфера",
-                            "Read buffer exceeded MAX_BUFFER_SIZE",
+                            "OOM Protection",
                         ));
                     }
 
@@ -134,29 +142,15 @@ impl TunnelEngine {
                             break;
                         }
                         res = inbound.read_buf(&mut read_buf) => {
-                            let n = res.map_err(|e| {
-                                AppError::new(
-                                    ERR_INFRA_TIMEOUT,
-                                    "Сбой сети",
-                                    e.to_string(),
-                                )
-                            })?;
-
+                            let n = res.map_err(|e| AppError::new(ERR_INFRA_TIMEOUT, "Сбой сети", e.to_string()))?;
                             if n == 0 {
-                                if read_buf.is_empty() {
-                                    info!("Connection closed by peer (Clean EOF)");
-                                } else {
-                                    error!("Connection abruptly closed by peer (Incomplete frame: {} bytes left)", read_buf.len());
-                                }
-                                // Возвращаем rx_codec обратно при EOF
+                                info!("Connection closed by peer (Clean EOF)");
                                 return Ok::<_, AppError>((true, read_buf, rx_codec));
                             }
 
                             muxer.record_leg_rx(leg_id, n as u64);
-
                             let mut frames = Vec::new();
 
-                            // 💡 ИЗМЕНЕНО: Вызов decode_inbound напрямую без блокировок
                             loop {
                                 match rx_codec.decode_inbound(&mut read_buf) {
                                     Ok(Some(frame)) => frames.push(frame),
@@ -164,19 +158,9 @@ impl TunnelEngine {
                                     Err(e) => {
                                         if e.action == ErrorAction::Wait { break; }
                                         if e.action == ErrorAction::Drop {
-                                            error!("CRITICAL: Crypto tampering or sync lost. Hard dropping tunnel!");
-                                            return Err(AppError::new(
-                                                ERR_NET_TLS_TAMPER,
-                                                "Критическая ошибка шифрования",
-                                                "Crypto drop",
-                                            ));
+                                            return Err(AppError::new(ERR_NET_TLS_TAMPER, "Ошибка шифрования", "Crypto drop"));
                                         }
-                                        error!(error = ?e, "Codec inbound failed");
-                                        return Err(AppError::new(
-                                            ERR_NET_TLS_TAMPER,
-                                            "Ошибка декодирования",
-                                            format!("Codec error: {:?}", e),
-                                        ));
+                                        return Err(AppError::new(ERR_NET_TLS_TAMPER, "Сбой кодека", format!("{:?}", e)));
                                     }
                                 }
                             }
@@ -184,9 +168,7 @@ impl TunnelEngine {
                             for frame in frames {
                                 if frame.header.frame_type == FrameType::Heartbeat {
                                     let m = muxer.clone();
-                                    tokio::spawn(async move {
-                                        m.record_pong(leg_id).await;
-                                    });
+                                    tokio::spawn(async move { m.record_pong(leg_id).await; });
                                 }
                                 handler.handle(frame).await;
                             }
@@ -201,18 +183,15 @@ impl TunnelEngine {
                 let mut outbound = outbound;
                 let mut heartbeat = tokio::time::interval(HEALTH_CHECK_INTERVAL);
 
+                let mut pending_data: Option<MuxMessage> = None;
+                const INTERLEAVE_CHUNK: usize = 16384;
+
                 loop {
                     tokio::select! {
                         biased;
+
                         _ = token_writer.cancelled() => break,
-                        msg_opt = control_rx.recv() => {
-                            if let Some(msg) = msg_opt {
-                                // 💡 ИЗМЕНЕНО: Передаем &mut tx_codec напрямую, никаких .lock().await!
-                                if let Err(e) = Self::handle_outbound(&mut outbound, &mut tx_codec, msg).await {
-                                    return Err((e, control_rx, data_rx, tx_codec));
-                                }
-                            } else { break; }
-                        }
+
                         _ = heartbeat.tick() => {
                             muxer_pong.record_ping_sent(leg_id);
                             let msg = MuxMessage { stream_id: 0, frame_type: FrameType::Heartbeat, data: Bytes::new() };
@@ -220,16 +199,48 @@ impl TunnelEngine {
                                 return Err((e, control_rx, data_rx, tx_codec));
                             }
                         }
-                        msg_opt = data_rx.recv() => {
+
+                        msg_opt = control_rx.recv() => {
                             if let Some(msg) = msg_opt {
                                 if let Err(e) = Self::handle_outbound(&mut outbound, &mut tx_codec, msg).await {
                                     return Err((e, control_rx, data_rx, tx_codec));
                                 }
                             } else { break; }
                         }
+
+                        // 💡 ИСПРАВЛЕНИЕ 1: Мгновенно заходим в эту ветку, если есть данные
+                        _ = std::future::ready(()), if pending_data.is_some() => {
+                            let mut msg = pending_data.take().unwrap();
+
+                            let chunk_size = std::cmp::min(msg.data.len(), INTERLEAVE_CHUNK);
+                            let chunk_data = msg.data.split_to(chunk_size);
+
+                            let chunk_msg = MuxMessage {
+                                stream_id: msg.stream_id,
+                                frame_type: msg.frame_type.clone(),
+                                data: chunk_data,
+                            };
+
+                            if let Err(e) = Self::handle_outbound(&mut outbound, &mut tx_codec, chunk_msg).await {
+                                return Err((e, control_rx, data_rx, tx_codec));
+                            }
+
+                            if !msg.data.is_empty() {
+                                pending_data = Some(msg);
+                            }
+
+                            // 💡 ИСПРАВЛЕНИЕ 1.2: Вызываем yield ЗДЕСЬ. Это заставит планировщик
+                            // проверить пинги и контрольные пакеты перед отправкой следующего куска.
+                            tokio::task::yield_now().await;
+                        }
+
+                        msg_opt = data_rx.recv(), if pending_data.is_none() => {
+                            if let Some(msg) = msg_opt {
+                                pending_data = Some(msg);
+                            } else { break; }
+                        }
                     }
                 }
-                // Возвращаем receiver'ы и tx_codec обратно при корректном завершении
                 Ok::<
                     _,
                     (
@@ -246,7 +257,7 @@ impl TunnelEngine {
                     match res_reader {
                         Ok(Ok((is_eof, r_buf, returned_rx_codec))) => {
                             self.read_buf = r_buf;
-                            self.rx_codec = Some(returned_rx_codec); // Восстанавливаем
+                            self.rx_codec = Some(returned_rx_codec);
                             if is_eof {
                                 token.cancel();
                                 let w_res = writer_handle.await.unwrap();
@@ -288,16 +299,23 @@ impl TunnelEngine {
             };
 
             token.cancel();
+            reader_handle.abort();
+            writer_handle.abort();
 
-            if let Err(e) = &res {
+            if let Err(e) = res {
                 error!("TunnelEngine critical failure: {}", e);
-                return res;
-            } else {
+                return Err(e);
+            }
+
+            // 💡 ИСПРАВЛЕНИЕ 2.2: И здесь тоже, если сервер словил EOF, он не должен идти на реконнект.
+            if self.remote_addr.is_empty() {
                 return Ok(());
             }
+
+            info!("Tunnel iteration finished, preparing to reconnect...");
+            continue;
         }
     }
-
     // 💡 ИЗМЕНЕНО: Принимает &mut TxCodec, синхронное и сверхбыстрое шифрование
     async fn handle_outbound(
         outbound: &mut OwnedWriteHalf,
@@ -342,8 +360,9 @@ impl TunnelEngine {
 
         for pkt in packets {
             let write_future = outbound.write_all(&pkt);
+            // 💡 ИЗМЕНЕНО: Увеличен таймаут отправки до 20 секунд для совместимости с агрессивным BBR
             if let Err(_) =
-                tokio::time::timeout(std::time::Duration::from_secs(10), write_future).await
+                tokio::time::timeout(std::time::Duration::from_secs(20), write_future).await
             {
                 error!(stream_id, "🔥 Physical leg STUCK on write. Killing leg.");
                 return Err(AppError::new(

@@ -1,4 +1,4 @@
-use bytes::{Bytes, BytesMut};
+use bytes::BytesMut;
 use chacha20poly1305::aead::generic_array::GenericArray;
 use chacha20poly1305::{AeadInPlace, ChaCha20Poly1305, Key, KeyInit, Nonce};
 
@@ -30,7 +30,6 @@ impl NonceState {
     }
 }
 
-// Универсальная структура для одного направления трафика (Tx или Rx)
 pub struct ChaChaStream {
     cipher: ChaCha20Poly1305,
     state: NonceState,
@@ -45,12 +44,14 @@ impl ChaChaStream {
     }
 }
 
-// Реализуем трейт AeadPacker для однонаправленного потока
 impl AeadPacker for ChaChaStream {
-    fn encrypt(&mut self, data: &mut BytesMut) -> Result<Bytes, chacha20poly1305::aead::Error> {
+    fn encrypt(&mut self, data: &mut BytesMut) -> Result<(), chacha20poly1305::aead::Error> {
         let current_counter = self.state.counter;
         let nonce = self.state.next_nonce();
         let data_len = data.len();
+
+        // Убеждаемся, что в BytesMut есть место для тега, чтобы избежать аллокации
+        data.reserve(16);
 
         match self.cipher.encrypt_in_place(&nonce, &nonce, data) {
             Ok(_) => {
@@ -60,7 +61,7 @@ impl AeadPacker for ChaChaStream {
                     len = data_len,
                     "Encryption successful"
                 );
-                Ok(data.split().freeze())
+                Ok(())
             }
             Err(e) => {
                 netrunner_logger::error!(
@@ -75,7 +76,7 @@ impl AeadPacker for ChaChaStream {
         }
     }
 
-    fn decrypt(&mut self, data: &mut BytesMut) -> Result<Bytes, chacha20poly1305::aead::Error> {
+    fn decrypt(&mut self, data: &mut BytesMut) -> Result<(), chacha20poly1305::aead::Error> {
         let current_counter = self.state.counter;
         let nonce = self.state.next_nonce();
         let data_len = data.len();
@@ -88,7 +89,7 @@ impl AeadPacker for ChaChaStream {
                     len = data_len,
                     "Decryption successful"
                 );
-                Ok(data.split().freeze())
+                Ok(())
             }
             Err(e) => {
                 let data_prefix = if data.len() >= 8 {
@@ -110,7 +111,6 @@ impl AeadPacker for ChaChaStream {
     }
 }
 
-// Контейнер для двух потоков, который легко разделяется
 pub struct ChaChaCipher {
     pub tx: ChaChaStream,
     pub rx: ChaChaStream,
@@ -130,7 +130,6 @@ impl ChaChaCipher {
         netrunner_logger::debug!("Cipher keys and IVs updated for both directions");
     }
 
-    // Возвращает независимые потоки (Rx, Tx) для параллельной работы в Tokio
     pub fn split(self) -> (ChaChaStream, ChaChaStream) {
         (self.rx, self.tx)
     }

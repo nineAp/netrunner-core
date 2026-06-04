@@ -54,15 +54,8 @@ impl RawCastFrame {
         Self::new(protocol, RawCastEvent::Connect, id, ip, port, Bytes::new())
     }
 
-    pub fn data(protocol: LocalProtocol, id: u64, ip: Ipv4Addr, port: u16, data: Vec<u8>) -> Self {
-        Self::new(
-            protocol,
-            RawCastEvent::Data,
-            id,
-            ip,
-            port,
-            Bytes::from(data),
-        )
+    pub fn data(protocol: LocalProtocol, id: u64, ip: Ipv4Addr, port: u16, data: Bytes) -> Self {
+        Self::new(protocol, RawCastEvent::Data, id, ip, port, data)
     }
 
     pub fn close(protocol: LocalProtocol, id: u64, ip: Ipv4Addr, port: u16) -> Self {

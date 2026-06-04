@@ -285,7 +285,7 @@ impl TcpConnection {
                     socket_id,
                     dst_ip,
                     dst_port,
-                    data.to_vec(),
+                    data
                 );
 
                 if tx_tunnel.send(data_frame).await.is_err() {
@@ -391,7 +391,7 @@ impl UdpConnection {
 
             while let Some((data, ip, port)) = rx_smol.recv().await {
                 let data_frame =
-                    RawCastFrame::data(LocalProtocol::Udp, socket_id, ip, port, data.to_vec());
+                    RawCastFrame::data(LocalProtocol::Udp, socket_id, ip, port, data);
                 if tx_tunnel.send(data_frame).await.is_err() {
                     break;
                 }

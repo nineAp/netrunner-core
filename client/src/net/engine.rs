@@ -220,18 +220,31 @@ impl Engine {
     ) {
         tokio::spawn(async move {
             debug!("TUN Reader task started");
-            let mut buf = [0u8; 65536];
-            while let Ok(n) = reader.read(&mut buf).await {
-                if n == 0 {
-                    break;
-                }
-                let mut token = TokenBuffer::with_capacity(n);
-                token.extend_from_slice(&buf[..n]);
 
-                if to_engine.send(token).is_ok() {
-                    is_avail.store(true, Ordering::Release);
-                } else {
-                    break;
+            loop {
+                // 1. Берем чистый буфер
+                let mut token = TokenBuffer::with_capacity(65536);
+
+                // 2. Используем временный срез для чтения
+                // Это гарантирует, что мы пишем в начало буфера
+                let mut temp_buf = [0u8; 65536];
+
+                match reader.read(&mut temp_buf).await {
+                    Ok(n) if n > 0 => {
+                        // 3. Копируем в наш TokenBuffer (это быстро, 64кБ - это L1 кэш)
+                        token.extend_from_slice(&temp_buf[..n]);
+
+                        if to_engine.send(token).is_ok() {
+                            is_avail.store(true, Ordering::Release);
+                        } else {
+                            break;
+                        }
+                    }
+                    Ok(_) => break, // EOF
+                    Err(e) => {
+                        error!("FATAL: TUN Reader task died with error: {}", e);
+                        break;
+                    }
                 }
             }
         });
