@@ -207,7 +207,7 @@ pub fn setup_platform_routing(
     Ok(())
 }
 
-pub fn reset_platform_routing(_proxy_ip: Option<&str>) -> io::Result<()> {
+pub fn reset_platform_routing(_proxy_ip: Option<&str>, _was_killswitch: &bool) -> io::Result<()> {
     #[cfg(target_os = "linux")]
     {
         let _ = run_cmd_ext("ip link delete netr0", true);
@@ -231,7 +231,7 @@ pub fn reset_platform_routing(_proxy_ip: Option<&str>) -> io::Result<()> {
             true,
         );
 
-        if was_killswitch {
+        if _was_killswitch {
             netrunner_logger::info!(
                 "Restoring physical default route (DHCP renew needed or manual restore)"
             );

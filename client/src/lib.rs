@@ -41,6 +41,7 @@ pub struct VpnTrafficStats {
 pub struct Session {
     pub(crate) cancel_token: CancellationToken,
     pub(crate) proxy_ip: String,
+    pub(crate) killswitch_enabled: bool,
 }
 
 #[uniffi::export]
@@ -48,7 +49,7 @@ impl Session {
     pub fn stop(&self) {
         info!("Stopping session...");
         self.cancel_token.cancel();
-        let _ = reset_platform_routing(Some(&self.proxy_ip));
+        let _ = reset_platform_routing(Some(&self.proxy_ip), &self.killswitch_enabled);
     }
 }
 
@@ -56,7 +57,7 @@ impl Drop for Session {
     fn drop(&mut self) {
         info!("Session dropped, stopping all tasks...");
         self.cancel_token.cancel();
-        let _ = reset_platform_routing(Some(&self.proxy_ip));
+        let _ = reset_platform_routing(Some(&self.proxy_ip), &self.killswitch_enabled);
     }
 }
 
@@ -165,6 +166,7 @@ impl SessionManager {
         Arc::new(Session {
             cancel_token: session_token,
             proxy_ip: remote_proxy_ip,
+            killswitch_enabled: killswitch_enabled,
         })
     }
     pub fn get_traffic_stats(&self) -> VpnTrafficStats {

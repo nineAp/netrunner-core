@@ -316,6 +316,7 @@ impl TunnelEngine {
             continue;
         }
     }
+
     // 💡 ИЗМЕНЕНО: Принимает &mut TxCodec, синхронное и сверхбыстрое шифрование
     async fn handle_outbound(
         outbound: &mut OwnedWriteHalf,
