@@ -1,5 +1,6 @@
 use netrunner_logger::{error, info};
 use std::io;
+
 use std::process::Command;
 
 pub fn run_cmd_ext(full_cmd: &str, ignore_errors: bool) -> io::Result<()> {
@@ -10,7 +11,18 @@ pub fn run_cmd_ext(full_cmd: &str, ignore_errors: bool) -> io::Result<()> {
         return Ok(());
     }
 
-    let status = Command::new(&parts[0]).args(&parts[1..]).status()?;
+    let mut cmd = Command::new(&parts[0]);
+    cmd.args(&parts[1..]);
+
+    // Добавляем логику для скрытия окна на Windows
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        // 0x08000000 — это флаг CREATE_NO_WINDOW
+        cmd.creation_flags(0x08000000);
+    }
+
+    let status = cmd.status()?;
 
     if !status.success() && !ignore_errors {
         let err = format!("Command failed: {} with status {}", full_cmd, status);
@@ -207,7 +219,7 @@ pub fn setup_platform_routing(
     Ok(())
 }
 
-pub fn reset_platform_routing(_proxy_ip: Option<&str>, _was_killswitch: &bool) -> io::Result<()> {
+pub fn reset_platform_routing(_proxy_ip: Option<&str>, _was_killswitch: bool) -> io::Result<()> {
     #[cfg(target_os = "linux")]
     {
         let _ = run_cmd_ext("ip link delete netr0", true);

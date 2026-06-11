@@ -49,7 +49,7 @@ impl Session {
     pub fn stop(&self) {
         info!("Stopping session...");
         self.cancel_token.cancel();
-        let _ = reset_platform_routing(Some(&self.proxy_ip), &self.killswitch_enabled);
+        let _ = reset_platform_routing(Some(&self.proxy_ip), self.killswitch_enabled);
     }
 }
 
@@ -57,7 +57,7 @@ impl Drop for Session {
     fn drop(&mut self) {
         info!("Session dropped, stopping all tasks...");
         self.cancel_token.cancel();
-        let _ = reset_platform_routing(Some(&self.proxy_ip), &self.killswitch_enabled);
+        let _ = reset_platform_routing(Some(&self.proxy_ip), self.killswitch_enabled);
     }
 }
 
