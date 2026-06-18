@@ -6,7 +6,7 @@ use netrunner_core::{
     },
     rawcast::RawCastFrame,
 };
-use netrunner_logger::{debug, warn};
+use netrunner_logger::warn;
 use smoltcp::{
     iface::{SocketHandle, SocketSet},
     socket::{Socket, tcp, udp},

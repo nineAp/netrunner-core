@@ -4,7 +4,7 @@ use std::{
     ops::{Deref, DerefMut},
     sync::{
         Arc, LazyLock, Mutex,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Instant as StdInstant,
 };

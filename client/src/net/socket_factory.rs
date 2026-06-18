@@ -92,7 +92,7 @@ impl SocketProvider for SmolSocketFactory {
         socket
     }
 
-    fn reconfigure_tcp(&self, socket: &mut tcp::Socket, profile: TrafficProfile) {
+    fn reconfigure_tcp(&self, socket: &mut tcp::Socket, _profile: TrafficProfile) {
         socket.set_nagle_enabled(false);
 
         socket.set_ack_delay(None);

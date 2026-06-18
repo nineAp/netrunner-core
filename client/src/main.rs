@@ -65,7 +65,7 @@ async fn main() -> anyhow::Result<()> {
     let addr: std::net::SocketAddr = remote_address.parse().expect("Invalid address format");
     let p_ip = addr.ip().to_string();
 
-    if let Err(e) = reset_platform_routing(Some(&p_ip)) {
+    if let Err(e) = reset_platform_routing(Some(&p_ip), false) {
         error!("Failed to restore routing: {}", e);
     } else {
         info!("System routing restored successfully.");
