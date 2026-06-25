@@ -1,8 +1,6 @@
 use bytes::Bytes;
 use std::net::Ipv4Addr;
 
-use netrunner_logger::{debug, trace};
-
 use crate::{
     nrxp::{Frame, FrameType},
     rawcast::frame::{LocalProtocol, RawCastEvent, RawCastFrame},

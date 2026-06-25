@@ -2,8 +2,6 @@ use crate::parser::Parser;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use rand::Rng;
 
-pub const MAX_PADDING_SIZE: u32 = 255;
-
 #[derive(Copy, Clone, Debug, PartialEq)]
 #[repr(u8)]
 pub(crate) enum FrameType {
@@ -15,8 +13,6 @@ pub(crate) enum FrameType {
     UdpData = 0x05,
 }
 
-// 🔥 ОПТИМИЗАЦИЯ: Поля отсортированы по размеру для идеального Data Packing
-// (устраняет скрытые байты выравнивания, структура ровно 28 байт в памяти).
 #[derive(Copy, Clone)]
 pub(crate) struct FrameHeader {
     pub(crate) auth_tag: [u8; 16],
@@ -40,6 +36,7 @@ const PADDING_LEN_SIZE: u16 = 2;
 
 pub const FRAME_HEADER_SIZE: u16 =
     AUTH_TAG_SIZE + STREAM_ID_SIZE + FRAME_TYPE_SIZE + PAYLOAD_LEN_SIZE + PADDING_LEN_SIZE; // 25 bytes
+pub const MAX_FRAME_PAYLOAD: usize = 16 * 1024;
 
 impl Frame {
     #[inline(always)]

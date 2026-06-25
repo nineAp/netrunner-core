@@ -1,0 +1,26 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls -la /home/kirill/netrunner-proxy 2>/dev/null || ls -la ~/netrunner-proxy 2>/dev/null || pwd)",
+      "Bash(ls -la /home/kirill/ 2>/dev/null | grep -E \"nxrp|netrunner\")",
+      "Bash(ls -la //wsl.localhost/ubuntu-22.04/home/kirill/ | grep -E \"nxrp|netrunner\")",
+      "Bash(ls -la //wsl.localhost/ubuntu-22.04/home/kirill/netrunner-proxy/)",
+      "Bash(find //wsl.localhost/ubuntu-22.04/home/kirill/nxrp-smoltcp -type f \\\\\\( -name \"*.rs\" -o -name \"*.toml\" \\\\\\) | head -50)",
+      "Bash(find //wsl.localhost/ubuntu-22.04/home/kirill/netrunner-proxy/core/src -name \"*.rs\" | sort)",
+      "Bash(find //wsl.localhost/ubuntu-22.04/home/kirill/nxrp-smoltcp/src -maxdepth 1 -type f -name \"*.rs\")",
+      "Bash(find //wsl.localhost/ubuntu-22.04/home/kirill/netrunner-proxy/server/src -name \"*.rs\" | sort)",
+      "Bash(ls -la //wsl.localhost/ubuntu-22.04/home/kirill/nxrp-smoltcp/src/socket/)",
+      "Bash(ls -la //wsl.localhost/ubuntu-22.04/home/kirill/nxrp-smoltcp/src/phy/)",
+      "Bash(ls -la //wsl.localhost/ubuntu-22.04/home/kirill/nxrp-smoltcp/src/iface/)",
+      "Bash(ls -la //wsl.localhost/ubuntu-22.04/home/kirill/nxrp-smoltcp/src/storage/)",
+      "Bash(find //wsl.localhost/ubuntu-22.04/home/kirill/nxrp-smoltcp -name \"README*\" -o -name \"*.md\" | grep -v target)",
+      "Bash(grep -r \"netrunner\\\\|proxy\\\\|interface\\\\|Channel\\\\|trait.*Device\" //wsl.localhost/ubuntu-22.04/home/kirill/nxrp-smoltcp/src --include=\"*.rs\" | head -30)",
+      "Bash(grep -r \"pub trait\\\\|pub struct.*Device\" //wsl.localhost/ubuntu-22.04/home/kirill/nxrp-smoltcp/src/phy --include=\"*.rs\" -A 5 | head -80)",
+      "Bash(grep -r \"netrunner\\\\|proxy\\\\|nxrp\" //wsl.localhost/ubuntu-22.04/home/kirill/nxrp-smoltcp --include=\"*.rs\" --include=\"*.md\" --include=\"*.toml\" 2>/dev/null | grep -v target)",
+      "Bash(head -50 //wsl.localhost/ubuntu-22.04/home/kirill/nxrp-smoltcp/CHANGELOG.md)",
+      "Bash(grep -n \"impl.*Device\\\\|impl.*RxToken\\\\|impl.*TxToken\" //wsl.localhost/ubuntu-22.04/home/kirill/nxrp-smoltcp/src/phy/*.rs | head -40)",
+      "mcp__visualize__read_me",
+      "mcp__visualize__show_widget"
+    ]
+  }
+}

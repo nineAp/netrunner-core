@@ -17,7 +17,7 @@ use crate::{
         connection::{handler::StreamHandler, muxer::MuxMessage},
         NetworkConfig, HEALTH_CHECK_INTERVAL,
     },
-    nrxp::{ErrorAction, FrameType, RxCodec, TxCodec},
+    nrxp::{ErrorAction, FrameType, RxCodec, TxCodec, MAX_FRAME_PAYLOAD},
 };
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -330,7 +330,7 @@ impl TunnelEngine {
 
         if frame_type == FrameType::Data {
             while !data.is_empty() {
-                let chunk_size = std::cmp::min(data.len(), NetworkConfig::global().tcp_chunk_size);
+                let chunk_size = std::cmp::min(data.len(), MAX_FRAME_PAYLOAD);
                 let chunk = data.split_to(chunk_size);
 
                 match tx_codec.encode_frame(stream_id, frame_type.clone(), chunk) {

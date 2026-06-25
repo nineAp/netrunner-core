@@ -29,7 +29,7 @@ pub struct Logger {
 static INIT: Once = Once::new();
 static LOGGER: OnceLock<Logger> = OnceLock::new();
 
-// Слой для маскировки PII (Privacy by Design)
+#[allow(dead_code)]
 struct PiiRedactorLayer {
     ip_regex: Regex,
 }

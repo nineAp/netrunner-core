@@ -33,9 +33,9 @@ impl NetworkConfig {
             connection_buf_size: 128 * 1024, // Уменьшили с 256KB
             tcp_buffer_size: 128 * 1024,     // Уменьшили с 256KB
             udp_buffer_size: 64 * 1024,      // Уменьшили со 128KB
-            tcp_chunk_size: 1024 * 1024 * 64,
+            tcp_chunk_size: 1024 * 64,
 
-            channel_capacity: 512,
+            channel_capacity: 16,
 
             // Окна smoltcp (уменьшаем, чтобы не создавать огромные очереди)
             tcp_rx_heavy: 128 * 1024,

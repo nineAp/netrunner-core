@@ -48,6 +48,8 @@ pub enum ConnectionState {
     Closed,
 }
 
+
+
 pub struct TcpConnection {
     core: ConnectionCore<Bytes>,
     state: ConnectionState,
@@ -62,9 +64,20 @@ pub struct TcpConnection {
     total_down_bytes: u64,
     rx_congested: bool,
     tx_congested: bool, 
+    last_rtt_push_ms: i64,
+    last_pushed_rtt_ms: u32,
 }
 
 impl TcpConnection {
+    const RTT_PUSH_INTERVAL_MS: i64 = 50;
+    const RTT_CHANGE_RATIO: f64 = 0.10;
+
+    const BUF_FLOOR: usize = 64 * 1024;
+/// Верхняя граница (2 МБ) — тоже как в smoltcp.
+    const BUF_CEIL: usize = 2 * 1024 * 1024;
+    /// Fallback, когда BBR ещё не дал оценку BDP.
+    const BUF_FALLBACK: usize = 256 * 1024;
+
     pub fn new(
         handle: SocketHandle,
         permit: tokio::sync::OwnedSemaphorePermit,
@@ -91,6 +104,8 @@ impl TcpConnection {
             total_down_bytes: 0,
             rx_congested: false,
             tx_congested: false,
+            last_rtt_push_ms: i64::MIN,
+            last_pushed_rtt_ms: 0,
         };
 
         (conn, rx_from_smol, tx_to_smol, handshake_tx, is_saturated)
@@ -151,10 +166,61 @@ impl TcpConnection {
         true
     }
 
-    fn poll_and_process(&mut self, socket: &mut tcp::Socket, timestamp: smoltcp::time::Instant) {
+    fn maybe_update_tunnel_rtt(
+    &mut self,
+    socket: &mut tcp::Socket,
+    timestamp: smoltcp::time::Instant,
+    ) {
+        let now_ms = timestamp.total_millis();
+
+        // 1. Троттлинг по времени (кроме самого первого вызова).
+        if self.last_rtt_push_ms != i64::MIN
+            && now_ms - self.last_rtt_push_ms < Self::RTT_PUSH_INTERVAL_MS
+        {
+            return;
+        }
+
         let current_rtt = GLOBAL_MIN_RTT.load(Ordering::Relaxed);
-        let rtt = smoltcp::time::Duration::from_millis(current_rtt as u64);
-        socket.set_tunnel_rtt(rtt);
+
+        // 2. Игнорируем заведомо некорректное нулевое значение.
+        if current_rtt == 0 {
+            return;
+        }
+
+        // 3. Обновляем только при значимом изменении (или при первом запуске).
+        let first_push = self.last_rtt_push_ms == i64::MIN;
+        let changed_enough = if self.last_pushed_rtt_ms == 0 {
+            true
+        } else {
+            let prev = self.last_pushed_rtt_ms as f64;
+            let diff = (current_rtt as f64 - prev).abs();
+            diff / prev >= Self::RTT_CHANGE_RATIO
+        };
+
+        if first_push || changed_enough {
+            socket.set_tunnel_rtt(smoltcp::time::Duration::from_millis(current_rtt as u64));
+            let aqm_age = (current_rtt as u64 * 2).max(50);
+            socket.set_aqm_max_age(aqm_age);
+            self.last_pushed_rtt_ms = current_rtt;
+            self.last_rtt_push_ms = now_ms;
+            debug!(%self.core.handle, "BBR RTT: {} ms", current_rtt);
+        } else {
+            self.last_rtt_push_ms = now_ms;
+        }
+    }
+
+    fn optimal_buffer_size(&self, socket: &tcp::Socket) -> usize {
+        let bdp = socket.estimated_bdp();
+        if bdp == 0 {
+            // BBR ещё не оценил полосу (старт соединения) — безопасный дефолт.
+            Self::BUF_FALLBACK
+        } else {
+            (bdp.saturating_mul(2)).clamp(Self::BUF_FLOOR, Self::BUF_CEIL)
+        }
+    }
+
+    fn poll_and_process(&mut self, socket: &mut tcp::Socket, timestamp: smoltcp::time::Instant) {
+        self.maybe_update_tunnel_rtt(socket, timestamp);
 
         // 1. Читаем из браузера -> в Туннель (Upload)
         while socket.can_recv() && self.core.tx.capacity() > 0 {
@@ -190,26 +256,39 @@ impl TcpConnection {
 
         // 2. Читаем из Туннеля -> в Браузер (Download)
         if !self.server_eof {
+            // Считаем пороги ОДИН раз до цикла: BDP за время цикла не изменится,
+            // а дёргать BBR на каждой итерации незачем.
+            let optimal = self.optimal_buffer_size(socket);
+            let congestion_threshold = optimal + optimal / 2; // optimal * 1.5
+            let relief_threshold = optimal / 2;                // optimal * 0.5  (гистерезис 3:1)
+
             loop {
-                if self.pending_bytes > 1024 * 1024 { 
+                if self.pending_bytes > congestion_threshold {
                     if !self.rx_congested {
-                        netrunner_logger::warn!(%self.core.handle, "🟡 Download Congestion: App buffer high. Pausing tunnel read.");
+                        netrunner_logger::warn!(
+                            %self.core.handle,
+                            "🟡 Download Congestion: pending={} > {} (optimal={}). Pausing tunnel read.",
+                            self.pending_bytes, congestion_threshold, optimal
+                        );
                         self.rx_congested = true;
-                        self.core.is_saturated.store(true, Ordering::Release); // 🔥 ОПОВЕЩАЕМ ENGINE
+                        self.core.is_saturated.store(true, Ordering::Release);
                     }
                     break;
-                } 
-                // Нижний порог (512 КБ)
-                else if self.rx_congested && self.pending_bytes < 512 * 1024 {
-                    netrunner_logger::debug!(%self.core.handle, "🟢 Download buffer relieved. Resuming tunnel read.");
+                }
+                else if self.rx_congested && self.pending_bytes < relief_threshold {
+                    netrunner_logger::debug!(
+                        %self.core.handle,
+                        "🟢 Download buffer relieved: pending={} < {}. Resuming tunnel read.",
+                        self.pending_bytes, relief_threshold
+                    );
                     self.rx_congested = false;
-                    self.core.is_saturated.store(false, Ordering::Release); // 🔥 ДАЕМ ДОБРО ENGINE
+                    self.core.is_saturated.store(false, Ordering::Release);
                 }
 
                 match self.core.rx.try_recv() {
                     Ok(data) => {
                         self.pending_bytes += data.len();
-                        self.total_down_bytes += data.len() as u64; // Учет Download
+                        self.total_down_bytes += data.len() as u64;
                         self.pending_data.push_back(data);
                     }
                     Err(mpsc::error::TryRecvError::Empty) => break,

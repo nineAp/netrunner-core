@@ -38,6 +38,7 @@ impl BrowserProfile {
         target_padding_len: 512,
     };
 
+    #[allow(dead_code)]
     pub const FIREFOX_130: Self = Self {
         groups: TlsGroups::MODERN,
         signatures: TlsSignatures::BROWSER_STANDARD,
