@@ -65,7 +65,24 @@
       "PowerShell(wsl -d Ubuntu-22.04 -u kirill -- bash -c \"RUST_BACKTRACE=1 /home/kirill/.cargo/bin/cargo check -p netrunner-client --manifest-path /home/kirill/netrunner-proxy/Cargo.toml 2>&1 | tail -20\")",
       "PowerShell(wsl -d Ubuntu-22.04 -u kirill -- bash -c \"RUST_BACKTRACE=1 /home/kirill/.cargo/bin/cargo check -p netrunner-client --bin netrunner-client --manifest-path /home/kirill/netrunner-proxy/Cargo.toml 2>&1 | tail -15\")",
       "Bash(find //wsl.localhost/ubuntu-22.04/home/kirill/netrunner-proxy/core/src -type f -name \"*.rs\" | sort)",
-      "Bash(find \"//wsl.localhost/ubuntu-22.04/home/kirill/netrunner-proxy/core/src\" -name \"*.rs\" 2>/dev/null | head -50)"
+      "Bash(find \"//wsl.localhost/ubuntu-22.04/home/kirill/netrunner-proxy/core/src\" -name \"*.rs\" 2>/dev/null | head -50)",
+      "Bash(wsl -d ubuntu-22.04 -- bash -c \"cd /home/kirill/netrunner-proxy && cargo check -p netrunner-core 2>&1 | grep -E '^error' | head -20\")",
+      "Bash(wsl -d ubuntu-22.04 -- bash -c \"cd /home/kirill/netrunner-proxy && cargo check -p netrunner-core 2>&1 | tail -30\")",
+      "Bash(wsl -d ubuntu-22.04 -- bash -c \"cd /home/kirill/netrunner-proxy && ~/.cargo/bin/cargo check -p netrunner-core 2>&1 | tail -15\")",
+      "Bash(wsl -d ubuntu-22.04 -- bash -c \"cd /home/kirill/netrunner-proxy && ~/.cargo/bin/cargo check -p netrunner-core 2>&1 | grep 'error\\\\[' | head -20\")",
+      "Bash(wsl -d ubuntu-22.04 -- bash -c \"cd /home/kirill/netrunner-proxy && ~/.cargo/bin/cargo check -p netrunner-core 2>&1 | grep -E 'error\\\\[|-->'\")",
+      "Bash(wsl -d ubuntu-22.04 -- bash -c \"cd /home/kirill/netrunner-proxy && ~/.cargo/bin/cargo check -p netrunner-core 2>&1 | grep -E '^error|error\\\\[' | head -20\")",
+      "Bash(grep -A 5 'tokio' //wsl.localhost/ubuntu-22.04/home/kirill/netrunner-proxy/core/Cargo.toml)",
+      "Bash(wsl -d ubuntu-22.04 -- bash -c \"cd /home/kirill/netrunner-proxy && ~/.cargo/bin/cargo check -p netrunner-core 2>&1 | grep -v '^warning' | head -60\")",
+      "Bash(wsl -d ubuntu-22.04 -- bash -c \"cd /home/kirill/netrunner-proxy && ~/.cargo/bin/cargo check --exclude netrunner-client 2>&1 | grep -E '^error' | head -20\")",
+      "Bash(wsl -d ubuntu-22.04 -- bash -c \"cd /home/kirill/netrunner-proxy && ~/.cargo/bin/cargo check --workspace --exclude netrunner-client 2>&1 | grep -E '^error' | head -20\")",
+      "Bash(wsl -d ubuntu-22.04 -- bash -c \"cd /home/kirill/netrunner-proxy && ~/.cargo/bin/cargo check --workspace --exclude netrunner-client 2>&1 | grep -E 'warning.*bridge|warning.*unused.*bridge|bridge.*unused'\")",
+      "Bash(wsl -d ubuntu-22.04 -- bash -c \"cd /home/kirill/netrunner-proxy && ~/.cargo/bin/cargo check --workspace --exclude netrunner-client 2>&1 | grep 'unused import'\")",
+      "Bash(wsl -d ubuntu-22.04 -- bash -c \"cd /home/kirill/netrunner-proxy && ~/.cargo/bin/cargo check --workspace --exclude netrunner-client 2>&1 | grep -E 'warning.*unused' | grep -E 'bridge|muxer'\")",
+      "Bash(wsl -d ubuntu-22.04 -- bash -c \"cd /home/kirill/netrunner-proxy && ~/.cargo/bin/cargo check --workspace --exclude netrunner-client 2>&1 | grep -B1 'unused import'\")",
+      "Bash(wsl -d ubuntu-22.04 -- bash -c \"cd /home/kirill/netrunner-proxy && ~/.cargo/bin/cargo check --workspace --exclude netrunner-client 2>&1 | grep -A3 'unused import'\")",
+      "Bash(wsl -d ubuntu-22.04 -- bash -c \"cd /home/kirill/netrunner-proxy && ~/.cargo/bin/cargo check --workspace --exclude netrunner-client 2>&1 | grep -E '^error|unused import'\")",
+      "Bash(wsl -d ubuntu-22.04 -- bash -c \"cd /home/kirill/netrunner-proxy && ~/.cargo/bin/cargo check --workspace --exclude netrunner-client 2>&1 | grep -E '^error'\")"
     ]
   }
 }

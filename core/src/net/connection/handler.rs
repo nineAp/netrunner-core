@@ -112,7 +112,7 @@ impl StreamHandler {
                     });
                 } else if payload == b"PONG" {
                     trace!(stream_id, "🤝 [Tunnel] PONG received");
-                    self.muxer.dispatch_to_local(stream_id, frame.payload);
+                    self.muxer.dispatch_to_local(stream_id, frame.payload).await;
                 } else {
                     if self.opener.is_some() {
                         trace!(

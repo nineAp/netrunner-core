@@ -230,19 +230,23 @@ impl ClientHandler {
             )
         })?;
 
-        let stream = tokio::time::timeout(
-            FALLBACK_CONNECT_TIMEOUT,
-            tokio::net::TcpStream::connect(addr),
-        )
-        .await
-        .map_err(|_| {
-            AppError::new(
-                ERR_INFRA_TIMEOUT,
-                "Таймаут подключения",
-                "Connection timeout",
-            )
-        })?
+        let socket = (if addr.is_ipv4() {
+            tokio::net::TcpSocket::new_v4()
+        } else {
+            tokio::net::TcpSocket::new_v6()
+        })
         .map_err(|e| AppError::new(ERR_INFRA_TIMEOUT, "Сбой сокета", e.to_string()))?;
+        // Limit OS TCP send buffer to reduce bufferbloat on the tunnel leg.
+        // Default buffers (4–8 MB) can hold seconds of data at mobile speeds.
+        let _ = socket.set_send_buffer_size(crate::net::TUNNEL_SOCKET_SNDBUF);
+        let _ = socket.set_recv_buffer_size(crate::net::TUNNEL_SOCKET_RCVBUF);
+
+        let stream = tokio::time::timeout(FALLBACK_CONNECT_TIMEOUT, socket.connect(addr))
+            .await
+            .map_err(|_| {
+                AppError::new(ERR_INFRA_TIMEOUT, "Таймаут подключения", "Connection timeout")
+            })?
+            .map_err(|e| AppError::new(ERR_INFRA_TIMEOUT, "Сбой сокета", e.to_string()))?;
 
         let (inbound, outbound, rx_codec, tx_codec) =
             Self::perform_handshake(stream, session_id, leg_id).await?;

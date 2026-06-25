@@ -15,9 +15,10 @@ use tracing::instrument;
 use crate::{
     net::{
         connection::{handler::StreamHandler, muxer::MuxMessage},
-        NetworkConfig, HEALTH_CHECK_INTERVAL, FALLBACK_CONNECT_TIMEOUT,
-        RECONNECT_BACKOFF_BASE, RECONNECT_BACKOFF_JITTER_MS,
-        TUNNEL_INTERLEAVE_CHUNK, TUNNEL_MAX_BUFFER_SIZE, TUNNEL_READ_RESERVE,
+        NetworkConfig, FALLBACK_CONNECT_TIMEOUT, HEALTH_CHECK_INTERVAL,
+        MAX_INTERNAL_RECONNECT_ATTEMPTS, MAX_RECONNECT_BACKOFF_MS, RECONNECT_BACKOFF_BASE,
+        RECONNECT_BACKOFF_JITTER_MS, TUNNEL_INTERLEAVE_CHUNK, TUNNEL_MAX_BUFFER_SIZE,
+        TUNNEL_READ_RESERVE,
     },
     nrxp::{ErrorAction, FrameType, RxCodec, TxCodec, MAX_FRAME_PAYLOAD},
 };
@@ -50,19 +51,41 @@ impl TunnelEngine {
         &mut self,
     ) -> Result<(OwnedReadHalf, OwnedWriteHalf, RxCodec, TxCodec), AppError> {
         info!("🔄 Attempting reconnect to {}", self.remote_addr);
-        let stream = tokio::time::timeout(
-            FALLBACK_CONNECT_TIMEOUT,
-            tokio::net::TcpStream::connect(&self.remote_addr),
-        )
-        .await
-        .map_err(|_| AppError::new(ERR_INFRA_TIMEOUT, "Сбой сети", "Reconnect timeout"))?
-        .map_err(|e| AppError::new(ERR_INFRA_TIMEOUT, "Сбой сети", e.to_string()))?;
+
+        // Re-resolve the hostname each time so a server IP change or DNS
+        // failover is picked up automatically.
+        let mut addrs = tokio::net::lookup_host(&self.remote_addr)
+            .await
+            .map_err(|e| AppError::new(ERR_INFRA_TIMEOUT, "DNS при реконнекте", e.to_string()))?;
+        let addr = addrs.next().ok_or_else(|| {
+            AppError::new(ERR_INFRA_TIMEOUT, "Нет IP", "No IPs for reconnect addr")
+        })?;
+
+        let socket = (if addr.is_ipv4() {
+            tokio::net::TcpSocket::new_v4()
+        } else {
+            tokio::net::TcpSocket::new_v6()
+        })
+        .map_err(|e| AppError::new(ERR_INFRA_TIMEOUT, "Сокет", e.to_string()))?;
+        let _ = socket.set_send_buffer_size(crate::net::TUNNEL_SOCKET_SNDBUF);
+        let _ = socket.set_recv_buffer_size(crate::net::TUNNEL_SOCKET_RCVBUF);
+
+        let stream = tokio::time::timeout(FALLBACK_CONNECT_TIMEOUT, socket.connect(addr))
+            .await
+            .map_err(|_| AppError::new(ERR_INFRA_TIMEOUT, "Сбой сети", "Reconnect timeout"))?
+            .map_err(|e| AppError::new(ERR_INFRA_TIMEOUT, "Сбой сети", e.to_string()))?;
 
         crate::net::ClientHandler::perform_handshake(stream, &self.session_id, self.leg_id).await
     }
 
     #[instrument(skip_all, fields(leg_id = self.leg_id))]
     pub async fn run(mut self) -> Result<(), AppError> {
+        // Tracks consecutive internal reconnect failures.  Resets to 0 on
+        // success.  When it reaches MAX_INTERNAL_RECONNECT_ATTEMPTS the engine
+        // returns Err so the outer establish_leg loop gets control: it re-runs
+        // DNS, resets its own counters, and emits proper diagnostic events.
+        let mut internal_attempt: u32 = 0;
+
         loop {
             // Проверяем наличие всех необходимых ресурсов
             if self.inbound.is_none()
@@ -83,6 +106,8 @@ impl TunnelEngine {
                 self.leg_status = LegStatus::Reconnecting;
                 match self.attempt_reconnect().await {
                     Ok((new_in, new_out, new_rx, new_tx)) => {
+                        internal_attempt = 0; // successful reconnect — reset counter
+
                         let cap = crate::net::NetworkConfig::global().channel_capacity;
                         let (control_tx, control_rx) =
                             tokio::sync::mpsc::channel::<MuxMessage>(cap);
@@ -99,9 +124,40 @@ impl TunnelEngine {
                         info!("✅ Leg {} reconnected successfully", self.leg_id);
                     }
                     Err(e) => {
-                        error!("Reconnect failed for leg {}: {}", self.leg_id, e);
+                        internal_attempt += 1;
+
+                        // Emit a diagnostic event so the snapshot system (and
+                        // operator dashboards) can see we're stuck, even though
+                        // the outer establish_leg loop hasn't returned yet.
+                        crate::net::diagnostics::send_diag_event(
+                            crate::net::diagnostics::DiagnosticsEvent::LegReconnecting {
+                                leg_id: self.leg_id,
+                                attempt: internal_attempt,
+                            },
+                        );
+
+                        if internal_attempt >= MAX_INTERNAL_RECONNECT_ATTEMPTS {
+                            // Give up so the outer loop re-runs DNS, resets
+                            // its state, and records the failure in counters.
+                            error!(
+                                "Leg {} giving up after {} consecutive reconnect failures — handing off to outer loop",
+                                self.leg_id, internal_attempt
+                            );
+                            return Err(e);
+                        }
+
+                        error!(
+                            "Reconnect failed for leg {} (attempt {}/{}): {}",
+                            self.leg_id, internal_attempt, MAX_INTERNAL_RECONNECT_ATTEMPTS, e
+                        );
+
+                        // Exponential back-off: 2 s, 4 s, 8 s, 16 s, 30 s (cap).
+                        // The shift is capped at 4 to avoid overflow (2^4 = 16).
+                        let exp_ms = RECONNECT_BACKOFF_BASE.as_millis() as u64
+                            * (1u64 << internal_attempt.saturating_sub(1).min(4));
                         let jitter = rand::random::<u64>() % RECONNECT_BACKOFF_JITTER_MS;
-                        tokio::time::sleep(RECONNECT_BACKOFF_BASE + tokio::time::Duration::from_millis(jitter)).await;
+                        let backoff_ms = (exp_ms + jitter).min(MAX_RECONNECT_BACKOFF_MS);
+                        tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
                         continue;
                     }
                 }
@@ -178,7 +234,7 @@ impl TunnelEngine {
                                     let m = muxer.clone();
                                     tokio::spawn(async move { m.record_pong(leg_id).await; });
                                 }
-                                handler.handle(frame).await;
+                                let _ = handler.handle(frame).await;
                             }
                         }
                     }

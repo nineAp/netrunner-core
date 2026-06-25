@@ -8,7 +8,7 @@ use tokio::sync::mpsc::Sender;
 use tokio_util::sync::CancellationToken;
 
 use crate::net::{INITIAL_RTT_MS, MUXER_CONGESTION_WEIGHT};
-use crate::net::{HEALTH_CHECK_TIMEOUT, MAX_TUNNEL_LEGS, MUXER_POOL_SIZE};
+use crate::net::{DISPATCH_TO_LOCAL_TIMEOUT, HEALTH_CHECK_TIMEOUT, MAX_TUNNEL_LEGS};
 use crate::net::diagnostics::{self, DiagnosticsEvent, DIAG_COUNTERS, LegMetrics, TunnelMetrics};
 use crate::nrxp::FrameType;
 
@@ -173,14 +173,12 @@ impl Muxer {
             }
         }
 
-        // 3. O(N) поиск лучшей леги без сортировки всего вектора
-        // Мы берем подмножество (pool) и сразу ищем в нем минимум
-        let pool_size = std::cmp::min(legs.len(), MUXER_POOL_SIZE);
-
-        // Используем min_by, чтобы найти лучший вариант за один проход
+        // 3. O(N) поиск лучшей леги без сортировки всего вектора.
+        // Consider all available legs so the 4th leg is not permanently starved.
+        // MUXER_POOL_SIZE is kept for topology printing but no longer limits
+        // leg selection: sticky bindings already prevent hot-leg thrashing.
         let selected_leg = legs
             .iter()
-            .take(pool_size) // Берем только пул
             .min_by(|a, b| {
                 let score_a = a.stats.rtt_ms.load(Ordering::Relaxed) as f64
                     + (a.congestion_factor() * MUXER_CONGESTION_WEIGHT);
@@ -206,8 +204,18 @@ impl Muxer {
 
     pub async fn record_pong(&self, leg_id: u32) {
         if let Some((_, start_time)) = self.pending_pings.remove(&leg_id) {
-            let rtt = start_time.elapsed().as_millis() as u32;
+            let measured = start_time.elapsed().as_millis() as u32;
             if let Some(leg) = self.legs.get(&leg_id) {
+                let current = leg.stats.rtt_ms.load(Ordering::Relaxed);
+                // EWMA with α=0.25: new = (3·old + measured) / 4.
+                // A single noisy heartbeat (e.g. 300 ms on a 50 ms baseline)
+                // only moves the stored RTT to ~112 ms instead of jumping
+                // straight to 300 ms, preventing unnecessary leg re-selection.
+                let rtt = if current == crate::net::INITIAL_RTT_MS {
+                    measured  // first real measurement: accept immediately
+                } else {
+                    (current.saturating_mul(3).saturating_add(measured)) / 4
+                };
                 leg.stats.rtt_ms.store(rtt, Ordering::Relaxed);
                 let min_rtt = self
                     .legs
@@ -366,6 +374,11 @@ impl Muxer {
     // is a spawned task, so blocking here creates correct back-pressure all the way
     // back to the kernel TCP socket buffer.  Never spawn a task to deliver data
     // from this function — that breaks in-order delivery guarantees.
+    //
+    // TIMEOUT GUARD: if the stream's receive channel stays full for longer than
+    // DISPATCH_TO_LOCAL_TIMEOUT the stream is forcibly closed.  Without this a
+    // single slow consumer (app socket buffer full, background app paused, etc.)
+    // would block the engine reader and starve every other stream on the same leg.
     pub async fn dispatch_to_local(&self, stream_id: u32, data: Bytes) {
         let size = data.len() as u64;
 
@@ -375,10 +388,15 @@ impl Muxer {
         });
 
         if let Some((tx, stats)) = tx_and_stats {
-            // .send().await blocks until the receiver has space.
-            // If the receiver is closed the error is silently ignored.
-            if tx.send(data).await.is_ok() {
-                stats.rx_bytes.fetch_add(size, Ordering::Relaxed);
+            match tokio::time::timeout(DISPATCH_TO_LOCAL_TIMEOUT, tx.send(data)).await {
+                Ok(Ok(_)) => { stats.rx_bytes.fetch_add(size, Ordering::Relaxed); }
+                Ok(Err(_)) => { /* receiver already closed — stream gone */ }
+                Err(_) => {
+                    // Bridge isn't consuming: app socket full or app paused too long.
+                    // Close the stream to free the leg for all other streams.
+                    warn!(stream_id, "dispatch_to_local: stream stalled for {:?}, closing", DISPATCH_TO_LOCAL_TIMEOUT);
+                    self.remove_stream(stream_id);
+                }
             }
         }
     }

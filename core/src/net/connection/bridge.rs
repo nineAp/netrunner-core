@@ -1,14 +1,13 @@
 use std::sync::Arc;
-use std::time::Duration;
 
-use crate::net::connection::muxer::{MuxMessage, Muxer};
+use crate::net::connection::muxer::Muxer;
 use crate::net::{NetworkConfig, BRIDGE_IDLE_TIMEOUT};
-use crate::nrxp::FrameType;
 use bytes::{Bytes, BytesMut};
 use netrunner_logger::{debug, error, info, warn};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
+use tokio_util::sync::CancellationToken;
 
 struct StreamGuard {
     stream_id: u32,
@@ -23,10 +22,10 @@ impl Drop for StreamGuard {
 }
 pub(crate) async fn run_tcp_bridge<R, W>(
     stream_id: u32,
-    mut reader: R,
-    mut writer: W,
+    reader: R,
+    writer: W,
     muxer: Arc<Muxer>,
-    mut v_rx: mpsc::Receiver<Bytes>,
+    v_rx: mpsc::Receiver<Bytes>,
 ) where
     R: tokio::io::AsyncReadExt + Unpin,
     W: tokio::io::AsyncWriteExt + Unpin,
@@ -36,50 +35,76 @@ pub(crate) async fn run_tcp_bridge<R, W>(
         muxer: muxer.clone(),
     };
     let buf_size = NetworkConfig::global().tcp_buffer_size;
+    let token = CancellationToken::new();
 
-    // Создаем отдельный канал для упорядоченной отправки в туннель
-    let (tx_to_mux, mut rx_from_bridge) = mpsc::channel::<Bytes>(16);
-
-    // Задача-отправщик: гарантирует порядок и не блокирует основной цикл моста
-    let m_clone = muxer.clone();
-    tokio::spawn(async move {
-        while let Some(data) = rx_from_bridge.recv().await {
-            if let Err(_) = m_clone.send_data_safe(stream_id, data, false).await {
-                break;
-            }
-        }
-    });
-
-    let mut buf = BytesMut::with_capacity(buf_size);
-    loop {
-        if buf.capacity() < 16384 {
-            buf.reserve(buf_size);
-        }
-
-        tokio::select! {
-            // Читаем из Интернета -> В очередь отправки (Upload)
-            res = reader.read_buf(&mut buf) => {
-                match res {
-                    Ok(0) => break,
-                    Ok(_) => {
-                        let data = buf.split().freeze();
-                        if tx_to_mux.send(data).await.is_err() { break; }
+    // Upload: internet → tunnel.
+    // Runs concurrently with download so a congested muxer path does not
+    // prevent downstream data from being delivered.
+    let upload = {
+        let muxer = muxer.clone();
+        let token = token.clone();
+        async move {
+            let mut reader = reader;
+            let mut buf = BytesMut::with_capacity(buf_size);
+            loop {
+                if buf.capacity() < 16384 {
+                    buf.reserve(buf_size);
+                }
+                tokio::select! {
+                    biased;
+                    _ = token.cancelled() => break,
+                    res = reader.read_buf(&mut buf) => match res {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {
+                            let data = buf.split().freeze();
+                            if muxer.send_data_safe(stream_id, data, false).await.is_err() {
+                                break;
+                            }
+                        }
                     }
-                    Err(_) => break,
                 }
             }
-            // Читаем из Туннеля -> В Интернет (Download)
-            maybe_data = v_rx.recv() => {
-                match maybe_data {
-                    Some(data) => {
-                        if data.is_empty() { continue; }
-                        if writer.write_all(&data).await.is_err() { break; }
+            token.cancel();
+        }
+    };
+
+    // Download: tunnel → internet.
+    // write_all has a hard timeout so a slow local app (full socket buffer)
+    // does not block the pipeline indefinitely and starve other streams on
+    // the same tunnel leg.
+    let download = {
+        let token = token.clone();
+        async move {
+            let mut writer = writer;
+            let mut v_rx = v_rx;
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = token.cancelled() => break,
+                    maybe_data = v_rx.recv() => match maybe_data {
+                        None => break,
+                        Some(data) => {
+                            if data.is_empty() { continue; }
+                            match timeout(crate::net::BRIDGE_STREAM_WRITE_TIMEOUT, writer.write_all(&data)).await {
+                                Ok(Ok(_)) => {}
+                                _ => break,
+                            }
+                        }
                     }
-                    None => break,
                 }
             }
+            token.cancel();
         }
+    };
+
+    // Both halves run concurrently via the outer select. When either half
+    // finishes (connection closed, error, or write timeout), the token
+    // cancels the other half so cleanup is prompt.
+    tokio::select! {
+        _ = upload => {}
+        _ = download => {}
     }
+    token.cancel();
 }
 pub(crate) async fn run_udp_bridge(
     stream_id: u32,

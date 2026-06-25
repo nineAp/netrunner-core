@@ -17,6 +17,14 @@ pub const HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(3);
 pub const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(20);
 pub const LEG_RECONNECT_DELAY: Duration = Duration::from_secs(2);
 pub const BRIDGE_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Max time to wait for a local app socket to accept downloaded data.
+/// If the app's receive buffer stays full longer than this, the connection
+/// is closed to unblock the tunnel leg for other streams.
+pub const BRIDGE_STREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Max time dispatch_to_local will block waiting for a stream's receive channel.
+/// Protects the engine reader (and thus the entire tunnel leg) from being stuck
+/// behind one slow stream's backlog. On timeout the stream is forcibly closed.
+pub const DISPATCH_TO_LOCAL_TIMEOUT: Duration = Duration::from_secs(10);
 pub const TLS_HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 pub const SECURE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
 pub const FALLBACK_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -26,6 +34,12 @@ pub const DNS_LOOKUP_TIMEOUT: Duration = Duration::from_secs(3);
 pub const RECONNECT_BACKOFF_BASE: Duration = Duration::from_millis(2000);
 /// Upper bound of the random jitter added to `RECONNECT_BACKOFF_BASE`.
 pub const RECONNECT_BACKOFF_JITTER_MS: u64 = 1000;
+/// After this many consecutive internal reconnect failures the engine gives up
+/// and returns Err to the outer establish_leg loop, which re-runs DNS resolution
+/// and resets all counters.  10 × ~18 s ≈ 3 minutes max stuck-silent time.
+pub const MAX_INTERNAL_RECONNECT_ATTEMPTS: u32 = 10;
+/// Cap for exponential reconnect backoff inside the engine (milliseconds).
+pub const MAX_RECONNECT_BACKOFF_MS: u64 = 30_000;
 /// How long to wait before removing an idle session after all legs drop.
 pub const SESSION_CLEANUP_DELAY: Duration = Duration::from_secs(120);
 /// How often the network-change watcher checks the local IP address.
@@ -65,6 +79,16 @@ pub const TUNNEL_MAX_BUFFER_SIZE: usize = 1024 * 1024;
 pub const TUNNEL_READ_RESERVE: usize = 16 * 1024;
 /// Maximum bytes written per stream in a single interleaved write pass.
 pub const TUNNEL_INTERLEAVE_CHUNK: usize = 16 * 1024;
+
+// ── Tunnel leg TCP socket tuning ─────────────────────────────────────────────
+/// OS-level TCP send buffer for each tunnel leg.  The default (4–8 MB on
+/// Linux/Android) can hold seconds of data at typical mobile speeds, causing
+/// severe jitter.  256 KB limits extra queuing to ~80 ms at 25 Mbit/s per leg
+/// while still providing enough headroom for TCP slow-start.
+pub const TUNNEL_SOCKET_SNDBUF: u32 = 256 * 1024;
+/// OS-level TCP receive buffer for each tunnel leg.  Larger than the send
+/// buffer so the receiver can absorb bursts without dropping packets.
+pub const TUNNEL_SOCKET_RCVBUF: u32 = 512 * 1024;
 
 // ── Smoltcp socket defaults ──────────────────────────────────────────────────
 /// Packet slots for the ICMP socket's RX and TX packet buffers.
