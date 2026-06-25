@@ -1,4 +1,4 @@
-use bytes::{Buf, Bytes};
+use bytes::Bytes;
 use netrunner_core::{
     net::{GLOBAL_MIN_RTT, NetworkConfig, UDP_IDLE_TIMEOUT},
     rawcast::{LocalProtocol, RawCastFrame},
@@ -11,10 +11,11 @@ use smoltcp::{
         Ipv6Address,
     },
 };
-use std::{collections::VecDeque, sync::{Arc, atomic::{AtomicBool, Ordering}}};
+use std::{sync::{Arc, atomic::{AtomicBool, Ordering}}};
 use tokio::sync::{OwnedSemaphorePermit, mpsc, oneshot};
 
 use netrunner_logger::{debug, info, instrument};
+
 pub struct ConnectionCore<T> {
     pub handle: SocketHandle,
     pub tx: mpsc::Sender<T>,
@@ -23,7 +24,9 @@ pub struct ConnectionCore<T> {
 }
 
 impl<T> ConnectionCore<T> {
-    pub fn new(handle: SocketHandle) -> (Self, mpsc::Receiver<T>, mpsc::Sender<Bytes>, Arc<AtomicBool>) {
+    pub fn new(
+        handle: SocketHandle,
+    ) -> (Self, mpsc::Receiver<T>, mpsc::Sender<Bytes>, Arc<AtomicBool>) {
         let cap = NetworkConfig::global().channel_capacity;
         let (tx_to_net, rx_from_smol) = mpsc::channel::<T>(cap);
         let (tx_to_smol, rx_from_net) = mpsc::channel::<Bytes>(cap);
@@ -48,13 +51,12 @@ pub enum ConnectionState {
     Closed,
 }
 
-
-
 pub struct TcpConnection {
     core: ConnectionCore<Bytes>,
     state: ConnectionState,
-    pending_data: VecDeque<Bytes>,
-    pending_bytes: usize,
+    /// A single in-flight chunk that partially fit into smoltcp's tx_buf.
+    /// When Some, we retry flushing it before reading the next chunk from core.rx.
+    pending_chunk: Option<Bytes>,
     handshake_rx: Option<oneshot::Receiver<()>>,
     chunk_buf: Vec<u8>,
     server_eof: bool,
@@ -62,8 +64,7 @@ pub struct TcpConnection {
 
     total_up_bytes: u64,
     total_down_bytes: u64,
-    rx_congested: bool,
-    tx_congested: bool, 
+    tx_congested: bool,
     last_rtt_push_ms: i64,
     last_pushed_rtt_ms: u32,
 }
@@ -72,21 +73,15 @@ impl TcpConnection {
     const RTT_PUSH_INTERVAL_MS: i64 = 50;
     const RTT_CHANGE_RATIO: f64 = 0.10;
 
-    const BUF_FLOOR: usize = 64 * 1024;
-/// Верхняя граница (2 МБ) — тоже как в smoltcp.
-    const BUF_CEIL: usize = 2 * 1024 * 1024;
-    /// Fallback, когда BBR ещё не дал оценку BDP.
-    const BUF_FALLBACK: usize = 256 * 1024;
-
     pub fn new(
         handle: SocketHandle,
-        permit: tokio::sync::OwnedSemaphorePermit,
+        permit: OwnedSemaphorePermit,
     ) -> (
         Self,
         mpsc::Receiver<Bytes>,
         mpsc::Sender<Bytes>,
         oneshot::Sender<()>,
-        Arc<AtomicBool>
+        Arc<AtomicBool>,
     ) {
         let (core, rx_from_smol, tx_to_smol, is_saturated) = ConnectionCore::new(handle);
         let (handshake_tx, handshake_rx) = oneshot::channel();
@@ -95,14 +90,12 @@ impl TcpConnection {
             core,
             state: ConnectionState::Handshaking,
             permit: Some(permit),
-            pending_data: VecDeque::new(),
-            pending_bytes: 0,
+            pending_chunk: None,
             handshake_rx: Some(handshake_rx),
             chunk_buf: vec![0u8; NetworkConfig::global().tcp_chunk_size],
             server_eof: false,
             total_up_bytes: 0,
             total_down_bytes: 0,
-            rx_congested: false,
             tx_congested: false,
             last_rtt_push_ms: i64::MIN,
             last_pushed_rtt_ms: 0,
@@ -139,9 +132,9 @@ impl TcpConnection {
 
                 if matches!(socket.state(), tcp::State::Closed | tcp::State::TimeWait) {
                     info!(
-                        %self.core.handle, 
-                        UP = %self.total_up_bytes, 
-                        DOWN = %self.total_down_bytes, 
+                        %self.core.handle,
+                        UP = %self.total_up_bytes,
+                        DOWN = %self.total_down_bytes,
                         "🏁 TCP Socket finished and closed"
                     );
                     self.state = ConnectionState::Closed;
@@ -149,9 +142,7 @@ impl TcpConnection {
                 }
             }
 
-            ConnectionState::Closed => {
-                return false;
-            }
+            ConnectionState::Closed => return false,
 
             ConnectionState::Established => {
                 info!(
@@ -167,13 +158,12 @@ impl TcpConnection {
     }
 
     fn maybe_update_tunnel_rtt(
-    &mut self,
-    socket: &mut tcp::Socket,
-    timestamp: smoltcp::time::Instant,
+        &mut self,
+        socket: &mut tcp::Socket,
+        timestamp: smoltcp::time::Instant,
     ) {
         let now_ms = timestamp.total_millis();
 
-        // 1. Троттлинг по времени (кроме самого первого вызова).
         if self.last_rtt_push_ms != i64::MIN
             && now_ms - self.last_rtt_push_ms < Self::RTT_PUSH_INTERVAL_MS
         {
@@ -181,13 +171,10 @@ impl TcpConnection {
         }
 
         let current_rtt = GLOBAL_MIN_RTT.load(Ordering::Relaxed);
-
-        // 2. Игнорируем заведомо некорректное нулевое значение.
         if current_rtt == 0 {
             return;
         }
 
-        // 3. Обновляем только при значимом изменении (или при первом запуске).
         let first_push = self.last_rtt_push_ms == i64::MIN;
         let changed_enough = if self.last_pushed_rtt_ms == 0 {
             true
@@ -209,133 +196,122 @@ impl TcpConnection {
         }
     }
 
-    fn optimal_buffer_size(&self, socket: &tcp::Socket) -> usize {
-        let bdp = socket.estimated_bdp();
-        if bdp == 0 {
-            // BBR ещё не оценил полосу (старт соединения) — безопасный дефолт.
-            Self::BUF_FALLBACK
-        } else {
-            (bdp.saturating_mul(2)).clamp(Self::BUF_FLOOR, Self::BUF_CEIL)
-        }
-    }
-
     fn poll_and_process(&mut self, socket: &mut tcp::Socket, timestamp: smoltcp::time::Instant) {
         self.maybe_update_tunnel_rtt(socket, timestamp);
 
-        // 1. Читаем из браузера -> в Туннель (Upload)
+        // ── Upload: browser → smoltcp rx_buf → channel → muxer ──────────
         while socket.can_recv() && self.core.tx.capacity() > 0 {
             if let Ok(n) = socket.peek_slice(&mut self.chunk_buf, timestamp) {
-                if n == 0 { break; }
+                if n == 0 {
+                    break;
+                }
                 let chunk = Bytes::copy_from_slice(&self.chunk_buf[..n]);
-
                 match self.core.tx.try_send(chunk) {
                     Ok(_) => {
                         socket.recv_slice(&mut self.chunk_buf[..n]).unwrap();
-                        self.total_up_bytes += n as u64; // Учет Upload
-                        
-                        // Если была перегрузка, а теперь прошло — пишем радостный лог
+                        self.total_up_bytes += n as u64;
                         if self.tx_congested {
-                            netrunner_logger::debug!(%self.core.handle, "🟢 Upload channel cleared. Resuming read from browser.");
+                            netrunner_logger::debug!(
+                                %self.core.handle,
+                                "🟢 Upload channel cleared. Resuming read from browser."
+                            );
                             self.tx_congested = false;
                         }
                     }
                     Err(mpsc::error::TrySendError::Full(_)) => {
                         if !self.tx_congested {
-                            netrunner_logger::debug!(%self.core.handle, "🟡 Upload Congestion: Channel to Muxer is full. Pausing read from browser.");
+                            netrunner_logger::debug!(
+                                %self.core.handle,
+                                "🟡 Upload Congestion: Channel to Muxer is full. Pausing."
+                            );
                             self.tx_congested = true;
                         }
-                        continue;
+                        break;
                     }
                     Err(mpsc::error::TrySendError::Closed(_)) => {
                         self.server_eof = true;
                         break;
                     }
                 }
-            } else { break; }
+            } else {
+                break;
+            }
         }
 
-        // 2. Читаем из Туннеля -> в Браузер (Download)
+        // ── Download: muxer → channel → smoltcp tx_buf → browser ─────────
+        //
+        // We keep at most ONE in-flight chunk (pending_chunk). When smoltcp's
+        // tx_buf is full we stop reading from core.rx, which naturally
+        // backpressures the bounded channel and eventually the muxer.
         if !self.server_eof {
-            // Считаем пороги ОДИН раз до цикла: BDP за время цикла не изменится,
-            // а дёргать BBR на каждой итерации незачем.
-            let optimal = self.optimal_buffer_size(socket);
-            let congestion_threshold = optimal + optimal / 2; // optimal * 1.5
-            let relief_threshold = optimal / 2;                // optimal * 0.5  (гистерезис 3:1)
-
             loop {
-                if self.pending_bytes > congestion_threshold {
-                    if !self.rx_congested {
-                        netrunner_logger::warn!(
-                            %self.core.handle,
-                            "🟡 Download Congestion: pending={} > {} (optimal={}). Pausing tunnel read.",
-                            self.pending_bytes, congestion_threshold, optimal
-                        );
-                        self.rx_congested = true;
-                        self.core.is_saturated.store(true, Ordering::Release);
-                    }
+                // First flush any partially-sent chunk from a previous tick.
+                let chunk = match self.pending_chunk.take() {
+                    Some(c) => c,
+                    None => match self.core.rx.try_recv() {
+                        Ok(data) => {
+                            self.total_down_bytes += data.len() as u64;
+                            data
+                        }
+                        Err(mpsc::error::TryRecvError::Empty) => break,
+                        Err(mpsc::error::TryRecvError::Disconnected) => {
+                            self.server_eof = true;
+                            break;
+                        }
+                    },
+                };
+
+                if !socket.can_send() {
+                    // tx_buf is full → hold the chunk, signal saturation.
+                    self.pending_chunk = Some(chunk);
+                    self.core.is_saturated.store(true, Ordering::Release);
                     break;
                 }
-                else if self.rx_congested && self.pending_bytes < relief_threshold {
-                    netrunner_logger::debug!(
-                        %self.core.handle,
-                        "🟢 Download buffer relieved: pending={} < {}. Resuming tunnel read.",
-                        self.pending_bytes, relief_threshold
-                    );
-                    self.rx_congested = false;
-                    self.core.is_saturated.store(false, Ordering::Release);
-                }
 
-                match self.core.rx.try_recv() {
-                    Ok(data) => {
-                        self.pending_bytes += data.len();
-                        self.total_down_bytes += data.len() as u64;
-                        self.pending_data.push_back(data);
+                match socket.send_slice(&chunk) {
+                    Ok(n) if n == chunk.len() => {
+                        // Entire chunk accepted.
                     }
-                    Err(mpsc::error::TryRecvError::Empty) => break,
-                    Err(mpsc::error::TryRecvError::Disconnected) => {
-                        self.server_eof = true;
+                    Ok(n) => {
+                        // Partial write — keep the remainder for the next tick.
+                        self.pending_chunk = Some(chunk.slice(n..));
+                        break;
+                    }
+                    Err(e) => {
+                        netrunner_logger::debug!(
+                            %self.core.handle,
+                            "smoltcp send error: {:?}", e
+                        );
+                        self.pending_chunk = Some(chunk);
                         break;
                     }
                 }
             }
+
+            // Clear saturation when tx_buf has room and no chunk is pending.
+            if self.pending_chunk.is_none() && socket.can_send() {
+                self.core.is_saturated.store(false, Ordering::Release);
+            }
         }
 
-        // 3. Отправляем в smoltcp то, что накопилось (оставляем как было)
-        while socket.can_send() {
-            if let Some(mut chunk) = self.pending_data.pop_front() {
-                match socket.send_slice(&chunk) {
-                    Ok(n) => {
-                        self.pending_bytes -= n;
-                        if n < chunk.len() {
-                            chunk.advance(n);
-                            self.pending_data.push_front(chunk);
-                            break; 
-                        }
-                    }
-                    Err(e) => {
-                        netrunner_logger::debug!(%self.core.handle, "Smoltcp send error: {:?}", e);
-                        self.pending_data.push_front(chunk);
-                        break;
-                    }
-                }
-            } else { break; }
-        }
-
-        if self.server_eof && self.pending_data.is_empty() {
+        if self.server_eof && self.pending_chunk.is_none() {
             let state = socket.state();
             if state == tcp::State::Established || state == tcp::State::CloseWait {
-                netrunner_logger::debug!(%self.core.handle, "All data flushed, sending FIN to browser");
+                netrunner_logger::debug!(
+                    %self.core.handle,
+                    "All data flushed, sending FIN to browser"
+                );
                 socket.close();
             }
         }
     }
 
     pub fn app_pending_out_size(&self) -> usize {
-        self.pending_bytes
+        self.pending_chunk.as_ref().map(|c| c.len()).unwrap_or(0)
     }
 
     #[instrument(skip(rx_smol, handshake_tx, tx_tunnel), fields(
-        socket_id = socket_id, 
+        socket_id = socket_id,
         dst = %target
     ))]
     pub fn spawn(
@@ -359,26 +335,22 @@ impl TcpConnection {
             let _ = handshake_tx.send(());
 
             while let Some(data) = rx_smol.recv().await {
-                let data_frame = RawCastFrame::data(
-                    LocalProtocol::Tcp,
-                    socket_id,
-                    dst_ip,
-                    dst_port,
-                    data
-                );
-
+                let data_frame =
+                    RawCastFrame::data(LocalProtocol::Tcp, socket_id, dst_ip, dst_port, data);
                 if tx_tunnel.send(data_frame).await.is_err() {
                     break;
                 }
             }
 
-            let close_frame = RawCastFrame::close(LocalProtocol::Tcp, socket_id, dst_ip, dst_port);
+            let close_frame =
+                RawCastFrame::close(LocalProtocol::Tcp, socket_id, dst_ip, dst_port);
             let _ = tx_tunnel.send(close_frame).await;
-
             debug!("🏁 [TCP {}] Spawned task finished", socket_id);
         });
     }
 }
+
+// ─── UDP ────────────────────────────────────────────────────────────────────
 
 pub type UdpPacketTarget = (Bytes, std::net::Ipv4Addr, u16);
 
@@ -391,7 +363,7 @@ pub struct UdpConnection {
 impl UdpConnection {
     pub fn new(
         handle: SocketHandle,
-        client_addr: smoltcp::wire::IpAddress,
+        client_addr: IpAddress,
         client_port: u16,
     ) -> (Self, mpsc::Receiver<UdpPacketTarget>, mpsc::Sender<Bytes>, Arc<AtomicBool>) {
         let (core, rx_from_smol, tx_to_smol, is_saturated) = ConnectionCore::new(handle);
@@ -416,7 +388,7 @@ impl UdpConnection {
 
         if socket.can_recv() {
             while let Ok((data, metadata)) = socket.recv(timestamp) {
-                if let smoltcp::wire::IpAddress::Ipv4(ip) = metadata.endpoint.addr {
+                if let IpAddress::Ipv4(ip) = metadata.endpoint.addr {
                     self.last_client_endpoint = Some(metadata.endpoint);
                     let target_ip = std::net::Ipv4Addr::from(ip);
                     let target_port = metadata.endpoint.port;
@@ -447,7 +419,7 @@ impl UdpConnection {
     }
 
     #[instrument(skip(rx_smol, tx_tunnel), fields(
-        socket_id = socket_id, 
+        socket_id = socket_id,
         dst = %target
     ))]
     pub fn spawn(
@@ -469,19 +441,21 @@ impl UdpConnection {
             }
 
             while let Some((data, ip, port)) = rx_smol.recv().await {
-                let data_frame =
-                    RawCastFrame::data(LocalProtocol::Udp, socket_id, ip, port, data);
+                let data_frame = RawCastFrame::data(LocalProtocol::Udp, socket_id, ip, port, data);
                 if tx_tunnel.send(data_frame).await.is_err() {
                     break;
                 }
             }
 
-            let close_frame = RawCastFrame::close(LocalProtocol::Udp, socket_id, dst_ip, dst_port);
+            let close_frame =
+                RawCastFrame::close(LocalProtocol::Udp, socket_id, dst_ip, dst_port);
             let _ = tx_tunnel.send(close_frame).await;
             info!("🛑 [UDP {}] Task stopped", socket_id);
         });
     }
 }
+
+// ─── ICMP ───────────────────────────────────────────────────────────────────
 
 use smoltcp::socket::icmp;
 
@@ -493,11 +467,8 @@ impl IcmpResponder {
             return;
         }
 
-        let result = socket.recv(timestamp);
-
-        if let Ok((data, src_addr)) = result {
+        if let Ok((data, src_addr)) = socket.recv(timestamp) {
             let payload = data.to_vec();
-
             match src_addr {
                 IpAddress::Ipv4(_) => Self::reply_v4(socket, payload, src_addr),
                 IpAddress::Ipv6(v6) => Self::reply_v6(socket, payload, v6),
@@ -511,7 +482,6 @@ impl IcmpResponder {
                 let mut reply_pkt = Icmpv4Packet::new_unchecked(&mut payload);
                 reply_pkt.set_msg_type(Icmpv4Message::EchoReply);
                 reply_pkt.fill_checksum();
-
                 let _ = socket.send_slice(&payload, src);
                 info!("🏓 [ICMPv4] Echo Reply -> {}", src);
             }
@@ -523,10 +493,8 @@ impl IcmpResponder {
             if pkt.msg_type() == Icmpv6Message::EchoRequest {
                 let mut reply_pkt = Icmpv6Packet::new_unchecked(&mut payload);
                 reply_pkt.set_msg_type(Icmpv6Message::EchoReply);
-
                 let gateway = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
                 reply_pkt.fill_checksum(&gateway, &src);
-
                 let _ = socket.send_slice(&payload, src.into());
                 info!("🏓 [ICMPv6] Echo Reply -> {}", src);
             }

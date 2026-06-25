@@ -330,18 +330,32 @@ impl Muxer {
 
     #[inline]
     pub fn dispatch_to_local(&self, stream_id: u32, data: Bytes) {
-        // Вычисляем размер здесь, так как переменная size не была определена
         let size = data.len() as u64;
 
         let tx_and_stats = self.streams.get(&stream_id).map(|s| {
             let val = s.value();
-            (val.0.clone(), val.1.clone()) // Клонируем Arc и Sender
+            (val.0.clone(), val.1.clone())
         });
 
         if let Some((tx, stats)) = tx_and_stats {
-            // Используем .try_send() для неблокирующей доставки в локальный поток
-            if tx.try_send(data).is_ok() {
-                stats.rx_bytes.fetch_add(size, Ordering::Relaxed);
+            match tx.try_send(data) {
+                Ok(_) => {
+                    stats.rx_bytes.fetch_add(size, Ordering::Relaxed);
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Full(data)) => {
+                    // Channel is full: spawn a task to wait for space.
+                    // This keeps the reader loop unblocked while providing
+                    // backpressure — the spawned future will be pending until
+                    // TcpConnection drains the channel and makes room.
+                    tokio::spawn(async move {
+                        if tx.send(data).await.is_ok() {
+                            stats.rx_bytes.fetch_add(size, Ordering::Relaxed);
+                        }
+                    });
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    // Stream is gone; nothing to do.
+                }
             }
         }
     }

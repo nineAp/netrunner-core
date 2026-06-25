@@ -20,7 +20,20 @@
       "Bash(head -50 //wsl.localhost/ubuntu-22.04/home/kirill/nxrp-smoltcp/CHANGELOG.md)",
       "Bash(grep -n \"impl.*Device\\\\|impl.*RxToken\\\\|impl.*TxToken\" //wsl.localhost/ubuntu-22.04/home/kirill/nxrp-smoltcp/src/phy/*.rs | head -40)",
       "mcp__visualize__read_me",
-      "mcp__visualize__show_widget"
+      "mcp__visualize__show_widget",
+      "Bash(ls -la /mnt/c/Users/ 2>/dev/null || ls -la /home/ 2>/dev/null | head -20)",
+      "Bash(ls -la /home/kirill/nxrp-smoltcp 2>&1 || ls -la /root/nxrp-smoltcp 2>&1 || find .. -maxdepth 2 -name \"nxrp-smoltcp\" -type d 2>/dev/null)",
+      "Bash(cargo check *)",
+      "PowerShell(wsl -d Ubuntu-22.04 -- bash -c \"cd /home/kirill/nxrp-smoltcp && cargo check --features 'socket-tcp,socket-udp,socket-icmp,medium-ip,proto-ipv4,proto-ipv6,socket-tcp-bbr,alloc' 2>&1 | tail -40\")",
+      "PowerShell(wsl -d Ubuntu-22.04 bash -c 'export PATH=$PATH:$HOME/.cargo/bin; cd /home/kirill/nxrp-smoltcp && cargo check --features \"socket-tcp,socket-udp,socket-icmp,medium-ip,proto-ipv4,proto-ipv6,socket-tcp-bbr,alloc\" 2>&1 | tail -40')",
+      "PowerShell(wsl -d Ubuntu-22.04 -- bash -c $script)",
+      "PowerShell(wsl -d Ubuntu-22.04 bash -c 'cd /home/kirill/netrunner-proxy && RUSTFLAGS=\"-A dead_code\" /home/kirill/.cargo/bin/cargo check -p netrunner-client 2>&1')",
+      "PowerShell(wsl -d Ubuntu-22.04 bash -c 'cd /home/kirill/netrunner-proxy && RUSTFLAGS=\"-A dead_code\" /home/kirill/.cargo/bin/cargo check -p netrunner-client > /tmp/check_out.txt 2>&1; echo \"EXIT:$?\"')",
+      "Bash(RUSTFLAGS=\"-A dead_code\" /home/kirill/.cargo/bin/cargo check -p netrunner-client)",
+      "PowerShell(wsl -d Ubuntu-22.04 -u kirill -- git -C /home/kirill/netrunner-proxy log --oneline -5 2>&1)",
+      "PowerShell(wsl -d Ubuntu-22.04 -u kirill -- git -C /home/kirill/netrunner-proxy stash 2>&1)",
+      "PowerShell(wsl -d Ubuntu-22.04 -u kirill -- /home/kirill/.cargo/bin/cargo check --manifest-path /home/kirill/netrunner-proxy/Cargo.toml -p netrunner-core 2>&1)",
+      "PowerShell(tail -5)"
     ]
   }
 }

@@ -3,6 +3,7 @@ use netrunner_core::net::ClientHandler;
 use netrunner_core::net::NetworkConfig;
 use netrunner_core::rawcast::{RawCastEvent, RawCastFrame};
 use smoltcp::iface::PollResult;
+use smoltcp::phy::ChannelDevice;
 use smoltcp::time::Instant;
 use smoltcp::wire::{IpAddress, IpCidr};
 use smoltcp::{
@@ -10,13 +11,11 @@ use smoltcp::{
     phy::DeviceCapabilities,
 };
 use std::net::Ipv4Addr;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::{
-    sync::{Arc, LazyLock, atomic::AtomicBool},
-    time::Instant as StdInstant,
-};
+use std::{sync::LazyLock, time::Instant as StdInstant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::mpsc::{self, Receiver, Sender, UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc;
 use tokio::time::{Duration, sleep};
 use tun::{DeviceReader, DeviceWriter};
 
@@ -25,22 +24,32 @@ use netrunner_logger::{debug, error, info, warn};
 use crate::net::connection_manager::ConnectionManager;
 use crate::net::dns::DnsHandler;
 use crate::net::socket_factory::{SmolSocketFactory, SocketProvider};
-use crate::tun::device::{TokenBuffer, VirtTunDevice};
+use crate::tun::device::TrafficCounter;
 use crate::tun::routing::setup_platform_routing;
 use crate::tun::tun::Tun;
 
 pub static START_TIME: LazyLock<StdInstant> = LazyLock::new(StdInstant::now);
 
+/// How many inbound packets the device can hold before backpressure kicks in.
+/// Each packet is ≤ MTU bytes, so at 1500 B × 64 = 96 KB max queue.
+const DEVICE_RX_CAP: usize = 64;
+/// How many outbound packets smoltcp can stage before we drain them.
+const DEVICE_TX_CAP: usize = 64;
+/// Bounded capacity for the TUN-reader → engine channel (packets).
+const TUN_CHAN_CAP: usize = 128;
+
 pub struct Engine {
     interface: Interface,
     socket_set: SocketSet<'static>,
     manager: ConnectionManager,
-    device: VirtTunDevice,
-    to_smoltcp_tx: UnboundedSender<TokenBuffer>,
-    from_smoltcp_rx: Option<UnboundedReceiver<TokenBuffer>>,
-    avail: Arc<AtomicBool>,
-    rx_from_tunnel: Option<Receiver<RawCastFrame>>,
+    device: ChannelDevice,
+    /// Bounded channel from TUN reader task to engine loop.
+    tun_rx: Option<mpsc::Receiver<Vec<u8>>>,
+    /// Bounded channel from engine loop to TUN writer task.
+    tun_tx: mpsc::Sender<Vec<u8>>,
+    rx_from_tunnel: Option<mpsc::Receiver<RawCastFrame>>,
     factory: Arc<dyn SocketProvider>,
+    stats: TrafficCounter,
 }
 
 impl Engine {
@@ -48,28 +57,32 @@ impl Engine {
         config: Config,
         caps: DeviceCapabilities,
         dns_handler: DnsHandler,
-        tx_to_tunnel: Sender<RawCastFrame>,
-        rx_from_tunnel: Receiver<RawCastFrame>,
+        tx_to_tunnel: mpsc::Sender<RawCastFrame>,
+        rx_from_tunnel: mpsc::Receiver<RawCastFrame>,
         factory: Arc<dyn SocketProvider>,
     ) -> Self {
         let now = Engine::current_time();
 
-        let (mut device, to_smoltcp_tx, from_smoltcp_rx, avail) = VirtTunDevice::new(caps);
+        let mut device = ChannelDevice::new(caps, DEVICE_RX_CAP, DEVICE_TX_CAP);
         let interface = Interface::new(config, &mut device, now);
 
         let socket_set = ConnectionManager::setup_sockets(factory.as_ref(), 2);
         let manager = ConnectionManager::new(dns_handler, tx_to_tunnel, factory.clone());
 
+        // Bounded TUN writer channel — smoltcp's TCP window limits how many
+        // outgoing packets can pile up, so a modest cap is enough.
+        let (tun_tx, _placeholder) = mpsc::channel(DEVICE_TX_CAP * 2);
+
         Self {
             interface,
             socket_set,
             device,
-            to_smoltcp_tx,
-            from_smoltcp_rx: Some(from_smoltcp_rx),
-            avail,
+            tun_rx: None,
+            tun_tx,
             manager,
             rx_from_tunnel: Some(rx_from_tunnel),
             factory,
+            stats: TrafficCounter::new(),
         }
     }
 
@@ -77,129 +90,163 @@ impl Engine {
         info!("Current routes: {:?}", self.interface.routes());
         let (writer, reader) = tun.split().expect("Failed to split TUN");
 
-        let (tun_to_engine_tx, mut tun_to_engine_rx) = mpsc::unbounded_channel::<TokenBuffer>();
+        // Bounded: TUN reader blocks when engine is overloaded → kernel TUN
+        // buffer fills → natural backpressure to the OS.
+        let (tun_to_engine_tx, tun_to_engine_rx) = mpsc::channel::<Vec<u8>>(TUN_CHAN_CAP);
+        // Bounded: engine drops TX packets if TUN writer is slow (TCP retransmits).
+        let (engine_to_tun_tx, engine_to_tun_rx) = mpsc::channel::<Vec<u8>>(DEVICE_TX_CAP * 2);
 
-        Self::spawn_tun_reader(reader, tun_to_engine_tx, self.avail.clone());
+        self.tun_tx = engine_to_tun_tx;
+        self.tun_rx = Some(tun_to_engine_rx);
 
-        let from_smoltcp_rx = self.from_smoltcp_rx.take().expect("Engine started twice");
-        Self::spawn_tun_writer(writer, from_smoltcp_rx);
+        Self::spawn_tun_reader(reader, tun_to_engine_tx);
+        Self::spawn_tun_writer(writer, engine_to_tun_rx);
 
         let mut last_stats_log = StdInstant::now();
 
         let inbound_map = self.manager.tracker.inbound_tx.clone();
         let mut rx_tunnel = self.rx_from_tunnel.take().unwrap();
+        let mut tun_rx = self.tun_rx.take().unwrap();
 
-        tokio::spawn(async move {
-            let mut local_cache: std::collections::HashMap<
-                u64,
-                (mpsc::Sender<Bytes>, Arc<AtomicBool>),
-            > = std::collections::HashMap::new();
-
-            while let Some(frame) = rx_tunnel.recv().await {
-                if frame.event == RawCastEvent::Close {
-                    local_cache.remove(&frame.socket_id);
-                    inbound_map.remove(&frame.socket_id);
-                } else if frame.event == RawCastEvent::Data {
-                    let tx_opt: Option<(mpsc::Sender<Bytes>, Arc<AtomicBool>)> =
-                        if let Some(cached) = local_cache.get(&frame.socket_id) {
-                            Some(cached.clone())
-                        } else if let Some(ref_tx) = inbound_map.get(&frame.socket_id) {
-                            let val = ref_tx.value().clone();
-                            local_cache.insert(frame.socket_id, val.clone());
-                            Some(val)
-                        } else {
-                            None
-                        };
-
-                    if let Some((tx, is_saturated)) = tx_opt {
-                        // Pressure-Aware drop (нулевая нагрузка на ОС)
-                        if is_saturated.load(Ordering::Relaxed) {
-                            continue;
-                        }
-
-                        match tx.try_send(frame.payload) {
-                            Ok(_) => {}
-                            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                                netrunner_logger::trace!(
-                                    "⚠️ Local socket {} buffer suddenly full. Dropping frame.",
-                                    frame.socket_id
-                                );
-                            }
-                            Err(_) => {}
-                        }
-                    }
-                }
-            }
-        });
+        // Local cache to avoid DashMap lookups on every frame.
+        let mut local_cache: std::collections::HashMap<
+            u64,
+            (mpsc::Sender<Bytes>, Arc<std::sync::atomic::AtomicBool>),
+        > = std::collections::HashMap::new();
 
         loop {
-            let mut work_done = false;
-            let mut repeat_poll = true;
             let now = Self::current_time();
+            let mut work_done = false;
 
-            // 1. Опрашиваем сокеты до тех пор, пока есть движение данных
-            while repeat_poll {
-                self.manager.process_sockets(&mut self.socket_set, now);
-                let poll_res = self.poll();
-                self.manager.cleanup(&mut self.socket_set);
-                if matches!(poll_res, PollResult::SocketStateChanged) {
-                    work_done = true;
-                    repeat_poll = true;
-                } else {
-                    repeat_poll = false;
+            // ── 1. Dispatch tunnel → local sockets (download) ────────────
+            // Drain all available frames without blocking.
+            loop {
+                match rx_tunnel.try_recv() {
+                    Ok(frame) => {
+                        work_done = true;
+                        if frame.event == RawCastEvent::Close {
+                            local_cache.remove(&frame.socket_id);
+                            inbound_map.remove(&frame.socket_id);
+                        } else if frame.event == RawCastEvent::Data {
+                            let tx_opt = if let Some(cached) = local_cache.get(&frame.socket_id) {
+                                Some(cached.clone())
+                            } else if let Some(ref_tx) = inbound_map.get(&frame.socket_id) {
+                                let val = ref_tx.value().clone();
+                                local_cache.insert(frame.socket_id, val.clone());
+                                Some(val)
+                            } else {
+                                None
+                            };
+
+                            if let Some((tx, is_saturated)) = tx_opt {
+                                if is_saturated.load(Ordering::Relaxed) {
+                                    continue;
+                                }
+                                match tx.try_send(frame.payload) {
+                                    Ok(_) => {}
+                                    Err(mpsc::error::TrySendError::Full(data)) => {
+                                        // Spawn a task to wait for space rather than drop.
+                                        let tx2 = tx.clone();
+                                        tokio::spawn(async move {
+                                            let _ = tx2.send(data).await;
+                                        });
+                                    }
+                                    Err(_) => {}
+                                }
+                            }
+                        }
+                    }
+                    Err(_) => break,
                 }
             }
 
+            // ── 2. Accept TUN packets → device (upload) ──────────────────
+            // Stop reading when the device's RX queue is full (backpressure).
+            let mut packets_read = 0;
+            while !self.device.rx_full() {
+                match tun_rx.try_recv() {
+                    Ok(pkt) => {
+                        self.stats.record_rx(pkt.len());
+                        self.manager
+                            .try_create_socket_from_packet(&pkt, &mut self.socket_set);
+                        self.device.push_rx(pkt);
+                        work_done = true;
+                        packets_read += 1;
+                        if packets_read >= 250 {
+                            break; // Yield occasionally to prevent starvation.
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+
+            // ── 3. Run smoltcp ───────────────────────────────────────────
+            let mut repeat = true;
+            while repeat {
+                self.manager.process_sockets(&mut self.socket_set, now);
+                let res = self.poll();
+                self.manager.cleanup(&mut self.socket_set);
+                repeat = matches!(res, PollResult::SocketStateChanged);
+                if repeat {
+                    work_done = true;
+                }
+            }
+
+            // ── 4. Drain smoltcp TX → TUN writer ─────────────────────────
+            while let Some(pkt) = self.device.pop_tx() {
+                self.stats.record_tx(pkt.len());
+                // Non-blocking: if TUN writer is overloaded, drop the packet.
+                // TCP will retransmit; UDP is best-effort.
+                if self.tun_tx.try_send(pkt).is_err() {
+                    break;
+                }
+            }
+
+            // ── 5. Stats logging ─────────────────────────────────────────
             if last_stats_log.elapsed() >= Duration::from_secs(5) {
+                let stats = self.stats.get_stats();
+                info!(
+                    "TunDevice Traffic: RX: {:.2} MB ({} pkts) | TX: {:.2} MB ({} pkts) | Speed: ↓{:.2} MB/s, ↑{:.2} MB/s",
+                    stats.rx_bytes as f64 / 1_048_576.0,
+                    stats.rx_packets,
+                    stats.tx_bytes as f64 / 1_048_576.0,
+                    stats.tx_packets,
+                    stats.rx_speed_mb_s,
+                    stats.tx_speed_mb_s,
+                );
                 let manager_ref = &self.manager;
                 self.factory
                     .log_stats(&self.socket_set, &|handle| manager_ref.get_buf_info(handle));
                 last_stats_log = StdInstant::now();
             }
 
-            // 2. БАТЧИНГ: Выгребаем все доступные пакеты из TUN без блокировки
-            let mut packets_processed = 0;
-            while let Ok(token) = tun_to_engine_rx.try_recv() {
-                self.manager
-                    .try_create_socket_from_packet(&token, &mut self.socket_set);
-                if self.to_smoltcp_tx.send(token).is_ok() {
-                    self.device.mark_rx_available();
-                }
-                work_done = true;
-                packets_processed += 1;
-                // Предотвращаем starvation: если пакетов слишком много, даем другим потокам подышать
-                if packets_processed > 250 {
-                    break;
-                }
-            }
-
-            // 3. АДАПТИВНЫЙ ТАЙМИНГ
+            // ── 6. Adaptive timing ───────────────────────────────────────
             if work_done {
-                // Если мы обработали пакеты или сокеты сдвинулись - НЕ СПИМ.
-                // Уступаем квант времени другим задачам и моментально возвращаемся в цикл.
                 tokio::task::yield_now().await;
             } else {
-                // Мы отдыхаем только если сеть полностью простаивает
                 let delay = self
                     .interface
                     .poll_delay(Self::current_time(), &self.socket_set);
 
                 let sleep_time = delay
                     .map(|d| {
-                        std::cmp::min(Duration::from_micros(d.micros()), Duration::from_millis(5))
+                        std::cmp::min(
+                            Duration::from_micros(d.micros()),
+                            Duration::from_millis(5),
+                        )
                     })
                     .unwrap_or(Duration::from_millis(5));
 
                 tokio::select! {
                     _ = sleep(sleep_time) => {}
-                    msg = tun_to_engine_rx.recv() => {
-                        if let Some(token) = msg {
-                            self.manager.try_create_socket_from_packet(&token, &mut self.socket_set);
-                            if self.to_smoltcp_tx.send(token).is_ok() {
-                                self.device.mark_rx_available();
+                    msg = tun_rx.recv() => {
+                        match msg {
+                            Some(pkt) => {
+                                self.stats.record_rx(pkt.len());
+                                self.manager.try_create_socket_from_packet(&pkt, &mut self.socket_set);
+                                self.device.push_rx(pkt);
                             }
-                        } else {
-                            break;
+                            None => break,
                         }
                     }
                 }
@@ -213,36 +260,23 @@ impl Engine {
             .poll(now, &mut self.device, &mut self.socket_set)
     }
 
-    fn spawn_tun_reader(
-        mut reader: DeviceReader,
-        to_engine: mpsc::UnboundedSender<TokenBuffer>,
-        is_avail: Arc<AtomicBool>,
-    ) {
+    fn spawn_tun_reader(mut reader: DeviceReader, to_engine: mpsc::Sender<Vec<u8>>) {
         tokio::spawn(async move {
             debug!("TUN Reader task started");
-
+            let mut buf = vec![0u8; 65536];
             loop {
-                // 1. Берем чистый буфер
-                let mut token = TokenBuffer::with_capacity(65536);
-
-                // 2. Используем временный срез для чтения
-                // Это гарантирует, что мы пишем в начало буфера
-                let mut temp_buf = [0u8; 65536];
-
-                match reader.read(&mut temp_buf).await {
+                match reader.read(&mut buf).await {
                     Ok(n) if n > 0 => {
-                        // 3. Копируем в наш TokenBuffer (это быстро, 64кБ - это L1 кэш)
-                        token.extend_from_slice(&temp_buf[..n]);
-
-                        if to_engine.send(token).is_ok() {
-                            is_avail.store(true, Ordering::Release);
-                        } else {
+                        let pkt = buf[..n].to_vec();
+                        // .send().await blocks when engine channel is full →
+                        // backpressure propagates to OS TUN device.
+                        if to_engine.send(pkt).await.is_err() {
                             break;
                         }
                     }
-                    Ok(_) => break, // EOF
+                    Ok(_) => break,
                     Err(e) => {
-                        error!("FATAL: TUN Reader task died with error: {}", e);
+                        error!("FATAL: TUN Reader task died: {}", e);
                         break;
                     }
                 }
@@ -250,14 +284,11 @@ impl Engine {
         });
     }
 
-    fn spawn_tun_writer(
-        mut writer: DeviceWriter,
-        mut from_smoltcp: UnboundedReceiver<TokenBuffer>,
-    ) {
+    fn spawn_tun_writer(mut writer: DeviceWriter, mut from_engine: mpsc::Receiver<Vec<u8>>) {
         tokio::spawn(async move {
             debug!("TUN Writer task started");
-            while let Some(token) = from_smoltcp.recv().await {
-                if writer.write_all(&token).await.is_err() {
+            while let Some(pkt) = from_engine.recv().await {
+                if writer.write_all(&pkt).await.is_err() {
                     break;
                 }
             }
@@ -265,7 +296,7 @@ impl Engine {
         });
     }
 
-    fn current_time() -> Instant {
+    pub fn current_time() -> Instant {
         let duration = StdInstant::now().duration_since(*START_TIME);
         Instant::from_micros(duration.as_micros() as i64)
     }
@@ -300,6 +331,8 @@ impl Engine {
         self.manager.start_listening(&mut self.socket_set);
     }
 }
+
+// ─── EngineConfig & EngineBuilder (unchanged API surface) ──────────────────
 
 #[derive(Clone, Debug)]
 pub struct EngineConfig {
@@ -457,7 +490,10 @@ impl EngineBuilder {
                                 );
                                 #[cfg(target_os = "windows")]
                                 let _ = crate::tun::routing::run_cmd_ext(
-                                    &format!("route add {} mask 255.255.255.255 {}", ipv4, phys_gw),
+                                    &format!(
+                                        "route add {} mask 255.255.255.255 {}",
+                                        ipv4, phys_gw
+                                    ),
                                     true,
                                 );
                             }
@@ -480,7 +516,6 @@ impl EngineBuilder {
         if self.config.transparent_mode {
             engine.set_transparent_mode();
         }
-
         engine.set_default_gateway(self.config.default_gateway);
         engine.activate();
 
