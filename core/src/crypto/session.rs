@@ -233,7 +233,11 @@ impl SessionAuth {
     pub fn generate_current_tag(&self) -> [u8; 16] {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            // NTP step-back can make this return Err; saturate to 0 so the
+            // writer task doesn't panic.  The peer's verify_tag will accept
+            // tags up to AUTH_WINDOW_SIZE steps away, so a brief clock skew
+            // is tolerated without a reconnect.
+            .unwrap_or_default()
             .as_secs();
 
         Self::compute_tag(&self.auth_key, now / AUTH_TIME_STEP)
@@ -242,26 +246,44 @@ impl SessionAuth {
     pub fn verify_tag(&self, received_tag: &[u8; 16]) -> bool {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .expect("Time went backwards")
+            // NTP step-back can make duration_since return an error. Saturate to 0
+            // rather than panic; the tag comparison will fail and we log AUTH MISMATCH.
+            .unwrap_or_default()
             .as_secs();
 
         let current_step = now / AUTH_TIME_STEP;
 
+        // Constant-time path: always evaluate ALL 2*AUTH_WINDOW_SIZE+1 candidates
+        // so the loop duration doesn't leak which step (if any) matched.
+        let mut matched_step: Option<u64> = None;
         for step in (current_step.saturating_sub(AUTH_WINDOW_SIZE))
             ..=(current_step.saturating_add(AUTH_WINDOW_SIZE))
         {
-            if &Self::compute_tag(&self.auth_key, step) == received_tag {
-                if step != current_step {
-                    netrunner_logger::debug!(expected = %current_step, matched = %step, "Auth tag valid with time offset");
-                }
-                return true;
+            let candidate = Self::compute_tag(&self.auth_key, step);
+            let mut diff = 0u8;
+            for (a, b) in candidate.iter().zip(received_tag.iter()) {
+                diff |= a ^ b;
+            }
+            if diff == 0 && matched_step.is_none() {
+                matched_step = Some(step);
+                // Do NOT break — iterate full window for constant time.
             }
         }
 
-        netrunner_logger::warn!(
-            current_step = %current_step,
-            "AUTH MISMATCH: All tags rejected for current window"
-        );
-        false
+        match matched_step {
+            Some(step) => {
+                if step != current_step {
+                    netrunner_logger::debug!(expected = %current_step, matched = %step, "Auth tag valid with time offset");
+                }
+                true
+            }
+            None => {
+                netrunner_logger::warn!(
+                    current_step = %current_step,
+                    "AUTH MISMATCH: All tags rejected for current window"
+                );
+                false
+            }
+        }
     }
 }

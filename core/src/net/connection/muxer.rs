@@ -7,7 +7,9 @@ use std::time::Instant;
 use tokio::sync::mpsc::Sender;
 use tokio_util::sync::CancellationToken;
 
+use crate::net::{INITIAL_RTT_MS, MUXER_CONGESTION_WEIGHT};
 use crate::net::{HEALTH_CHECK_TIMEOUT, MAX_TUNNEL_LEGS, MUXER_POOL_SIZE};
+use crate::net::diagnostics::{self, DiagnosticsEvent, DIAG_COUNTERS, LegMetrics, TunnelMetrics};
 use crate::nrxp::FrameType;
 
 #[derive(Default, Debug)]
@@ -62,7 +64,7 @@ pub struct MuxMessage {
     pub(crate) data: Bytes,
 }
 
-pub static GLOBAL_MIN_RTT: AtomicU32 = AtomicU32::new(250);
+pub static GLOBAL_MIN_RTT: AtomicU32 = AtomicU32::new(INITIAL_RTT_MS);
 
 #[derive(Clone)]
 pub struct Muxer {
@@ -131,11 +133,18 @@ impl Muxer {
             .map_or(false, |leg| leg.control_tx.same_channel(tx));
         if should_remove {
             self.legs.remove(&leg_id);
-            self.update_legs_cache(); // Обновляем Lock-Free кэш
+            self.update_legs_cache();
             info!(
                 leg_id,
                 "MUXER: TCP leg removed safely, streams will re-balance"
             );
+        }
+    }
+
+    pub fn force_remove_leg(&self, leg_id: u32) {
+        if self.legs.remove(&leg_id).is_some() {
+            self.update_legs_cache();
+            info!(leg_id, "MUXER: TCP leg force-removed on engine exit");
         }
     }
 
@@ -174,9 +183,9 @@ impl Muxer {
             .take(pool_size) // Берем только пул
             .min_by(|a, b| {
                 let score_a = a.stats.rtt_ms.load(Ordering::Relaxed) as f64
-                    + (a.congestion_factor() * 2000.0);
+                    + (a.congestion_factor() * MUXER_CONGESTION_WEIGHT);
                 let score_b = b.stats.rtt_ms.load(Ordering::Relaxed) as f64
-                    + (b.congestion_factor() * 2000.0);
+                    + (b.congestion_factor() * MUXER_CONGESTION_WEIGHT);
                 score_a
                     .partial_cmp(&score_b)
                     .unwrap_or(std::cmp::Ordering::Equal)
@@ -244,36 +253,61 @@ impl Muxer {
                     Ok(())
                 }
                 Err(_) => {
+                    DIAG_COUNTERS.upload_fails.fetch_add(1, Ordering::Relaxed);
+                    diagnostics::send_diag_event(DiagnosticsEvent::UploadFailed {
+                        stream_id,
+                        reason: "data channel closed (leg dropped)".into(),
+                    });
                     self.remove_leg(leg.id, &leg.control_tx);
                     Err(AppError::new(ERR_INFRA_TIMEOUT, "Обрыв", "Leg closed"))
                 }
             }
         } else {
-            // 💡 КОНТРОЛЬ: Используем .try_send() для мгновенной приоритетной отправки (Non-blocking)
-            match leg.control_tx.try_send(message) {
-                Ok(_) => {
-                    leg.stats.tx_bytes.fetch_add(size, Ordering::Relaxed);
-                    if let Some(stream_ref) = self.streams.get(&stream_id) {
-                        stream_ref
-                            .value()
-                            .1
-                            .tx_bytes
-                            .fetch_add(size, Ordering::Relaxed);
+            // Close and Heartbeat frames MUST be delivered reliably (.send().await).
+            // Close: dropping it leaks stream resources.
+            // Heartbeat (PONG): dropping it via try_send causes the health-check
+            // probe to time out after HEALTH_CHECK_TIMEOUT and evict a live leg.
+            let is_critical = matches!(message.frame_type, FrameType::Close | FrameType::Heartbeat);
+
+            if is_critical {
+                match leg.control_tx.send(message).await {
+                    Ok(_) => {
+                        leg.stats.tx_bytes.fetch_add(size, Ordering::Relaxed);
+                        if let Some(stream_ref) = self.streams.get(&stream_id) {
+                            stream_ref.value().1.tx_bytes.fetch_add(size, Ordering::Relaxed);
+                        }
+                        Ok(())
                     }
-                    Ok(())
+                    Err(_) => {
+                        self.remove_leg(leg.id, &leg.control_tx);
+                        Err(AppError::new(ERR_INFRA_TIMEOUT, "Обрыв", "Leg closed"))
+                    }
                 }
-                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                    // Канал контроля не должен забиваться. Если это произошло, пакет сбрасывается,
-                    // чтобы предотвратить зависание критических задач.
-                    netrunner_logger::warn!(
-                        stream_id,
-                        "Control queue FULL! Dropping control frame to avoid deadlock."
-                    );
-                    Ok(())
-                }
-                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                    self.remove_leg(leg.id, &leg.control_tx);
-                    Err(AppError::new(ERR_INFRA_TIMEOUT, "Обрыв", "Leg closed"))
+            } else {
+                match leg.control_tx.try_send(message) {
+                    Ok(_) => {
+                        leg.stats.tx_bytes.fetch_add(size, Ordering::Relaxed);
+                        if let Some(stream_ref) = self.streams.get(&stream_id) {
+                            stream_ref.value().1.tx_bytes.fetch_add(size, Ordering::Relaxed);
+                        }
+                        Ok(())
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(ref dropped)) => {
+                        netrunner_logger::warn!(
+                            stream_id,
+                            "Control queue FULL! Dropping non-critical control frame."
+                        );
+                        DIAG_COUNTERS.control_full_drops.fetch_add(1, Ordering::Relaxed);
+                        diagnostics::send_diag_event(DiagnosticsEvent::ControlChannelFull {
+                            stream_id,
+                            frame_type: format!("{:?}", dropped.frame_type),
+                        });
+                        Ok(())
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                        self.remove_leg(leg.id, &leg.control_tx);
+                        Err(AppError::new(ERR_INFRA_TIMEOUT, "Обрыв", "Leg closed"))
+                    }
                 }
             }
         }
@@ -328,8 +362,11 @@ impl Muxer {
         self.stream_bindings.remove(&stream_id);
     }
 
-    #[inline]
-    pub fn dispatch_to_local(&self, stream_id: u32, data: Bytes) {
+    // ORDERING CONTRACT: callers MUST .await this; the caller (TunnelEngine reader)
+    // is a spawned task, so blocking here creates correct back-pressure all the way
+    // back to the kernel TCP socket buffer.  Never spawn a task to deliver data
+    // from this function — that breaks in-order delivery guarantees.
+    pub async fn dispatch_to_local(&self, stream_id: u32, data: Bytes) {
         let size = data.len() as u64;
 
         let tx_and_stats = self.streams.get(&stream_id).map(|s| {
@@ -338,24 +375,10 @@ impl Muxer {
         });
 
         if let Some((tx, stats)) = tx_and_stats {
-            match tx.try_send(data) {
-                Ok(_) => {
-                    stats.rx_bytes.fetch_add(size, Ordering::Relaxed);
-                }
-                Err(tokio::sync::mpsc::error::TrySendError::Full(data)) => {
-                    // Channel is full: spawn a task to wait for space.
-                    // This keeps the reader loop unblocked while providing
-                    // backpressure — the spawned future will be pending until
-                    // TcpConnection drains the channel and makes room.
-                    tokio::spawn(async move {
-                        if tx.send(data).await.is_ok() {
-                            stats.rx_bytes.fetch_add(size, Ordering::Relaxed);
-                        }
-                    });
-                }
-                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                    // Stream is gone; nothing to do.
-                }
+            // .send().await blocks until the receiver has space.
+            // If the receiver is closed the error is silently ignored.
+            if tx.send(data).await.is_ok() {
+                stats.rx_bytes.fetch_add(size, Ordering::Relaxed);
             }
         }
     }
@@ -391,17 +414,46 @@ impl Muxer {
                 frame_type: FrameType::Heartbeat,
                 data: Bytes::from("PING"),
             };
-            if tx.try_send(msg).is_err() {
-                self.remove_leg(leg_id, &tx);
-                self.remove_stream(probe_stream_id);
-                continue;
+            match tx.try_send(msg) {
+                Ok(_) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    // Writer is already dead — evict immediately without waiting 20s.
+                    warn!(leg_id, "Health check: control channel closed, evicting dead leg");
+                    self.remove_leg(leg_id, &tx);
+                    self.remove_stream(probe_stream_id);
+                    continue;
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    // Control channel is temporarily full: the writer is alive and
+                    // busy processing other frames. Skip this probe cycle — evicting
+                    // a healthy leg because its queue is momentarily saturated would
+                    // cause a spurious reconnect.
+                    self.remove_stream(probe_stream_id);
+                    continue;
+                }
             }
 
             match tokio::time::timeout(crate::net::HEALTH_CHECK_TIMEOUT, probe_rx.recv()).await {
                 Ok(Some(_)) => trace!(leg_id, "✅ TCP Leg Health Check OK"),
                 _ => {
-                    warn!(leg_id, "❌ TCP Leg Health Check FAIL/Timeout - Evicting");
-                    self.remove_leg(leg_id, &tx);
+                    // Before evicting, verify the muxer still holds the same control_tx
+                    // we probed with.  After an internal reconnect, add_leg replaces the
+                    // entry with new channels, and the old probe belongs to a dead leg
+                    // that the engine has already recycled — evicting the new leg here
+                    // would be wrong.
+                    let still_same = self
+                        .legs
+                        .get(&leg_id)
+                        .map_or(false, |l| l.control_tx.same_channel(&tx));
+                    if still_same {
+                        warn!(leg_id, "❌ TCP Leg Health Check FAIL/Timeout - Evicting");
+                        self.remove_leg(leg_id, &tx);
+                    } else {
+                        netrunner_logger::debug!(
+                            leg_id,
+                            "Health check probe timed out but leg already reconnected — skipping eviction"
+                        );
+                    }
                 }
             }
             self.remove_stream(probe_stream_id);
@@ -506,5 +558,41 @@ impl Muxer {
             ));
         }
         info!("\n{}", out);
+    }
+
+    /// Collect a point-in-time snapshot of tunnel metrics for diagnostics.
+    /// Lock-free: reads only atomics and the RwLock-protected legs cache.
+    pub fn snapshot_tunnel_metrics(&self) -> TunnelMetrics {
+        let global_min_rtt = crate::net::GLOBAL_MIN_RTT.load(Ordering::Relaxed);
+        let cached_legs = self.active_legs_cache.read().unwrap().clone();
+
+        let active_legs: Vec<LegMetrics> = cached_legs
+            .iter()
+            .map(|leg| {
+                let cap = leg.data_tx.max_capacity();
+                let free = leg.data_tx.capacity();
+                let filled = cap.saturating_sub(free);
+                let congestion_factor = if cap > 0 {
+                    filled as f64 / cap as f64
+                } else {
+                    0.0
+                };
+                LegMetrics {
+                    leg_id: leg.id,
+                    rtt_ms: leg.stats.rtt_ms.load(Ordering::Relaxed),
+                    tx_mb: leg.stats.tx_bytes.load(Ordering::Relaxed) as f64 / 1_048_576.0,
+                    rx_mb: leg.stats.rx_bytes.load(Ordering::Relaxed) as f64 / 1_048_576.0,
+                    congestion_factor,
+                    data_channel_free: free,
+                    data_channel_capacity: cap,
+                }
+            })
+            .collect();
+
+        TunnelMetrics {
+            global_min_rtt_ms: global_min_rtt,
+            active_legs,
+            total_streams: self.streams.len(),
+        }
     }
 }

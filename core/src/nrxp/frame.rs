@@ -121,7 +121,14 @@ impl Parser for FrameHeader {
             0x03 => FrameType::Heartbeat,
             0x04 => FrameType::UdpConnect,
             0x05 => FrameType::UdpData,
-            _ => FrameType::Close,
+            unknown => {
+                // After successful AEAD decryption an unknown frame type means a
+                // protocol version mismatch or data corruption that the cipher
+                // somehow didn't catch. Propagate as an error so the caller can
+                // drop the leg and reconnect rather than silently treating it as
+                // Close (which would leak resources on the remote end).
+                return Err(format!("Unknown FrameType byte: 0x{:02x}", unknown));
+            }
         };
 
         let payload_len = u16::from_be_bytes(header_slice[21..23].try_into().unwrap());

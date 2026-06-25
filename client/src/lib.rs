@@ -1,3 +1,6 @@
+// Workaround for rustc 1.94 ICE in check_mod_deathness (dead-code MIR pass).
+#![allow(dead_code)]
+
 use netrunner_core::net::NetworkConfig;
 use uniffi;
 uniffi::setup_scaffolding!();

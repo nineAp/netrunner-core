@@ -7,6 +7,8 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
+use crate::diagnostics::ServerDiagnosticsLogger;
+
 pub struct Network {
     host: String,
     port: u16,
@@ -21,6 +23,9 @@ impl Network {
         let addr = format!("{}:{}", self.host, self.port);
 
         NetworkConfig::init_global(1450);
+
+        // Start diagnostics logger — writes events to ./netrunner_diagnostics.jsonl
+        Arc::new(ServerDiagnosticsLogger::new(".")).start();
 
         // 🔥 CRITICAL FIX: Create ONE global session manager for multiplexing
         let session_manager = Arc::new(SessionManager::new());

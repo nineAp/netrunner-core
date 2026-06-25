@@ -77,14 +77,14 @@ impl AeadPacker for ChaChaStream {
     }
 
     fn decrypt(&mut self, data: &mut BytesMut) -> Result<(), chacha20poly1305::aead::Error> {
-        let current_counter = self.state.counter;
+        let saved_counter = self.state.counter;
         let nonce = self.state.next_nonce();
         let data_len = data.len();
 
         match self.cipher.decrypt_in_place(&nonce, &nonce, data) {
             Ok(_) => {
                 netrunner_logger::trace!(
-                    counter = current_counter,
+                    counter = saved_counter,
                     nonce = %hex::encode(nonce),
                     len = data_len,
                     "Decryption successful"
@@ -92,13 +92,21 @@ impl AeadPacker for ChaChaStream {
                 Ok(())
             }
             Err(e) => {
+                // Roll back the counter: the plaintext was not produced, so the
+                // peer's TX counter is still at saved_counter. If the caller
+                // decides to retry (e.g., after a corrective re-read) rather
+                // than drop the connection, the next decrypt attempt will use
+                // the same nonce and succeed. In practice we always Drop on
+                // AEAD failure, but correctness requires the rollback.
+                self.state.counter = saved_counter;
+
                 let data_prefix = if data.len() >= 8 {
                     hex::encode(&data[..8])
                 } else {
                     hex::encode(data.as_ref())
                 };
                 netrunner_logger::error!(
-                    counter = current_counter,
+                    counter = saved_counter,
                     nonce = %hex::encode(nonce),
                     len = data_len,
                     prefix = %data_prefix,

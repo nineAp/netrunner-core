@@ -1,4 +1,8 @@
-use netrunner_core::net::{MAX_SOCKETS, NetworkConfig};
+use netrunner_core::net::{
+    BUFFERBLOAT_WARN_THRESHOLD, HTTPS_PORT, HTTP_ALT_PORT, HTTP_PORT, ICMP_BUFFER_SIZE,
+    ICMP_META_SLOTS, MAX_SOCKETS, NTP_PORT, RDP_PORT, RTMP_PORT, SSH_PORT, VNC_PORT, NetworkConfig,
+    DNS_PORT,
+};
 use netrunner_logger::{info, warn};
 use smoltcp::{
     iface::SocketSet,
@@ -26,9 +30,11 @@ pub const TCP_SOCKET_ACTIVE_TIMEOUT: Duration = Duration::from_secs(60);
 impl TrafficProfile {
     pub fn guess_from_port(port: u16, is_tcp: bool) -> Self {
         match (port, is_tcp) {
-            (22, true) | (3389, true) | (5900, true) => Self::Interactive,
-            (443, true) | (80, true) | (8080, true) | (1935, true) => Self::Bulk,
-            (53, false) | (123, false) => Self::Dns,
+            (SSH_PORT, true) | (RDP_PORT, true) | (VNC_PORT, true) => Self::Interactive,
+            (HTTPS_PORT, true) | (HTTP_PORT, true) | (HTTP_ALT_PORT, true) | (RTMP_PORT, true) => {
+                Self::Bulk
+            }
+            (DNS_PORT, false) | (NTP_PORT, false) => Self::Dns,
             _ => Self::Default,
         }
     }
@@ -143,11 +149,11 @@ impl SocketProvider for SmolSocketFactory {
                         app_pending_len / 1024  // Ждет входа в стек (из туннеля)
                     );
 
-                    // Если очередь приложения раздута — это красный флаг
-                    if app_pending_len > 1024 * 1024 {
+                    if app_pending_len > BUFFERBLOAT_WARN_THRESHOLD {
                         warn!(
-                            "⚠️ [TCP {}] Bufferbloat detected! Application queue is > 1MB",
-                            handle
+                            "⚠️ [TCP {}] Bufferbloat detected! Application queue is > {} KB",
+                            handle,
+                            BUFFERBLOAT_WARN_THRESHOLD / 1024
                         );
                     }
                 }
@@ -179,8 +185,14 @@ impl SocketProvider for SmolSocketFactory {
 
     fn create_icmp(&self, _profile: TrafficProfile) -> icmp::Socket<'static> {
         icmp::Socket::new(
-            icmp::PacketBuffer::new(vec![icmp::PacketMetadata::EMPTY; 4], vec![0; 512]),
-            icmp::PacketBuffer::new(vec![icmp::PacketMetadata::EMPTY; 4], vec![0; 512]),
+            icmp::PacketBuffer::new(
+                vec![icmp::PacketMetadata::EMPTY; ICMP_META_SLOTS],
+                vec![0; ICMP_BUFFER_SIZE],
+            ),
+            icmp::PacketBuffer::new(
+                vec![icmp::PacketMetadata::EMPTY; ICMP_META_SLOTS],
+                vec![0; ICMP_BUFFER_SIZE],
+            ),
         )
     }
 

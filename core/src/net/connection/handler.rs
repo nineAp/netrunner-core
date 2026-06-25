@@ -141,8 +141,8 @@ impl StreamHandler {
             }
 
             FrameType::Data | FrameType::UdpData => {
-                // Полностью синхронный вызов
-                self.muxer.dispatch_to_local(stream_id, frame.payload);
+                // MUST .await — maintains in-order delivery via back-pressure.
+                self.muxer.dispatch_to_local(stream_id, frame.payload).await;
             }
 
             FrameType::Close => {

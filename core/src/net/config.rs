@@ -26,25 +26,51 @@ pub struct NetworkConfig {
     pub udp_meta_light: usize,
 }
 
+/// MTU-aware defaults.
+///
+/// TCP socket buffers scale with the MTU so that the initial smoltcp window
+/// always fits at least `WINDOW_SEGMENTS` back-to-back segments.  Channel
+/// capacity is sized to hold at most `CHANNEL_PACKETS` MTU-sized packets.
 impl NetworkConfig {
     pub fn new(system_mtu: usize) -> Self {
+        // Keep a minimum useful MTU even if the caller supplies something tiny.
+        let mtu = system_mtu.max(576);
+
+        // Minimum number of segments that must fit in a full TCP RX/TX buffer.
+        const BULK_WINDOW_SEGMENTS: usize = 128;
+        const LIGHT_WINDOW_SEGMENTS: usize = 32;
+
+        // How many MTU-sized packets the Tokio mpsc channel should hold.
+        // At MTU 1450 and 128 slots: ~185 KB per channel — enough to absorb
+        // ~15 ms of jitter at 100 Mbps without spawning backpressure tasks.
+        const CHANNEL_PACKETS: usize = 128;
+
+        // Payload bytes per segment (no IP/TCP headers in the smoltcp buffer).
+        let seg = mtu.saturating_sub(40).max(512); // subtract typical IP+TCP overhead
+
+        // Round up to the nearest 4 KB for alignment.
+        let round = |n: usize| ((n + 4095) / 4096) * 4096;
+
+        let tcp_heavy = round(seg * BULK_WINDOW_SEGMENTS);
+        let tcp_light = round(seg * LIGHT_WINDOW_SEGMENTS);
+
         Self {
-            mtu: system_mtu,
-            connection_buf_size: 128 * 1024, // Уменьшили с 256KB
-            tcp_buffer_size: 128 * 1024,     // Уменьшили с 256KB
-            udp_buffer_size: 64 * 1024,      // Уменьшили со 128KB
-            tcp_chunk_size: 1024 * 64,
+            mtu,
+            connection_buf_size: tcp_heavy,
+            tcp_buffer_size: tcp_heavy,
+            udp_buffer_size: tcp_light,
+            // Read chunks up to one smoltcp frame payload; larger values just
+            // add latency without improving throughput.
+            tcp_chunk_size: 64 * 1024,
 
-            channel_capacity: 16,
+            channel_capacity: CHANNEL_PACKETS,
 
-            // Окна smoltcp (уменьшаем, чтобы не создавать огромные очереди)
-            tcp_rx_heavy: 128 * 1024,
-            tcp_tx_heavy: 128 * 1024,
+            tcp_rx_heavy: tcp_heavy,
+            tcp_tx_heavy: tcp_heavy,
+            tcp_rx_light: tcp_light,
+            tcp_tx_light: tcp_light,
 
-            tcp_rx_light: 32 * 1024, // Уменьшили с 64KB
-            tcp_tx_light: 32 * 1024,
-
-            udp_buf_heavy: 128 * 1024,
+            udp_buf_heavy: tcp_heavy,
             udp_meta_heavy: 512,
             udp_buf_light: 16 * 1024,
             udp_meta_light: 32,

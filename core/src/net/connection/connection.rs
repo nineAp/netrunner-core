@@ -8,9 +8,10 @@ use crate::{
             handler::{RemoteOpener, StreamHandler},
             muxer::{MuxMessage, Muxer},
         },
-        NetworkConfig, FALLBACK_CONNECT_TIMEOUT, LEG_RECONNECT_DELAY, LEG_STAGGER_DELAY,
-        MAX_TUNNEL_LEGS, SECURE_HANDSHAKE_TIMEOUT, STEALTH_FALLBACK_HOST, TLS_HELLO_TIMEOUT,
-        TOPOLOGY_PRINT_INTERVAL,
+        DNS_LOOKUP_TIMEOUT, FALLBACK_CONNECT_TIMEOUT, LEG_RECONNECT_DELAY, LEG_STAGGER_DELAY,
+        MAX_TUNNEL_LEGS, NETWORK_WATCHER_INTERVAL, SECURE_HANDSHAKE_TIMEOUT,
+        SESSION_CLEANUP_DELAY, STEALTH_FALLBACK_HOST, STEALTH_FALLBACK_SNI, TLS_HELLO_TIMEOUT,
+        TOPOLOGY_PRINT_INTERVAL, NetworkConfig,
     },
     nrxp::{Codec, Frame, FrameType, TlsBridge},
     rawcast::{LocalProtocol, RawCastAdapter, RawCastFrame},
@@ -126,7 +127,7 @@ impl ClientHandler {
         let mut conn = Connection::new(stream);
         let mut session_keys = SessionKeys::new(true);
         let ch =
-            TlsBridge::wrap_client_hello(&BrowserProfile::CHROME_131, "ubuntu.com", &session_keys);
+            TlsBridge::wrap_client_hello(&BrowserProfile::CHROME_131, STEALTH_FALLBACK_SNI, &session_keys);
 
         conn.outbound
             .write_all(&ch)
@@ -141,7 +142,7 @@ impl ClientHandler {
                 }
                 Ok(None) => {
                     let res = tokio::time::timeout(
-                        std::time::Duration::from_secs(5),
+                        TLS_HELLO_TIMEOUT,
                         conn.inbound.read_buf(&mut conn.read_buf),
                     )
                     .await;
@@ -214,7 +215,7 @@ impl ClientHandler {
         let leg_name = format!("TCP-Leg-{}", leg_id);
 
         let addrs_future = tokio::net::lookup_host(remote_proxy_addr);
-        let mut addrs = tokio::time::timeout(std::time::Duration::from_secs(3), addrs_future)
+        let mut addrs = tokio::time::timeout(DNS_LOOKUP_TIMEOUT, addrs_future)
             .await
             .map_err(|_| {
                 AppError::new(ERR_INFRA_TIMEOUT, "Сервер недоступен", "DNS Lookup Timeout")
@@ -230,7 +231,7 @@ impl ClientHandler {
         })?;
 
         let stream = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            FALLBACK_CONNECT_TIMEOUT,
             tokio::net::TcpStream::connect(addr),
         )
         .await
@@ -250,7 +251,6 @@ impl ClientHandler {
         let (control_tx, control_rx) = mpsc::channel::<MuxMessage>(cap);
         let (data_tx, data_rx) = mpsc::channel::<MuxMessage>(cap);
 
-        let control_tx_clone = control_tx.clone();
         muxer.add_leg(leg_id, control_tx, data_tx);
 
         let handler = Arc::new(StreamHandler::new(muxer.clone(), None));
@@ -272,7 +272,9 @@ impl ClientHandler {
         };
 
         let run_result = engine.run().await;
-        muxer.remove_leg(leg_id, &control_tx_clone);
+        // Use force_remove because the engine may have re-registered the leg internally
+        // (via reconnect + add_leg), making control_tx_clone stale for same_channel comparison.
+        muxer.force_remove_leg(leg_id);
 
         run_result?;
         Err(AppError::new(
@@ -286,7 +288,7 @@ impl ClientHandler {
         remote_proxy_addr: &str,
         mut rx_from_engine: mpsc::Receiver<RawCastFrame>,
         tx_to_engine: mpsc::Sender<RawCastFrame>,
-    ) -> Result<(), AppError> {
+    ) -> Result<Arc<Muxer>, AppError> {
         let session_id = SessionManager::generate_id();
         let muxer = Arc::new(Muxer::new(true, session_id.clone()));
         let registry: Arc<DashMap<u32, (u64, Ipv4Addr, u16, LocalProtocol)>> =
@@ -297,7 +299,7 @@ impl ClientHandler {
         let watcher_muxer = muxer.clone();
         tokio::spawn(async move {
             let mut last_ip = Self::get_local_ip();
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+            let mut interval = tokio::time::interval(NETWORK_WATCHER_INTERVAL);
             loop {
                 interval.tick().await;
                 let current_ip = Self::get_local_ip();
@@ -321,10 +323,31 @@ impl ClientHandler {
             let sid = session_id.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(LEG_STAGGER_DELAY * id).await;
+                let mut attempt: u32 = 0;
                 loop {
                     if let Err(e) = Self::establish_leg(&addr, id, m.clone(), &sid).await {
+                        attempt += 1;
                         error!("Leg {} disconnected: {}. Reconnecting in 2s...", id, e);
+                        let rtt = crate::net::GLOBAL_MIN_RTT.load(std::sync::atomic::Ordering::Relaxed);
+                        crate::net::diagnostics::DIAG_COUNTERS
+                            .leg_disconnects
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        crate::net::diagnostics::send_diag_event(
+                            crate::net::diagnostics::DiagnosticsEvent::LegDisconnected {
+                                leg_id: id,
+                                rtt_ms: rtt,
+                                reason: e.to_string(),
+                            },
+                        );
                         tokio::time::sleep(LEG_RECONNECT_DELAY).await;
+                        crate::net::diagnostics::send_diag_event(
+                            crate::net::diagnostics::DiagnosticsEvent::LegReconnecting {
+                                leg_id: id,
+                                attempt,
+                            },
+                        );
+                    } else {
+                        attempt = 0;
                     }
                 }
             });
@@ -431,15 +454,11 @@ impl ClientHandler {
                             });
                         }
                         FrameType::Data | FrameType::UdpData => {
-                            if let Some(up_tx) = local_to_upload_tx.get(&local_socket_id) {
-                                if let Err(mpsc::error::TrySendError::Full(_)) =
-                                    up_tx.try_send(payload)
-                                {
-                                    netrunner_logger::trace!(
-                                        local_socket_id,
-                                        "⚠️ Upload stream buffer full, dropping frame (TCP will retransmit)"
-                                    );
-                                }
+                            if let Some(up_tx) = local_to_upload_tx.get(&local_socket_id).map(|r| r.value().clone()) {
+                                // .send().await blocks the upload task when the muxer leg
+                                // is saturated, creating back-pressure back to smoltcp
+                                // (no drops → no unnecessary retransmits → lower jitter).
+                                let _ = up_tx.send(payload).await;
                             }
                         }
                         FrameType::Close => {
@@ -468,7 +487,7 @@ impl ClientHandler {
             }
         });
 
-        Ok(())
+        Ok(muxer)
     }
 }
 
@@ -685,7 +704,7 @@ impl TunnelHandler for ServerHandler {
             let sid = log_session_id;
             let m = muxer.clone();
             tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+                tokio::time::sleep(SESSION_CLEANUP_DELAY).await;
                 if m.active_legs_count() == 0 {
                     sm.remove(&sid);
                 }

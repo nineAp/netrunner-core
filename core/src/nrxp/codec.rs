@@ -61,23 +61,33 @@ impl RxCodec {
         &mut self,
         buffer: &mut BytesMut,
     ) -> Result<Option<Frame>, TlsError> {
-        // Пытаемся распарсить из того, что уже в staging
+        // Drain any complete frame that was left in staging from the previous call.
+        // This happens when multiple TLS records arrived in one TCP read and we
+        // returned after the first parsed frame, leaving the rest in staging.
         if !self.staging.is_empty() {
             if let Some(frame) = self.try_parse_frame()? {
                 return Ok(Some(frame));
             }
         }
 
-        // Подкачиваем новые данные из TLS Record
-        while let Some(app_data) = TlsBridge::unpack_app_data(buffer).map_err(|e| e)? {
+        // Encoding invariant: one TLS ApplicationData record = one encrypted NRXP
+        // frame.  We decrypt each record independently into the staging buffer and
+        // immediately attempt to parse.  split_off + decrypt_in_place + unsplit is
+        // used to keep the decrypted bytes in staging's existing allocation (zero
+        // extra allocation on the fast path).
+        while let Some(app_data) = TlsBridge::unpack_app_data(buffer)? {
             let start_idx = self.staging.len();
             self.staging.extend_from_slice(&app_data.payload);
 
+            // Split off just the new encrypted bytes; staging[..start_idx] holds
+            // any prior plaintext that is still waiting for a parse attempt.
             let mut data_to_decrypt = self.staging.split_off(start_idx);
 
-            // Шифрование In-Place
             if let Err(_) = self.crypto.decrypt(&mut data_to_decrypt) {
-                // Сбрасываем только при ошибке крипто-аутентификации (tampering)
+                // AEAD failure after a successful TCP delivery means key/nonce
+                // mismatch or tampering.  Clear staging to avoid feeding garbled
+                // plaintext into the parser on the next call, then signal Drop so
+                // the caller tears down and reconnects (fresh keys, nonce=0).
                 self.staging.clear();
                 return Err(TlsError::new(
                     ErrorStage::Tls("AEAD Decrypt Failed"),
@@ -86,12 +96,21 @@ impl RxCodec {
                 ));
             }
 
+            // Re-join: staging now contains [prev_plaintext || new_plaintext].
+            // decrypt_in_place shrank data_to_decrypt by 16 (stripped AEAD tag);
+            // unsplit handles the adjusted length correctly because the underlying
+            // allocation is contiguous and data_to_decrypt is still adjacent.
             self.staging.unsplit(data_to_decrypt);
 
-            // ИСПРАВЛЕНО: try_parse_frame теперь не сбрасывает буфер при ошибке парсинга
             if let Some(frame) = self.try_parse_frame()? {
                 return Ok(Some(frame));
             }
+
+            // try_parse_frame returned Ok(None) — this should never happen with the
+            // 1:1 TLS-record→NRXP-frame invariant, but if it does (e.g. an empty
+            // padding-only frame), we continue to the next TLS record rather than
+            // looping indefinitely.  The staging bytes will be parsed on the next
+            // decode_inbound call.
         }
 
         Ok(None)
@@ -102,11 +121,17 @@ impl RxCodec {
             Ok(Some(frame)) => Ok(Some(frame)),
             Ok(None) => Ok(None),
             Err(e) => {
-                // ИСПРАВЛЕНО: Убрали self.staging.clear().
-                // Если парсинг не удался (например, неполный заголовок),
-                // мы оставляем staging как есть и ждем новых данных.
-                trace!("Frame parse incomplete or waiting for more data: {}", e);
-                Ok(None)
+                // Frame::parse only returns Err for protocol-level violations
+                // (e.g. unknown FrameType byte) that survive AEAD decryption.
+                // This is not a partial-data situation — it means the stream is
+                // desynchronised. Drop the leg so reconnect generates fresh keys.
+                netrunner_logger::error!("Frame parse error after AEAD success — dropping leg: {}", e);
+                self.staging.clear();
+                Err(TlsError::new(
+                    crate::nrxp::errors::ErrorStage::Tls("Frame parse error"),
+                    crate::nrxp::errors::ErrorAction::Drop,
+                    bytes::Bytes::new(),
+                ))
             }
         }
     }

@@ -15,7 +15,9 @@ use tracing::instrument;
 use crate::{
     net::{
         connection::{handler::StreamHandler, muxer::MuxMessage},
-        NetworkConfig, HEALTH_CHECK_INTERVAL,
+        NetworkConfig, HEALTH_CHECK_INTERVAL, FALLBACK_CONNECT_TIMEOUT,
+        RECONNECT_BACKOFF_BASE, RECONNECT_BACKOFF_JITTER_MS,
+        TUNNEL_INTERLEAVE_CHUNK, TUNNEL_MAX_BUFFER_SIZE, TUNNEL_READ_RESERVE,
     },
     nrxp::{ErrorAction, FrameType, RxCodec, TxCodec, MAX_FRAME_PAYLOAD},
 };
@@ -49,7 +51,7 @@ impl TunnelEngine {
     ) -> Result<(OwnedReadHalf, OwnedWriteHalf, RxCodec, TxCodec), AppError> {
         info!("🔄 Attempting reconnect to {}", self.remote_addr);
         let stream = tokio::time::timeout(
-            tokio::time::Duration::from_secs(5),
+            FALLBACK_CONNECT_TIMEOUT,
             tokio::net::TcpStream::connect(&self.remote_addr),
         )
         .await
@@ -81,6 +83,14 @@ impl TunnelEngine {
                 self.leg_status = LegStatus::Reconnecting;
                 match self.attempt_reconnect().await {
                     Ok((new_in, new_out, new_rx, new_tx)) => {
+                        let cap = crate::net::NetworkConfig::global().channel_capacity;
+                        let (control_tx, control_rx) =
+                            tokio::sync::mpsc::channel::<MuxMessage>(cap);
+                        let (data_tx, data_rx) = tokio::sync::mpsc::channel::<MuxMessage>(cap);
+                        self.muxer.add_leg(self.leg_id, control_tx, data_tx);
+                        self.control_rx = Some(control_rx);
+                        self.data_rx = Some(data_rx);
+
                         self.inbound = Some(new_in);
                         self.outbound = Some(new_out);
                         self.rx_codec = Some(new_rx);
@@ -90,8 +100,8 @@ impl TunnelEngine {
                     }
                     Err(e) => {
                         error!("Reconnect failed for leg {}: {}", self.leg_id, e);
-                        let jitter = rand::random::<u64>() % 1000;
-                        tokio::time::sleep(tokio::time::Duration::from_millis(2000 + jitter)).await;
+                        let jitter = rand::random::<u64>() % RECONNECT_BACKOFF_JITTER_MS;
+                        tokio::time::sleep(RECONNECT_BACKOFF_BASE + tokio::time::Duration::from_millis(jitter)).await;
                         continue;
                     }
                 }
@@ -119,10 +129,8 @@ impl TunnelEngine {
             let mut reader_handle = tokio::spawn(async move {
                 let mut read_buf = read_buf;
                 let mut inbound = inbound;
-                const MAX_BUFFER_SIZE: usize = 1024 * 1024; // 1 MB
-
                 loop {
-                    if read_buf.len() > MAX_BUFFER_SIZE {
+                    if read_buf.len() > TUNNEL_MAX_BUFFER_SIZE {
                         error!("CRITICAL: Read buffer exceeded 1MB (OOM Protection). Dropping connection!");
                         return Err(AppError::new(
                             ERR_INFRA_TIMEOUT,
@@ -134,7 +142,7 @@ impl TunnelEngine {
                     if read_buf.is_empty() {
                         read_buf.clear();
                     }
-                    read_buf.reserve(16384);
+                    read_buf.reserve(TUNNEL_READ_RESERVE);
 
                     tokio::select! {
                         _ = token_reader.cancelled() => {
@@ -184,7 +192,7 @@ impl TunnelEngine {
                 let mut heartbeat = tokio::time::interval(HEALTH_CHECK_INTERVAL);
 
                 let mut pending_data: Option<MuxMessage> = None;
-                const INTERLEAVE_CHUNK: usize = 16384;
+                let interleave_chunk = TUNNEL_INTERLEAVE_CHUNK;
 
                 loop {
                     tokio::select! {
@@ -196,13 +204,24 @@ impl TunnelEngine {
                             muxer_pong.record_ping_sent(leg_id);
                             let msg = MuxMessage { stream_id: 0, frame_type: FrameType::Heartbeat, data: Bytes::new() };
                             if let Err(e) = Self::handle_outbound(&mut outbound, &mut tx_codec, msg).await {
+                                crate::net::diagnostics::send_diag_event(
+                                    crate::net::diagnostics::DiagnosticsEvent::TunnelWriteStuck {
+                                        leg_id, stream_id: 0,
+                                    },
+                                );
                                 return Err((e, control_rx, data_rx, tx_codec));
                             }
                         }
 
                         msg_opt = control_rx.recv() => {
                             if let Some(msg) = msg_opt {
+                                let sid = msg.stream_id;
                                 if let Err(e) = Self::handle_outbound(&mut outbound, &mut tx_codec, msg).await {
+                                    crate::net::diagnostics::send_diag_event(
+                                        crate::net::diagnostics::DiagnosticsEvent::TunnelWriteStuck {
+                                            leg_id, stream_id: sid,
+                                        },
+                                    );
                                     return Err((e, control_rx, data_rx, tx_codec));
                                 }
                             } else { break; }
@@ -212,7 +231,7 @@ impl TunnelEngine {
                         _ = std::future::ready(()), if pending_data.is_some() => {
                             let mut msg = pending_data.take().unwrap();
 
-                            let chunk_size = std::cmp::min(msg.data.len(), INTERLEAVE_CHUNK);
+                            let chunk_size = std::cmp::min(msg.data.len(), interleave_chunk);
                             let chunk_data = msg.data.split_to(chunk_size);
 
                             let chunk_msg = MuxMessage {
@@ -220,8 +239,14 @@ impl TunnelEngine {
                                 frame_type: msg.frame_type.clone(),
                                 data: chunk_data,
                             };
+                            let chunk_sid = chunk_msg.stream_id;
 
                             if let Err(e) = Self::handle_outbound(&mut outbound, &mut tx_codec, chunk_msg).await {
+                                crate::net::diagnostics::send_diag_event(
+                                    crate::net::diagnostics::DiagnosticsEvent::TunnelWriteStuck {
+                                        leg_id, stream_id: chunk_sid,
+                                    },
+                                );
                                 return Err((e, control_rx, data_rx, tx_codec));
                             }
 
@@ -366,6 +391,11 @@ impl TunnelEngine {
                 tokio::time::timeout(std::time::Duration::from_secs(20), write_future).await
             {
                 error!(stream_id, "🔥 Physical leg STUCK on write. Killing leg.");
+                // Increment counter; the call site in run() emits the full event
+                // with the correct leg_id since handle_outbound is a static fn.
+                crate::net::diagnostics::DIAG_COUNTERS
+                    .tunnel_write_stalls
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return Err(AppError::new(
                     ERR_INFRA_TIMEOUT,
                     "Таймаут отправки",

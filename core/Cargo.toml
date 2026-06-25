@@ -22,3 +22,5 @@ socket2 = { version = "0.5", features = ["all"] }
 libc = "0.2"
 netrunner-logger = { path = "../tools/log" }
 tracing = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

@@ -11,9 +11,20 @@ use std::time::{Duration, SystemTime};
 use tokio::fs::{self, File};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
-// --- Fake IP Storage ---
+// --- Constants ---
 
-const START_IP: u32 = 0x64400001; // 100.64.0.1
+/// Start of the RFC 6598 (CGNAT) range used for fake DNS responses.
+const FAKE_IP_START: u32 = 0x6440_0001; // 100.64.0.1
+/// LRU capacity for the domain→IP and IP→domain mapping tables.
+const FAKE_IP_CACHE_SIZE: usize = 2000;
+/// Re-download the blocklist if the cached file is older than this.
+const BLOCKLIST_UPDATE_INTERVAL: Duration = Duration::from_secs(7 * 24 * 3600);
+/// Delay before starting a background blocklist download on first run.
+const BLOCKLIST_DOWNLOAD_DELAY: Duration = Duration::from_secs(10);
+/// HTTP timeout for the blocklist download request.
+const BLOCKLIST_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+/// TTL advertised in fake DNS A records (seconds).
+const FAKE_DNS_TTL: u32 = 60;
 
 pub struct FakeIpStore {
     cache: LruCache<String, Ipv4Addr>,
@@ -23,11 +34,11 @@ pub struct FakeIpStore {
 
 impl FakeIpStore {
     pub fn new() -> Self {
-        info!("Initializing FakeIpStore starting at 100.64.0.1");
+        info!("Initializing FakeIpStore starting at {}", Ipv4Addr::from(FAKE_IP_START));
         Self {
-            cache: LruCache::new(NonZeroUsize::new(2000).unwrap()),
-            rev_cache: LruCache::new(NonZeroUsize::new(2000).unwrap()),
-            next_ip: START_IP,
+            cache: LruCache::new(NonZeroUsize::new(FAKE_IP_CACHE_SIZE).unwrap()),
+            rev_cache: LruCache::new(NonZeroUsize::new(FAKE_IP_CACHE_SIZE).unwrap()),
+            next_ip: FAKE_IP_START,
         }
     }
 
@@ -90,7 +101,7 @@ impl DnsHandler {
             SystemTime::now()
                 .duration_since(meta.modified()?)
                 .unwrap_or_default()
-                > Duration::from_secs(604800) // 1 неделя
+                > BLOCKLIST_UPDATE_INTERVAL
         } else {
             true
         };
@@ -98,7 +109,7 @@ impl DnsHandler {
         if needs_update {
             let p_clone = self.cache_path.clone();
             tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_secs(10)).await;
+                tokio::time::sleep(BLOCKLIST_DOWNLOAD_DELAY).await;
                 if let Err(e) = Self::download_blocklist_async(p_clone).await {
                     error!("DNS: Background update failed: {}", e);
                 }
@@ -111,7 +122,7 @@ impl DnsHandler {
     async fn download_blocklist_async(cache_path: String) -> Result<()> {
         info!("DNS: Starting background download to {}", cache_path);
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
+            .timeout(BLOCKLIST_HTTP_TIMEOUT)
             .build()?;
 
         let resp = client
@@ -183,7 +194,7 @@ impl DnsHandler {
             let fake_ip = store.get_or_assign(&name);
             res.add_answer(Record::from_rdata(
                 query.name().clone(),
-                60,
+                FAKE_DNS_TTL,
                 RData::A(fake_ip.into()),
             ));
             res.set_response_code(ResponseCode::NoError);
