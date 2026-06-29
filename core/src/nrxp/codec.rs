@@ -4,7 +4,6 @@ use crate::nrxp::errors::{ErrorAction, ErrorStage, TlsError};
 use crate::nrxp::frame::{Frame, FrameType};
 use crate::parser::Parser;
 use bytes::{Bytes, BytesMut};
-use netrunner_logger::trace;
 
 pub struct TxCodec {
     crypto: ChaChaStream,
@@ -125,7 +124,10 @@ impl RxCodec {
                 // (e.g. unknown FrameType byte) that survive AEAD decryption.
                 // This is not a partial-data situation — it means the stream is
                 // desynchronised. Drop the leg so reconnect generates fresh keys.
-                netrunner_logger::error!("Frame parse error after AEAD success — dropping leg: {}", e);
+                netrunner_logger::error!(
+                    "Frame parse error after AEAD success — dropping leg: {}",
+                    e
+                );
                 self.staging.clear();
                 Err(TlsError::new(
                     crate::nrxp::errors::ErrorStage::Tls("Frame parse error"),

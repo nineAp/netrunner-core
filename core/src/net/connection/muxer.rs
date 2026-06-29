@@ -7,9 +7,9 @@ use std::time::Instant;
 use tokio::sync::mpsc::Sender;
 use tokio_util::sync::CancellationToken;
 
+use crate::net::diagnostics::{self, DiagnosticsEvent, LegMetrics, TunnelMetrics, DIAG_COUNTERS};
+use crate::net::{DISPATCH_TO_LOCAL_TIMEOUT, MAX_TUNNEL_LEGS};
 use crate::net::{INITIAL_RTT_MS, MUXER_CONGESTION_WEIGHT};
-use crate::net::{DISPATCH_TO_LOCAL_TIMEOUT, HEALTH_CHECK_TIMEOUT, MAX_TUNNEL_LEGS};
-use crate::net::diagnostics::{self, DiagnosticsEvent, DIAG_COUNTERS, LegMetrics, TunnelMetrics};
 use crate::nrxp::FrameType;
 
 #[derive(Default, Debug)]
@@ -212,7 +212,7 @@ impl Muxer {
                 // only moves the stored RTT to ~112 ms instead of jumping
                 // straight to 300 ms, preventing unnecessary leg re-selection.
                 let rtt = if current == crate::net::INITIAL_RTT_MS {
-                    measured  // first real measurement: accept immediately
+                    measured // first real measurement: accept immediately
                 } else {
                     (current.saturating_mul(3).saturating_add(measured)) / 4
                 };
@@ -282,7 +282,11 @@ impl Muxer {
                     Ok(_) => {
                         leg.stats.tx_bytes.fetch_add(size, Ordering::Relaxed);
                         if let Some(stream_ref) = self.streams.get(&stream_id) {
-                            stream_ref.value().1.tx_bytes.fetch_add(size, Ordering::Relaxed);
+                            stream_ref
+                                .value()
+                                .1
+                                .tx_bytes
+                                .fetch_add(size, Ordering::Relaxed);
                         }
                         Ok(())
                     }
@@ -296,7 +300,11 @@ impl Muxer {
                     Ok(_) => {
                         leg.stats.tx_bytes.fetch_add(size, Ordering::Relaxed);
                         if let Some(stream_ref) = self.streams.get(&stream_id) {
-                            stream_ref.value().1.tx_bytes.fetch_add(size, Ordering::Relaxed);
+                            stream_ref
+                                .value()
+                                .1
+                                .tx_bytes
+                                .fetch_add(size, Ordering::Relaxed);
                         }
                         Ok(())
                     }
@@ -305,7 +313,9 @@ impl Muxer {
                             stream_id,
                             "Control queue FULL! Dropping non-critical control frame."
                         );
-                        DIAG_COUNTERS.control_full_drops.fetch_add(1, Ordering::Relaxed);
+                        DIAG_COUNTERS
+                            .control_full_drops
+                            .fetch_add(1, Ordering::Relaxed);
                         diagnostics::send_diag_event(DiagnosticsEvent::ControlChannelFull {
                             stream_id,
                             frame_type: format!("{:?}", dropped.frame_type),
@@ -389,12 +399,18 @@ impl Muxer {
 
         if let Some((tx, stats)) = tx_and_stats {
             match tokio::time::timeout(DISPATCH_TO_LOCAL_TIMEOUT, tx.send(data)).await {
-                Ok(Ok(_)) => { stats.rx_bytes.fetch_add(size, Ordering::Relaxed); }
+                Ok(Ok(_)) => {
+                    stats.rx_bytes.fetch_add(size, Ordering::Relaxed);
+                }
                 Ok(Err(_)) => { /* receiver already closed — stream gone */ }
                 Err(_) => {
                     // Bridge isn't consuming: app socket full or app paused too long.
                     // Close the stream to free the leg for all other streams.
-                    warn!(stream_id, "dispatch_to_local: stream stalled for {:?}, closing", DISPATCH_TO_LOCAL_TIMEOUT);
+                    warn!(
+                        stream_id,
+                        "dispatch_to_local: stream stalled for {:?}, closing",
+                        DISPATCH_TO_LOCAL_TIMEOUT
+                    );
                     self.remove_stream(stream_id);
                 }
             }
@@ -436,7 +452,10 @@ impl Muxer {
                 Ok(_) => {}
                 Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                     // Writer is already dead — evict immediately without waiting 20s.
-                    warn!(leg_id, "Health check: control channel closed, evicting dead leg");
+                    warn!(
+                        leg_id,
+                        "Health check: control channel closed, evicting dead leg"
+                    );
                     self.remove_leg(leg_id, &tx);
                     self.remove_stream(probe_stream_id);
                     continue;

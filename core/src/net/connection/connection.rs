@@ -8,10 +8,10 @@ use crate::{
             handler::{RemoteOpener, StreamHandler},
             muxer::{MuxMessage, Muxer},
         },
-        DNS_LOOKUP_TIMEOUT, FALLBACK_CONNECT_TIMEOUT, LEG_RECONNECT_DELAY, LEG_STAGGER_DELAY,
-        MAX_TUNNEL_LEGS, NETWORK_WATCHER_INTERVAL, SECURE_HANDSHAKE_TIMEOUT,
+        NetworkConfig, DNS_LOOKUP_TIMEOUT, FALLBACK_CONNECT_TIMEOUT, LEG_RECONNECT_DELAY,
+        LEG_STAGGER_DELAY, MAX_TUNNEL_LEGS, NETWORK_WATCHER_INTERVAL, SECURE_HANDSHAKE_TIMEOUT,
         SESSION_CLEANUP_DELAY, STEALTH_FALLBACK_HOST, STEALTH_FALLBACK_SNI, TLS_HELLO_TIMEOUT,
-        TOPOLOGY_PRINT_INTERVAL, NetworkConfig,
+        TOPOLOGY_PRINT_INTERVAL,
     },
     nrxp::{Codec, Frame, FrameType, TlsBridge},
     rawcast::{LocalProtocol, RawCastAdapter, RawCastFrame},
@@ -72,7 +72,6 @@ impl SessionManager {
 
         info!("📊 --- SERVER GLOBAL SESSIONS REPORT ---");
         for entry in self.sessions.iter() {
-            let session_id = entry.key();
             let muxer = entry.value();
             muxer.print_topology_tree();
         }
@@ -111,7 +110,7 @@ impl ClientHandler {
     }
 
     pub async fn perform_handshake(
-        mut stream: tokio::net::TcpStream,
+        stream: tokio::net::TcpStream,
         session_id: &str,
         leg_id: u32,
     ) -> Result<
@@ -126,8 +125,11 @@ impl ClientHandler {
         stream.set_nodelay(true).unwrap_or_default();
         let mut conn = Connection::new(stream);
         let mut session_keys = SessionKeys::new(true);
-        let ch =
-            TlsBridge::wrap_client_hello(&BrowserProfile::CHROME_131, STEALTH_FALLBACK_SNI, &session_keys);
+        let ch = TlsBridge::wrap_client_hello(
+            &BrowserProfile::CHROME_131,
+            STEALTH_FALLBACK_SNI,
+            &session_keys,
+        );
 
         conn.outbound
             .write_all(&ch)
@@ -244,7 +246,11 @@ impl ClientHandler {
         let stream = tokio::time::timeout(FALLBACK_CONNECT_TIMEOUT, socket.connect(addr))
             .await
             .map_err(|_| {
-                AppError::new(ERR_INFRA_TIMEOUT, "Таймаут подключения", "Connection timeout")
+                AppError::new(
+                    ERR_INFRA_TIMEOUT,
+                    "Таймаут подключения",
+                    "Connection timeout",
+                )
             })?
             .map_err(|e| AppError::new(ERR_INFRA_TIMEOUT, "Сбой сокета", e.to_string()))?;
 
@@ -332,7 +338,8 @@ impl ClientHandler {
                     if let Err(e) = Self::establish_leg(&addr, id, m.clone(), &sid).await {
                         attempt += 1;
                         error!("Leg {} disconnected: {}. Reconnecting in 2s...", id, e);
-                        let rtt = crate::net::GLOBAL_MIN_RTT.load(std::sync::atomic::Ordering::Relaxed);
+                        let rtt =
+                            crate::net::GLOBAL_MIN_RTT.load(std::sync::atomic::Ordering::Relaxed);
                         crate::net::diagnostics::DIAG_COUNTERS
                             .leg_disconnects
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -458,7 +465,10 @@ impl ClientHandler {
                             });
                         }
                         FrameType::Data | FrameType::UdpData => {
-                            if let Some(up_tx) = local_to_upload_tx.get(&local_socket_id).map(|r| r.value().clone()) {
+                            if let Some(up_tx) = local_to_upload_tx
+                                .get(&local_socket_id)
+                                .map(|r| r.value().clone())
+                            {
                                 // .send().await blocks the upload task when the muxer leg
                                 // is saturated, creating back-pressure back to smoltcp
                                 // (no drops → no unnecessary retransmits → lower jitter).

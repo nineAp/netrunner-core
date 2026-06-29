@@ -77,7 +77,7 @@ impl SessionManager {
     pub fn spawn_session(
         &self,
         remote_address: String,
-        tun_fd: Option<i32>,
+        _tun_fd: Option<i32>,
         cache_dir: String,
         killswitch_enabled: bool,
         excluded_apps: Vec<String>,
@@ -118,7 +118,7 @@ impl SessionManager {
             let tun_device = {
                 #[cfg(any(target_os = "android", target_os = "ios"))]
                 {
-                    Tun::from_fd(tun_fd.expect("TUN FD required on mobile"))
+                    Tun::from_fd(_tun_fd.expect("TUN FD required on mobile"))
                         .expect("Failed to init TUN from FD")
                 }
                 #[cfg(target_os = "linux")]
