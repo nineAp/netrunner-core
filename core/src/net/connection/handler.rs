@@ -181,6 +181,27 @@ impl StreamHandler {
                 debug!(stream_id, "🏁 [Tunnel] Peer closed stream");
                 self.muxer.remove_stream(stream_id);
             }
+
+            FrameType::Diag => {
+                // Диагностика клиента, доставленная по туннелю. Осмысленна только
+                // на сервере: пересылаем в сток вместе с id сессии (берём из
+                // muxer'а — на сервере это сессия этой ноги). На клиенте сток не
+                // поднят, поэтому отчёт просто отбрасывается. Никогда не идёт в
+                // локальные сокеты и не маршрутизируется как данные.
+                let session_id = self.muxer.session_id().to_string();
+                let json_line = String::from_utf8_lossy(&frame.payload).into_owned();
+                trace!(
+                    session_id = %session_id,
+                    bytes = json_line.len(),
+                    "🩺 [Tunnel] Client diagnostics report received"
+                );
+                crate::net::diagnostics::report_client_diag(
+                    crate::net::diagnostics::ClientDiagReport {
+                        session_id,
+                        json_line,
+                    },
+                );
+            }
         }
     }
 

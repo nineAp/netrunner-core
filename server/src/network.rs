@@ -15,7 +15,7 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
-use crate::diagnostics::ServerDiagnosticsLogger;
+use crate::diagnostics::{ClientDiagnosticsLogger, ServerDiagnosticsLogger};
 
 /// Параметры прослушивания сервера.
 pub struct Network {
@@ -36,6 +36,10 @@ impl Network {
 
         // Start diagnostics logger — writes events to ./netrunner_diagnostics.jsonl
         Arc::new(ServerDiagnosticsLogger::new(".")).start();
+
+        // Start client-diagnostics logger — saves snapshots shipped by clients
+        // over the tunnel into ./netrunner_client_diag_<session>.jsonl
+        Arc::new(ClientDiagnosticsLogger::new(".")).start();
 
         // 🔥 CRITICAL FIX: Create ONE global session manager for multiplexing
         let session_manager = Arc::new(SessionManager::new());

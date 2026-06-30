@@ -54,6 +54,42 @@ pub fn send_diag_event(event: DiagnosticsEvent) {
     }
 }
 
+// ── Client-diagnostics sink (server side) ─────────────────────────────────────
+
+/// Отчёт диагностики клиента, доставленный по туннелю на сервер.
+///
+/// Клиент по триггеру строит снапшот, сериализует его в одну JSON-строку и шлёт
+/// `Diag`-кадром. Сервер принимает кадр, оборачивает payload в этот тип (вместе с
+/// `session_id` ноги, по которой он пришёл) и кладёт в сток
+/// [`report_client_diag`], откуда серверный логгер пишет его в пер-сессионный файл.
+#[derive(Debug, Clone)]
+pub struct ClientDiagReport {
+    /// Идентификатор сессии (источник имени файла на сервере).
+    pub session_id: String,
+    /// Одна готовая JSON-строка снапшота (как прислал клиент).
+    pub json_line: String,
+}
+
+/// Sender end of the client-diagnostics sink. Set once by the server via
+/// [`init_client_diag_sink`]; stays `None` on the client, where reports are dropped.
+static GLOBAL_CLIENT_DIAG_TX: OnceLock<mpsc::UnboundedSender<ClientDiagReport>> = OnceLock::new();
+
+/// Серверная сторона: вызвать один раз при старте. Возвращает приёмник
+/// клиентских отчётов, который логгер держит и сливает в пер-сессионные файлы.
+pub fn init_client_diag_sink() -> mpsc::UnboundedReceiver<ClientDiagReport> {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let _ = GLOBAL_CLIENT_DIAG_TX.set(tx);
+    rx
+}
+
+/// Fire-and-forget: переслать клиентский отчёт в сток. No-op, если сток не поднят
+/// (т.е. на клиенте) — ровно как [`send_diag_event`] относительно своего канала.
+pub fn report_client_diag(report: ClientDiagReport) {
+    if let Some(tx) = GLOBAL_CLIENT_DIAG_TX.get() {
+        let _ = tx.send(report);
+    }
+}
+
 // ── Event types ───────────────────────────────────────────────────────────────
 
 /// Событие, которое стало триггером снапшота (и единица потока событий).
@@ -182,6 +218,15 @@ pub struct DiagnosticsSnapshot {
     pub sockets: Vec<SocketMetrics>,
     /// Running totals of all error/event counters up to this snapshot.
     pub error_totals: ErrorCounters,
+}
+
+impl DiagnosticsSnapshot {
+    /// Сериализует снапшот в одну компактную JSON-строку (без отступов и переводов
+    /// строк). Это формат, в котором клиент шлёт снапшот `Diag`-кадром, а сервер
+    /// дописывает его строкой в пер-сессионный JSONL-файл.
+    pub fn to_json_line(&self) -> String {
+        serde_json::to_string(self).unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}"))
+    }
 }
 
 // ── Atomic error counters (global, updated at event sites) ───────────────────

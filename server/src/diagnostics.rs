@@ -19,6 +19,10 @@ use tokio::{
     time::{interval, Duration},
 };
 
+/// Max bytes of a session id used when building a client-diagnostics filename.
+/// Generated ids are 32 hex chars; the cap just bounds a hostile/oversized id.
+const CLIENT_DIAG_SESSION_ID_MAX: usize = 64;
+
 /// Maximum number of snapshots kept in the in-memory store on the server.
 const SERVER_MAX_SNAPSHOTS: usize = 100;
 /// Rotate the log file when it exceeds this many bytes (~10 MB).
@@ -164,5 +168,82 @@ impl ServerDiagnosticsLogger {
             _ => {}
         }
         Ok(())
+    }
+}
+
+/// Логгер клиентской диагностики, доставленной по туннелю.
+///
+/// Подписывается на сток [`diagnostics::init_client_diag_sink`] и для каждого
+/// пришедшего отчёта дописывает его JSON-строку в пер-сессионный JSONL-файл
+/// `netrunner_client_diag_<session_id>.jsonl`. Так снапшоты ядра клиента, которые
+/// раньше копились вхолостую в памяти приложения, оседают на сервере рядом с его
+/// собственной диагностикой, разложенные по сессиям.
+pub struct ClientDiagnosticsLogger {
+    log_dir: PathBuf,
+}
+
+impl ClientDiagnosticsLogger {
+    pub fn new(log_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            log_dir: log_dir.into(),
+        }
+    }
+
+    /// Очищает `session_id` для безопасного использования в имени файла: оставляет
+    /// только `[A-Za-z0-9._-]` и ограничивает длину. Защита от path-traversal —
+    /// `session_id` приходит из клиентского auth-payload и не доверенный.
+    fn sanitize_session_id(session_id: &str) -> String {
+        let cleaned: String = session_id
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+            .take(CLIENT_DIAG_SESSION_ID_MAX)
+            .collect();
+        if cleaned.is_empty() {
+            "unknown".to_string()
+        } else {
+            cleaned
+        }
+    }
+
+    /// Запускает фоновую задачу: читает отчёты из стока и пишет их по сессиям.
+    /// Завершается, когда сток закрыт (все отправители ушли).
+    pub fn start(self: Arc<Self>) {
+        let mut rx = diagnostics::init_client_diag_sink();
+        tokio::spawn(async move {
+            info!(
+                "Client diagnostics logger started → {}/netrunner_client_diag_<session>.jsonl",
+                self.log_dir.display()
+            );
+            while let Some(report) = rx.recv().await {
+                self.append_report(&report.session_id, &report.json_line)
+                    .await;
+            }
+            warn!("Client diagnostics sink closed; logger task stopping");
+        });
+    }
+
+    /// Дописывает одну JSON-строку в файл сессии (создавая его при необходимости).
+    async fn append_report(&self, session_id: &str, json_line: &str) {
+        let safe_id = Self::sanitize_session_id(session_id);
+        let mut path = self.log_dir.clone();
+        path.push(format!("netrunner_client_diag_{}.jsonl", safe_id));
+
+        let result = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .await;
+
+        match result {
+            Ok(mut file) => {
+                let _ = file.write_all(json_line.as_bytes()).await;
+                let _ = file.write_all(b"\n").await;
+            }
+            Err(e) => error!(
+                "Cannot open client diagnostics log {}: {}",
+                path.display(),
+                e
+            ),
+        }
     }
 }

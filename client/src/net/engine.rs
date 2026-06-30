@@ -76,6 +76,14 @@ const MAX_POLL_SLEEP: Duration = Duration::from_millis(2);
 /// than this many queued frames is treated as a dead/stuck consumer and dropped,
 /// so it can never stall the shared download pipe for other sockets.
 const MAX_PENDING_FRAMES_PER_SOCKET: usize = 64;
+/// Max diagnostics snapshots buffered locally awaiting upload to the server.
+/// The most useful triggers (leg disconnect/reconnect) fire exactly when no leg
+/// is up to carry them, so snapshots wait here and flush once a leg recovers.
+/// Oldest is dropped past the cap — recent state matters more than ancient.
+const DIAG_OUTBOX_CAP: usize = 128;
+/// Diagnostics snapshots flushed to the server per engine tick. Bounds the cold
+/// path so a large backlog can't monopolise a loop iteration after reconnect.
+const DIAG_FLUSH_PER_TICK: usize = 16;
 
 /// Движок клиентского стека: интерфейс smoltcp, реестр сокетов, мост в туннель
 /// и диагностика. Живёт в одной задаче `tokio` (см. [`run`](Engine::run)).
@@ -98,6 +106,11 @@ pub struct Engine {
     diag_rx: Option<DiagnosisRx>,
     /// Shared store that holds the last N snapshots (readable via public API).
     pub diag_store: Arc<DiagnosticsStore>,
+    /// Snapshots serialized to JSON and queued for upload to the connected
+    /// server (one `Diag` frame each). Filled on every trigger; drained whenever
+    /// a tunnel leg is available so reports survive the disconnect that produced
+    /// them. See [`DIAG_OUTBOX_CAP`] / [`DIAG_FLUSH_PER_TICK`].
+    diag_outbox: std::collections::VecDeque<Bytes>,
     /// Per-socket backlog of download frames whose target channel was full.
     /// Keyed by socket_id so a single slow/dead consumer can NEVER stall the
     /// shared download pipe for other sockets — the old single global slot did
@@ -146,6 +159,7 @@ impl Engine {
             muxer: None,
             diag_rx: None,
             diag_store: Arc::new(DiagnosticsStore::new(20)),
+            diag_outbox: std::collections::VecDeque::new(),
             pending_download: std::collections::HashMap::new(),
             dl_dispatched: 0,
             dl_dropped_stuck: 0,
@@ -381,12 +395,39 @@ impl Engine {
                     match diag_rx.try_recv() {
                         Ok(event) => {
                             let snap = self.build_snapshot(event);
+                            // Queue a compact JSON copy for upload to the server,
+                            // then keep the snapshot in the local ring buffer.
+                            if self.diag_outbox.len() >= DIAG_OUTBOX_CAP {
+                                self.diag_outbox.pop_front();
+                            }
+                            self.diag_outbox.push_back(Bytes::from(snap.to_json_line()));
                             self.diag_store.push(snap);
                         }
                         Err(_) => break,
                     }
                 }
                 self.diag_rx = Some(diag_rx);
+            }
+
+            // ── 6b. Ship queued diagnostics to the server ────────────────
+            // Best-effort, cold path: only runs when there's a backlog AND a leg
+            // is up to carry it. send_diag_report is a non-blocking try_send under
+            // the hood, so the await is cheap; on failure (no leg accepted it) we
+            // re-queue the snapshot and retry on a later tick.
+            if !self.diag_outbox.is_empty() {
+                if let Some(muxer) = self.muxer.clone() {
+                    if muxer.active_legs_count() > 0 {
+                        for _ in 0..DIAG_FLUSH_PER_TICK {
+                            let Some(line) = self.diag_outbox.pop_front() else {
+                                break;
+                            };
+                            if !muxer.send_diag_report(line.clone()).await {
+                                self.diag_outbox.push_front(line);
+                                break;
+                            }
+                        }
+                    }
+                }
             }
 
             // ── 7. Adaptive timing ───────────────────────────────────────

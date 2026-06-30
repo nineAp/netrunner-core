@@ -31,6 +31,10 @@ pub(crate) enum FrameType {
     UdpConnect = 0x04,
     /// Датаграмма UDP-сессии.
     UdpData = 0x05,
+    /// Диагностический отчёт клиента (один JSON-снапшот в payload). Холодный
+    /// путь: едет по контрольному каналу, сервер сохраняет его в пер-сессионный
+    /// файл. Никогда не маршрутизируется в локальные сокеты.
+    Diag = 0x06,
 }
 
 /// Разобранный заголовок кадра (25 байт). Поля идут в том же порядке, что и в wire.
@@ -165,6 +169,7 @@ impl Parser for FrameHeader {
             0x03 => FrameType::Heartbeat,
             0x04 => FrameType::UdpConnect,
             0x05 => FrameType::UdpData,
+            0x06 => FrameType::Diag,
             unknown => {
                 // After successful AEAD decryption an unknown frame type means a
                 // protocol version mismatch or data corruption that the cipher
