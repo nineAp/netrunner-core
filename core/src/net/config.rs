@@ -40,10 +40,17 @@ impl NetworkConfig {
         const BULK_WINDOW_SEGMENTS: usize = 128;
         const LIGHT_WINDOW_SEGMENTS: usize = 32;
 
-        // How many MTU-sized packets the Tokio mpsc channel should hold.
-        // At MTU 1450 and 128 slots: ~185 KB per channel — enough to absorb
-        // ~15 ms of jitter at 100 Mbps without spawning backpressure tasks.
-        const CHANNEL_PACKETS: usize = 128;
+        // How many messages the Tokio mpsc channels hold.
+        //
+        // 🔥 ANTI-BUFFERBLOAT: this is the dominant app-layer queue on every
+        // tunnel leg. A single server→leg data message can be up to one read
+        // buffer (~180 KB), so 128 slots meant up to ~23 MB of in-flight data
+        // QUEUED per leg. After a speedtest that reservoir is full of data for
+        // streams the app already closed; the downlink wastes seconds draining
+        // it (observed: mux_dispatch no_stream ≫ ok, RTT → 1.3 s, tunnel "dies").
+        // 16 slots bounds the per-leg queue ~8× lower so it drains in ~1 s and
+        // RTT stays low, while still keeping the writer fed for full throughput.
+        const CHANNEL_PACKETS: usize = 16;
 
         // Payload bytes per segment (no IP/TCP headers in the smoltcp buffer).
         let seg = mtu.saturating_sub(40).max(512); // subtract typical IP+TCP overhead

@@ -378,7 +378,61 @@ impl ClientHandler {
 
         let muxer_inner = muxer.clone();
         tokio::spawn(async move {
-            while let Some(raw_frame) = rx_from_engine.recv().await {
+            // Per-socket upload backlog. When a stream's up_tx is momentarily full we
+            // stash the frame here and KEEP PROCESSING other streams — so one slow
+            // upload can no longer head-of-line-block the shared loop, and we never
+            // kill a healthy stream. Only a single stream sustaining more than
+            // UPLOAD_PENDING_CAP buffered frames triggers bounded back-pressure
+            // (a one-frame blocking send) to keep memory bounded.
+            const UPLOAD_PENDING_CAP: usize = 64;
+            let mut pending_upload: std::collections::HashMap<
+                u64,
+                std::collections::VecDeque<Bytes>,
+            > = std::collections::HashMap::new();
+
+            loop {
+                // Flush existing per-socket backlogs first (fully non-blocking).
+                if !pending_upload.is_empty() {
+                    pending_upload.retain(|sid, q| {
+                        match local_to_upload_tx.get(sid).map(|r| r.value().clone()) {
+                            Some(up_tx) => {
+                                while let Some(front) = q.pop_front() {
+                                    match up_tx.try_send(front) {
+                                        Ok(_) => {}
+                                        Err(mpsc::error::TrySendError::Full(p)) => {
+                                            q.push_front(p);
+                                            break;
+                                        }
+                                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                                            q.clear();
+                                            break;
+                                        }
+                                    }
+                                }
+                                !q.is_empty() // keep the entry only if still backlogged
+                            }
+                            None => false, // socket gone — drop its backlog
+                        }
+                    });
+                }
+
+                // Wait for the next frame; while backlogged, also wake on a short timer
+                // to retry the flush as the uplink drains.
+                let raw_frame = if pending_upload.is_empty() {
+                    match rx_from_engine.recv().await {
+                        Some(f) => f,
+                        None => break,
+                    }
+                } else {
+                    tokio::select! {
+                        f = rx_from_engine.recv() => match f {
+                            Some(f) => f,
+                            None => break,
+                        },
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(5)) => continue,
+                    }
+                };
+
                 if let Ok(nrxp_frame) = RawCastAdapter::to_nrxp(raw_frame.clone()) {
                     let local_socket_id = raw_frame.socket_id;
                     let f_type = nrxp_frame.header.frame_type;
@@ -446,7 +500,11 @@ impl ClientHandler {
                                 }
                             });
 
-                            let (up_tx, mut up_rx) = mpsc::channel::<Bytes>(cap);
+                            // Per-stream upload buffer, kept deeper than the (deliberately
+                            // small, anti-bufferbloat) default so upload bursts — e.g. a
+                            // speedtest over a slow uplink — are absorbed here and the shared
+                            // rx_from_engine loop rarely has to apply back-pressure on it.
+                            let (up_tx, mut up_rx) = mpsc::channel::<Bytes>(cap.max(32));
                             local_to_upload_tx.insert(local_socket_id, up_tx);
 
                             let m_clone = muxer_inner.clone();
@@ -469,13 +527,44 @@ impl ClientHandler {
                                 .get(&local_socket_id)
                                 .map(|r| r.value().clone())
                             {
-                                // .send().await blocks the upload task when the muxer leg
-                                // is saturated, creating back-pressure back to smoltcp
-                                // (no drops → no unnecessary retransmits → lower jitter).
-                                let _ = up_tx.send(payload).await;
+                                // PER-STREAM, no shared-loop HOL: if this stream already has a
+                                // backlog, queue behind it (preserve order). Otherwise try a
+                                // non-blocking send; on full, START a backlog and keep serving
+                                // OTHER streams. (Replaces the old 2 s blocking grace that
+                                // stalled the whole loop and then killed healthy streams.)
+                                if let Some(q) = pending_upload.get_mut(&local_socket_id) {
+                                    q.push_back(payload);
+                                } else {
+                                    match up_tx.try_send(payload) {
+                                        Ok(_) => {}
+                                        Err(mpsc::error::TrySendError::Closed(_)) => {}
+                                        Err(mpsc::error::TrySendError::Full(p)) => {
+                                            let mut q = std::collections::VecDeque::with_capacity(16);
+                                            q.push_back(p);
+                                            pending_upload.insert(local_socket_id, q);
+                                        }
+                                    }
+                                }
+
+                                // Bounded back-pressure: only if THIS stream's backlog exceeds
+                                // the cap (sustained uplink-bound overload) do we block on a
+                                // single frame, so memory stays bounded. Never closes the
+                                // stream; other streams were already flushed at the loop top.
+                                let over_cap = pending_upload
+                                    .get(&local_socket_id)
+                                    .map_or(false, |q| q.len() > UPLOAD_PENDING_CAP);
+                                if over_cap {
+                                    let front = pending_upload
+                                        .get_mut(&local_socket_id)
+                                        .and_then(|q| q.pop_front());
+                                    if let Some(front) = front {
+                                        let _ = up_tx.send(front).await;
+                                    }
+                                }
                             }
                         }
                         FrameType::Close => {
+                            pending_upload.remove(&local_socket_id);
                             if let Some(kv) = local_to_global.remove(&local_socket_id) {
                                 let global_stream_id = kv.1;
 

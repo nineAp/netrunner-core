@@ -1,15 +1,16 @@
+use arc_swap::ArcSwap;
 use bytes::Bytes;
 use dashmap::DashMap;
 use netrunner_logger::{info, instrument, trace, warn, AppError, ERR_INFRA_TIMEOUT};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
-use std::time::Instant;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc::Sender;
 use tokio_util::sync::CancellationToken;
 
 use crate::net::diagnostics::{self, DiagnosticsEvent, LegMetrics, TunnelMetrics, DIAG_COUNTERS};
 use crate::net::{DISPATCH_TO_LOCAL_TIMEOUT, MAX_TUNNEL_LEGS};
-use crate::net::{INITIAL_RTT_MS, MUXER_CONGESTION_WEIGHT};
+use crate::net::INITIAL_RTT_MS;
 use crate::nrxp::FrameType;
 
 #[derive(Default, Debug)]
@@ -66,11 +67,43 @@ pub struct MuxMessage {
 
 pub static GLOBAL_MIN_RTT: AtomicU32 = AtomicU32::new(INITIAL_RTT_MS);
 
+/// Write timeout that scales with the observed network RTT.
+///
+/// On a healthy path (RTT ~50 ms) this stays at `floor`. When the path degrades
+/// to multi-second RTT (the > 2500 ms peaks seen in production), a flat 20 s
+/// timeout fires on a leg that is merely *slow*, not dead — and a killed leg
+/// triggers the leg-drop → stream-close cascade ("domino effect"). Allowing
+/// ~8 RTT of drain time (capped at 60 s) keeps slow-but-alive legs from being
+/// evicted under high latency, while still reaping genuinely stuck sockets.
+pub fn adaptive_write_timeout(floor: Duration) -> Duration {
+    let rtt_ms = GLOBAL_MIN_RTT.load(Ordering::Relaxed) as u64;
+    let scaled = Duration::from_millis(rtt_ms.saturating_mul(8));
+    scaled.clamp(floor, Duration::from_secs(60))
+}
+
+/// Interleave/batch chunk size that grows with RTT.
+///
+/// At low RTT keep the `base` (snappy, fair interleaving); under high RTT — where
+/// the bandwidth-delay product is large — write bigger batches per pass so more
+/// 16 KB frames coalesce into a single contiguous socket write (see
+/// `handle_outbound`), cutting the number of `write()` syscalls under exactly the
+/// conditions that were producing `tunnel_write_stuck`.
+///
+/// 1× at ≤250 ms, +1× per extra 250 ms of RTT, capped at 4×.
+pub fn adaptive_batch_chunk(base: usize) -> usize {
+    let rtt_ms = GLOBAL_MIN_RTT.load(Ordering::Relaxed) as usize;
+    let factor = (1 + rtt_ms / 250).clamp(1, 4);
+    base.saturating_mul(factor)
+}
+
 #[derive(Clone)]
 pub struct Muxer {
     legs: Arc<DashMap<u32, MuxLeg>>,
-    // 🔥 ОПТИМИЗАЦИЯ: Lock-Free кэш для горячего пути
-    active_legs_cache: Arc<RwLock<Arc<Vec<MuxLeg>>>>,
+    // 🔥 ОПТИМИЗАЦИЯ: полностью lock-free кэш горячего пути.
+    // ArcSwap: чтение (load_full) — атомарный bump Arc без блокировок; запись
+    // (store) реже и тоже неблокирующая. Заменил RwLock<Arc<Vec>> — у которого
+    // чтение брало read-guard.
+    active_legs_cache: Arc<ArcSwap<Vec<MuxLeg>>>,
 
     // Добавили CancellationToken для предотвращения утечек памяти (Зомби-задач)
     streams: Arc<DashMap<u32, (Sender<Bytes>, Arc<StreamStats>, CancellationToken)>>,
@@ -78,24 +111,29 @@ pub struct Muxer {
     pending_pings: Arc<DashMap<u32, Instant>>,
     id_gen: Arc<IdGenerator>,
     session_id: Arc<String>,
+    /// Rotating cursor for round-robin leg selection among similar-quality legs,
+    /// so a burst of new streams spreads across legs instead of all binding to
+    /// the single current-best one (thundering herd).
+    rr_counter: Arc<AtomicU32>,
 }
 
 impl Muxer {
     pub fn new(is_client: bool, session_id: String) -> Self {
         Self {
             legs: Arc::new(DashMap::new()),
-            active_legs_cache: Arc::new(RwLock::new(Arc::new(Vec::new()))),
+            active_legs_cache: Arc::new(ArcSwap::from_pointee(Vec::new())),
             streams: Arc::new(DashMap::new()),
             stream_bindings: Arc::new(DashMap::new()),
             id_gen: Arc::new(IdGenerator::new(is_client)),
             pending_pings: Arc::new(DashMap::new()),
             session_id: Arc::new(session_id),
+            rr_counter: Arc::new(AtomicU32::new(0)),
         }
     }
 
     fn update_legs_cache(&self) {
         let new_cache: Vec<MuxLeg> = self.legs.iter().map(|kv| kv.value().clone()).collect();
-        *self.active_legs_cache.write().unwrap() = Arc::new(new_cache);
+        self.active_legs_cache.store(Arc::new(new_cache));
     }
 
     pub fn add_leg(
@@ -126,6 +164,13 @@ impl Muxer {
         );
     }
 
+    /// Drop every stream→leg binding that points at `leg_id`. Stale bindings to a
+    /// removed leg force `select_leg` to re-balance each affected stream onto a
+    /// healthy leg on its next send, instead of repeatedly probing the dead one.
+    fn clear_bindings_for_leg(&self, leg_id: u32) {
+        self.stream_bindings.retain(|_, bound_leg| *bound_leg != leg_id);
+    }
+
     pub fn remove_leg(&self, leg_id: u32, tx: &Sender<MuxMessage>) {
         let should_remove = self
             .legs
@@ -133,6 +178,9 @@ impl Muxer {
             .map_or(false, |leg| leg.control_tx.same_channel(tx));
         if should_remove {
             self.legs.remove(&leg_id);
+            // Unbind streams BEFORE refreshing the cache so a concurrent
+            // select_leg never re-binds a stream to the leg we are evicting.
+            self.clear_bindings_for_leg(leg_id);
             self.update_legs_cache();
             info!(
                 leg_id,
@@ -143,6 +191,7 @@ impl Muxer {
 
     pub fn force_remove_leg(&self, leg_id: u32) {
         if self.legs.remove(&leg_id).is_some() {
+            self.clear_bindings_for_leg(leg_id);
             self.update_legs_cache();
             info!(leg_id, "MUXER: TCP leg force-removed on engine exit");
         }
@@ -159,36 +208,56 @@ impl Muxer {
     }
 
     fn select_leg(&self, stream_id: u32) -> Option<MuxLeg> {
-        // 1. Читаем кэш (это Arc, поэтому clone здесь — это просто инкремент счетчика, не копирование данных)
-        let legs = self.active_legs_cache.read().unwrap().clone();
-        if legs.is_empty() {
-            return None;
-        }
-
-        // 2. Если поток уже привязан к леге, используем её (Sticky Connection)
+        // 1. FAST PATH (hot, per data frame): a bound stream resolves its leg by
+        //    id straight from the legs map — no full-cache Arc clone and no vector
+        //    scan. Reading `legs` (source of truth, not the cached snapshot) also
+        //    transparently picks up a leg that reconnected under the same id.
         if let Some(leg_id_ref) = self.stream_bindings.get(&stream_id) {
             let leg_id = *leg_id_ref;
-            if let Some(leg) = legs.iter().find(|l| l.id == leg_id) {
+            if let Some(leg) = self.legs.get(&leg_id) {
                 return Some(leg.clone());
             }
+            // Bound leg disappeared — fall through and re-pick a fresh one below.
+        }
+
+        // 2. New (or re-homed) stream: load the leg set and choose.
+        let legs = self.active_legs_cache.load_full();
+        if legs.is_empty() {
+            return None;
         }
 
         // 3. O(N) поиск лучшей леги без сортировки всего вектора.
         // Consider all available legs so the 4th leg is not permanently starved.
         // MUXER_POOL_SIZE is kept for topology printing but no longer limits
         // leg selection: sticky bindings already prevent hot-leg thrashing.
-        let selected_leg = legs
-            .iter()
-            .min_by(|a, b| {
-                let score_a = a.stats.rtt_ms.load(Ordering::Relaxed) as f64
-                    + (a.congestion_factor() * MUXER_CONGESTION_WEIGHT);
-                let score_b = b.stats.rtt_ms.load(Ordering::Relaxed) as f64
-                    + (b.congestion_factor() * MUXER_CONGESTION_WEIGHT);
-                score_a
-                    .partial_cmp(&score_b)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .cloned();
+        // RTT-DOMINANT score: a leg's latency sets the scale, congestion only
+        // modulates within legs of similar RTT. A drastically slower leg is never
+        // preferred over a fast one, even when the fast leg is congested. (The old
+        // additive `rtt + congestion*2000` could score a busy 160 ms leg WORSE
+        // than an idle 1300 ms one, routing new streams onto the laggy leg.)
+        let score = |leg: &MuxLeg| -> f64 {
+            let rtt = (leg.stats.rtt_ms.load(Ordering::Relaxed) as f64).max(1.0);
+            rtt * (1.0 + leg.congestion_factor())
+        };
+
+        let best = legs.iter().map(|l| score(l)).fold(f64::MAX, f64::min);
+
+        // Candidate set = every leg within 2× of the best score. Drastically
+        // worse (slow / bufferbloated) legs are excluded; near-equal legs are all
+        // eligible. We then ROUND-ROBIN across the candidates so a burst of new
+        // streams (speedtest / multi-connection upload opening many sockets at
+        // once, before congestion registers) spreads across legs instead of all
+        // binding to the single current-best leg — which previously left one leg
+        // saturated and the others idle (low aggregate upload + stop-start stalls).
+        let candidates: Vec<&MuxLeg> = legs.iter().filter(|&l| score(l) <= best * 2.0).collect();
+
+        let selected_leg = if candidates.is_empty() {
+            None
+        } else {
+            let idx =
+                self.rr_counter.fetch_add(1, Ordering::Relaxed) as usize % candidates.len();
+            Some(candidates[idx].clone())
+        };
 
         if let Some(leg) = selected_leg {
             self.stream_bindings.insert(stream_id, leg.id);
@@ -230,47 +299,75 @@ impl Muxer {
     }
 
     #[instrument(skip(self, message), fields(session_id = %self.session_id, stream_id = message.stream_id, frame = ?message.frame_type))]
-    pub async fn send_to_network(&self, message: MuxMessage) -> Result<(), AppError> {
-        let leg = match self.select_leg(message.stream_id) {
-            Some(l) => l,
-            None => {
-                return Err(AppError::new(
-                    ERR_INFRA_TIMEOUT,
-                    "Нет связи",
-                    "No active legs",
-                ))
-            }
-        };
-
+    pub async fn send_to_network(&self, mut message: MuxMessage) -> Result<(), AppError> {
         let is_data = matches!(message.frame_type, FrameType::Data | FrameType::UdpData);
-        let stream_id = message.stream_id;
-        let size = message.data.len() as u64;
 
         if is_data {
-            // 💡 ДАННЫЕ: Используем .send().await для создания Backpressure
-            match leg.data_tx.send(message).await {
-                Ok(_) => {
-                    leg.stats.tx_bytes.fetch_add(size, Ordering::Relaxed);
-                    if let Some(stream_ref) = self.streams.get(&stream_id) {
-                        stream_ref
-                            .value()
-                            .1
-                            .tx_bytes
-                            .fetch_add(size, Ordering::Relaxed);
+            // 🔥 ANTI-DOMINO FAILOVER.
+            // A single leg dropping must NOT close the stream. We evict the dead
+            // leg, unbind the stream, and retry on the next-best leg. Only when
+            // *every* leg is gone do we return Err — and the bridge treats that
+            // as "pause & buffer", not "close" (see run_tcp_bridge). The loop is
+            // bounded: remove_leg drops the leg from the cache, so select_leg can
+            // never hand back the same dead leg, and it terminates at None.
+            loop {
+                let leg = match self.select_leg(message.stream_id) {
+                    Some(l) => l,
+                    None => {
+                        return Err(AppError::new(
+                            ERR_INFRA_TIMEOUT,
+                            "Нет связи",
+                            "No active legs",
+                        ))
                     }
-                    Ok(())
-                }
-                Err(_) => {
-                    DIAG_COUNTERS.upload_fails.fetch_add(1, Ordering::Relaxed);
-                    diagnostics::send_diag_event(DiagnosticsEvent::UploadFailed {
-                        stream_id,
-                        reason: "data channel closed (leg dropped)".into(),
-                    });
-                    self.remove_leg(leg.id, &leg.control_tx);
-                    Err(AppError::new(ERR_INFRA_TIMEOUT, "Обрыв", "Leg closed"))
+                };
+
+                let stream_id = message.stream_id;
+                let size = message.data.len() as u64;
+
+                // 💡 ДАННЫЕ: Используем .send().await для создания Backpressure
+                match leg.data_tx.send(message).await {
+                    Ok(_) => {
+                        leg.stats.tx_bytes.fetch_add(size, Ordering::Relaxed);
+                        if let Some(stream_ref) = self.streams.get(&stream_id) {
+                            stream_ref
+                                .value()
+                                .1
+                                .tx_bytes
+                                .fetch_add(size, Ordering::Relaxed);
+                        }
+                        return Ok(());
+                    }
+                    Err(send_err) => {
+                        // Recover the payload from the failed send so the retry
+                        // on another leg does not lose the chunk.
+                        message = send_err.0;
+                        DIAG_COUNTERS.upload_fails.fetch_add(1, Ordering::Relaxed);
+                        diagnostics::send_diag_event(DiagnosticsEvent::UploadFailed {
+                            stream_id,
+                            reason: "data channel closed (leg dropped) — failing over".into(),
+                        });
+                        // Evict the dead leg (also unbinds its streams) so the
+                        // next select_leg re-balances onto a healthy leg.
+                        self.remove_leg(leg.id, &leg.control_tx);
+                        // loop → pick another leg, or return Err if none remain.
+                    }
                 }
             }
         } else {
+            let leg = match self.select_leg(message.stream_id) {
+                Some(l) => l,
+                None => {
+                    return Err(AppError::new(
+                        ERR_INFRA_TIMEOUT,
+                        "Нет связи",
+                        "No active legs",
+                    ))
+                }
+            };
+
+            let stream_id = message.stream_id;
+            let size = message.data.len() as u64;
             // Close and Heartbeat frames MUST be delivered reliably (.send().await).
             // Close: dropping it leaks stream resources.
             // Heartbeat (PONG): dropping it via try_send causes the health-check
@@ -380,15 +477,16 @@ impl Muxer {
         self.stream_bindings.remove(&stream_id);
     }
 
-    // ORDERING CONTRACT: callers MUST .await this; the caller (TunnelEngine reader)
-    // is a spawned task, so blocking here creates correct back-pressure all the way
-    // back to the kernel TCP socket buffer.  Never spawn a task to deliver data
-    // from this function — that breaks in-order delivery guarantees.
+    // ORDERING CONTRACT: in-order delivery — never spawn a task to deliver data
+    // from this function.
     //
-    // TIMEOUT GUARD: if the stream's receive channel stays full for longer than
-    // DISPATCH_TO_LOCAL_TIMEOUT the stream is forcibly closed.  Without this a
-    // single slow consumer (app socket buffer full, background app paused, etc.)
-    // would block the engine reader and starve every other stream on the same leg.
+    // HEAD-OF-LINE GUARD: the hot path is a non-blocking try_send, so one slow or
+    // dead stream can NEVER block the shared per-leg reader. (A finished speedtest
+    // socket the app stopped reading used to back its channel up and freeze EVERY
+    // other download on that leg, because the reader awaited here for up to 10 s.)
+    // Only a genuinely-full channel gets a SHORT grace wait (DISPATCH_TO_LOCAL_
+    // TIMEOUT); if it is still full that ONE stream is closed so the leg keeps
+    // serving everyone else.
     pub async fn dispatch_to_local(&self, stream_id: u32, data: Bytes) {
         let size = data.len() as u64;
 
@@ -397,22 +495,53 @@ impl Muxer {
             (val.0.clone(), val.1.clone())
         });
 
-        if let Some((tx, stats)) = tx_and_stats {
-            match tokio::time::timeout(DISPATCH_TO_LOCAL_TIMEOUT, tx.send(data)).await {
-                Ok(Ok(_)) => {
-                    stats.rx_bytes.fetch_add(size, Ordering::Relaxed);
-                }
-                Ok(Err(_)) => { /* receiver already closed — stream gone */ }
-                Err(_) => {
-                    // Bridge isn't consuming: app socket full or app paused too long.
-                    // Close the stream to free the leg for all other streams.
-                    warn!(
-                        stream_id,
-                        "dispatch_to_local: stream stalled for {:?}, closing",
-                        DISPATCH_TO_LOCAL_TIMEOUT
-                    );
-                    self.remove_stream(stream_id);
-                }
+        let Some((tx, stats)) = tx_and_stats else {
+            // No stream registered for this id (already closed / never opened).
+            DIAG_COUNTERS
+                .mux_dispatch_no_stream
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+
+        // Fast path: deliver without awaiting → zero head-of-line blocking.
+        let data = match tx.try_send(data) {
+            Ok(()) => {
+                stats.rx_bytes.fetch_add(size, Ordering::Relaxed);
+                DIAG_COUNTERS.mux_dispatch_ok.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            // Receiver already closed — stream gone.
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                DIAG_COUNTERS
+                    .mux_dispatch_recv_closed
+                    .fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            // Channel full: recover the payload and fall through to a bounded wait.
+            Err(tokio::sync::mpsc::error::TrySendError::Full(data)) => data,
+        };
+
+        match tokio::time::timeout(DISPATCH_TO_LOCAL_TIMEOUT, tx.send(data)).await {
+            Ok(Ok(_)) => {
+                stats.rx_bytes.fetch_add(size, Ordering::Relaxed);
+                DIAG_COUNTERS.mux_dispatch_ok.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(Err(_)) => {
+                DIAG_COUNTERS
+                    .mux_dispatch_recv_closed
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            Err(_) => {
+                // Consumer stayed full past the grace window: close just this one
+                // stream so the leg keeps serving everyone else.
+                DIAG_COUNTERS
+                    .mux_dispatch_full_closed
+                    .fetch_add(1, Ordering::Relaxed);
+                warn!(
+                    stream_id,
+                    "dispatch_to_local: stream stalled for {:?}, closing", DISPATCH_TO_LOCAL_TIMEOUT
+                );
+                self.remove_stream(stream_id);
             }
         }
     }
@@ -524,7 +653,7 @@ impl Muxer {
         let mut total_rx = 0;
         let mut legs_info = Vec::new();
 
-        let cached_legs = self.active_legs_cache.read().unwrap().clone();
+        let cached_legs = self.active_legs_cache.load_full();
         for leg in cached_legs.iter() {
             let tx = leg.stats.tx_bytes.load(Ordering::Relaxed);
             let rx = leg.stats.rx_bytes.load(Ordering::Relaxed);
@@ -594,14 +723,32 @@ impl Muxer {
                 Self::format_size(rx)
             ));
         }
+
+        // ── Pipeline health counters (cumulative) ────────────────────────────
+        let c = &DIAG_COUNTERS;
+        out.push_str(&format!(
+            "├─ 📥 Mux dispatch: ok={} no_stream={} full_closed={} recv_closed={}\n",
+            c.mux_dispatch_ok.load(Ordering::Relaxed),
+            c.mux_dispatch_no_stream.load(Ordering::Relaxed),
+            c.mux_dispatch_full_closed.load(Ordering::Relaxed),
+            c.mux_dispatch_recv_closed.load(Ordering::Relaxed),
+        ));
+        out.push_str(&format!(
+            "└─ 📤 Upload/legs: upload_fails={} ctrl_full_drops={} write_stalls={} leg_disconnects={}",
+            c.upload_fails.load(Ordering::Relaxed),
+            c.control_full_drops.load(Ordering::Relaxed),
+            c.tunnel_write_stalls.load(Ordering::Relaxed),
+            c.leg_disconnects.load(Ordering::Relaxed),
+        ));
+
         info!("\n{}", out);
     }
 
     /// Collect a point-in-time snapshot of tunnel metrics for diagnostics.
-    /// Lock-free: reads only atomics and the RwLock-protected legs cache.
+    /// Lock-free: reads only atomics and the ArcSwap-backed legs cache.
     pub fn snapshot_tunnel_metrics(&self) -> TunnelMetrics {
         let global_min_rtt = crate::net::GLOBAL_MIN_RTT.load(Ordering::Relaxed);
-        let cached_legs = self.active_legs_cache.read().unwrap().clone();
+        let cached_legs = self.active_legs_cache.load_full();
 
         let active_legs: Vec<LegMetrics> = cached_legs
             .iter()

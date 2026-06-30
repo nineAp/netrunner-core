@@ -1,9 +1,13 @@
 use std::sync::Arc;
 
-use crate::net::connection::muxer::Muxer;
-use crate::net::{NetworkConfig, BRIDGE_IDLE_TIMEOUT};
+use crate::net::connection::muxer::{adaptive_write_timeout, Muxer};
+use crate::net::{
+    NetworkConfig, BRIDGE_IDLE_TIMEOUT, BRIDGE_READ_CHUNK, BRIDGE_STREAM_WRITE_TIMEOUT,
+    STREAM_PAUSE_BUDGET, STREAM_PAUSE_RETRY,
+};
 use bytes::{Bytes, BytesMut};
 use netrunner_logger::{debug, error, info, warn};
+use std::time::Instant;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
@@ -34,7 +38,6 @@ pub(crate) async fn run_tcp_bridge<R, W>(
         stream_id,
         muxer: muxer.clone(),
     };
-    let buf_size = NetworkConfig::global().tcp_buffer_size;
     let token = CancellationToken::new();
 
     // Upload: internet → tunnel.
@@ -45,10 +48,13 @@ pub(crate) async fn run_tcp_bridge<R, W>(
         let token = token.clone();
         async move {
             let mut reader = reader;
-            let mut buf = BytesMut::with_capacity(buf_size);
+            // Read in ≤ BRIDGE_READ_CHUNK (one-frame) units so a single data
+            // message can't be huge. Combined with CHANNEL_PACKETS this byte-bounds
+            // the per-leg queue and keeps post-speedtest bufferbloat small.
+            let mut buf = BytesMut::with_capacity(BRIDGE_READ_CHUNK);
             loop {
-                if buf.capacity() < 16384 {
-                    buf.reserve(buf_size);
+                if buf.capacity() - buf.len() < BRIDGE_READ_CHUNK {
+                    buf.reserve(BRIDGE_READ_CHUNK);
                 }
                 tokio::select! {
                     biased;
@@ -57,7 +63,31 @@ pub(crate) async fn run_tcp_bridge<R, W>(
                         Ok(0) | Err(_) => break,
                         Ok(_) => {
                             let data = buf.split().freeze();
-                            if muxer.send_data_safe(stream_id, data, false).await.is_err() {
+                            // 🔥 GRACEFUL PAUSE (anti-domino).
+                            // send_data_safe already fails over between live legs;
+                            // it only errors when EVERY leg is down. In that case we
+                            // do NOT close the stream — we hold this chunk and retry
+                            // while the engine reconnects, bounded by STREAM_PAUSE_BUDGET.
+                            // Because we stop reading meanwhile, TCP back-pressure
+                            // naturally pauses the source instead of dropping data.
+                            let deadline = Instant::now() + STREAM_PAUSE_BUDGET;
+                            let mut delivered = false;
+                            loop {
+                                if muxer.send_data_safe(stream_id, data.clone(), false).await.is_ok() {
+                                    delivered = true;
+                                    break;
+                                }
+                                if Instant::now() >= deadline {
+                                    warn!(stream_id, "Stream pause budget exceeded — no leg recovered, closing");
+                                    break;
+                                }
+                                tokio::select! {
+                                    biased;
+                                    _ = token.cancelled() => break,
+                                    _ = tokio::time::sleep(STREAM_PAUSE_RETRY) => {}
+                                }
+                            }
+                            if !delivered {
                                 break;
                             }
                         }
@@ -85,7 +115,11 @@ pub(crate) async fn run_tcp_bridge<R, W>(
                         None => break,
                         Some(data) => {
                             if data.is_empty() { continue; }
-                            match timeout(crate::net::BRIDGE_STREAM_WRITE_TIMEOUT, writer.write_all(&data)).await {
+                            // Adaptive: BRIDGE_STREAM_WRITE_TIMEOUT is the floor, but
+                            // under high RTT we grant the slow local socket more drain
+                            // time before declaring it stuck and closing the stream.
+                            let write_timeout = adaptive_write_timeout(BRIDGE_STREAM_WRITE_TIMEOUT);
+                            match timeout(write_timeout, writer.write_all(&data)).await {
                                 Ok(Ok(_)) => {}
                                 _ => break,
                             }
@@ -118,17 +152,27 @@ pub(crate) async fn run_udp_bridge(
     };
 
     let config = NetworkConfig::global();
-    let mut buf = vec![0u8; config.udp_buffer_size];
+    let dgram_cap = config.udp_buffer_size;
+    // 🔥 ZERO-COPY: receive directly into BytesMut spare capacity and hand the
+    // datagram downstream via split().freeze() (ownership transfer, no memcpy).
+    // Replaces `vec![0u8; N]` + `Bytes::copy_from_slice` (one full copy/datagram).
+    let mut buf = BytesMut::with_capacity(dgram_cap);
 
     info!(stream_id, "🌉 UDP Bridge active");
 
     loop {
+        // Guarantee room for a whole datagram so recv_buf never truncates it.
+        if buf.capacity() - buf.len() < dgram_cap {
+            buf.reserve(dgram_cap);
+        }
         let select_res = timeout(BRIDGE_IDLE_TIMEOUT, async {
             tokio::select! {
-                res = socket.recv(&mut buf) => {
+                res = socket.recv_buf(&mut buf) => {
                     match res {
                         Ok(n) if n > 0 => {
-                            let data = Bytes::copy_from_slice(&buf[..n]);
+                            // Ownership transfer: the just-received bytes are moved
+                            // out with no copy; buf is left empty for the next reserve.
+                            let data = buf.split().freeze();
                             if let Err(e) = muxer.send_data_safe(stream_id, data, true).await {
                                 warn!(stream_id, "UDP Tunnel legs dead. Dropping packet: {}", e);
                                 // 🔥 ФИКС: Опять же, не обрываем стрим из-за мертвого туннеля!

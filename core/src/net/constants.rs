@@ -21,10 +21,20 @@ pub const BRIDGE_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// If the app's receive buffer stays full longer than this, the connection
 /// is closed to unblock the tunnel leg for other streams.
 pub const BRIDGE_STREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
-/// Max time dispatch_to_local will block waiting for a stream's receive channel.
-/// Protects the engine reader (and thus the entire tunnel leg) from being stuck
-/// behind one slow stream's backlog. On timeout the stream is forcibly closed.
-pub const DISPATCH_TO_LOCAL_TIMEOUT: Duration = Duration::from_secs(10);
+/// While *every* tunnel leg is momentarily down (all reconnecting), an upload
+/// stream holds its current chunk and retries instead of closing — turning a
+/// leg outage into a short pause rather than a mass stream reset. This bounds
+/// how long a stream will wait before it finally gives up and closes.
+pub const STREAM_PAUSE_BUDGET: Duration = Duration::from_secs(30);
+/// Poll interval while a paused upload stream waits for a leg to come back.
+pub const STREAM_PAUSE_RETRY: Duration = Duration::from_millis(250);
+/// Grace window dispatch_to_local waits when a stream's receive channel is full
+/// before closing that ONE stream. The hot path now uses try_send (no await), so
+/// this applies only to a genuinely backed-up consumer; kept short so a slow or
+/// dead stream (e.g. a finished speedtest socket the app stopped reading) can
+/// never head-of-line-block the shared per-leg reader and freeze every other
+/// download on that leg (was 10 s — caused multi-second download stalls).
+pub const DISPATCH_TO_LOCAL_TIMEOUT: Duration = Duration::from_millis(300);
 pub const TLS_HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 pub const SECURE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
 pub const FALLBACK_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -79,16 +89,24 @@ pub const TUNNEL_MAX_BUFFER_SIZE: usize = 1024 * 1024;
 pub const TUNNEL_READ_RESERVE: usize = 16 * 1024;
 /// Maximum bytes written per stream in a single interleaved write pass.
 pub const TUNNEL_INTERLEAVE_CHUNK: usize = 16 * 1024;
+/// Max bytes a stream bridge reads per pass before producing a data message.
+/// Bounds the size of a single MuxMessage so the per-leg queue is byte-bounded
+/// (CHANNEL_PACKETS × this), keeping post-speedtest bufferbloat small. One NRXP
+/// frame is 16 KB, so reading in 16 KB units also aligns with the wire framing.
+pub const BRIDGE_READ_CHUNK: usize = 16 * 1024;
 
 // ── Tunnel leg TCP socket tuning ─────────────────────────────────────────────
 /// OS-level TCP send buffer for each tunnel leg.  The default (4–8 MB on
 /// Linux/Android) can hold seconds of data at typical mobile speeds, causing
-/// severe jitter.  256 KB limits extra queuing to ~80 ms at 25 Mbit/s per leg
-/// while still providing enough headroom for TCP slow-start.
-pub const TUNNEL_SOCKET_SNDBUF: u32 = 256 * 1024;
+/// severe jitter.  128 KB limits extra queuing to ~40 ms at 25 Mbit/s per leg
+/// while still providing enough headroom for TCP slow-start.  (Halved from
+/// 256 KB to cut post-speedtest bufferbloat — see CHANNEL_PACKETS.)
+pub const TUNNEL_SOCKET_SNDBUF: u32 = 128 * 1024;
 /// OS-level TCP receive buffer for each tunnel leg.  Larger than the send
-/// buffer so the receiver can absorb bursts without dropping packets.
-pub const TUNNEL_SOCKET_RCVBUF: u32 = 512 * 1024;
+/// buffer so the receiver can absorb bursts without dropping packets, but
+/// bounded to keep stale in-flight download data (for already-closed streams)
+/// small so the tunnel recovers in ~1 s after a heavy download.
+pub const TUNNEL_SOCKET_RCVBUF: u32 = 256 * 1024;
 
 // ── Smoltcp socket defaults ──────────────────────────────────────────────────
 /// Packet slots for the ICMP socket's RX and TX packet buffers.

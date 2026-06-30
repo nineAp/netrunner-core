@@ -67,11 +67,18 @@ pub struct TcpConnection {
     tx_congested: bool,
     last_rtt_push_ms: i64,
     last_pushed_rtt_ms: u32,
+    /// Snapshot of (up+down) bytes at the previous had_io() call, used to detect
+    /// real data movement so the socket's LRU/idle timestamp is refreshed only
+    /// when the connection is genuinely active.
+    last_io_total: u64,
 }
 
 impl TcpConnection {
     const RTT_PUSH_INTERVAL_MS: i64 = 50;
     const RTT_CHANGE_RATIO: f64 = 0.10;
+    /// Hard ceiling (ms) on the AQM sojourn budget. Stops the bufferbloat
+    /// feedback loop where a higher RTT was granted an ever-larger queue.
+    const AQM_MAX_AGE_CEILING_MS: u64 = 300;
 
     pub fn new(
         handle: SocketHandle,
@@ -99,9 +106,23 @@ impl TcpConnection {
             tx_congested: false,
             last_rtt_push_ms: i64::MIN,
             last_pushed_rtt_ms: 0,
+            last_io_total: 0,
         };
 
         (conn, rx_from_smol, tx_to_smol, handshake_tx, is_saturated)
+    }
+
+    /// True if this connection moved any bytes since the previous call. The
+    /// socket manager uses it to refresh the LRU/idle timestamp, so a connection
+    /// that is actively transferring is NEVER mistaken for idle and reaped.
+    /// (Previously `last_activity` was frozen at creation, so both the 120 s idle
+    /// sweep and the MAX_SOCKETS LRU eviction killed long-lived ACTIVE
+    /// connections — e.g. a big download — once enough sockets churned.)
+    pub fn had_io(&mut self) -> bool {
+        let total = self.total_up_bytes.wrapping_add(self.total_down_bytes);
+        let moved = total != self.last_io_total;
+        self.last_io_total = total;
+        moved
     }
 
     pub fn tick(&mut self, socket: &mut tcp::Socket, timestamp: smoltcp::time::Instant) -> bool {
@@ -186,7 +207,11 @@ impl TcpConnection {
 
         if first_push || changed_enough {
             socket.set_tunnel_rtt(smoltcp::time::Duration::from_millis(current_rtt as u64));
-            let aqm_age = (current_rtt as u64 * 2).max(50);
+            // Bound the AQM sojourn budget. Was rtt*2 — positive-feedback
+            // bufferbloat: higher RTT → bigger allowed queue → even higher RTT
+            // (download RTT blew past 1.3 s under speedtest). Cap it so download
+            // queueing delay / jitter stay bounded; only tightens at high RTT.
+            let aqm_age = (current_rtt as u64 * 2).clamp(50, Self::AQM_MAX_AGE_CEILING_MS);
             socket.set_aqm_max_age(aqm_age);
             self.last_pushed_rtt_ms = current_rtt;
             self.last_rtt_push_ms = now_ms;

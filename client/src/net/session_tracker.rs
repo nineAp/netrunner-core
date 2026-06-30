@@ -70,6 +70,7 @@ impl SessionTracker {
         self.id_to_handle.insert(id, handle);
         self.active_tcp.insert(handle, conn);
         self.inbound_tx.insert(id, (tx, is_saturated));
+        self.last_activity.insert(handle, StdInstant::now());
     }
 
     pub fn register_udp(

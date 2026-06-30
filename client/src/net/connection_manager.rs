@@ -299,7 +299,6 @@ impl ConnectionManager {
         socket: &mut tcp::Socket,
         now: smoltcp::time::Instant,
     ) {
-        // 🔥 ИСПРАВЛЕНИЕ: Убрали update_activity. Теперь LRU работает как честный FIFO
         let state = socket.state();
 
         if state == tcp::State::Closed || state == tcp::State::TimeWait {
@@ -337,8 +336,19 @@ impl ConnectionManager {
                 );
             }
         }
-        if let Some(conn) = self.tracker.get_tcp_mut(handle) {
+        // Refresh the LRU/idle timestamp ONLY when real data moved, so an active
+        // connection keeps a fresh activity time and is never reaped as "idle"
+        // nor evicted as "oldest" while it is still transferring. (Idle sockets,
+        // moving no bytes, are NOT refreshed and still get swept after the idle
+        // timeout — that part is intended.)
+        let did_io = if let Some(conn) = self.tracker.get_tcp_mut(handle) {
             let _ = conn.tick(socket, now);
+            conn.had_io()
+        } else {
+            false
+        };
+        if did_io {
+            self.tracker.update_activity(handle);
         }
     }
 
@@ -348,7 +358,6 @@ impl ConnectionManager {
         socket: &mut udp::Socket,
         now: smoltcp::time::Instant,
     ) {
-        // 🔥 ИСПРАВЛЕНИЕ: Убрали update_activity.
         if socket.endpoint().port == 53 {
             while let Ok((data, meta)) = socket.recv(now) {
                 if let Some(res) = self.resolver.process_dns_query(data) {
@@ -357,10 +366,18 @@ impl ConnectionManager {
             }
             return;
         }
-        if let Some(conn) = self.tracker.get_udp_mut(handle) {
-            if !conn.tick(socket, now) {
-                self.tracker.queue_removal(handle);
-            }
+        let alive = if let Some(conn) = self.tracker.get_udp_mut(handle) {
+            conn.tick(socket, now)
+        } else {
+            return;
+        };
+        if alive {
+            // Keep active UDP flows (calls, games) from being reaped as idle/oldest;
+            // a genuinely idle flow still self-expires via its own idle timeout
+            // (conn.tick returns false), which removes it below.
+            self.tracker.update_activity(handle);
+        } else {
+            self.tracker.queue_removal(handle);
         }
     }
 

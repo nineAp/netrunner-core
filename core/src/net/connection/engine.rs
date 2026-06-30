@@ -230,8 +230,9 @@ impl TunnelEngine {
 
                             for frame in frames {
                                 if frame.header.frame_type == FrameType::Heartbeat {
-                                    let m = muxer.clone();
-                                    tokio::spawn(async move { m.record_pong(leg_id).await; });
+                                    // record_pong does no .await internally, so run it inline:
+                                    // a spawn+Arc-clone per PONG was pure scheduler churn.
+                                    muxer.record_pong(leg_id).await;
                                 }
                                 let _ = handler.handle(frame).await;
                             }
@@ -247,7 +248,6 @@ impl TunnelEngine {
                 let mut heartbeat = tokio::time::interval(HEALTH_CHECK_INTERVAL);
 
                 let mut pending_data: Option<MuxMessage> = None;
-                let interleave_chunk = TUNNEL_INTERLEAVE_CHUNK;
 
                 loop {
                     tokio::select! {
@@ -286,6 +286,12 @@ impl TunnelEngine {
                         _ = std::future::ready(()), if pending_data.is_some() => {
                             let mut msg = pending_data.take().unwrap();
 
+                            // #4 Adaptive batch: under high RTT take a bigger interleave
+                            // chunk so more frames coalesce into one write in
+                            // handle_outbound (#3); at low RTT stay small for fairness.
+                            let interleave_chunk = crate::net::connection::muxer::adaptive_batch_chunk(
+                                TUNNEL_INTERLEAVE_CHUNK,
+                            );
                             let chunk_size = std::cmp::min(msg.data.len(), interleave_chunk);
                             let chunk_data = msg.data.split_to(chunk_size);
 
@@ -439,23 +445,47 @@ impl TunnelEngine {
             }
         }
 
-        for pkt in packets {
-            let write_future = outbound.write_all(&pkt);
-            // 💡 ИЗМЕНЕНО: Увеличен таймаут отправки до 20 секунд для совместимости с агрессивным BBR
-            if let Err(_) =
-                tokio::time::timeout(std::time::Duration::from_secs(20), write_future).await
-            {
-                error!(stream_id, "🔥 Physical leg STUCK on write. Killing leg.");
-                // Increment counter; the call site in run() emits the full event
-                // with the correct leg_id since handle_outbound is a static fn.
-                crate::net::diagnostics::DIAG_COUNTERS
-                    .tunnel_write_stalls
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return Err(AppError::new(
-                    ERR_INFRA_TIMEOUT,
-                    "Таймаут отправки",
-                    "Physical leg STUCK on write",
-                ));
+        // Adaptive write deadline: floor of 20 s (BBR-friendly), but scales with
+        // the live RTT so a high-latency path (RTT > 2.5 s) doesn't trip a flat
+        // timeout on a leg that is slow rather than dead. Killing such a leg is
+        // what set off the leg-drop → stream-close cascade.
+        let write_timeout = crate::net::connection::muxer::adaptive_write_timeout(
+            std::time::Duration::from_secs(20),
+        );
+        // #3 Syscall batching (sendmmsg-analog for a TCP byte stream): when a Data
+        // message produced several MAX_FRAME_PAYLOAD frames, coalesce them into ONE
+        // contiguous buffer and issue a single write_all instead of N — fewer
+        // User→Kernel transitions under exactly the high-throughput conditions that
+        // were producing tunnel_write_stuck. The single-frame case (control/UDP and
+        // ≤16 KB payloads) keeps the zero-copy direct write with no extra copy.
+        let stuck = || -> AppError {
+            error!(stream_id, "🔥 Physical leg STUCK on write. Killing leg.");
+            // Increment counter; the call site in run() emits the full event
+            // with the correct leg_id since handle_outbound is a static fn.
+            crate::net::diagnostics::DIAG_COUNTERS
+                .tunnel_write_stalls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            AppError::new(
+                ERR_INFRA_TIMEOUT,
+                "Таймаут отправки",
+                "Physical leg STUCK on write",
+            )
+        };
+
+        if packets.len() == 1 {
+            let write_future = outbound.write_all(&packets[0]);
+            if tokio::time::timeout(write_timeout, write_future).await.is_err() {
+                return Err(stuck());
+            }
+        } else if !packets.is_empty() {
+            let total: usize = packets.iter().map(|p| p.len()).sum();
+            let mut batch = BytesMut::with_capacity(total);
+            for pkt in &packets {
+                batch.extend_from_slice(pkt);
+            }
+            let write_future = outbound.write_all(&batch);
+            if tokio::time::timeout(write_timeout, write_future).await.is_err() {
+                return Err(stuck());
             }
         }
         Ok(())

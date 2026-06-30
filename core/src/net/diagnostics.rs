@@ -166,6 +166,15 @@ pub struct DiagnosticsCounters {
     pub control_full_drops: AtomicU64,
     pub tunnel_write_stalls: AtomicU64,
     pub stream_errors: AtomicU64,
+    // ── Download dispatch funnel (muxer.dispatch_to_local) ──────────────────
+    /// Frames handed to a local stream's channel successfully.
+    pub mux_dispatch_ok: AtomicU64,
+    /// Frames dropped because no stream is registered for that id (gone/unknown).
+    pub mux_dispatch_no_stream: AtomicU64,
+    /// Streams closed because their channel stayed full past the grace window.
+    pub mux_dispatch_full_closed: AtomicU64,
+    /// Frames dropped because the stream's receiver was already closed.
+    pub mux_dispatch_recv_closed: AtomicU64,
 }
 
 impl DiagnosticsCounters {
@@ -177,6 +186,10 @@ impl DiagnosticsCounters {
             control_full_drops: AtomicU64::new(0),
             tunnel_write_stalls: AtomicU64::new(0),
             stream_errors: AtomicU64::new(0),
+            mux_dispatch_ok: AtomicU64::new(0),
+            mux_dispatch_no_stream: AtomicU64::new(0),
+            mux_dispatch_full_closed: AtomicU64::new(0),
+            mux_dispatch_recv_closed: AtomicU64::new(0),
         }
     }
 

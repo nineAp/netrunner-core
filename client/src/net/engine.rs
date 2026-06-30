@@ -52,6 +52,10 @@ const TUN_READ_BUF_SIZE: usize = 65536;
 /// 2 ms is a good balance: low enough for interactive traffic (<5ms added RTT),
 /// high enough to avoid spinning the CPU under light load.
 const MAX_POLL_SLEEP: Duration = Duration::from_millis(2);
+/// Per-socket download backlog cap. A socket whose channel stays full for more
+/// than this many queued frames is treated as a dead/stuck consumer and dropped,
+/// so it can never stall the shared download pipe for other sockets.
+const MAX_PENDING_FRAMES_PER_SOCKET: usize = 64;
 
 pub struct Engine {
     interface: Interface,
@@ -72,10 +76,18 @@ pub struct Engine {
     diag_rx: Option<DiagnosisRx>,
     /// Shared store that holds the last N snapshots (readable via public API).
     pub diag_store: Arc<DiagnosticsStore>,
-    /// A single download frame that couldn't be forwarded to its socket channel
-    /// (channel was full).  Retried at the start of the next engine tick BEFORE
-    /// reading more frames from rx_tunnel.  This preserves in-order delivery.
-    pending_download: Option<(u64, Bytes)>,
+    /// Per-socket backlog of download frames whose target channel was full.
+    /// Keyed by socket_id so a single slow/dead consumer can NEVER stall the
+    /// shared download pipe for other sockets — the old single global slot did
+    /// exactly that: one stuck socket (e.g. an app that stopped reading after a
+    /// speedtest) froze rx_tunnel draining for everyone, killing all download.
+    /// Frames per socket stay in order; a backlog past
+    /// MAX_PENDING_FRAMES_PER_SOCKET means the consumer is dead → socket dropped.
+    pending_download: std::collections::HashMap<u64, std::collections::VecDeque<Bytes>>,
+    /// Cumulative download diagnostics (logged every STATS_LOG_INTERVAL).
+    dl_dispatched: u64,
+    dl_dropped_stuck: u64,
+    dl_recv_closed: u64,
 }
 
 impl Engine {
@@ -112,7 +124,10 @@ impl Engine {
             muxer: None,
             diag_rx: None,
             diag_store: Arc::new(DiagnosticsStore::new(20)),
-            pending_download: None,
+            pending_download: std::collections::HashMap::new(),
+            dl_dispatched: 0,
+            dl_dropped_stuck: 0,
+            dl_recv_closed: 0,
         }
     }
 
@@ -150,75 +165,92 @@ impl Engine {
 
             // ── 1. Dispatch tunnel → local sockets (download) ────────────
             //
-            // ORDERING CONTRACT: we must NEVER reorder bytes for a given socket.
-            // Spawning a background task when the channel is full is forbidden —
-            // it creates a race where later frames overtake the stalled one.
-            //
-            // Instead we use a single `pending_download` slot:
-            //   • Retry any stalled frame FIRST each tick.
-            //   • Only drain rx_tunnel once pending is empty.
-            //   • If delivery fails again, set pending and skip rx_tunnel until
-            //     the next tick (when smoltcp has had a chance to drain the channel).
+            // ORDERING CONTRACT: bytes for a given socket are never reordered.
+            // A PER-SOCKET backlog (pending_download) preserves order WITHOUT
+            // ever blocking other sockets: rx_tunnel is always fully drained, and
+            // a frame that can't be delivered is queued for that one socket only.
+            // (The old single global slot let one stuck socket freeze ALL download
+            //  — after a speedtest, one app that stopped reading killed the pipe.)
 
-            // — Retry stalled frame from previous tick —
-            if let Some((socket_id, payload)) = self.pending_download.take() {
-                let tx_opt = if let Some(cached) = local_cache.get(&socket_id) {
-                    Some(cached.clone())
-                } else if let Some(ref_tx) = inbound_map.get(&socket_id) {
-                    let val = ref_tx.value().clone();
-                    local_cache.insert(socket_id, val.clone());
-                    Some(val)
-                } else {
-                    None
-                };
-                match tx_opt {
-                    Some((tx, _)) => match tx.try_send(payload) {
-                        Ok(_) => { work_done = true; }
-                        Err(mpsc::error::TrySendError::Full(p)) => {
-                            // Still full — will retry next tick.
-                            self.pending_download = Some((socket_id, p));
+            // — Flush per-socket backlogs first, in order, non-blocking —
+            if !self.pending_download.is_empty() {
+                let stuck_ids: Vec<u64> = self.pending_download.keys().copied().collect();
+                for sid in stuck_ids {
+                    let tx = match local_cache.get(&sid).map(|(t, _)| t.clone()) {
+                        Some(t) => Some(t),
+                        None => inbound_map.get(&sid).map(|r| {
+                            let v = r.value().clone();
+                            local_cache.insert(sid, v.clone());
+                            v.0
+                        }),
+                    };
+                    let tx = match tx {
+                        Some(t) => t,
+                        None => {
+                            // Socket gone — drop its whole backlog.
+                            self.pending_download.remove(&sid);
+                            local_cache.remove(&sid);
+                            continue;
                         }
-                        Err(_) => {} // socket gone — drop
-                    },
-                    None => {} // socket gone — drop
-                }
-            }
-
-            // — Drain rx_tunnel only when no frame is waiting for its slot —
-            if self.pending_download.is_none() {
-                loop {
-                    match rx_tunnel.try_recv() {
-                        Ok(frame) => {
-                            work_done = true;
-                            if frame.event == RawCastEvent::Close {
-                                local_cache.remove(&frame.socket_id);
-                                inbound_map.remove(&frame.socket_id);
-                            } else if frame.event == RawCastEvent::Data {
-                                let socket_id = frame.socket_id;
-                                let tx_opt = if let Some(cached) = local_cache.get(&socket_id) {
-                                    Some(cached.clone())
-                                } else if let Some(ref_tx) = inbound_map.get(&socket_id) {
-                                    let val = ref_tx.value().clone();
-                                    local_cache.insert(socket_id, val.clone());
-                                    Some(val)
-                                } else {
-                                    None
-                                };
-                                if let Some((tx, _)) = tx_opt {
-                                    match tx.try_send(frame.payload) {
-                                        Ok(_) => {}
-                                        Err(mpsc::error::TrySendError::Full(data)) => {
-                                            // Channel full — stash and stop draining.
-                                            self.pending_download = Some((socket_id, data));
-                                            break;
-                                        }
-                                        Err(_) => {} // socket gone — drop
-                                    }
+                    };
+                    if let Some(q) = self.pending_download.get_mut(&sid) {
+                        while let Some(front) = q.pop_front() {
+                            match tx.try_send(front) {
+                                Ok(_) => {
+                                    work_done = true;
+                                    self.dl_dispatched += 1;
+                                }
+                                Err(mpsc::error::TrySendError::Full(p)) => {
+                                    q.push_front(p);
+                                    break;
+                                }
+                                Err(mpsc::error::TrySendError::Closed(_)) => {
+                                    self.dl_recv_closed += 1;
+                                    q.clear();
+                                    break;
                                 }
                             }
                         }
-                        Err(_) => break,
                     }
+                    // Drop the backlog entry once fully drained (borrow of q ended).
+                    if self
+                        .pending_download
+                        .get(&sid)
+                        .map_or(false, |q| q.is_empty())
+                    {
+                        self.pending_download.remove(&sid);
+                    }
+                }
+            }
+
+            // — Drain rx_tunnel (a stuck socket only queues its own frames) —
+            // Bounded per iteration (symmetric to the upload-accept cap below) so a
+            // download flood can't starve upload ingestion or the smoltcp poll: both
+            // directions share this single engine task and must take turns. Leftover
+            // frames are picked up next iteration (work_done forces a prompt re-loop).
+            let mut dl_processed = 0;
+            loop {
+                match rx_tunnel.try_recv() {
+                    Ok(frame) => {
+                        work_done = true;
+                        if frame.event == RawCastEvent::Close {
+                            local_cache.remove(&frame.socket_id);
+                            inbound_map.remove(&frame.socket_id);
+                            self.pending_download.remove(&frame.socket_id);
+                        } else if frame.event == RawCastEvent::Data {
+                            self.route_download(
+                                frame.socket_id,
+                                frame.payload,
+                                &mut local_cache,
+                                &inbound_map,
+                            );
+                        }
+                        dl_processed += 1;
+                        if dl_processed >= MAX_PACKETS_PER_TICK {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
                 }
             }
 
@@ -287,6 +319,31 @@ impl Engine {
                 let manager_ref = &self.manager;
                 self.factory
                     .log_stats(&self.socket_set, &|handle| manager_ref.get_buf_info(handle));
+
+                // Download pipeline health: how many sockets are backlogged, total
+                // queued frames, and cumulative dispatch outcomes. If pending_*
+                // climb while TunDevice ↓ is flat, the stall is at the smoltcp/app
+                // boundary; if they stay ~0, look upstream (muxer/leg dispatch).
+                let pending_sockets = self.pending_download.len();
+                let pending_frames: usize =
+                    self.pending_download.values().map(|q| q.len()).sum();
+                let worst_backlog = self
+                    .pending_download
+                    .values()
+                    .map(|q| q.len())
+                    .max()
+                    .unwrap_or(0);
+                info!(
+                    "📥 Download pipe: pending_sockets={} pending_frames={} worst_backlog={} | dispatched={} recv_closed={} stuck_dropped={} | tun_tx_free={}",
+                    pending_sockets,
+                    pending_frames,
+                    worst_backlog,
+                    self.dl_dispatched,
+                    self.dl_recv_closed,
+                    self.dl_dropped_stuck,
+                    self.tun_tx.capacity(),
+                );
+
                 last_stats_log = StdInstant::now();
             }
 
@@ -314,74 +371,46 @@ impl Engine {
                     .interface
                     .poll_delay(Self::current_time(), &self.socket_set);
 
-                let sleep_time = delay
+                let mut sleep_time = delay
                     .map(|d| Duration::from_micros(d.micros()).min(MAX_POLL_SLEEP))
                     .unwrap_or(MAX_POLL_SLEEP);
+                // Backlogs are waiting on smoltcp to drain — re-poll soon to retry.
+                if !self.pending_download.is_empty() {
+                    sleep_time = sleep_time.min(Duration::from_millis(2));
+                }
 
-                if self.pending_download.is_some() {
-                    // A frame is stalled — don't read more from rx_tunnel yet
-                    // (would risk overwriting the pending slot or draining out-
-                    // of-order).  Just wait for smoltcp to drain inbound_tx.
-                    tokio::select! {
-                        _ = sleep(sleep_time) => {}
-                        msg = tun_rx.recv() => {
-                            match msg {
-                                Some(pkt) => {
-                                    self.stats.record_tx(pkt.len());
-                                    self.manager.try_create_socket_from_packet(&pkt, &mut self.socket_set);
-                                    self.device.push_rx(pkt);
-                                }
-                                None => break,
+                tokio::select! {
+                    _ = sleep(sleep_time) => {}
+
+                    // Upload: wake immediately when the app sends data.
+                    msg = tun_rx.recv() => {
+                        match msg {
+                            Some(pkt) => {
+                                self.stats.record_tx(pkt.len());
+                                self.manager.try_create_socket_from_packet(&pkt, &mut self.socket_set);
+                                self.device.push_rx(pkt);
                             }
+                            None => break,
                         }
                     }
-                } else {
-                    tokio::select! {
-                        _ = sleep(sleep_time) => {}
 
-                        // Upload: wake immediately when the app sends data.
-                        msg = tun_rx.recv() => {
-                            match msg {
-                                Some(pkt) => {
-                                    self.stats.record_tx(pkt.len());
-                                    self.manager.try_create_socket_from_packet(&pkt, &mut self.socket_set);
-                                    self.device.push_rx(pkt);
-                                }
-                                None => break,
-                            }
-                        }
-
-                        // Download: wake immediately when tunnel data arrives.
-                        // Dispatch inline; step 1 drains the rest next iteration.
-                        frame = rx_tunnel.recv() => {
-                            match frame {
-                                None => break,
-                                Some(f) => {
-                                    if f.event == RawCastEvent::Close {
-                                        local_cache.remove(&f.socket_id);
-                                        inbound_map.remove(&f.socket_id);
-                                    } else if f.event == RawCastEvent::Data {
-                                        let socket_id = f.socket_id;
-                                        let tx_opt = if let Some(cached) = local_cache.get(&socket_id) {
-                                            Some(cached.clone())
-                                        } else if let Some(ref_tx) = inbound_map.get(&socket_id) {
-                                            let val = ref_tx.value().clone();
-                                            local_cache.insert(socket_id, val.clone());
-                                            Some(val)
-                                        } else {
-                                            None
-                                        };
-                                        if let Some((tx, _)) = tx_opt {
-                                            match tx.try_send(f.payload) {
-                                                Ok(_) => {}
-                                                Err(mpsc::error::TrySendError::Full(data)) => {
-                                                    // Stash — next tick retries.
-                                                    self.pending_download = Some((socket_id, data));
-                                                }
-                                                Err(_) => {}
-                                            }
-                                        }
-                                    }
+                    // Download: wake immediately when tunnel data arrives.
+                    // Routed per-socket; step 1 drains the rest next iteration.
+                    frame = rx_tunnel.recv() => {
+                        match frame {
+                            None => break,
+                            Some(f) => {
+                                if f.event == RawCastEvent::Close {
+                                    local_cache.remove(&f.socket_id);
+                                    inbound_map.remove(&f.socket_id);
+                                    self.pending_download.remove(&f.socket_id);
+                                } else if f.event == RawCastEvent::Data {
+                                    self.route_download(
+                                        f.socket_id,
+                                        f.payload,
+                                        &mut local_cache,
+                                        &inbound_map,
+                                    );
                                 }
                             }
                         }
@@ -389,6 +418,75 @@ impl Engine {
                 }
             }
         }
+    }
+
+    /// Deliver ONE download frame to its local socket without ever blocking
+    /// other sockets. If the socket already has a backlog, the frame is appended
+    /// (preserving in-order delivery). If the channel is full a per-socket
+    /// backlog is started. A backlog past MAX_PENDING_FRAMES_PER_SOCKET means the
+    /// consumer is dead → the socket is dropped so it can't stall the shared pipe.
+    fn route_download(
+        &mut self,
+        socket_id: u64,
+        payload: Bytes,
+        local_cache: &mut std::collections::HashMap<
+            u64,
+            (mpsc::Sender<Bytes>, Arc<std::sync::atomic::AtomicBool>),
+        >,
+        inbound_map: &dashmap::DashMap<
+            u64,
+            (mpsc::Sender<Bytes>, Arc<std::sync::atomic::AtomicBool>),
+        >,
+    ) {
+        // Preserve order: once a socket has a backlog, everything queues behind it.
+        // (Borrow of `q` ends inside this block; the over-cap drop happens after,
+        //  so we never re-borrow self.pending_download while `q` is live.)
+        if let Some(q) = self.pending_download.get_mut(&socket_id) {
+            if q.len() < MAX_PENDING_FRAMES_PER_SOCKET {
+                q.push_back(payload);
+                return;
+            }
+            // Over cap → fall through to drop the stuck socket.
+        } else {
+            // No backlog yet: resolve the sender (local cache → shared map).
+            let tx = match local_cache.get(&socket_id).map(|(t, _)| t.clone()) {
+                Some(t) => t,
+                None => match inbound_map.get(&socket_id) {
+                    Some(r) => {
+                        let v = r.value().clone();
+                        local_cache.insert(socket_id, v.clone());
+                        v.0
+                    }
+                    None => return, // socket gone — drop
+                },
+            };
+
+            match tx.try_send(payload) {
+                Ok(_) => self.dl_dispatched += 1,
+                Err(mpsc::error::TrySendError::Full(p)) => {
+                    // Start a per-socket backlog; OTHER sockets stay unaffected.
+                    let mut q = std::collections::VecDeque::with_capacity(8);
+                    q.push_back(p);
+                    self.pending_download.insert(socket_id, q);
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    self.dl_recv_closed += 1;
+                    local_cache.remove(&socket_id);
+                }
+            }
+            return;
+        }
+
+        // Reached only when an existing backlog is at/over cap: the consumer is
+        // dead/stuck — drop the socket so it can't stall the shared download pipe.
+        self.dl_dropped_stuck += 1;
+        warn!(
+            "📥 Download: socket {} backlog cap ({}) hit — consumer dead, dropping socket to free the pipe",
+            socket_id, MAX_PENDING_FRAMES_PER_SOCKET
+        );
+        self.pending_download.remove(&socket_id);
+        local_cache.remove(&socket_id);
+        inbound_map.remove(&socket_id);
     }
 
     fn poll(&mut self) -> PollResult {

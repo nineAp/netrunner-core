@@ -12,12 +12,20 @@ hkdf = "0.12"
 hmac = "0.12"
 sha2 = "0.10"
 bytes = "1.5"
-tokio = "1.49.0"
+# core uses tokio's net/time/io/macros/rt/sync directly, so it must declare these
+# features itself instead of relying on feature-unification from sibling crates
+# (otherwise `cargo check -p netrunner-core` in isolation fails). Minimal set that
+# compiles standalone:
+#   ["rt", "rt-multi-thread", "macros", "net", "time", "io-util", "sync"]
+# "full" is used to stay consistent with the client crate; features are additive,
+# so this does not change the whole-workspace build.
+tokio = { version = "1.49.0", features = ["full"] }
 rand = "0.10.0"
 hex = "0.4.3"
 tokio-util = { version = "0.7", features = ["rt"] }
 async-trait = "0.1.89"
 dashmap = "6.1.0"
+arc-swap = "1"
 socket2 = { version = "0.5", features = ["all"] }
 libc = "0.2"
 netrunner-logger = { path = "../tools/log" }
