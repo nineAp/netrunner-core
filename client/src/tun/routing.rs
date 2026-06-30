@@ -1,8 +1,29 @@
+//! Платформенная маршрутизация и kill-switch.
+//!
+//! Заворачивает системный трафик в TUN-интерфейс и (опционально) режет утечки
+//! мимо туннеля. Реализация целиком платформо-зависимая (`cfg`):
+//!
+//! - **Linux** — `nftables` (таблица `netrunner`): маркировка трафика в TUN,
+//!   split-tunneling по UID, DNAT DNS на стек, kill-switch с исключениями для LAN
+//!   и самого прокси; плюс policy-routing через `ip rule`/`ip route table 100`.
+//! - **Windows** — таблица маршрутов (`route add` половинками `0.0.0.0/1`+`128.0.0.0/1`,
+//!   чтобы перебить дефолт, не удаляя его), kill-switch удалением дефолтного
+//!   маршрута, восстановление через DHCP-renew.
+//! - **Android/iOS** — ничего: маршрутизацию ставит нативная сторона (`VpnService`).
+//!
+//! [`setup_platform_routing`] ставит правила, [`reset_platform_routing`] —
+//! откатывает их при остановке. Все внешние команды идут через [`run_cmd_ext`].
+
 use netrunner_logger::{error, info};
 use std::io;
 
 use std::process::Command;
 
+/// Выполняет внешнюю команду (через `shlex`-разбор строки).
+///
+/// `ignore_errors` — не падать на ненулевом коде возврата (для идемпотентных
+/// операций вроде «удалить правило, которого может не быть»). На Windows окно
+/// процесса скрывается флагом `CREATE_NO_WINDOW`.
 pub fn run_cmd_ext(full_cmd: &str, ignore_errors: bool) -> io::Result<()> {
     let parts = shlex::split(full_cmd)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid syntax"))?;
@@ -76,6 +97,9 @@ pub fn get_default_gateway_linux() -> Option<String> {
     stdout.split_whitespace().nth(2).map(|s| s.to_string())
 }
 
+/// Ставит платформенные правила маршрутизации: весь трафic → TUN, доступ к
+/// прокси сохраняется, при `killswitch` всё прочее блокируется. `excluded_apps`
+/// (на Linux — UID) проходят мимо туннеля (split-tunneling).
 pub fn setup_platform_routing(
     remote_address: &str,
     killswitch: bool,
@@ -219,6 +243,9 @@ pub fn setup_platform_routing(
     Ok(())
 }
 
+/// Откатывает всё, что поставил [`setup_platform_routing`]: удаляет TUN-интерфейс/
+/// правила/таблицы и восстанавливает обычную маршрутизацию (на Windows — через
+/// DHCP-renew, если был включён kill-switch).
 pub fn reset_platform_routing(_proxy_ip: Option<&str>, _was_killswitch: bool) -> io::Result<()> {
     #[cfg(target_os = "linux")]
     {

@@ -1,44 +1,79 @@
+//! Кадр NRXP: структура и (де)сериализация.
+//!
+//! Полный байтовый формат см. в [обзоре модуля](super). Здесь — типы кадра и две
+//! зеркальные операции:
+//! - [`Frame::into_bytes`] — собрать заголовок + payload + случайный padding в
+//!   единый [`BytesMut`] (заготовка под последующее AEAD-шифрование на месте);
+//! - реализации [`Parser`] для [`FrameHeader`] и [`Frame`] — разобрать буфер
+//!   обратно в кадр, не копируя payload лишний раз (zero-copy через `split_to`).
+//!
+//! Весь файл написан под zero-copy/zero-alloc на горячем пути — комментарии
+//! «🔥 ОПТИМИЗАЦИЯ» помечают места, где это сознательно важно.
+
 use crate::parser::Parser;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use rand::Rng;
 
+/// Тип кадра — первый байт после `stream_id`. Числовые значения фиксированы и
+/// являются частью wire-формата (менять — это смена версии протокола).
 #[derive(Copy, Clone, Debug, PartialEq)]
 #[repr(u8)]
 pub(crate) enum FrameType {
+    /// Открыть TCP-поток к цели (payload — адрес назначения).
     Connect = 0x00,
+    /// Данные TCP-потока.
     Data = 0x01,
+    /// Закрыть поток (FIN/abort).
     Close = 0x02,
+    /// Keep-alive; держит туннель живым и измеряет RTT.
     Heartbeat = 0x03,
+    /// Открыть UDP-«сессию» к цели.
     UdpConnect = 0x04,
+    /// Датаграмма UDP-сессии.
     UdpData = 0x05,
 }
 
+/// Разобранный заголовок кадра (25 байт). Поля идут в том же порядке, что и в wire.
 #[derive(Copy, Clone)]
 pub(crate) struct FrameHeader {
+    /// Time-based HMAC-тег (анти-replay). Проверяется приёмной стороной.
     pub(crate) auth_tag: [u8; 16],
+    /// Идентификатор логического потока внутри туннеля.
     pub(crate) stream_id: u32,
+    /// Длина полезной нагрузки в байтах.
     pub(crate) payload_len: u16,
+    /// Длина случайного padding после payload (0 для Data/UdpData).
     pub(crate) padding_len: u16,
+    /// Тип кадра.
     pub(crate) frame_type: FrameType,
 }
 
+/// Полный разобранный кадр: заголовок + payload (без padding — он отбрасывается).
 pub(crate) struct Frame {
     // 🔥 ОПТИМИЗАЦИЯ: Поле _padding удалено, так как оно никогда не используется.
+    /// Полезная нагрузка как [`Bytes`] (zero-copy ссылка на исходный буфер).
     pub(crate) payload: Bytes,
+    /// Разобранный заголовок.
     pub(crate) header: FrameHeader,
 }
 
+// Размеры полей заголовка в байтах (см. формат в обзоре модуля).
 const AUTH_TAG_SIZE: u16 = 16;
 const STREAM_ID_SIZE: u16 = 4;
 const FRAME_TYPE_SIZE: u16 = 1;
 const PAYLOAD_LEN_SIZE: u16 = 2;
 const PADDING_LEN_SIZE: u16 = 2;
 
+/// Суммарный размер заголовка кадра — 25 байт.
 pub const FRAME_HEADER_SIZE: u16 =
     AUTH_TAG_SIZE + STREAM_ID_SIZE + FRAME_TYPE_SIZE + PAYLOAD_LEN_SIZE + PADDING_LEN_SIZE; // 25 bytes
+/// Потолок payload одного кадра (16 КБ). Совпадает с размером interleave-чанка
+/// writer'а: большие сообщения режутся на куски не больше этого значения.
 pub const MAX_FRAME_PAYLOAD: usize = 16 * 1024;
 
 impl Frame {
+    /// Конструирует кадр с нулевым `auth_tag` и `padding_len` — оба заполняются
+    /// позже в [`into_bytes`](Frame::into_bytes) при сериализации.
     #[inline(always)]
     pub(crate) fn new(stream_id: u32, frame_type: FrameType, payload: Bytes) -> Self {
         Self {
@@ -53,6 +88,13 @@ impl Frame {
         }
     }
 
+    /// Сериализует кадр в [`BytesMut`], готовый к шифрованию на месте.
+    ///
+    /// `auth_key` здесь — это уже готовый 16-байтовый тег (имя историческое),
+    /// который кладётся в начало заголовка. Для `Data`/`UdpData` padding не
+    /// добавляется (throughput важнее), для остальных типов — 0..255 случайных
+    /// байт. Буфер выделяется один раз точно под итоговый размер; заголовок
+    /// собирается на стеке и пишется одним `copy_from_slice`.
     #[inline]
     pub(crate) fn into_bytes(mut self, auth_key: &[u8; 16]) -> BytesMut {
         // 🔥 ОПТИМИЗАЦИЯ: Быстрая побитовая маска (& 0xFF) вместо дорогого деления с остатком (%)
@@ -91,6 +133,8 @@ impl Frame {
     }
 }
 
+/// Разбор только заголовка: `can_parse` проверяет, накопились ли 25 байт,
+/// `parse` читает их и сдвигает курсор буфера (payload остаётся в `bytes`).
 impl Parser for FrameHeader {
     type Error = String;
 
@@ -147,6 +191,9 @@ impl Parser for FrameHeader {
     }
 }
 
+/// Разбор полного кадра. `can_parse` подглядывает в поля длин прямо в буфере
+/// (без сдвига курсора), чтобы убедиться, что пришёл весь кадр целиком; только
+/// тогда `parse` извлекает заголовок и payload и пропускает padding.
 impl Parser for Frame {
     type Error = String;
 
@@ -156,6 +203,8 @@ impl Parser for Frame {
             return false;
         }
 
+        // Подглядываем payload_len и padding_len по их смещениям в заголовке,
+        // не трогая курсор: байты 21..23 и 23..25.
         let p_len = u16::from_be_bytes([bytes[21], bytes[22]]) as usize;
         let pad_len = u16::from_be_bytes([bytes[23], bytes[24]]) as usize;
 

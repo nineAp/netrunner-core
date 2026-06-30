@@ -14,11 +14,19 @@ Netrunner Core — это высокопроизводительный сете�
 
 ## Основные компоненты
 
-- `core/` — общая сетевая логика, кодек кастомного протокола и реализация AEAD-шифрования.
-- `tlseng/` — движок формирования TLS-отпечатков (Fingerprinting Engine) для маскировки трафика под популярные браузеры.
-- `client/` — локальный прокси-клиент (создает TUN-интерфейс, парсит пакеты и инкапсулирует их в туннель).
-- `server/` — серверная часть, принимающая замаскированные TLS-соединения, маршрутизирующая кадры и выполняющая запросы во внешнюю сеть.
-- `tools/` — набор утилит, включая логгер и `bindgen-tool` для генерации связующего кода (Kotlin bindings) под Android.
+Архитектура протокола в целом — в [ARCH.md](ARCH.md). У каждого логического блока
+есть свой `README.MD` с картой файлов и ментальной моделью, а детали — в
+inline-rustdoc (`cargo doc --open`).
+
+- **`core/`** — ядро (платформо-независимая логика). Блоки:
+  - [`core/src/crypto/`](core/src/crypto/README.MD) — обмен ключами, HKDF, AEAD, auth-теги.
+  - [`core/src/nrxp/`](core/src/nrxp/README.MD) — протокол NRXP: формат кадра, кодек, TLS-мост.
+  - [`core/src/tlseng/`](core/src/tlseng/README.MD) — TLS-маскировка (JA3/JA4 fingerprinting).
+  - [`core/src/net/`](core/src/net/README.MD) — туннель, мультиплексор, движок, мосты, диагностика.
+  - [`core/src/rawcast/`](core/src/rawcast/README.MD) — локальный протокол сокет ⇄ кадр.
+- **[`client/`](client/README.MD)** — VPN-клиент: [`net/`](client/src/net/README.MD) (userspace-стек) + [`tun/`](client/src/tun/README.MD) (TUN/маршрутизация) + FFI.
+- **[`server/`](server/README.MD)** — серверная часть, принимающая замаскированные TLS-соединения и проксирующая трафик.
+- **[`tools/`](tools/README.MD)** — логгер `netrunner-logger` и `bindgen` для Kotlin/Swift-биндингов.
 
 ## Быстрый старт
 

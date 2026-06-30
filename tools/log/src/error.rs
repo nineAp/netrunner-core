@@ -1,20 +1,37 @@
-// tools/log/src/error.rs
+//! Типизированная ошибка приложения и реестр кодов ошибок.
+//!
+//! [`AppError`] несёт стабильный машинный `code` (из реестра `ERR_*` ниже),
+//! раздельные сообщения для пользователя и для логов, произвольные метаданные и
+//! опциональную причину-источник. Коды используются в логах и метриках как
+//! устойчивые идентификаторы классов ошибок.
+
 use std::collections::HashMap;
 use std::fmt;
 
-// Реестр кодов ошибок (Error Codes Registry)
+// ── Реестр кодов ошибок (стабильные машинные идентификаторы) ──
+/// Таймаут инфраструктуры (сеть/DNS/соединение).
 pub const ERR_INFRA_TIMEOUT: &str = "INFRA_TIMEOUT";
+/// Провал аутентификации (неверный auth-тег/payload).
 pub const ERR_AUTH_FAILED: &str = "AUTH_FAILED";
+/// Пакет отброшен из-за MTU в туннеле.
 pub const ERR_NET_MTU_DROP: &str = "NET_TUNNEL_MTU_DROP";
+/// Нарушение маскировки/целостности TLS (tampering, провал AEAD).
 pub const ERR_NET_TLS_TAMPER: &str = "NET_TLS_TAMPER";
+/// Необработанная паника (перехватывается логгером).
 pub const ERR_SYS_PANIC: &str = "SYS_UNHANDLED_PANIC";
 
+/// Ошибка приложения с машинным кодом, раздельными сообщениями и контекстом.
 #[derive(Debug)]
 pub struct AppError {
+    /// Стабильный код класса ошибки (один из `ERR_*`).
     pub code: &'static str,
+    /// Сообщение для пользователя (может показываться в UI).
     pub user_msg: String,
+    /// Техническое сообщение для логов/отладки.
     pub internal_msg: String,
+    /// Произвольные пары ключ-значение с контекстом.
     pub metadata: HashMap<String, String>,
+    /// Опциональная причина-источник (для цепочки ошибок).
     pub cause: Option<Box<dyn std::error::Error + Send + Sync>>,
 }
 
@@ -33,11 +50,13 @@ impl AppError {
         }
     }
 
+    /// Добавляет пару ключ-значение в метаданные (builder-стиль).
     pub fn with_context(mut self, key: &str, value: &str) -> Self {
         self.metadata.insert(key.to_string(), value.to_string());
         self
     }
 
+    /// Прикрепляет причину-источник ошибки (builder-стиль).
     pub fn with_cause(mut self, err: impl std::error::Error + Send + Sync + 'static) -> Self {
         self.cause = Some(Box::new(err));
         self

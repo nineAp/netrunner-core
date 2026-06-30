@@ -1,3 +1,22 @@
+//! Движок одной ноги туннеля: жизненный цикл TCP-соединения и его reader/writer.
+//!
+//! [`TunnelEngine`] владеет одним физическим TCP+TLS-соединением и крутит его в
+//! [`run`](TunnelEngine::run), пока нога жива. Внутри одной итерации соединение
+//! расщепляется на две параллельные задачи tokio:
+//!
+//! - **Reader** — читает байты из сокета, прогоняет через [`RxCodec`]
+//!   (расшифровка + сборка кадров), PONG'и инлайн обновляют RTT, остальные кадры
+//!   уходят в [`StreamHandler`].
+//! - **Writer** — `biased`-`select!` по приоритету: heartbeat → control → data.
+//!   Данные режутся на interleave-чанки (адаптивно под RTT) и шифруются
+//!   [`TxCodec`] в [`handle_outbound`](TunnelEngine::handle_outbound); несколько
+//!   кадров коалесятся в один `write_all` (экономия syscalls).
+//!
+//! При обрыве (EOF/ошибка) задачи останавливаются, их состояние (кодеки,
+//! приёмники, буфер) возвращается в `self`, и — если это клиент — нога идёт на
+//! переподключение с экспоненциальным backoff+jitter. Сервер (`remote_addr`
+//! пуст) при обрыве просто завершает задачу: реконнект инициирует клиент.
+
 use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
@@ -22,30 +41,52 @@ use crate::{
     nrxp::{ErrorAction, FrameType, RxCodec, TxCodec, MAX_FRAME_PAYLOAD},
 };
 
+/// Состояние ноги: работает или в процессе переподключения.
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum LegStatus {
     Active,
     Reconnecting,
 }
 
+/// Состояние и ресурсы одной ноги туннеля.
+///
+/// Половинки сокета, кодеки, приёмники каналов и буфер чтения хранятся в
+/// [`Option`], потому что на время работы reader/writer они «выдаются» в задачи
+/// через `take()`, а по завершении итерации возвращаются обратно — это позволяет
+/// переиспользовать кодеки (с их счётчиками nonce) между итерациями без Arc/Mutex.
 pub(crate) struct TunnelEngine {
+    /// Читающая половина TCP-сокета (выдаётся reader-задаче).
     pub inbound: Option<OwnedReadHalf>,
+    /// Пишущая половина TCP-сокета (выдаётся writer-задаче).
     pub outbound: Option<OwnedWriteHalf>,
+    /// Адрес удалённой стороны; **пустой у сервера** (сервер не реконнектит).
     pub remote_addr: String,
+    /// Идентификатор сессии (для логов и хендшейка реконнекта).
     pub session_id: String,
+    /// Текущий статус ноги.
     pub leg_status: LegStatus,
-    // 💡 ИЗМЕНЕНО: Кодеки теперь хранятся как Option без Arc/Mutex
+    /// Кодек расшифровки входящего потока.
     pub rx_codec: Option<RxCodec>,
+    /// Кодек шифрования исходящего потока.
     pub tx_codec: Option<TxCodec>,
+    /// Накопительный буфер чтения из сокета.
     pub read_buf: BytesMut,
+    /// Приёмник управляющих сообщений от muxer (Close/Heartbeat).
     pub control_rx: Option<Receiver<MuxMessage>>,
+    /// Приёмник сообщений данных от muxer.
     pub data_rx: Option<Receiver<MuxMessage>>,
+    /// Обработчик входящих кадров.
     pub handler: Arc<StreamHandler>,
+    /// Идентификатор этой ноги.
     pub leg_id: u32,
+    /// Общий мультиплексор туннеля.
     pub muxer: Arc<crate::net::connection::muxer::Muxer>,
 }
 
 impl TunnelEngine {
+    /// Переподключает ногу: заново резолвит хост (подхватывает смену IP/DNS),
+    /// создаёт TCP-сокет с тюнингом буферов и проводит хендшейк заново. Возвращает
+    /// свежие половинки сокета и кодеки.
     pub async fn attempt_reconnect(
         &mut self,
     ) -> Result<(OwnedReadHalf, OwnedWriteHalf, RxCodec, TxCodec), AppError> {
@@ -77,6 +118,13 @@ impl TunnelEngine {
         crate::net::ClientHandler::perform_handshake(stream, &self.session_id, self.leg_id).await
     }
 
+    /// Главный цикл ноги: переподключение (при нужде) → запуск reader/writer →
+    /// ожидание завершения одной из задач → сбор состояния обратно → повтор.
+    ///
+    /// Возвращает `Ok(())` при штатном завершении (например, сервер словил EOF);
+    /// `Err` — когда исчерпан внутренний лимит реконнектов
+    /// ([`MAX_INTERNAL_RECONNECT_ATTEMPTS`]) и управление надо вернуть внешнему
+    /// циклу `establish_leg` (он перерезолвит DNS и сбросит счётчики).
     #[instrument(skip_all, fields(leg_id = self.leg_id))]
     pub async fn run(mut self) -> Result<(), AppError> {
         // Tracks consecutive internal reconnect failures.  Resets to 0 on
@@ -403,7 +451,14 @@ impl TunnelEngine {
         }
     }
 
-    // 💡 ИЗМЕНЕНО: Принимает &mut TxCodec, синхронное и сверхбыстрое шифрование
+    /// Шифрует сообщение в один или несколько кадров и пишет их в сокет.
+    ///
+    /// `Data` режется на кадры по [`MAX_FRAME_PAYLOAD`]; управляющие/UDP идут одним
+    /// кадром. Срабатывает адаптивный по RTT дедлайн записи
+    /// ([`adaptive_write_timeout`](super::muxer::adaptive_write_timeout)) — чтобы
+    /// медленная, но живая нога не убивалась по жёсткому тайм-ауту. Несколько
+    /// кадров коалесятся в один `write_all` (аналог sendmmsg для байт-потока:
+    /// меньше syscalls); одиночный кадр пишется напрямую без лишней копии.
     async fn handle_outbound(
         outbound: &mut OwnedWriteHalf,
         tx_codec: &mut TxCodec,

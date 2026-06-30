@@ -1,3 +1,23 @@
+//! Главный движок клиента: poll-цикл smoltcp + мост TUN ⇄ туннель.
+//!
+//! [`Engine`] — это «сердце» клиентской стороны. В одной задаче `tokio` крутится
+//! цикл [`run`](Engine::run), который на каждой итерации делает 7 шагов:
+//! 1. download: туннель → локальные сокеты (с пер-сокетными бэклогами);
+//! 2. upload: пакеты из TUN → устройство smoltcp;
+//! 3. прогон стека smoltcp (`poll`);
+//! 4. слив TX smoltcp → writer TUN;
+//! 5. периодический лог статистики;
+//! 6. обработка диагностических событий → снапшоты;
+//! 7. адаптивный сон/пробуждение по событию (анти-spin).
+//!
+//! Принципиальная защита от bufferbloat и head-of-line: download раздаётся
+//! **пер-сокетно** (`pending_download`), поэтому один застрявший потребитель не
+//! морозит общий канал для остальных; оба направления делят одну задачу и ходят
+//! по очереди с лимитом [`MAX_PACKETS_PER_TICK`] за тик.
+//!
+//! [`EngineBuilder`]/[`EngineConfig`] — сборка движка: DNS, маршрутизация,
+//! установка туннеля ([`ClientHandler::connect`]) и параметры интерфейса.
+
 use bytes::Bytes;
 use netrunner_core::net::ClientHandler;
 use netrunner_core::net::NetworkConfig;
@@ -57,6 +77,8 @@ const MAX_POLL_SLEEP: Duration = Duration::from_millis(2);
 /// so it can never stall the shared download pipe for other sockets.
 const MAX_PENDING_FRAMES_PER_SOCKET: usize = 64;
 
+/// Движок клиентского стека: интерфейс smoltcp, реестр сокетов, мост в туннель
+/// и диагностика. Живёт в одной задаче `tokio` (см. [`run`](Engine::run)).
 pub struct Engine {
     interface: Interface,
     socket_set: SocketSet<'static>,
@@ -131,6 +153,10 @@ impl Engine {
         }
     }
 
+    /// Запускает главный цикл движка (не возвращается, пока туннель/TUN живы).
+    ///
+    /// Поднимает reader/writer-задачи TUN и крутит 7-шаговый цикл из обзора
+    /// модуля. `tun` забирается во владение и расщепляется на половины.
     pub async fn run(&mut self, tun: Tun) {
         info!("Current routes: {:?}", self.interface.routes());
         let (writer, reader) = tun.split().expect("Failed to split TUN");
@@ -495,6 +521,8 @@ impl Engine {
             .poll(now, &mut self.device, &mut self.socket_set)
     }
 
+    /// Задача чтения из TUN: читает IP-пакеты и шлёт их в движок. `send().await`
+    /// блокируется при полном канале → backpressure доходит до TUN-устройства ОС.
     fn spawn_tun_reader(mut reader: DeviceReader, to_engine: mpsc::Sender<Vec<u8>>) {
         tokio::spawn(async move {
             debug!("TUN Reader task started");
@@ -519,6 +547,8 @@ impl Engine {
         });
     }
 
+    /// Задача записи в TUN: принимает готовые пакеты из движка и пишет их в
+    /// устройство (отдаёт приложению то, что пришло из туннеля).
     fn spawn_tun_writer(mut writer: DeviceWriter, mut from_engine: mpsc::Receiver<Vec<u8>>) {
         tokio::spawn(async move {
             debug!("TUN Writer task started");
@@ -674,17 +704,28 @@ impl Engine {
 
 // ─── EngineConfig & EngineBuilder (unchanged API surface) ──────────────────
 
+/// Параметры запуска движка (билдер-стайл через `with_*`).
 #[derive(Clone, Debug)]
 pub struct EngineConfig {
+    /// Адрес прокси-сервера (`host:port`).
     pub remote_address: String,
+    /// Путь к директории кэша (блок-лист DNS и т.п.).
     pub cache_path: String,
+    /// MTU интерфейса.
     pub mtu: usize,
+    /// Настраивать ли системную маршрутизацию (на мобильных — нет, это делает ОС).
     pub setup_routing: bool,
+    /// Принимать пакеты на любой IP (`any_ip` интерфейса smoltcp).
     pub any_ip: bool,
+    /// Прозрачный режим (стек как промежуточный узел, без своего «адреса»).
     pub transparent_mode: bool,
+    /// Шлюз по умолчанию внутри стека.
     pub default_gateway: Ipv4Addr,
+    /// Включён ли kill-switch (резать трафик мимо туннеля).
     pub killswitch_enabled: bool,
+    /// Приложения в обход туннеля (split-tunneling).
     pub excluded_apps: Vec<String>,
+    /// Домены в обход туннеля.
     pub excluded_domains: Vec<String>,
 }
 
@@ -735,6 +776,7 @@ impl EngineConfig {
     }
 }
 
+/// Сборщик [`Engine`]: подготавливает DNS, маршрутизацию, туннель и интерфейс.
 pub struct EngineBuilder {
     config: EngineConfig,
     tun_device: Option<Tun>,
@@ -755,6 +797,12 @@ impl EngineBuilder {
         self
     }
 
+    /// Собирает готовый к запуску движок.
+    ///
+    /// Инициализирует DNS-блоклист, при необходимости ставит системные маршруты,
+    /// поднимает диагностику и **устанавливает туннель** ([`ClientHandler::connect`]),
+    /// затем создаёт [`Engine`], настраивает интерфейс и добавляет маршруты-исключения
+    /// для split-tunneling доменов. Возвращает движок и TUN для последующего `run`.
     pub async fn build(self) -> Result<(Engine, Tun), String> {
         let tun = self.tun_device.ok_or("TUN device is required")?;
 

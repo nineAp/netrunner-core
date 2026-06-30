@@ -1,3 +1,17 @@
+//! Диспетчеризация входящих кадров туннеля по их типу и `stream_id`.
+//!
+//! [`StreamHandler`] — это «маршрутизатор» на приёмной стороне: один кадр входит,
+//! и в зависимости от типа происходит одно из:
+//! - `Heartbeat` → ответить PONG / измерить RTT / переслать локально;
+//! - `Connect`/`UdpConnect` → (только сервер) открыть соединение к цели;
+//! - `Data`/`UdpData` → доставить данные в локальный поток (с backpressure);
+//! - `Close` → закрыть поток.
+//!
+//! Открытием реальных соединений к целям занимается [`RemoteOpener`] (есть только
+//! на сервере: у клиента `opener == None`, поэтому входящие `Connect` отвергаются).
+//! Каждое открытое соединение защищено [`CancellationToken`] — при эвикте/закрытии
+//! потока мост и установка соединения мгновенно обрываются.
+
 use bytes::Bytes;
 use netrunner_logger::{debug, error, info, trace, warn};
 use std::sync::Arc;
@@ -15,11 +29,21 @@ use crate::net::{
 };
 use crate::nrxp::{Frame, FrameType};
 
+/// Открыватель реальных соединений к целям (серверная сторона туннеля).
+///
+/// На каждый входящий `Connect`/`UdpConnect` поднимает TCP/UDP-сокет к цели и
+/// запускает соответствующий мост, прокачивающий данные между туннелем и целью.
 pub struct RemoteOpener {
     pub muxer: Arc<Muxer>,
 }
 
 impl RemoteOpener {
+    /// Открывает TCP-соединение к `target` и запускает TCP-мост.
+    ///
+    /// Всё происходит в отдельной задаче. Установка соединения (тайм-аут 7 с) и
+    /// сам мост обёрнуты в `select!` с `token.cancelled()` — эвикт обрывает их
+    /// немедленно. При неудаче подключения шлёт `Close` обратно в туннель. По
+    /// завершении всегда снимает регистрацию потока.
     pub async fn open_tcp(
         &self,
         stream_id: u32,
@@ -60,6 +84,8 @@ impl RemoteOpener {
         });
     }
 
+    /// Биндит UDP-сокет, «подключает» его к `target` и запускает UDP-мост.
+    /// Так же защищено токеном отмены; по завершении снимает регистрацию потока.
     pub async fn open_udp(
         &self,
         stream_id: u32,
@@ -86,6 +112,9 @@ impl RemoteOpener {
     }
 }
 
+/// Маршрутизатор входящих кадров. Наличие `opener` определяет роль:
+/// `Some` — серверная сторона (умеет открывать соединения к целям),
+/// `None` — клиентская (входящие `Connect` отвергаются).
 pub(crate) struct StreamHandler {
     muxer: Arc<Muxer>,
     opener: Option<Arc<RemoteOpener>>,
@@ -96,6 +125,9 @@ impl StreamHandler {
         Self { muxer, opener }
     }
 
+    /// Диспетчеризует один кадр по типу. Для `Data`/`UdpData` доставка идёт через
+    /// `await` (backpressure ради сохранения порядка), для управляющих —
+    /// в отдельных задачах, чтобы не блокировать reader ноги.
     pub(crate) async fn handle(&self, frame: Frame) {
         let stream_id = frame.header.stream_id;
 
@@ -152,6 +184,9 @@ impl StreamHandler {
         }
     }
 
+    /// Обрабатывает `Connect`/`UdpConnect`: регистрирует поток (получая токен
+    /// отмены) и просит [`RemoteOpener`] открыть соединение. На клиенте (нет
+    /// opener) — отказ с `Close`. `payload` несёт адрес цели строкой `"ip:port"`.
     async fn handle_conn_request(&self, stream_id: u32, payload: Bytes, is_udp: bool) {
         let target = String::from_utf8_lossy(&payload).to_string();
 

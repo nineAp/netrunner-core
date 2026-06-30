@@ -1,3 +1,11 @@
+//! TCP-листенер сервера и приём входящих туннельных соединений.
+//!
+//! [`Network::run`] инициализирует глобальный конфиг и серверную диагностику,
+//! создаёт **один** общий [`SessionManager`] (мультиплексирование: разные ноги
+//! одной сессии цепляются к одному muxer), запускает фоновую задачу health-check
+//! и печати топологии, после чего в цикле принимает соединения и на каждое
+//! спавнит `ServerHandler::run` из ядра под отдельным tracing-span клиента.
+
 use netrunner_core::net::{
     Connection, NetworkConfig, ServerHandler, SessionManager, TunnelHandler,
     TOPOLOGY_PRINT_INTERVAL,
@@ -9,6 +17,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::diagnostics::ServerDiagnosticsLogger;
 
+/// Параметры прослушивания сервера.
 pub struct Network {
     host: String,
     port: u16,
@@ -19,6 +28,7 @@ impl Network {
         Self { host, port }
     }
 
+    /// Запускает сервер: слушает TCP и обслуживает соединения до отмены `token`.
     pub async fn run(&self, token: CancellationToken) {
         let addr = format!("{}:{}", self.host, self.port);
 

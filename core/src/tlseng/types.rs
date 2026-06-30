@@ -1,3 +1,15 @@
+//! Wire-константы и типы TLS, нужные для маскировки.
+//!
+//! Все числовые значения здесь — части формата TLS «на проводе» (RFC 8446 и
+//! реестр IANA tls-extensiontype-values). Менять их нельзя: от точного совпадения
+//! зависит JA3/JA4-отпечаток. Группировка по смыслу:
+//! - базовый каркас записи/хендшейка: [`ContentType`], [`ProtocolVersion`], [`HelloType`];
+//! - наборы для отпечатка: [`TlsGroups`], [`TlsSignatures`], [`TlsVersions`],
+//!   [`TlsExtensions`], [`ExtensionOrder`].
+
+/// Тип TLS-записи (первый байт на проводе). Мы используем три из них:
+/// `Handshake` для hello-сообщений, `ApplicationData` для кадров NRXP,
+/// `Alert` распознаём для совместимости.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ContentType {
@@ -21,6 +33,9 @@ impl TryFrom<u8> for ContentType {
     }
 }
 
+/// Версия TLS на проводе. Заметьте «маскировочный» нюанс: реальный TLS 1.3
+/// притворяется 1.2 в поле версии записи (`0x0303`), а настоящая версия едет в
+/// расширении `supported_versions` — ровно как делают браузеры.
 #[repr(u16)]
 #[derive(Copy, Clone, Debug)]
 pub(crate) enum ProtocolVersion {
@@ -44,6 +59,8 @@ impl TryFrom<u16> for ProtocolVersion {
     }
 }
 
+/// Тип handshake-сообщения: `ClientHello` (`0x01`) или `ServerHello` (`0x02`) —
+/// первый байт тела `Handshake`-записи.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub(crate) enum HelloType {
     Client = 0x01,
@@ -63,6 +80,10 @@ impl TryFrom<u8> for HelloType {
     }
 }
 
+/// Поддерживаемые ECDH-группы (расширение `supported_groups`). Обёртка над
+/// статическим срезом, чтобы профили могли ссылаться на готовые наборы
+/// ([`CHROMIUM`](TlsGroups::CHROMIUM)/[`MODERN`](TlsGroups::MODERN)) без аллокаций.
+/// На практике обмен идёт по `X25519` — остальные перечислены для правдоподобия.
 #[derive(Clone, Copy)]
 pub(crate) struct TlsGroups(pub &'static [u16]);
 
@@ -76,6 +97,9 @@ impl TlsGroups {
     pub const MODERN: Self = Self(&[Self::X25519, Self::SECP256R1]);
 }
 
+/// Алгоритмы подписи (`signature_algorithms`). Для нас это «декорация» отпечатка:
+/// сертификаты мы не проверяем, но список и его порядок должны совпадать с
+/// браузером ([`BROWSER_STANDARD`](TlsSignatures::BROWSER_STANDARD)).
 #[derive(Clone, Copy)]
 pub(crate) struct TlsSignatures(pub &'static [u16]);
 
@@ -99,6 +123,9 @@ impl TlsSignatures {
     ]);
 }
 
+/// Версии для расширения `supported_versions`. Профиль решает, рекламировать
+/// только 1.3 ([`TLS_13_ONLY`](TlsVersions::TLS_13_ONLY), как Chrome) или 1.3+1.2
+/// ([`MODERN`](TlsVersions::MODERN), как Firefox).
 #[derive(Clone, Copy)]
 pub struct TlsVersions(pub &'static [u16]);
 
@@ -109,6 +136,7 @@ impl TlsVersions {
     pub const TLS_13_ONLY: Self = Self(&[Self::TLS_1_3]);
     pub const MODERN: Self = Self(&[Self::TLS_1_3, Self::TLS_1_2]);
 
+    /// Наибольшая версия из набора — кладётся в основное поле версии хендшейка.
     pub fn max(&self) -> ProtocolVersion {
         if self.0.contains(&Self::TLS_1_3) {
             ProtocolVersion::Tls13
@@ -120,6 +148,9 @@ impl TlsVersions {
     }
 }
 
+/// Идентификаторы TLS-расширений (реестр IANA) + детектор GREASE.
+///
+/// Используются как ключи при сборке/поиске расширений в [`extension`](super::extension).
 pub struct TlsExtensions;
 
 impl TlsExtensions {
@@ -141,6 +172,11 @@ impl TlsExtensions {
     pub const ALPS: u16 = 0x44cd;
     pub const RENEGOTIATION_INFO: u16 = 0xff01;
 
+    /// Является ли id GREASE-значением (RFC 8701).
+    ///
+    /// GREASE-значения имеют вид `0x?a?a`, где оба байта равны (например `0x0a0a`,
+    /// `0x1a1a`). Браузеры на базе Chromium вставляют их, чтобы серверы не «костенели»
+    /// на конкретных значениях; для нас они — обязательная часть Chromium-отпечатка.
     pub fn is_grease(id: u16) -> bool {
         if (id & 0x0f0f) != 0x0a0a {
             return false;
@@ -150,6 +186,11 @@ impl TlsExtensions {
     }
 }
 
+/// Точный порядок расширений в `ClientHello` — определяющий фактор JA3/JA4.
+///
+/// Хранится как статический срез id и перебирается [`ExtensionBuilder`] при
+/// сборке. Константы ниже скопированы из реальных захватов соответствующих
+/// браузеров; первые/последние элементы — GREASE-значения.
 #[derive(Clone, Copy)]
 pub struct ExtensionOrder(pub &'static [u16]);
 

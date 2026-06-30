@@ -1,3 +1,11 @@
+//! Слой TLS-записи — самый внешний «конверт» на проводе.
+//!
+//! Каждая TLS-запись начинается с 5-байтового заголовка
+//! `content_type(1) | version(2) | length(2)`, за которым идёт `payload`. Здесь
+//! это (де)сериализуется. [`TlsRecord`] — полноценная запись с проверкой типа и
+//! длины, а [`ApplicationData`] — лёгкий «сырой payload» для горячего пути data-фазы
+//! (когда тип уже известен и проверять нечего).
+
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 use crate::{
@@ -6,14 +14,16 @@ use crate::{
     tlseng::types::{ContentType, ProtocolVersion},
 };
 
+/// Разобранная TLS-запись: заголовок + полезная нагрузка.
 #[derive(Debug)]
 pub struct TlsRecord {
+    /// Тип записи (`Handshake`/`ApplicationData`/`Alert`).
     pub content_type: ContentType,
-
+    /// Версия из заголовка записи (как правило `Tls12` для маскировки).
     pub version: ProtocolVersion,
-
+    /// Длина payload из заголовка (поле сохранено для отладки; имя с `_`).
     pub _len: u16,
-
+    /// Тело записи (zero-copy ссылка в исходный буфер).
     pub payload: Bytes,
 }
 
@@ -27,6 +37,7 @@ impl TlsRecord {
         }
     }
 
+    /// Сериализует запись в байты: `type | version | len | payload`.
     pub fn serialize(&self) -> Bytes {
         let mut buf = BytesMut::with_capacity(5 + self.payload.len());
 
@@ -38,6 +49,8 @@ impl TlsRecord {
         buf.freeze()
     }
 
+    /// Удобный конструктор: оборачивает готовый шифртекст в запись
+    /// `ApplicationData` (версия маскируется под TLS 1.2) и сериализует.
     pub fn build_application_data(payload: Bytes) -> Bytes {
         netrunner_logger::trace!(payload_len = payload.len(), "Building TlsRecord from Bytes");
 
@@ -50,6 +63,10 @@ impl TlsRecord {
     }
 }
 
+/// Разбор записи. `can_parse` проверяет валидность типа и наличие всех байт
+/// (для `ApplicationData` дополнительно требует ≥17 байт — минимум под AEAD-тег
+/// и непустой шифртекст). Ошибка типа/версии → [`ErrorAction::Redirect`]: это
+/// похоже не на наш трафик, поэтому проксируем как обычный TLS, а не рвём.
 impl Parser for TlsRecord {
     type Error = TlsError;
 
@@ -99,6 +116,10 @@ impl Parser for TlsRecord {
     }
 }
 
+/// «Сырой» payload записи `ApplicationData` без повторной валидации.
+///
+/// Используется в горячем пути: тип записи уже проверен выше, и кодеку нужен
+/// только зашифрованный кадр. Парсер просто забирает весь буфер целиком.
 pub struct ApplicationData {
     pub _len: usize,
     pub payload: Bytes,

@@ -1,3 +1,20 @@
+//! Виртуальные соединения клиента: мост между smoltcp-сокетом и туннелем.
+//!
+//! Каждое перехваченное приложение-соединение представлено одним из типов:
+//! [`TcpConnection`], [`UdpConnection`] или ответчиком [`IcmpResponder`]. Они
+//! живут в синхронном цикле стека (`tick`), но общаются с асинхронным туннелем
+//! через каналы (`ConnectionCore`): локальный сокет ⇄ канал ⇄ задача `spawn` ⇄
+//! [`RawCastFrame`] ⇄ туннель.
+//!
+//! Главное в [`TcpConnection`] — управление потоком без bufferbloat:
+//! - **upload** (браузер→туннель): читаем из smoltcp, пока есть место в канале;
+//!   переполнение канала ставит флаг `tx_congested` → перестаём читать → срабатывает
+//!   TCP backpressure к приложению;
+//! - **download** (туннель→браузер): держим максимум ОДИН `pending_chunk`; если
+//!   tx-буфер smoltcp полон — придерживаем чанк и поднимаем `is_saturated`;
+//! - **RTT-проброс** в smoltcp (`set_tunnel_rtt`/AQM) для BBR — с потолком, чтобы
+//!   рост RTT не раздувал очередь по положительной обратной связи.
+
 use bytes::Bytes;
 use netrunner_core::{
     net::{GLOBAL_MIN_RTT, NetworkConfig, UDP_IDLE_TIMEOUT},
@@ -16,10 +33,16 @@ use tokio::sync::{OwnedSemaphorePermit, mpsc, oneshot};
 
 use netrunner_logger::{debug, info, instrument};
 
+/// Общая «обвязка каналов» соединения: хендл сокета + два встречных канала +
+/// флаг насыщения tx-буфера. Параметр `T` — тип исходящего сообщения (для TCP
+/// это [`Bytes`], для UDP — кортеж с адресом).
 pub struct ConnectionCore<T> {
     pub handle: SocketHandle,
+    /// Канал «локальный сокет → туннель».
     pub tx: mpsc::Sender<T>,
+    /// Канал «туннель → локальный сокет».
     pub rx: mpsc::Receiver<Bytes>,
+    /// Полон ли tx-буфер smoltcp (сигнал backpressure для download).
     pub is_saturated: Arc<AtomicBool>,
 }
 
@@ -43,14 +66,20 @@ impl<T> ConnectionCore<T> {
     }
 }
 
+/// Стадия жизненного цикла виртуального TCP-соединения.
 #[derive(Debug, PartialEq)]
 pub enum ConnectionState {
+    /// Туннель подтвердил установку — можно переходить к Active.
     Established,
+    /// Ждём подтверждения от туннеля (CONNECT отправлен).
     Handshaking,
+    /// Рабочее состояние: качаем данные в обе стороны.
     Active,
+    /// Закрыто.
     Closed,
 }
 
+/// Виртуальное TCP-соединение: один smoltcp tcp-сокет ↔ один поток туннеля.
 pub struct TcpConnection {
     core: ConnectionCore<Bytes>,
     state: ConnectionState,
@@ -125,6 +154,11 @@ impl TcpConnection {
         moved
     }
 
+    /// Один шаг конечного автомата соединения внутри poll-цикла стека.
+    ///
+    /// Прогоняет состояние (Handshaking→Established→Active→Closed) и в активной
+    /// фазе качает данные через [`poll_and_process`](TcpConnection::poll_and_process).
+    /// Возвращает `false`, когда соединение закрылось и его пора убирать.
     pub fn tick(&mut self, socket: &mut tcp::Socket, timestamp: smoltcp::time::Instant) -> bool {
         match self.state {
             ConnectionState::Handshaking => {
@@ -221,6 +255,9 @@ impl TcpConnection {
         }
     }
 
+    /// Прокачивает данные в обе стороны за один тик (см. обзор модуля: upload с
+    /// `tx_congested`-паузой и download с одним `pending_chunk` + `is_saturated`).
+    /// В конце, если выгрузка завершена и буфер пуст, шлёт FIN приложению.
     fn poll_and_process(&mut self, socket: &mut tcp::Socket, timestamp: smoltcp::time::Instant) {
         self.maybe_update_tunnel_rtt(socket, timestamp);
 
@@ -335,6 +372,11 @@ impl TcpConnection {
         self.pending_chunk.as_ref().map(|c| c.len()).unwrap_or(0)
     }
 
+    /// Запускает асинхронную задачу-«насос» соединения.
+    ///
+    /// Шлёт в туннель `Connect` (с целью в payload), сигналит хендшейк, затем в
+    /// цикле гонит данные из smoltcp-канала в туннель `Data`-кадрами, а на выходе
+    /// отправляет `Close`. Связывает синхронный сокет с асинхронным туннелем.
     #[instrument(skip(rx_smol, handshake_tx, tx_tunnel), fields(
         socket_id = socket_id,
         dst = %target
@@ -377,11 +419,15 @@ impl TcpConnection {
 
 // ─── UDP ────────────────────────────────────────────────────────────────────
 
+/// UDP-датаграмма с адресом назначения: `(данные, ip, port)`.
 pub type UdpPacketTarget = (Bytes, std::net::Ipv4Addr, u16);
 
+/// Виртуальное UDP-«соединение» (NAT-запись): smoltcp udp-сокет ↔ поток туннеля.
 pub struct UdpConnection {
     core: ConnectionCore<UdpPacketTarget>,
+    /// Последний известный endpoint клиента (куда возвращать ответы).
     last_client_endpoint: Option<IpEndpoint>,
+    /// Время последней активности (для idle-таймаута).
     last_activity: std::time::Instant,
 }
 
@@ -484,9 +530,12 @@ impl UdpConnection {
 
 use smoltcp::socket::icmp;
 
+/// Отвечает на ICMP Echo (ping) локально, не гоняя его через туннель.
 pub struct IcmpResponder;
 
 impl IcmpResponder {
+    /// Принимает ICMP-пакет; на Echo Request формирует Echo Reply (v4/v6) с
+    /// пересчётом контрольной суммы и отправляет обратно источнику.
     pub fn handle(socket: &mut icmp::Socket, timestamp: smoltcp::time::Instant) {
         if !socket.can_recv() {
             return;

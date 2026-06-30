@@ -1,3 +1,25 @@
+//! Шифрующий кодек: мост между кадрами [`Frame`] и зашифрованными TLS-записями.
+//!
+//! Это слой, где встречаются протокол ([`nrxp::frame`](super::frame)),
+//! криптография ([`crypto`](crate::crypto)) и TLS-обёртка ([`bridge`](super::bridge)).
+//! Кодек разнесён на два независимых направления, чтобы чтение и запись жили в
+//! разных задачах tokio без общего мьютекса:
+//!
+//! - [`TxCodec`] — `Frame` → AEAD-шифр in-place → TLS `ApplicationData`;
+//! - [`RxCodec`] — TLS `ApplicationData` → AEAD-дешифр in-place → `Frame`.
+//!
+//! [`Codec`] — лишь фабрика: создаёт оба направления из одного [`ChaChaCipher`] и
+//! `auth_key`, после чего [`split`](Codec::split) раздаёт их reader'у и writer'у.
+//!
+//! ## Буфер `staging` в [`RxCodec`]
+//!
+//! Опирается на инвариант «1 TLS-запись = 1 кадр NRXP». TLS-записи
+//! расшифровываются по одной в общий буфер `staging`, и сразу делается попытка
+//! распарсить кадр. `staging` переживает вызовы `decode_inbound`: если в одном
+//! TCP-чтении пришло несколько записей, лишние остаются в нём до следующего
+//! вызова. Любой провал AEAD или парсинга после успешной расшифровки трактуется
+//! как рассинхрон/tampering → [`ErrorAction::Drop`] (пересоздать ногу с нуля).
+
 use crate::crypto::{AeadPacker, ChaChaCipher, ChaChaStream, SessionAuth};
 use crate::nrxp::bridge::TlsBridge;
 use crate::nrxp::errors::{ErrorAction, ErrorStage, TlsError};
@@ -5,6 +27,7 @@ use crate::nrxp::frame::{Frame, FrameType};
 use crate::parser::Parser;
 use bytes::{Bytes, BytesMut};
 
+/// Исходящее направление: шифрует кадры для отправки в туннель.
 pub struct TxCodec {
     crypto: ChaChaStream,
     auth: SessionAuth,
@@ -15,6 +38,11 @@ impl TxCodec {
         Self { crypto, auth }
     }
 
+    /// Кодирует один кадр в готовую к отправке TLS-запись `ApplicationData`.
+    ///
+    /// Шаги: сгенерировать time-based тег → собрать байты кадра → зашифровать
+    /// in-place (буфер вырастает на 16 байт AEAD-тега) → обернуть в TLS-запись.
+    /// Любая ошибка шифрования критична → [`ErrorAction::Drop`].
     pub(crate) fn encode_frame(
         &mut self,
         stream_id: u32,
@@ -42,9 +70,12 @@ impl TxCodec {
     }
 }
 
+/// Входящее направление: расшифровывает TLS-записи и собирает из них кадры.
 pub struct RxCodec {
     crypto: ChaChaStream,
     auth: SessionAuth,
+    /// Накопитель расшифрованного открытого текста между вызовами `decode_inbound`
+    /// (хранит «хвост» кадров, не разобранных в текущем вызове).
     staging: BytesMut,
 }
 
@@ -56,6 +87,12 @@ impl RxCodec {
             staging,
         }
     }
+    /// Пытается извлечь **один** следующий кадр из накопленных TCP-данных.
+    ///
+    /// Возвращает `Ok(Some(frame))`, если кадр готов; `Ok(None)`, если данных
+    /// пока недостаточно (ждём следующего чтения сокета); `Err(Drop)` при провале
+    /// AEAD/парсинга. Сначала дочищает «хвост» из `staging`, затем по одной
+    /// расшифровывает новые TLS-записи из `buffer`.
     pub(crate) fn decode_inbound(
         &mut self,
         buffer: &mut BytesMut,
@@ -139,12 +176,17 @@ impl RxCodec {
     }
 }
 
+/// Фабрика кодеков: владеет обоими направлениями до момента, пока их не раздадут
+/// в задачи reader/writer через [`split`](Codec::split).
 pub struct Codec {
     tx: Option<TxCodec>,
     rx: Option<RxCodec>,
 }
 
 impl Codec {
+    /// Создаёт оба направления из шифра сессии и ключа аутентификации.
+    /// `auth` (одна `SessionAuth`) общий для tx и rx — тег зависит только от
+    /// времени и `auth_key`, а не от направления.
     pub fn new(cipher: ChaChaCipher, auth_key: [u8; 32]) -> Self {
         let (rx_stream, tx_stream) = cipher.split();
         let auth = SessionAuth::new(auth_key);

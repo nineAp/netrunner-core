@@ -1,3 +1,10 @@
+//! Трансляция между локальным протоколом RawCast и протоколом туннеля NRXP.
+//!
+//! [`RawCastAdapter`] — чистый «переводчик» без состояния. Соответствия:
+//! `socket_id` ⇄ `stream_id`, `(protocol, event)` ⇄ [`FrameType`]. Для `Connect`
+//! без явного payload адрес назначения упаковывается строкой `"ip:port"` — это
+//! то, что ожидает серверная сторона при открытии потока.
+
 use bytes::Bytes;
 use std::net::Ipv4Addr;
 
@@ -6,9 +13,13 @@ use crate::{
     rawcast::frame::{LocalProtocol, RawCastEvent, RawCastFrame},
 };
 
+/// Безсостоятельный конвертер RawCast ⇄ NRXP.
 pub struct RawCastAdapter;
 
 impl RawCastAdapter {
+    /// RawCast → NRXP. Маппит протокол+событие в [`FrameType`]; для `Connect`
+    /// без payload подставляет адрес цели строкой `"ip:port"`. ICMP отвергается —
+    /// ядро NRXP его не проксирует.
     pub(crate) fn to_nrxp(raw: RawCastFrame) -> Result<Frame, String> {
         let stream_id = raw.socket_id as u32;
 
@@ -40,6 +51,9 @@ impl RawCastAdapter {
         Ok(Frame::new(stream_id, frame_type, payload))
     }
 
+    /// NRXP → RawCast. Обратный перевод; `is_udp` задаёт протокол локального
+    /// сокета (в NRXP-кадре эта информация частично растворена в типе). Кадры
+    /// `Heartbeat` сюда попадать не должны — их обрабатывает muxer, не мост.
     pub(crate) fn from_nrxp(
         nrxp_frame: Frame,
         dst_ip: Ipv4Addr,

@@ -1,3 +1,14 @@
+//! Фабрика smoltcp-сокетов с профилями трафика.
+//!
+//! Разные виды трафика хотят разные сокеты: «толстым» закачкам (HTTP/HTTPS) нужны
+//! большие буферы ради throughput, интерактиву (SSH/RDP/VNC) — маленькие ради
+//! низкой задержки, DNS — совсем маленькие. [`TrafficProfile`] классифицирует
+//! трафик по порту, а [`SmolSocketFactory`] (за трейтом [`SocketProvider`])
+//! создаёт TCP/UDP/ICMP-сокеты с буферами под профиль из [`NetworkConfig`].
+//!
+//! TCP-сокеты настраиваются под низкую задержку: Nagle off, без ack-delay,
+//! congestion control = BBR.
+
 use netrunner_core::net::{
     BUFFERBLOAT_WARN_THRESHOLD, HTTPS_PORT, HTTP_ALT_PORT, HTTP_PORT, ICMP_BUFFER_SIZE,
     ICMP_META_SLOTS, MAX_SOCKETS, NTP_PORT, RDP_PORT, RTMP_PORT, SSH_PORT, VNC_PORT, NetworkConfig,
@@ -16,11 +27,16 @@ use smoltcp::{
 };
 use std::sync::Arc;
 
+/// Класс трафика, определяющий размеры буферов сокета.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrafficProfile {
+    /// Интерактив (SSH/RDP/VNC): маленькие буферы, минимум задержки.
     Interactive,
+    /// Объёмные потоки (HTTP/HTTPS/RTMP): большие буферы, максимум throughput.
     Bulk,
+    /// DNS/NTP: совсем маленькие буферы.
     Dns,
+    /// Всё остальное: умеренные буферы.
     Default,
 }
 
@@ -28,6 +44,8 @@ pub const TCP_SOCKET_KEEP_ALIVE: Duration = Duration::from_secs(15);
 pub const TCP_SOCKET_ACTIVE_TIMEOUT: Duration = Duration::from_secs(60);
 
 impl TrafficProfile {
+    /// Угадывает профиль по (порту назначения, протоколу). Эвристика на основе
+    /// известных портов; неизвестные → [`TrafficProfile::Default`].
     pub fn guess_from_port(port: u16, is_tcp: bool) -> Self {
         match (port, is_tcp) {
             (SSH_PORT, true) | (RDP_PORT, true) | (VNC_PORT, true) => Self::Interactive,
@@ -40,17 +58,25 @@ impl TrafficProfile {
     }
 }
 
+/// Абстракция создания сокетов стека (позволяет подменять в тестах).
 pub trait SocketProvider: Send + Sync {
+    /// Создаёт исходящий TCP-сокет под профиль.
     fn create_tcp(&self, profile: TrafficProfile) -> tcp::Socket;
+    /// Создаёт UDP-сокет под профиль.
     fn create_udp(&self, profile: TrafficProfile) -> udp::Socket<'static>;
+    /// Создаёт ICMP-сокет (для ответов на ping).
     fn create_icmp(&self, profile: TrafficProfile) -> icmp::Socket<'static>;
 
+    /// Создаёт слушающий TCP-сокет (профиль угадывается по порту).
     fn create_listening_tcp(&self, addr: Option<IpAddress>, port: u16) -> tcp::Socket;
+    /// Создаёт привязанный UDP-сокет (профиль угадывается по порту).
     fn create_bound_udp(&self, addr: Option<IpAddress>, port: u16) -> udp::Socket<'static>;
+    /// Создаёт базовый набор сокетов (слушающий UDP:53 + `n_icmp` ICMP).
     fn create_base_set(&self, n_icmp: usize) -> SocketSet<'static>;
+    /// Перенастраивает уже существующий TCP-сокет под профиль (Nagle/BBR и т.п.).
     fn reconfigure_tcp(&self, socket: &mut tcp::Socket, profile: TrafficProfile);
 
-    // 🔥 НОВЫЙ МЕТОД: Логирование статистики всех сокетов в сете
+    /// Логирует статистику всех активных сокетов (диагностика bufferbloat).
     fn log_stats(
         &self,
         sockets: &SocketSet,
@@ -58,6 +84,7 @@ pub trait SocketProvider: Send + Sync {
     );
 }
 
+/// Реализация [`SocketProvider`] поверх [`NetworkConfig`].
 pub struct SmolSocketFactory {
     config: Arc<NetworkConfig>,
 }

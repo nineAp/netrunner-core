@@ -1,3 +1,18 @@
+//! Локальный перехват DNS: фейковые IP + блок-лист.
+//!
+//! Клиент сам отвечает на DNS-запросы приложений, чтобы (а) не утекал реальный
+//! DNS и (б) каждое имя получало стабильный «фейковый» IP из диапазона CGNAT
+//! (RFC 6598, 100.64.0.0/10), по которому потом восстанавливается хост.
+//!
+//! Две части:
+//! - [`FakeIpStore`] — двусторонний LRU-маппинг `домен ⇄ фейковый IP`. Выдаёт
+//!   новый IP по запросу и позволяет обратный поиск (IP → домен) при установке
+//!   туннельного соединения.
+//! - [`DnsHandler`] — обработчик запросов: режет приватные суффиксы и домены из
+//!   блок-листа (StevenBlack/hosts, фоново подкачивается и кэшируется),
+//!   пропускает исключённые домены мимо туннеля (ServFail → системный DNS),
+//!   остальным A-запросам выдаёт фейковый IP.
+
 use anyhow::Result;
 use hickory_proto::op::{Message, MessageType, ResponseCode};
 use hickory_proto::rr::{RData, Record, RecordType};
@@ -26,9 +41,13 @@ const BLOCKLIST_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 /// TTL advertised in fake DNS A records (seconds).
 const FAKE_DNS_TTL: u32 = 60;
 
+/// Двусторонний LRU-маппинг доменов на фейковые IP из CGNAT-диапазона.
 pub struct FakeIpStore {
+    /// Прямой: домен → выданный IP.
     cache: LruCache<String, Ipv4Addr>,
+    /// Обратный: IP → домен (для восстановления цели при connect).
     rev_cache: LruCache<Ipv4Addr, String>,
+    /// Следующий свободный IP (монотонно растёт от `FAKE_IP_START`).
     next_ip: u32,
 }
 
@@ -70,11 +89,16 @@ impl FakeIpStore {
 
 // --- DNS Handler & Blocklist Logic ---
 
+/// Обработчик DNS-запросов: фильтрация + выдача фейковых IP.
 pub struct DnsHandler {
+    /// Заблокированные домены (из StevenBlack/hosts).
     block_list: HashSet<String>,
+    /// Приватные суффиксы, которые всегда NXDomain (`.lan`, `.local`, …).
     forbidden_suffixes: Vec<String>,
+    /// Путь к кэшу блок-листа на диске.
     cache_path: String,
-    excluded_domains: HashSet<String>, // Добавлено
+    /// Домены в обход туннеля: на них отвечаем ServFail → системный DNS.
+    excluded_domains: HashSet<String>,
 }
 
 impl DnsHandler {
@@ -160,6 +184,11 @@ impl DnsHandler {
         Ok(())
     }
 
+    /// Обрабатывает один DNS-запрос и возвращает сериализованный ответ.
+    ///
+    /// Порядок решений: исключённый домен → ServFail (фолбэк на системный DNS);
+    /// приватный суффикс/блок-лист → NXDomain; A-запрос → фейковый IP; прочее →
+    /// пустой NoError. `None` — если запрос не разобрался.
     pub fn handle_query(&self, data: &[u8], store: &mut FakeIpStore) -> Option<Vec<u8>> {
         let req = Message::from_vec(data).ok()?;
         let query = req.queries().first()?;

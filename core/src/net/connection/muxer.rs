@@ -1,3 +1,31 @@
+//! Мультиплексор: распределение логических потоков по физическим ногам туннеля.
+//!
+//! Сердце сетевого ядра и единственный по-настоящему конкурентный компонент.
+//! [`Muxer`] держит реестр ног (TCP-соединений) и потоков (`stream_id`) и решает,
+//! по какой ноге отправить каждый кадр. Спроектирован под высокую нагрузку:
+//!
+//! - **Lock-free горячий путь.** Реестры — это [`DashMap`] (шардированный), а
+//!   снапшот ног для выбора — [`ArcSwap`] (чтение = атомарный bump `Arc`, без
+//!   read-guard). См. поле `active_legs_cache`.
+//! - **Sticky-привязка + ребаланс.** Поток «прилипает» к ноге
+//!   (`stream_bindings`), но при её падении мгновенно переезжает на лучшую из
+//!   оставшихся (`select_leg`). Среди равных по качеству ног — round-robin, чтобы
+//!   всплеск новых потоков не сел на одну «лучшую» ногу (thundering herd).
+//! - **Anti-domino failover.** Падение ноги НЕ закрывает поток: дохлая нога
+//!   эвиктится, кадр переотправляется на соседнюю; `Err` только когда живых ног
+//!   нет вовсе — и тогда мост делает паузу с буфером, а не сброс (см.
+//!   `send_to_network` и `run_tcp_bridge`).
+//! - **Анти-bufferbloat доставка.** Входящие кадры доставляются неблокирующим
+//!   `try_send` (`dispatch_to_local`), чтобы один медленный потребитель не
+//!   блокировал общий reader ноги (head-of-line).
+//!
+//! ## Адаптация под RTT
+//!
+//! [`GLOBAL_MIN_RTT`] обновляется по heartbeat'ам (EWMA). От него зависят
+//! [`adaptive_write_timeout`] (не убивать медленную, но живую ногу) и
+//! [`adaptive_batch_chunk`] (под высоким RTT слать кадры большими пачками,
+//! экономя syscalls).
+
 use arc_swap::ArcSwap;
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -13,6 +41,7 @@ use crate::net::{DISPATCH_TO_LOCAL_TIMEOUT, MAX_TUNNEL_LEGS};
 use crate::net::INITIAL_RTT_MS;
 use crate::nrxp::FrameType;
 
+/// Атомарная статистика одной ноги: переданные/принятые байты и сглаженный RTT.
 #[derive(Default, Debug)]
 pub struct LegStats {
     pub tx_bytes: AtomicU64,
@@ -20,12 +49,18 @@ pub struct LegStats {
     pub rtt_ms: AtomicU32,
 }
 
+/// Атомарная статистика одного потока: переданные/принятые байты.
 #[derive(Default, Debug)]
 pub struct StreamStats {
     pub tx_bytes: AtomicU64,
     pub rx_bytes: AtomicU64,
 }
 
+/// Одна нога туннеля = одно физическое TCP+TLS-соединение.
+///
+/// Два раздельных канала к writer-задаче ноги: `control_tx` (Close/Heartbeat,
+/// приоритетные) и `data_tx` (данные, с backpressure). `Clone` дёшев — внутри
+/// `Arc`/`Sender`, поэтому ногу можно копировать из кэша без затрат.
 #[derive(Clone)]
 struct MuxLeg {
     id: u32,
@@ -35,6 +70,8 @@ struct MuxLeg {
 }
 
 impl MuxLeg {
+    /// Степень загруженности `data`-канала: 0.0 — пусто, 1.0 — канал полностью
+    /// забит. Используется в скоринге ног при выборе (`select_leg`).
     fn congestion_factor(&self) -> f64 {
         let max = self.data_tx.max_capacity();
         let current_capacity = self.data_tx.capacity();
@@ -43,6 +80,10 @@ impl MuxLeg {
     }
 }
 
+/// Генератор `stream_id`, разводящий клиента и сервер по чётности.
+///
+/// Клиент выдаёт нечётные id (1,3,5…), сервер — чётные (2,4,6…). Так две стороны
+/// независимо открывают потоки, не споря за номера. Шаг — `+2`, атомарно.
 struct IdGenerator {
     counter: AtomicU32,
 }
@@ -58,6 +99,8 @@ impl IdGenerator {
     }
 }
 
+/// Единица передачи через muxer: что отправить (`data`), какого типа и в какой
+/// поток. Передаётся по каналам ноги к её writer-задаче.
 #[derive(Clone)]
 pub struct MuxMessage {
     pub(crate) stream_id: u32,
@@ -96,8 +139,11 @@ pub fn adaptive_batch_chunk(base: usize) -> usize {
     base.saturating_mul(factor)
 }
 
+/// Мультиплексор туннеля. Дёшево клонируется (всё внутри `Arc`) и шарится между
+/// всеми задачами ног и потоков.
 #[derive(Clone)]
 pub struct Muxer {
+    /// Источник истины по ногам (id → нога). Шардированная карта, lock-free.
     legs: Arc<DashMap<u32, MuxLeg>>,
     // 🔥 ОПТИМИЗАЦИЯ: полностью lock-free кэш горячего пути.
     // ArcSwap: чтение (load_full) — атомарный bump Arc без блокировок; запись
@@ -105,11 +151,16 @@ pub struct Muxer {
     // чтение брало read-guard.
     active_legs_cache: Arc<ArcSwap<Vec<MuxLeg>>>,
 
-    // Добавили CancellationToken для предотвращения утечек памяти (Зомби-задач)
+    /// Реестр потоков: id → (канал доставки данных, статистика, токен отмены).
+    /// Токен мгновенно убивает связанные с потоком задачи при `remove_stream`.
     streams: Arc<DashMap<u32, (Sender<Bytes>, Arc<StreamStats>, CancellationToken)>>,
+    /// Sticky-привязка потока к ноге (`stream_id` → `leg_id`).
     stream_bindings: Arc<DashMap<u32, u32>>,
+    /// Время отправки PING по каждой ноге — для измерения RTT по PONG.
     pending_pings: Arc<DashMap<u32, Instant>>,
+    /// Генератор `stream_id` (чётность по роли).
     id_gen: Arc<IdGenerator>,
+    /// Идентификатор сессии (для логов/топологии).
     session_id: Arc<String>,
     /// Rotating cursor for round-robin leg selection among similar-quality legs,
     /// so a burst of new streams spreads across legs instead of all binding to
@@ -131,11 +182,16 @@ impl Muxer {
         }
     }
 
+    /// Пересобирает lock-free снапшот ног из источника истины (`legs`) и
+    /// атомарно публикует его в `active_legs_cache`. Вызывается при любом
+    /// изменении набора ног (add/remove).
     fn update_legs_cache(&self) {
         let new_cache: Vec<MuxLeg> = self.legs.iter().map(|kv| kv.value().clone()).collect();
         self.active_legs_cache.store(Arc::new(new_cache));
     }
 
+    /// Регистрирует новую ногу (после установки TCP+TLS). Если лимит
+    /// [`MAX_TUNNEL_LEGS`] достигнут и это не обновление существующей — игнор.
     pub fn add_leg(
         &self,
         leg_id: u32,
@@ -171,6 +227,10 @@ impl Muxer {
         self.stream_bindings.retain(|_, bound_leg| *bound_leg != leg_id);
     }
 
+    /// Безопасно эвиктит ногу, но только если её текущий `control_tx` совпадает с
+    /// `tx` (защита от удаления ноги, уже переподключённой под тем же id). Сначала
+    /// снимает привязки, потом обновляет кэш — чтобы конкурентный `select_leg` не
+    /// привязался к эвиктируемой ноге.
     pub fn remove_leg(&self, leg_id: u32, tx: &Sender<MuxMessage>) {
         let should_remove = self
             .legs
@@ -189,6 +249,7 @@ impl Muxer {
         }
     }
 
+    /// Безусловно удаляет ногу (без сверки канала) — при выходе её движка.
     pub fn force_remove_leg(&self, leg_id: u32) {
         if self.legs.remove(&leg_id).is_some() {
             self.clear_bindings_for_leg(leg_id);
@@ -197,16 +258,25 @@ impl Muxer {
         }
     }
 
+    /// Сбрасывает все ноги и привязки (полная остановка туннеля).
     pub fn remove_all_legs(&self) {
         self.legs.clear();
         self.stream_bindings.clear();
         self.update_legs_cache();
     }
 
+    /// Число активных ног.
     pub fn active_legs_count(&self) -> usize {
         self.legs.len()
     }
 
+    /// Выбирает ногу для отправки кадра потока `stream_id`.
+    ///
+    /// Двухуровнево: (1) горячий путь — привязанный поток резолвит ногу по id
+    /// прямо из `legs` (без скана и клонирования кэша); (2) новый/осиротевший
+    /// поток скорится по всем ногам (RTT доминирует, congestion лишь модулирует),
+    /// из ног в пределах 2× от лучшего скора выбирается round-robin, и привязка
+    /// фиксируется. Подробности скоринга — в inline-комментариях ниже.
     fn select_leg(&self, stream_id: u32) -> Option<MuxLeg> {
         // 1. FAST PATH (hot, per data frame): a bound stream resolves its leg by
         //    id straight from the legs map — no full-cache Arc clone and no vector
@@ -267,10 +337,13 @@ impl Muxer {
         None
     }
 
+    /// Запоминает момент отправки PING по ноге (для замера RTT по PONG).
     pub fn record_ping_sent(&self, leg_id: u32) {
         self.pending_pings.insert(leg_id, Instant::now());
     }
 
+    /// Обрабатывает PONG: считает RTT и обновляет сглаженную оценку (EWMA, α=0.25),
+    /// затем пересчитывает глобальный минимум [`GLOBAL_MIN_RTT`] по всем ногам.
     pub async fn record_pong(&self, leg_id: u32) {
         if let Some((_, start_time)) = self.pending_pings.remove(&leg_id) {
             let measured = start_time.elapsed().as_millis() as u32;
@@ -298,6 +371,15 @@ impl Muxer {
         }
     }
 
+    /// Отправляет кадр в сеть, выбирая ногу и применяя стратегию по типу кадра.
+    ///
+    /// - **Данные** (`Data`/`UdpData`): `send().await` (backpressure) с
+    ///   anti-domino failover в цикле — при мёртвой ноге эвикт + переотправка на
+    ///   другую; `Err` лишь когда живых ног нет.
+    /// - **Критичные** (`Close`/`Heartbeat`): надёжно через `send().await`
+    ///   (потеря Close течёт ресурсы, потеря PONG валит health-check).
+    /// - **Прочий контроль**: `try_send`; при переполнении кадр дропается с
+    ///   сигналом `ControlChannelFull`, не блокируя.
     #[instrument(skip(self, message), fields(session_id = %self.session_id, stream_id = message.stream_id, frame = ?message.frame_type))]
     pub async fn send_to_network(&self, mut message: MuxMessage) -> Result<(), AppError> {
         let is_data = matches!(message.frame_type, FrameType::Data | FrameType::UdpData);
@@ -428,6 +510,7 @@ impl Muxer {
         }
     }
 
+    /// Удобная обёртка для отправки данных потока (выбирает `Data`/`UdpData`).
     pub async fn send_data_safe(
         &self,
         stream_id: u32,
@@ -446,6 +529,7 @@ impl Muxer {
         .await
     }
 
+    /// Удобная обёртка для отправки управляющего кадра заданного типа.
     pub(crate) async fn send_control(
         &self,
         stream_id: u32,
@@ -460,6 +544,8 @@ impl Muxer {
         .await
     }
 
+    /// Регистрирует поток и возвращает его [`CancellationToken`]. Канал `tx`
+    /// используется для доставки входящих данных потоку (`dispatch_to_local`).
     pub fn register_stream(&self, stream_id: u32, tx: Sender<Bytes>) -> CancellationToken {
         let token = CancellationToken::new();
         self.streams.insert(
@@ -469,6 +555,8 @@ impl Muxer {
         token
     }
 
+    /// Удаляет поток, отменяя его токен (мгновенно гасит связанные задачи) и
+    /// снимая привязку к ноге.
     pub fn remove_stream(&self, stream_id: u32) {
         // 🔥 Мгновенно убиваем "зомби-задачи", привязанные к стриму!
         if let Some((_, (_, _, token))) = self.streams.remove(&stream_id) {
@@ -546,16 +634,24 @@ impl Muxer {
         }
     }
 
+    /// Учитывает принятые ногой байты в её статистике.
     pub fn record_leg_rx(&self, leg_id: u32, bytes: u64) {
         if let Some(leg) = self.legs.get(&leg_id) {
             leg.stats.rx_bytes.fetch_add(bytes, Ordering::Relaxed);
         }
     }
 
+    /// Следующий свободный `stream_id` (с учётом чётности роли).
     pub fn next_stream_id(&self) -> u32 {
         self.id_gen.next()
     }
 
+    /// Прогоняет health-check по всем ногам: PING с уникальным probe-потоком и
+    /// ожидание PONG в пределах [`HEALTH_CHECK_TIMEOUT`](crate::net::HEALTH_CHECK_TIMEOUT).
+    ///
+    /// Тонкости (см. inline): закрытый канал → немедленный эвикт; временно
+    /// полный → пропуск цикла (нога жива, просто занята); перед эвиктом по
+    /// тайм-ауту сверяется, что нога не переподключилась под тем же id.
     pub async fn perform_health_check(&self) {
         let leg_ids: Vec<u32> = self.legs.iter().map(|kv| *kv.key()).collect();
 
@@ -642,6 +738,8 @@ impl Muxer {
         }
     }
 
+    /// Печатает в лог дерево топологии туннеля: ноги (трафик/RTT), виртуальные
+    /// потоки и кумулятивные счётчики здоровья пайплайна. Чисто диагностика.
     pub fn print_topology_tree(&self) {
         let mut out = String::new();
         out.push_str(&format!(

@@ -1,3 +1,17 @@
+//! TLS Extensions: сборка (исходящие) и разбор (входящие) — ядро отпечатка.
+//!
+//! Два направления:
+//! - [`ExtensionStack`] + его [`Parser`] — **читают** блок расширений из чужого
+//!   hello (нужно, чтобы достать KeyShare с публичным ключом по
+//!   [`find_by_type`](ExtensionStack::find_by_type));
+//! - [`ExtensionBuilder`] — **пишут** наш блок расширений в точном порядке профиля.
+//!
+//! Каждое расширение на проводе — это `type(2) | length(2) | data(length)`.
+//! Билдер-методы по одному кладут конкретные расширения, а
+//! [`apply_profile`](ExtensionBuilder::apply_profile) проходит по
+//! [`ExtensionOrder`](super::types::ExtensionOrder) профиля и вызывает нужный
+//! метод для каждого id — так гарантируется правильный порядок (JA3/JA4).
+
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 use crate::{
@@ -10,6 +24,7 @@ use crate::{
     },
 };
 
+/// Одно разобранное расширение: тип + сырые данные (длина продублирована в `_elen`).
 #[derive(Debug)]
 pub(crate) struct Extension {
     pub etype: u16,
@@ -17,12 +32,16 @@ pub(crate) struct Extension {
     pub data: Bytes,
 }
 
+/// Разобранный список расширений из входящего hello.
 #[derive(Debug)]
 pub(crate) struct ExtensionStack {
     pub extensions: Vec<Extension>,
 }
 
 impl ExtensionStack {
+    /// Находит расширение по типу и возвращает его данные (zero-copy clone
+    /// [`Bytes`]). Главный потребитель — извлечение KeyShare (`0x0033`) с
+    /// публичным ключом удалённой стороны при выводе ключей сессии.
     pub fn find_by_type(&self, etype: u16) -> Option<Bytes> {
         self.extensions
             .iter()
@@ -31,6 +50,10 @@ impl ExtensionStack {
     }
 }
 
+/// Разбор блока расширений. Сначала «холостым» проходом суммируются длины всех
+/// расширений, чтобы убедиться, что блок пришёл целиком и не содержит лишних
+/// байт (точное равенство `offset == data_len`); только потом извлекаются сами
+/// расширения. Хвостовой мусор → [`ErrorAction::Drop`] (испорченное/чужое hello).
 impl Parser for ExtensionStack {
     type Error = TlsError;
 
@@ -89,6 +112,9 @@ impl Extension {
     }
 }
 
+/// Накопитель блока расширений. Каждый `*`-метод дописывает одно конкретное
+/// расширение в `payload`; порядок определяется вызывающим
+/// [`apply_profile`](ExtensionBuilder::apply_profile), а не самими методами.
 pub(crate) struct ExtensionBuilder {
     payload: BytesMut,
 }
@@ -100,12 +126,15 @@ impl ExtensionBuilder {
         }
     }
 
+    /// Низкоуровневая запись одного расширения: `type | len | data`.
+    /// Все публичные методы-«рецепты» ниже сводятся к этому вызову.
     fn add_extension(&mut self, etype: u16, data: &[u8]) {
         self.payload.put_u16(etype);
         self.payload.put_u16(data.len() as u16);
         self.payload.put_slice(data);
     }
 
+    /// GREASE-«пустышка»: расширение со случайным id и нулевой длиной (RFC 8701).
     pub fn grease_with_id(&mut self, etype: u16) {
         self.add_extension(etype, &[]);
     }
@@ -118,6 +147,8 @@ impl ExtensionBuilder {
         }
     }
 
+    /// SNI (`server_name`): целевой хост в открытом виде — браузеры так и делают,
+    /// поэтому для маскировки имя сервера здесь не прячется.
     pub fn server_name(&mut self, host: &str) {
         let host_bytes = host.as_bytes();
         let host_len = host_bytes.len() as u16;
@@ -163,6 +194,9 @@ impl ExtensionBuilder {
         self.add_extension(TlsExtensions::SUPPORTED_VERSIONS, &data);
     }
 
+    /// KeyShare (`0x0033`): **самое важное** расширение — несёт наш публичный
+    /// ключ X25519. Группа берётся первой из профиля (по умолчанию `0x001d`).
+    /// Именно отсюда удалённая сторона достаёт ключ для ECDH.
     pub fn key_share(&mut self, profile: &BrowserProfile, pub_key: &[u8]) {
         let key_len = pub_key.len() as u16;
 
@@ -254,6 +288,9 @@ impl ExtensionBuilder {
         self.add_extension(TlsExtensions::RENEGOTIATION_INFO, &[0x00]);
     }
 
+    /// Padding (`0x0015`): добивает `ClientHello` нулями до `target_size` с учётом
+    /// `overhead` (заголовки записи/хендшейка и фикс. поля), чтобы итоговая длина
+    /// совпала с отпечатком браузера. `-4` — это собственные `type|len` паддинга.
     pub fn padding(&mut self, target_size: usize, overhead: usize) {
         let current_total_size = self.payload.len() + overhead;
 
@@ -264,6 +301,12 @@ impl ExtensionBuilder {
         }
     }
 
+    /// Собирает весь блок расширений строго в порядке профиля.
+    ///
+    /// Проходит по [`profile.extension_order`](BrowserProfile::extension_order) и
+    /// для каждого id вызывает соответствующий метод-«рецепт». GREASE-id
+    /// вставляются только при `profile.has_grease`, ALPS/Padding — только если
+    /// профиль их задаёт. Порядок здесь = порядок на проводе = отпечаток.
     pub fn apply_profile(
         &mut self,
         profile: &BrowserProfile,
@@ -315,6 +358,7 @@ impl ExtensionBuilder {
         }
     }
 
+    /// Завершает сборку и отдаёт готовый блок расширений (zero-copy `freeze`).
     pub fn build(&mut self) -> Bytes {
         self.payload.split().freeze()
     }

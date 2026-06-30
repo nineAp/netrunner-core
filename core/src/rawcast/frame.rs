@@ -1,34 +1,61 @@
+//! Кадр локального протокола RawCast и его (де)сериализация.
+//!
+//! Wire-формат: 16-байтовый фиксированный заголовок + 2 байта длины payload +
+//! сам payload:
+//!
+//! ```text
+//! ┌──────────┬───────┬───────────┬─────────┬──────────┬─────────────┬─────────┐
+//! │ protocol │ event │ socket_id │ dst_ip  │ dst_port │ payload_len │ payload │
+//! │ 1 байт   │ 1 б.  │ 8 байт    │ 4 байта │ 2 байта  │ 2 байта     │ N байт  │
+//! └──────────┴───────┴───────────┴─────────┴──────────┴─────────────┴─────────┘
+//!   └──────────────── LOCAL_HEADER_SIZE = 16 ────────────────┘
+//! ```
+
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use std::net::Ipv4Addr;
 
 use crate::parser::Parser;
 
+/// Транспортный протокол локального сокета.
 #[derive(Copy, Clone, Debug, PartialEq)]
 #[repr(u8)]
 pub enum LocalProtocol {
     Tcp = 0x01,
     Udp = 0x02,
+    /// ICMP распознаётся в формате, но ядром NRXP не поддерживается (см. адаптер).
     Icmp = 0x03,
 }
 
+/// Событие жизненного цикла локального сокета.
 #[derive(Copy, Clone, Debug, PartialEq)]
 #[repr(u8)]
 pub enum RawCastEvent {
+    /// Новое соединение/сессия к цели.
     Connect = 0x01,
+    /// Полезные данные.
     Data = 0x02,
+    /// Закрытие соединения.
     Close = 0x03,
 }
 
+/// Описание одного события локального сокета — единица обмена RawCast.
 #[derive(Debug, Clone)]
 pub struct RawCastFrame {
+    /// TCP/UDP/ICMP.
     pub protocol: LocalProtocol,
+    /// Connect/Data/Close.
     pub event: RawCastEvent,
+    /// Идентификатор локального сокета (→ `stream_id` в NRXP).
     pub socket_id: u64,
+    /// Адрес назначения.
     pub dst_ip: Ipv4Addr,
+    /// Порт назначения.
     pub dst_port: u16,
+    /// Полезные данные (пусто для Connect/Close).
     pub payload: Bytes,
 }
 
+/// Размер фиксированной части заголовка (без поля длины и payload) — 16 байт.
 const LOCAL_HEADER_SIZE: usize = 16;
 
 impl RawCastFrame {
@@ -50,18 +77,22 @@ impl RawCastFrame {
         }
     }
 
+    /// Кадр-событие открытия соединения (без payload).
     pub fn connect(protocol: LocalProtocol, id: u64, ip: Ipv4Addr, port: u16) -> Self {
         Self::new(protocol, RawCastEvent::Connect, id, ip, port, Bytes::new())
     }
 
+    /// Кадр с данными соединения.
     pub fn data(protocol: LocalProtocol, id: u64, ip: Ipv4Addr, port: u16, data: Bytes) -> Self {
         Self::new(protocol, RawCastEvent::Data, id, ip, port, data)
     }
 
+    /// Кадр-событие закрытия соединения (без payload).
     pub fn close(protocol: LocalProtocol, id: u64, ip: Ipv4Addr, port: u16) -> Self {
         Self::new(protocol, RawCastEvent::Close, id, ip, port, Bytes::new())
     }
 
+    /// Сериализует кадр в байты по wire-формату из обзора модуля.
     pub fn into_bytes(self) -> BytesMut {
         let total_size = LOCAL_HEADER_SIZE + 2 + self.payload.len();
         let mut buf = BytesMut::with_capacity(total_size);
@@ -78,6 +109,9 @@ impl RawCastFrame {
     }
 }
 
+/// Разбор кадра RawCast: `can_parse` подглядывает поле длины payload по
+/// смещению `LOCAL_HEADER_SIZE` и проверяет, что весь кадр на месте; `parse`
+/// читает фиксированный заголовок, затем payload.
 impl Parser for RawCastFrame {
     type Error = String;
 

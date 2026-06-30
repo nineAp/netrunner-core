@@ -1,3 +1,12 @@
+//! Серверный логгер диагностики: события ядра → JSONL-файл.
+//!
+//! Подписывается на канал диагностики ([`diagnostics::init_diagnostics`]) и
+//! пишет снапшоты в `netrunner_diagnostics.jsonl` (по одной JSON-строке на
+//! событие) с ротацией файла по размеру. Дополнительно пишет стартовый и
+//! периодические heartbeat-снапшоты, чтобы файл всегда существовал и было видно,
+//! что сервер жив. У сервера нет smoltcp-движка, поэтому socket-метрики пусты —
+//! только метрики туннеля.
+
 use netrunner_core::net::diagnostics::{
     self, DiagnosticsEvent, DiagnosticsSnapshot, DiagnosticsStore, TunnelMetrics,
     current_timestamp_ms,
@@ -17,6 +26,7 @@ const LOG_ROTATE_THRESHOLD: u64 = 10 * 1024 * 1024;
 /// Write a periodic heartbeat snapshot every N seconds even without error events.
 const HEARTBEAT_INTERVAL_SECS: u64 = 60;
 
+/// Логгер серверной диагностики: in-memory store последних снапшотов + файл.
 pub struct ServerDiagnosticsLogger {
     store: Arc<DiagnosticsStore>,
     log_path: PathBuf,

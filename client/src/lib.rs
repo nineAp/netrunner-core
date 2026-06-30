@@ -1,3 +1,23 @@
+//! # netrunner-client — клиент VPN и FFI-фасад для приложений
+//!
+//! Крейт собирается двумя способами: как библиотека (`.so`) для мобильных
+//! приложений через **UniFFI** (этот файл) и как самостоятельный бинарь для
+//! Linux ([`main.rs`](crate)). Вся реальная логика — в подмодулях:
+//!
+//! - [`net`] — userspace TCP/IP-стек на smoltcp и мост в туннель ядра;
+//! - [`tun`] — TUN-устройство, smoltcp-`Device` и системная маршрутизация.
+//!
+//! ## FFI-поверхность (что видит Kotlin/Swift)
+//!
+//! - [`SessionManager`] — фабрика сессий: [`spawn_session`](SessionManager::spawn_session)
+//!   поднимает движок в фоне и возвращает управляемую [`Session`]; [`get_traffic_stats`](SessionManager::get_traffic_stats)
+//!   отдаёт счётчики.
+//! - [`Session`] — ручка живого VPN; [`stop`](Session::stop) (и `Drop`) гасит
+//!   задачи и откатывает маршрутизацию.
+//! - [`VpnTrafficStats`] — снимок трафика для UI.
+//!
+//! Токио-рантайм создаётся один раз ([`RUNTIME`]) и переживёт все сессии.
+
 // Workaround for rustc 1.94 ICE in check_mod_deathness (dead-code MIR pass).
 #![allow(dead_code)]
 
@@ -21,8 +41,10 @@ use std::sync::{Arc, OnceLock};
 use tokio::runtime::Runtime;
 use tokio_util::sync::CancellationToken;
 
+/// Глобальный многопоточный tokio-рантайм, общий для всех сессий.
 pub static RUNTIME: OnceLock<Runtime> = OnceLock::new();
 
+/// Ленивая инициализация общего рантайма (создаётся при первом обращении).
 fn get_runtime() -> &'static Runtime {
     RUNTIME.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
@@ -32,6 +54,7 @@ fn get_runtime() -> &'static Runtime {
     })
 }
 
+/// Снимок счётчиков трафика для отображения в приложении.
 #[derive(uniffi::Record)]
 pub struct VpnTrafficStats {
     pub rx_bytes: u64,
@@ -40,6 +63,10 @@ pub struct VpnTrafficStats {
     pub tx_packets: u64,
 }
 
+/// Ручка одной живой VPN-сессии (передаётся в приложение как объект UniFFI).
+///
+/// Хранит токен отмены и данные для отката маршрутизации. Останавливается явно
+/// ([`stop`](Session::stop)) или автоматически при `Drop`.
 #[derive(uniffi::Object)]
 pub struct Session {
     pub(crate) cancel_token: CancellationToken,
@@ -64,6 +91,7 @@ impl Drop for Session {
     }
 }
 
+/// Фабрика VPN-сессий — главная точка входа FFI.
 #[derive(uniffi::Object)]
 pub struct SessionManager;
 
@@ -74,6 +102,11 @@ impl SessionManager {
         Arc::new(SessionManager)
     }
 
+    /// Поднимает VPN-сессию в фоне и возвращает управляющую [`Session`].
+    ///
+    /// Создаёт TUN (из переданного `_tun_fd` на мобильных или сам на Linux),
+    /// конфигурирует движок (MTU, kill-switch, исключения) и запускает его в
+    /// общем рантайме под токеном отмены. Не блокирует вызывающий поток.
     pub fn spawn_session(
         &self,
         remote_address: String,

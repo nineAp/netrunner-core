@@ -1,28 +1,56 @@
+//! Глобальная сетевая конфигурация, выводимая из MTU.
+//!
+//! Все размеры буферов и ёмкости каналов считаются один раз из системного MTU
+//! ([`NetworkConfig::new`]) и кладутся в глобальный [`OnceLock`]. Логика проста:
+//! буферы TCP-сокетов smoltcp масштабируются так, чтобы окно вмещало нужное число
+//! сегментов подряд, а ёмкость mpsc-каналов держится **намеренно маленькой** —
+//! это главный рычаг против bufferbloat (см. комментарий к `CHANNEL_PACKETS`).
+//!
+//! Деление буферов на `heavy`/`light` — это «толстые» потоки (bulk download) против
+//! «тонких» (DNS, интерактив): первым нужен большой буфер для throughput, вторым —
+//! маленький для низкой задержки.
+
 use netrunner_logger::warn;
 use std::sync::OnceLock;
 
+/// Глобально инициализируемая сетевая конфигурация (одна на процесс).
 pub static GLOBAL_NET_CONFIG: OnceLock<NetworkConfig> = OnceLock::new();
 
+/// Набор размеров буферов и каналов, выведенных из MTU.
 #[derive(Debug, Clone)]
 pub struct NetworkConfig {
+    /// Эффективный MTU (не ниже 576).
     pub mtu: usize,
+    /// Размер буфера чтения соединения туннеля.
     pub connection_buf_size: usize,
+    /// Базовый размер TCP-буфера (для «толстых» потоков).
     pub tcp_buffer_size: usize,
+    /// Базовый размер UDP-буфера.
     pub udp_buffer_size: usize,
+    /// Сколько байт читать из локального TCP-сокета за один проход.
     pub tcp_chunk_size: usize,
 
-    // 🔥 Единый конфиг для всех каналов Tokio
+    /// Единая ёмкость всех Tokio-каналов (в пакетах). Маленькая — против bufferbloat.
     pub channel_capacity: usize,
 
-    // Буферы сокетов smoltcp
+    // ── Буферы TCP-сокетов smoltcp: heavy (bulk) и light (интерактив) ──
+    /// RX-буфер «толстого» TCP-сокета.
     pub tcp_rx_heavy: usize,
+    /// TX-буфер «толстого» TCP-сокета.
     pub tcp_tx_heavy: usize,
+    /// RX-буфер «тонкого» TCP-сокета.
     pub tcp_rx_light: usize,
+    /// TX-буфер «тонкого» TCP-сокета.
     pub tcp_tx_light: usize,
 
+    // ── Буферы UDP-сокетов smoltcp: данные + слоты метаданных датаграмм ──
+    /// Буфер данных «толстого» UDP-сокета.
     pub udp_buf_heavy: usize,
+    /// Слотов метаданных датаграмм у «толстого» UDP-сокета.
     pub udp_meta_heavy: usize,
+    /// Буфер данных «тонкого» UDP-сокета.
     pub udp_buf_light: usize,
+    /// Слотов метаданных датаграмм у «тонкого» UDP-сокета.
     pub udp_meta_light: usize,
 }
 
@@ -84,6 +112,8 @@ impl NetworkConfig {
         }
     }
 
+    /// Инициализирует глобальный конфиг из MTU. Повторный вызов безвреден, но
+    /// логирует предупреждение (конфиг неизменяем после первой установки).
     pub fn init_global(system_mtu: usize) {
         let config = Self::new(system_mtu);
         if GLOBAL_NET_CONFIG.set(config).is_err() {
@@ -91,6 +121,8 @@ impl NetworkConfig {
         }
     }
 
+    /// Доступ к глобальному конфигу. Паникует, если [`init_global`](Self::init_global)
+    /// ещё не вызывали — это ошибка порядка инициализации, а не рантайм-ситуация.
     pub fn global() -> &'static Self {
         GLOBAL_NET_CONFIG
             .get()

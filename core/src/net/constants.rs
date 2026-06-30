@@ -1,8 +1,19 @@
+//! Все «магические числа» сетевого ядра в одном месте.
+//!
+//! Сгруппированы по назначению (пулы, тайм-ауты, аутентификация, порты, stealth,
+//! кодек, тюнинг сокетов). Многие значения — результат борьбы с конкретными
+//! проблемами (bufferbloat, «эффект домино» при падении ноги, рассинхрон часов);
+//! у таких констант в `///`-комментарии объяснено, **почему** именно это число, а
+//! не просто что оно значит. Меняя их, читайте обоснование рядом.
+
 use std::time::Duration;
 
 // ── Connection pool ──────────────────────────────────────────────────────────
+/// Максимум одновременных smoltcp-сокетов (виртуальных соединений) на клиенте.
 pub const MAX_SOCKETS: usize = 256;
+/// Сколько параллельных TCP-ног держит туннель (для throughput и отказоустойчивости).
 pub const MAX_TUNNEL_LEGS: u32 = 4;
+/// Размер пула мультиплексоров.
 pub const MUXER_POOL_SIZE: usize = 3;
 /// Weight applied to observed congestion when scoring tunnel legs.
 pub const MUXER_CONGESTION_WEIGHT: f64 = 2000.0;
@@ -10,12 +21,19 @@ pub const MUXER_CONGESTION_WEIGHT: f64 = 2000.0;
 pub const INITIAL_RTT_MS: u32 = 250;
 
 // ── Timeouts ─────────────────────────────────────────────────────────────────
+/// Тайм-аут TCP-хендшейка к целевому хосту (серверная сторона).
 pub const TCP_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
+/// Простой UDP-сессии, после которого она считается завершённой.
 pub const UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
+/// Глобальный простой соединения до его закрытия.
 pub const GLOBAL_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+/// Период health-check'ов ног туннеля (heartbeat/проверка живости).
 pub const HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(3);
+/// Сколько ждать ответа на health-check, прежде чем счесть ногу мёртвой.
 pub const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(20);
+/// Пауза перед переподключением упавшей ноги.
 pub const LEG_RECONNECT_DELAY: Duration = Duration::from_secs(2);
+/// Простой моста (стрима) до его закрытия.
 pub const BRIDGE_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Max time to wait for a local app socket to accept downloaded data.
 /// If the app's receive buffer stays full longer than this, the connection
@@ -62,10 +80,15 @@ pub const TOPOLOGY_PRINT_INTERVAL: Duration = Duration::from_secs(10);
 pub const STATS_LOG_INTERVAL: Duration = Duration::from_secs(5);
 
 // ── Authentication ───────────────────────────────────────────────────────────
+/// Длительность одного шага time-based auth-тега в секундах (TOTP-«окно»).
+/// Тег меняется раз в 60 с — см. [`SessionAuth`](crate::nrxp).
 pub const AUTH_TIME_STEP: u64 = 60;
+/// Допуск на рассинхрон часов при проверке тега: ±2 шага (~±2 минуты).
+/// Сужает окно replay, оставляя запас под дрейф NTP и сетевые задержки.
 pub const AUTH_WINDOW_SIZE: u64 = 2;
 
 // ── Well-known ports ─────────────────────────────────────────────────────────
+// Известные порты для эвристик классификации трафика (heavy/light, спец-обработка).
 pub const DNS_PORT: u16 = 53;
 pub const HTTP_PORT: u16 = 80;
 pub const HTTPS_PORT: u16 = 443;

@@ -1,3 +1,20 @@
+//! Диагностика туннеля: события, метрики, счётчики и снапшоты.
+//!
+//! Холодный путь, не влияющий на горячую обработку пакетов. Состоит из трёх
+//! независимых механизмов:
+//!
+//! 1. **Канал событий** ([`DiagnosticsEvent`]). Любой код из любого места делает
+//!    fire-and-forget [`send_diag_event`]; потребитель (на клиенте — движок, на
+//!    сервере — `Network::run`) держит приёмник из [`init_diagnostics`].
+//! 2. **Атомарные счётчики** ([`DIAG_COUNTERS`]). Глобальные накопители событий
+//!    (сбои загрузки, отвалы ног, переполнения каналов и т.п.), инкрементируются
+//!    прямо в местах событий через `Relaxed`.
+//! 3. **Снапшоты** ([`DiagnosticsSnapshot`] + [`DiagnosticsStore`]). По триггеру
+//!    собирается полный срез состояния (движок, ноги, сокеты, счётчики) и
+//!    кольцевым буфером хранятся последние N для выгрузки в JSON.
+//!
+//! Все структуры `Serialize` — снапшоты отдаются наружу как JSON для отладки.
+
 use std::{
     collections::VecDeque,
     sync::{
@@ -39,7 +56,11 @@ pub fn send_diag_event(event: DiagnosticsEvent) {
 
 // ── Event types ───────────────────────────────────────────────────────────────
 
-/// What triggered this diagnostics snapshot.
+/// Событие, которое стало триггером снапшота (и единица потока событий).
+///
+/// Каждый вариант — это «что-то пошло не так или примечательно» на горячем пути:
+/// сбой выгрузки, backpressure, отвал/переподключение ноги, переполнение
+/// управляющего канала, застрявшая запись в туннель. Сериализуется с тегом `kind`.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DiagnosticsEvent {
@@ -79,6 +100,8 @@ pub enum DiagnosticsEvent {
 
 // ── Per-snapshot sub-structs (all Serialize) ──────────────────────────────────
 
+/// Метрики движка (только клиент): трафик, глубины очередей устройства, свободное
+/// место в каналах TUN↔engine.
 #[derive(Debug, Clone, Serialize)]
 pub struct EngineMetrics {
     pub rx_total_mb: f64,
@@ -97,6 +120,7 @@ pub struct EngineMetrics {
     pub tun_rx_channel_free: usize,
 }
 
+/// Метрики одной ноги туннеля: RTT, объёмы, фактор перегруженности канала.
 #[derive(Debug, Clone, Serialize)]
 pub struct LegMetrics {
     pub leg_id: u32,
@@ -109,6 +133,7 @@ pub struct LegMetrics {
     pub data_channel_capacity: usize,
 }
 
+/// Сводка по туннелю в целом: глобальный мин. RTT, метрики всех ног, число потоков.
 #[derive(Debug, Clone, Serialize)]
 pub struct TunnelMetrics {
     pub global_min_rtt_ms: u32,
@@ -116,6 +141,7 @@ pub struct TunnelMetrics {
     pub total_streams: usize,
 }
 
+/// Метрики одного smoltcp-сокета (только клиент): состояние, очереди, congestion.
 #[derive(Debug, Clone, Serialize)]
 pub struct SocketMetrics {
     pub stream_id: u32,
@@ -143,6 +169,7 @@ pub struct ErrorCounters {
     pub stream_errors: u64,
 }
 
+/// Полный срез состояния системы на момент триггер-события.
 #[derive(Debug, Clone, Serialize)]
 pub struct DiagnosticsSnapshot {
     pub timestamp_ms: u64,
@@ -159,6 +186,9 @@ pub struct DiagnosticsSnapshot {
 
 // ── Atomic error counters (global, updated at event sites) ───────────────────
 
+/// Глобальные атомарные счётчики событий, инкрементируемые в местах их
+/// возникновения. Включают «воронку» доставки загрузки (`mux_dispatch_*`),
+/// по которой видно, куда деваются входящие кадры.
 pub struct DiagnosticsCounters {
     pub upload_fails: AtomicU64,
     pub download_backpressure: AtomicU64,
@@ -210,6 +240,8 @@ pub static DIAG_COUNTERS: DiagnosticsCounters = DiagnosticsCounters::new();
 
 // ── DiagnosticsStore — holds the last N snapshots ─────────────────────────────
 
+/// Кольцевой буфер последних N снапшотов под мьютексом (холодный путь —
+/// блокировка не вредит). Отдаёт их наружу как JSON для отладки.
 pub struct DiagnosticsStore {
     snapshots: Mutex<VecDeque<DiagnosticsSnapshot>>,
     max_snapshots: usize,

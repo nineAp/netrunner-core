@@ -1,3 +1,18 @@
+//! Сборка и разбор hello-сообщений рукопожатия.
+//!
+//! Здесь живёт «полезная контрабанда» внутри маскировки: поля поддельного
+//! `ClientHello`/`ServerHello` переиспользуются под обмен ключами.
+//!
+//! - **`random` (32 байта)** ← локальная соль стороны (см. [`SessionKeys::local_salt`]).
+//! - **`session_id` (32 байта)** ← 16 случайных байт + 16 байт time-based
+//!   auth-тега. Сервер первым делом проверяет этот тег (см.
+//!   [`bridge`](crate::nrxp)) — отсев чужих/сканеров до любой крипты.
+//! - **публичный ключ X25519** ← в расширении KeyShare (собирается [`ExtensionBuilder`]).
+//!
+//! Все три структуры реализуют [`Parser`] (разбор входящих) и имеют `serialize`
+//! (сборка исходящих). Точные размеры/порядок берутся из [`profile`](super::profile),
+//! чтобы итоговый отпечаток совпал с реальным браузером.
+
 use aead::{rand_core::RngCore, OsRng};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
@@ -15,6 +30,8 @@ use crate::{
     utils::u24::{BufExt, U24},
 };
 
+/// Заголовок handshake-сообщения: тип (`ClientHello`/`ServerHello`) + 24-битная
+/// длина тела. Парсится первым, чтобы понять, какое именно hello разбирать дальше.
 pub(crate) struct HelloHeader {
     pub header_type: HelloType,
     pub _len: U24,
@@ -49,15 +66,26 @@ impl Parser for HelloHeader {
     }
 }
 
+/// `ClientHello`: первое сообщение клиента, оно же главный носитель отпечатка.
+///
+/// `random` несёт соль, `session_id` — auth-тег, `extensions` — публичный ключ и
+/// прочие поля профиля. Cipher-suites и порядок расширений берутся из браузерного
+/// профиля.
 pub(crate) struct ClientHello {
     pub _version: ProtocolVersion,
+    /// 32 байта «random» = локальная соль клиента (для HKDF).
     pub random: [u8; 32],
+    /// 32 байта: 16 случайных + 16 auth-тег (проверяется сервером).
     pub session_id: Bytes,
+    /// Список cipher-suites (значения и порядок — часть JA3).
     pub cipher_suites: Vec<u16>,
+    /// Сырые байты блока расширений (содержат KeyShare с pubkey).
     pub extensions: Bytes,
 }
 
 impl ClientHello {
+    /// Сериализует `ClientHello` в тело handshake-сообщения с корректной
+    /// 24-битной длиной (длина дописывается задним числом по `length_pos`).
     pub fn serialize(&self) -> Bytes {
         let mut buf = BytesMut::with_capacity(512 + self.extensions.len());
 
@@ -91,12 +119,19 @@ impl ClientHello {
         buf.freeze()
     }
 
+    /// Высокоуровневая сборка готового к отправке `ClientHello` (в TLS-записи).
+    ///
+    /// Кладёт соль в `random`, формирует `session_id` = `[16 random | 16 auth-tag]`,
+    /// затем через [`ExtensionBuilder`] собирает расширения по профилю (включая
+    /// SNI=`host` и KeyShare с публичным ключом). `total_overhead` нужен билдеру,
+    /// чтобы посчитать padding до целевого размера отпечатка.
     pub fn make_client_hello(profile: &BrowserProfile, host: &str, keys: &SessionKeys) -> Bytes {
         let tls_random = keys.local_salt();
         let mut session_id_bytes = [0u8; 32];
         OsRng.fill_bytes(&mut session_id_bytes[..16]);
-        
-        // ИСПРАВЛЕНИЕ: Используем SessionAuth для генерации тега
+
+        // session_id[16..32] = текущий time-based auth-тег: сервер проверит его
+        // первым делом и отвергнет ClientHello без валидного тега.
         let auth = SessionAuth::new(keys.get_auth_key());
         session_id_bytes[16..].copy_from_slice(&auth.generate_current_tag());
 
@@ -130,12 +165,17 @@ impl ClientHello {
     }
 }
 
+/// Разбор входящего `ClientHello` (серверная сторона). `can_parse` «прыжковым
+/// поиском» проходит по полям переменной длины (session_id → ciphers →
+/// compression → extensions), не сдвигая курсор, и убеждается, что пришёл весь
+/// блок; `parse` затем извлекает поля по-настоящему.
 impl Parser for ClientHello {
     type Error = TlsError;
 
     fn can_parse(bytes: &BytesMut) -> bool {
         let mut reader = &bytes[..];
 
+        // 34 = 2 (version) + 32 (random) — фиксированная «голова» перед session_id.
         if reader.len() < 35 {
             return false;
         }
@@ -214,14 +254,22 @@ impl Parser for ClientHello {
     }
 }
 
+/// `ServerHello`: ответ сервера. Минимальный TLS 1.3-совместимый: всегда несёт
+/// `supported_versions` и `key_share` (публичный ключ сервера), `random` = соль
+/// сервера, а `session_id` эхом возвращается из `ClientHello`.
 pub(crate) struct ServerHello {
     pub version: ProtocolVersion,
+    /// 32 байта «random» = локальная соль сервера (для HKDF).
     pub random: [u8; 32],
+    /// Эхо `session_id` клиента (так требует TLS 1.3).
     pub session_id: Bytes,
+    /// Один выбранный cipher-suite.
     pub cipher_suite: u16,
+    /// Блок расширений (supported_versions + key_share с pubkey сервера).
     pub extensions: BytesMut,
 }
 impl ServerHello {
+    /// Высокоуровневая сборка готового к отправке `ServerHello` (в TLS-записи).
     pub fn make_server_hello(
         client_hello: &ClientHello,
         server_public_key: &[u8],
@@ -239,6 +287,13 @@ impl ServerHello {
         record.serialize()
     }
 
+    /// Конструирует `ServerHello` из принятого `ClientHello`.
+    ///
+    /// Выбор cipher-suite зависит от `honor_cipher_order`: либо берём первый из
+    /// предпочтений сервера, который поддержал клиент, либо наоборот; fallback —
+    /// `0x1301` (TLS_AES_128_GCM_SHA256). Дальше вручную пишутся два обязательных
+    /// расширения: `supported_versions` (0x002b) и `key_share` (0x0033) с
+    /// публичным ключом сервера по группе X25519 (0x001d).
     pub fn from_client_hello(
         client_hello: &ClientHello,
         server_public_key: &[u8],
@@ -287,6 +342,7 @@ impl ServerHello {
         }
     }
 
+    /// Сериализует `ServerHello` в тело handshake с 24-битной длиной.
     pub fn serialize(&self) -> Bytes {
         let mut buf = BytesMut::with_capacity(256 + self.extensions.len());
 
@@ -321,10 +377,14 @@ impl ServerHello {
     }
 }
 
+/// Разбор входящего `ServerHello` (клиентская сторона). Так же прыжками по полям
+/// вычисляет полную длину сообщения, отрезает его (`split_to`) и читает поля;
+/// из расширений потом достаётся публичный ключ сервера для ECDH.
 impl Parser for ServerHello {
     type Error = TlsError;
 
     fn can_parse(bytes: &BytesMut) -> bool {
+        // 34 = 2 (version) + 32 (random) перед длиной session_id.
         let mut offset = 34;
         if bytes.len() < offset + 1 {
             return false;

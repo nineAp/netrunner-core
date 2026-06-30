@@ -1,3 +1,22 @@
+//! Точки входа туннеля: установка соединений на стороне клиента и сервера.
+//!
+//! Здесь собирается всё ядро в две роли:
+//!
+//! - [`ClientHandler`] — клиентская сторона. [`connect`](ClientHandler::connect)
+//!   поднимает [`MAX_TUNNEL_LEGS`] ног (с разбежкой по времени), сторожит смену
+//!   сети и переводит локальный трафик ([`RawCastFrame`]) в потоки туннеля.
+//!   Каждая нога делает [`perform_handshake`](ClientHandler::perform_handshake)
+//!   (поддельный TLS + обмен ключами + auth-кадр) и крутится в [`TunnelEngine`].
+//! - [`ServerHandler`] — серверная сторона. Принимает соединение, проверяет, что
+//!   это валидный Netrunner-`ClientHello`; если нет — **stealth-fallback**:
+//!   прозрачно проксирует трафик на безобидный хост (`ubuntu.com:443`), маскируясь
+//!   под обычный TLS и не выдавая себя сканерам/DPI.
+//! - [`SessionManager`] — реестр сессий сервера (одна сессия = один [`Muxer`],
+//!   несколько ног).
+//!
+//! Обе роли сходятся на [`TunnelEngine`]: клиент задаёт `remote_addr`
+//! (реконнектит), сервер оставляет его пустым (нога просто завершается).
+
 use std::{net::Ipv4Addr, sync::Arc};
 
 use crate::{
@@ -32,6 +51,7 @@ use tokio::{
     sync::mpsc,
 };
 
+/// Реестр активных сессий сервера: `session_id` → общий на сессию [`Muxer`].
 pub struct SessionManager {
     sessions: DashMap<String, Arc<Muxer>>,
 }
@@ -52,6 +72,8 @@ impl SessionManager {
         &self.sessions
     }
 
+    /// Возвращает muxer сессии, создавая его при первом обращении. Так вторая и
+    /// последующие ноги одной сессии цепляются к тому же мультиплексору.
     pub fn get_or_create(&self, session_id: &str) -> Arc<Muxer> {
         self.sessions
             .entry(session_id.to_string())
@@ -79,11 +101,14 @@ impl SessionManager {
     }
 }
 
+/// Общий контракт обработчика входящего туннельного соединения (реализует сервер).
 #[async_trait::async_trait]
 pub trait TunnelHandler {
+    /// Обрабатывает соединение до его завершения.
     async fn run(self) -> Result<(), AppError>;
 }
 
+/// Обёртка над TCP-соединением: половинки сокета + накопительный буфер чтения.
 pub struct Connection {
     pub(crate) inbound: OwnedReadHalf,
     pub(crate) outbound: OwnedWriteHalf,
@@ -101,14 +126,24 @@ impl Connection {
     }
 }
 
+/// Клиентская сторона туннеля (набор статических операций).
 pub struct ClientHandler;
 impl ClientHandler {
+    /// Узнаёт локальный IP «трюком с UDP-connect»: соединение к 8.8.8.8 без
+    /// отправки заставляет ОС выбрать исходящий интерфейс, чей адрес мы и читаем.
+    /// Нужно для детектора смены сети (Wi-Fi↔LTE).
     fn get_local_ip() -> Option<std::net::IpAddr> {
         let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
         socket.connect("8.8.8.8:80").ok()?;
         socket.local_addr().ok().map(|a| a.ip())
     }
 
+    /// Проводит полный клиентский хендшейк по уже установленному TCP-сокету.
+    ///
+    /// Шаги: послать поддельный `ClientHello` (профиль Chrome, SNI=`ubuntu.com`) →
+    /// дождаться `ServerHello` и вывести ключи → зарядить шифр и кодек → отправить
+    /// первый зашифрованный auth-кадр `Heartbeat` с `"session_id:leg_id"`.
+    /// Возвращает половинки сокета и готовые кодеки.
     pub async fn perform_handshake(
         stream: tokio::net::TcpStream,
         session_id: &str,
@@ -208,6 +243,12 @@ impl ClientHandler {
         Ok((conn.inbound, conn.outbound, rx_codec, tx_codec))
     }
 
+    /// Устанавливает одну ногу и крутит её движок до остановки.
+    ///
+    /// Резолвит адрес (с тайм-аутом), создаёт TCP-сокет с анти-bufferbloat
+    /// тюнингом буферов, делает хендшейк, регистрирует ногу в muxer и запускает
+    /// [`TunnelEngine::run`]. Возвращается только при остановке движка; снаружи
+    /// (в [`connect`](ClientHandler::connect)) это уводит ногу на переподключение.
     async fn establish_leg(
         remote_proxy_addr: &str,
         leg_id: u32,
@@ -294,6 +335,18 @@ impl ClientHandler {
         ))
     }
 
+    /// Точка входа клиента: поднимает весь туннель и возвращает его [`Muxer`].
+    ///
+    /// Запускает три группы фоновых задач:
+    /// 1. **Ноги** — [`MAX_TUNNEL_LEGS`] задач, каждая в вечном цикле
+    ///    establish→disconnect→reconnect (со сдвигом старта [`LEG_STAGGER_DELAY`]).
+    /// 2. **Сторож сети** — следит за сменой локального IP и при переключении
+    ///    сети сбрасывает все ноги (быстрый реконнект вместо зависших сокетов).
+    /// 3. **Здоровье/топология** — периодический health-check и печать топологии.
+    ///
+    /// Плюс главный цикл, который переводит локальные [`RawCastFrame`]
+    /// (`rx_from_engine`) в потоки/данные туннеля и возвращает ответы обратно
+    /// (`tx_to_engine`), с пер-сокетными буферами выгрузки против HOL-блокировки.
     pub async fn connect(
         remote_proxy_addr: &str,
         mut rx_from_engine: mpsc::Receiver<RawCastFrame>,
@@ -594,6 +647,7 @@ impl ClientHandler {
     }
 }
 
+/// Серверная сторона: обрабатывает одно входящее соединение.
 pub struct ServerHandler {
     pub(crate) conn: Connection,
     pub(crate) session_manager: Arc<SessionManager>,
@@ -607,6 +661,13 @@ impl ServerHandler {
         }
     }
 
+    /// Stealth-fallback: прозрачно проксирует соединение на безобидный хост
+    /// (`ubuntu.com:443`), когда клиент оказался «не наш».
+    ///
+    /// Уже прочитанные байты (`initial_data`) пересылаются первыми, затем
+    /// соединение склеивается в обе стороны через `tokio::io::copy`. Снаружи это
+    /// выглядит как обычный визит на публичный сайт — сервер не выдаёт себя
+    /// сканерам и активным пробам DPI.
     async fn handle_stealth_fallback(
         mut client_inbound: OwnedReadHalf,
         mut client_outbound: OwnedWriteHalf,
@@ -639,6 +700,14 @@ impl ServerHandler {
     }
 }
 
+/// Серверный жизненный цикл соединения: хендшейк → аутентификация → движок.
+///
+/// Три фазы, на каждой при малейшем несоответствии — stealth-fallback или отказ:
+/// 1. Принять `ClientHello` и собрать `ServerHello`; невалидный/чужой → fallback.
+/// 2. Расшифровать первый кадр и проверить auth-payload `"session_id:leg_id"`;
+///    неверный → [`ERR_AUTH_FAILED`].
+/// 3. Прицепить ногу к muxer сессии и крутить [`TunnelEngine`]; по завершении —
+///    эвикт ноги и отложенная уборка сессии, если ног не осталось.
 #[async_trait::async_trait]
 impl TunnelHandler for ServerHandler {
     async fn run(self) -> Result<(), AppError> {

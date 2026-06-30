@@ -1,3 +1,18 @@
+//! # netrunner-logger — единый логгер и реестр ошибок проекта
+//!
+//! Тонкая обёртка над `tracing`/`tracing-subscriber`, дающая всем крейтам общий
+//! стиль логирования и типизированные ошибки ([`error`]). Особенности:
+//!
+//! - **Один глобальный [`Logger`]** (`OnceLock` + `Once`): инициализируется раз,
+//!   уровень переключается на лету через reloadable-фильтр ([`set_level`](Logger::set_level)).
+//! - **Два режима**: production (JSON в файл с суточной ротацией + перехват паник)
+//!   и debug (цветной вывод в консоль; на Android — `tracing_android`).
+//! - **PII-редактор** ([`PiiRedactorLayer`]) — слой-заготовка для маскировки IP и
+//!   прочих чувствительных данных перед записью.
+//!
+//! Макросы `info!`/`error!`/… ре-экспортируются, чтобы во всех крейтах писать
+//! `netrunner_logger::info!` без прямой зависимости на `tracing`.
+
 pub mod error;
 
 use regex::Regex;
@@ -21,6 +36,8 @@ pub use error::{
 
 type ReloadableFilter = Handle<EnvFilter, Registry>;
 
+/// Глобальный логгер: ручка перезагружаемого фильтра уровня + guard файлового
+/// аппендера (держит фоновый writer живым, пока жив логгер).
 pub struct Logger {
     filter_handle: ReloadableFilter,
     _guard: Option<WorkerGuard>,
@@ -29,6 +46,7 @@ pub struct Logger {
 static INIT: Once = Once::new();
 static LOGGER: OnceLock<Logger> = OnceLock::new();
 
+/// Слой маскировки PII (сейчас — заготовка; regex для IP готов к использованию).
 #[allow(dead_code)]
 struct PiiRedactorLayer {
     ip_regex: Regex,
@@ -50,6 +68,9 @@ impl<S: tracing::Subscriber> Layer<S> for PiiRedactorLayer {
 }
 
 impl Logger {
+    /// Инициализирует глобальный логгер (идемпотентно — только первый вызов
+    /// действует). `is_production` выбирает JSON-в-файл + перехват паник против
+    /// цветного вывода в консоль; `log_dir` — куда писать файлы в прод-режиме.
     pub fn init(log_dir: Option<&str>, is_production: bool) {
         INIT.call_once(|| {
             // 1. Настройка динамического фильтра
@@ -130,6 +151,7 @@ impl Logger {
         });
     }
 
+    /// Меняет уровень логирования на лету (например `"debug"`, `"info,foo=warn"`).
     pub fn set_level(&self, level: &str) {
         if let Ok(new_filter) = EnvFilter::try_new(level) {
             let _ = self.filter_handle.reload(new_filter);
@@ -137,6 +159,7 @@ impl Logger {
         }
     }
 
+    /// Доступ к глобальному логгеру (паникует, если [`init`](Logger::init) не звали).
     pub fn global() -> &'static Logger {
         LOGGER.get().expect("Logger not initialized!")
     }

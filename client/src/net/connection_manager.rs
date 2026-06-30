@@ -1,3 +1,16 @@
+//! Перехват L3-пакетов и порождение виртуальных соединений.
+//!
+//! [`ConnectionManager`] — «диспетчер» клиентского стека. Он разбирает сырые
+//! IP-пакеты из TUN, на TCP-`SYN` и первую UDP-датаграмму заводит новый
+//! smoltcp-сокет и виртуальное соединение, а в poll-цикле двигает все сокеты
+//! ([`process_sockets`](ConnectionManager::process_sockets)) и убирает мёртвые
+//! ([`cleanup`](ConnectionManager::cleanup)).
+//!
+//! Вспомогательные части: [`TargetResolver`] восстанавливает реальную цель по
+//! фейковому IP (через [`FakeIpStore`]) и обслуживает DNS на UDP:53;
+//! `connection_limiter` ([`Semaphore`]) ограничивает число одновременных
+//! установок, а `pending_connects` гасит повторные SYN до завершения хендшейка.
+
 use dashmap::DashMap;
 use netrunner_core::{
     net::{
@@ -24,8 +37,10 @@ use crate::net::{
     socket_factory::SocketProvider,
 };
 
+/// Ключ потока: `(src_ip, src_port, dst_ip, dst_port)`.
 type FlowKey = (IpAddress, u16, IpAddress, u16);
 
+/// Распарсенные адреса/порты одного перехваченного пакета.
 struct Flow {
     src: IpAddress,
     dst: IpAddress,
@@ -39,6 +54,7 @@ impl Flow {
     }
 }
 
+/// Восстановление цели соединения и обслуживание DNS.
 struct TargetResolver {
     dns_handler: DnsHandler,
     fake_ip_store: FakeIpStore,
@@ -56,6 +72,8 @@ impl TargetResolver {
         self.dns_handler.handle_query(data, &mut self.fake_ip_store)
     }
 
+    /// Восстанавливает реальную цель `(ip, "host:port")` по адресу из пакета.
+    /// Для фейкового IPv4 поднимает домен из [`FakeIpStore`]; иначе использует сам IP.
     pub fn resolve_destination(&self, addr: IpAddress, port: u16) -> (std::net::Ipv4Addr, String) {
         match addr {
             IpAddress::Ipv4(ip) => {
@@ -74,13 +92,21 @@ impl TargetResolver {
     }
 }
 
+/// Диспетчер клиентского стека: перехват пакетов, реестр сокетов, poll-цикл.
 pub struct ConnectionManager {
+    /// Реестр виртуальных соединений и их таймаутов.
     pub tracker: SessionTracker,
+    /// Резолвер целей + DNS.
     resolver: TargetResolver,
+    /// Канал в туннель (исходящие [`RawCastFrame`]).
     tx_to_tunnel: mpsc::Sender<RawCastFrame>,
+    /// Фабрика smoltcp-сокетов.
     factory: Arc<dyn SocketProvider>,
+    /// Незавершённые установки TCP (гасят повторные SYN), с временем старта.
     pending_connects: DashMap<FlowKey, Instant>,
+    /// Ограничитель числа одновременных соединений.
     connection_limiter: Arc<Semaphore>,
+    /// Переиспользуемый буфер хендлов для прохода по сокетам (без аллокаций).
     active_handles_cache: Vec<SocketHandle>,
 }
 
@@ -130,6 +156,8 @@ impl ConnectionManager {
         }
     }
 
+    /// Входная точка перехвата: разбирает версию IP из первого байта и направляет
+    /// пакет в обработчик IPv4/IPv6. Невалидное/прочее — молча игнорируется.
     pub fn try_create_socket_from_packet(&mut self, packet: &[u8], socket_set: &mut SocketSet) {
         if packet.is_empty() {
             return;
@@ -205,6 +233,11 @@ impl ConnectionManager {
         }
     }
 
+    /// Заводит виртуальное TCP-соединение на перехваченный `SYN` (без ACK).
+    ///
+    /// Дедупликация по `pending_connects` и наличию сокета; при достижении лимита
+    /// — LRU-эвикт; затем берётся семафор-пермит и создаётся слушающий сокет на
+    /// адрес назначения (smoltcp сам завершит хендшейк с приложением).
     fn intercept_tcp(&mut self, f: Flow, socket_set: &mut SocketSet) {
         let key = f.to_key();
         if self.pending_connects.contains_key(&key) {
@@ -238,6 +271,11 @@ impl ConnectionManager {
         }
     }
 
+    /// Заводит виртуальное UDP-«соединение» на перехваченную датаграмму.
+    ///
+    /// Пропускает служебный трафик (порт 0, локальный DNS:53, NetBIOS) и уже
+    /// известных клиентов; иначе — лимит/эвикт, создание привязанного UDP-сокета,
+    /// регистрация и запуск задачи-насоса в туннель.
     fn intercept_udp(&mut self, f: Flow, socket_set: &mut SocketSet) {
         if f.dst_p == 0
             || f.dst_p == DNS_PORT
@@ -275,6 +313,9 @@ impl ConnectionManager {
         }
     }
 
+    /// Двигает все сокеты на один шаг: для каждого вызывает соответствующий
+    /// обработчик (TCP/UDP/ICMP). Хендлы кешируются заранее, чтобы не одалживать
+    /// `socket_set` неизменяемо и изменяемо одновременно.
     pub fn process_sockets(&mut self, socket_set: &mut SocketSet, now: smoltcp::time::Instant) {
         self.active_handles_cache.clear();
         for (h, _) in socket_set.iter() {
@@ -381,6 +422,9 @@ impl ConnectionManager {
         }
     }
 
+    /// Периодическая уборка: снимает протухшие `pending_connects`, выметает
+    /// неактивные сокеты по [`GLOBAL_IDLE_TIMEOUT`] и физически удаляет
+    /// помеченные к удалению из `SocketSet`.
     pub fn cleanup(&mut self, socket_set: &mut SocketSet) {
         self.pending_connects
             .retain(|_, timestamp| timestamp.elapsed() < TCP_HANDSHAKE_TIMEOUT);

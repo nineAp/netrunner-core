@@ -1,11 +1,26 @@
+//! Учёт трафика TUN-интерфейса.
+//!
+//! Глобальные атомарные счётчики (`GLOBAL_*`) видны через FFI и отдают
+//! приложению суммарную статистику сессии. [`TrafficCounter`] — пер-сессионный
+//! учётчик, который вдобавок раз в секунду пересчитывает скользящую оценку
+//! скорости (МБ/с) для отображения в UI.
+//!
+//! Имя файла историческое: собственно реализация smoltcp-`Device` поверх TUN
+//! живёт во внешнем форке smoltcp; здесь — только метрики.
+
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant as StdInstant;
 
+/// Суммарно принято байт за всё время (для FFI-статистики).
 pub static GLOBAL_RX_BYTES: AtomicU64 = AtomicU64::new(0);
+/// Суммарно отправлено байт за всё время.
 pub static GLOBAL_TX_BYTES: AtomicU64 = AtomicU64::new(0);
+/// Суммарно принято пакетов.
 pub static GLOBAL_RX_PACKETS: AtomicU64 = AtomicU64::new(0);
+/// Суммарно отправлено пакетов.
 pub static GLOBAL_TX_PACKETS: AtomicU64 = AtomicU64::new(0);
 
+/// Снимок статистики трафика с мгновенной скоростью.
 #[derive(Debug, Clone, Copy)]
 pub struct TrafficStats {
     pub rx_bytes: u64,
@@ -16,7 +31,7 @@ pub struct TrafficStats {
     pub tx_speed_mb_s: f64,
 }
 
-/// Per-session traffic counter with rolling speed estimate.
+/// Пер-сессионный учётчик трафика со скользящей оценкой скорости.
 pub struct TrafficCounter {
     rx_bytes: u64,
     tx_bytes: u64,
@@ -60,6 +75,8 @@ impl TrafficCounter {
         GLOBAL_TX_PACKETS.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Возвращает текущий снимок статистики; скорость пересчитывается не чаще
+    /// раза в секунду (между вызовами отдаётся закешированное значение).
     pub fn get_stats(&mut self) -> TrafficStats {
         let now = StdInstant::now();
         let elapsed = now.duration_since(self.last_speed_calc).as_secs_f64();

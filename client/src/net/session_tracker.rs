@@ -1,3 +1,19 @@
+//! Реестр виртуальных соединений userspace-стека smoltcp.
+//!
+//! [`SessionTracker`] — это «NAT-таблица» клиента: он связывает хендлы сокетов
+//! smoltcp ([`SocketHandle`]) с логическими id, держит активные TCP/UDP-соединения
+//! и каналы доставки входящих данных, следит за активностью и убирает «призраков».
+//!
+//! Ключевые обязанности:
+//! - **Реестр** TCP/UDP-соединений и двусторонний маппинг `handle ⇄ id`.
+//! - **Pending TCP** — полуоткрытые соединения с удерживаемым семафор-пермитом
+//!   (ограничение числа одновременных установок).
+//! - **Idle-выметание** ([`enforce_idle_timeouts`](SessionTracker::enforce_idle_timeouts))
+//!   и **LRU-эвикт** ([`evict_oldest_socket`](SessionTracker::evict_oldest_socket))
+//!   при достижении лимита сокетов — с защитой системных/слушающих сокетов.
+//! - **Отложенное удаление**: `queue_removal` + `cleanup` (нельзя трогать
+//!   `SocketSet` во время итерации по нему).
+
 use std::{
     collections::HashMap,
     time::{Duration, Instant as StdInstant},
@@ -15,6 +31,7 @@ use tokio::sync::{OwnedSemaphorePermit, mpsc};
 
 use crate::net::connection::{TcpConnection, UdpConnection};
 
+/// Состояние всех виртуальных соединений и их маппингов на хендлы smoltcp.
 pub struct SessionTracker {
     last_activity: HashMap<SocketHandle, StdInstant>,
     active_tcp: HashMap<SocketHandle, TcpConnection>,
@@ -146,6 +163,11 @@ impl SessionTracker {
         }
     }
 
+    /// LRU-эвикт для освобождения слота при достижении лимита сокетов.
+    ///
+    /// Сначала ищет уже «мёртвый» TCP-сокет (Closed/TimeWait/CloseWait/FinWait);
+    /// если таких нет — закрывает самый давно неактивный пользовательский сокет,
+    /// **не трогая** системные/слушающие. Возвращает `true`, если кого-то закрыл.
     pub fn evict_oldest_socket(&mut self, socket_set: &mut SocketSet) -> bool {
         let mut victim = None;
 
@@ -193,6 +215,8 @@ impl SessionTracker {
         }
     }
 
+    /// Фактически удаляет все сокеты из очереди `to_remove` из `SocketSet` и всех
+    /// внутренних таблиц. Вызывается вне итерации по сокетам (см. отложенность).
     pub fn cleanup(&mut self, socket_set: &mut SocketSet) {
         for handle in self.to_remove.drain(..) {
             socket_set.remove(handle);

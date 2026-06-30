@@ -1,3 +1,19 @@
+//! TLS-обёртка: граница между NRXP и маскирующим слоем [`tlseng`](crate::tlseng).
+//!
+//! [`TlsBridge`] — единственная точка, где протокол соприкасается с TLS-кадрами.
+//! Он умеет две вещи:
+//!
+//! 1. **Хендшейк.** Собрать `ClientHello` (клиент) / `ServerHello` (сервер) с
+//!    нужным профилем браузера и провести обмен ключами. На стороне сервера здесь
+//!    же проверяется начальный auth-тег, спрятанный в `session_id` ClientHello, —
+//!    первый барьер против чужих/сканирующих подключений.
+//! 2. **Data-фаза.** Упаковать готовый шифртекст в TLS-запись `ApplicationData`
+//!    ([`pack_app_data`](TlsBridge::pack_app_data)) и распаковать обратно
+//!    ([`unpack_app_data`](TlsBridge::unpack_app_data)).
+//!
+//! Внутренний трейт [`TlsInterceptor`] задаёт общий каркас «распарсить TLS-запись
+//! → проверить её тип → достать полезное содержимое» для хендшейка и AppData.
+
 use crate::crypto::{SessionAuth, SessionKeys};
 use crate::nrxp::errors::{ErrorAction, ErrorStage, TlsError};
 use crate::parser::Parser;
@@ -8,6 +24,9 @@ use crate::tlseng::{ClientHello, HelloHeader, ServerHello};
 use crate::tlseng::{ContentType, HelloType};
 use bytes::{Bytes, BytesMut};
 
+/// Каркас разбора TLS-записи нужного типа: `start_process` парсит запись и
+/// делегирует в `handle_record`, который проверяет content-type и извлекает
+/// типизированный результат.
 trait TlsInterceptor {
     type Output;
 
@@ -22,11 +41,16 @@ trait TlsInterceptor {
     fn handle_record(record: TlsRecord) -> Result<Option<Self::Output>, TlsError>;
 }
 
+/// Разобранное handshake-сообщение одной из сторон вместе с его TLS-расширениями
+/// (в расширениях лежат публичный ключ KeyShare и прочие поля, нужные для вывода
+/// ключей сессии).
 pub(crate) enum HandshakeMessage {
+    /// `ClientHello` от клиента.
     Client {
         base: ClientHello,
         extensions: ExtensionStack,
     },
+    /// `ServerHello` от сервера.
     Server {
         base: ServerHello,
         extensions: ExtensionStack,
@@ -108,21 +132,31 @@ impl TlsInterceptor for ApplicationData {
     }
 }
 
+/// Фасад TLS-обёртки. Безсостоятельный набор статических операций над буферами;
+/// всё состояние сессии живёт в [`SessionKeys`], которые передаются явно.
 pub(crate) struct TlsBridge;
 
 impl TlsBridge {
+    /// Распаковать handshake-сообщение (`ClientHello`/`ServerHello`) из буфера.
     pub fn unpack_handshake(buffer: &mut BytesMut) -> Result<Option<HandshakeMessage>, TlsError> {
         HandshakeMessage::start_process(buffer)
     }
 
+    /// Распаковать TLS-запись `ApplicationData` (ещё зашифрованный кадр NRXP).
     pub fn unpack_app_data(buffer: &mut BytesMut) -> Result<Option<ApplicationData>, TlsError> {
         ApplicationData::start_process(buffer)
     }
 
+    /// Собрать `ClientHello` по профилю браузера для маскировки (клиент).
     pub fn wrap_client_hello(profile: &BrowserProfile, host: &str, keys: &SessionKeys) -> Bytes {
         ClientHello::make_client_hello(profile, host, keys)
     }
 
+    /// Обработать `ClientHello` и собрать ответный `ServerHello` (сервер).
+    ///
+    /// Порядок критичен: сначала проверяется auth-тег из `session_id`
+    /// (16 байт со смещения 16) — неверный тег ⇒ отказ ещё до любых
+    /// криптоопераций; затем выводятся ключи сессии и формируется ответ.
     pub fn wrap_server_hello(
         client_msg: &HandshakeMessage,
         keys: &mut SessionKeys,
@@ -156,6 +190,7 @@ impl TlsBridge {
         }
     }
     
+    /// Обернуть готовый шифртекст кадра в TLS-запись `ApplicationData` (`0x17`).
     pub fn pack_app_data(buffer: Bytes) -> Bytes {
         TlsRecord::build_application_data(buffer)
     }
