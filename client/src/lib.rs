@@ -107,9 +107,14 @@ impl SessionManager {
     /// Создаёт TUN (из переданного `_tun_fd` на мобильных или сам на Linux),
     /// конфигурирует движок (MTU, kill-switch, исключения) и запускает его в
     /// общем рантайме под токеном отмены. Не блокирует вызывающий поток.
+    ///
+    /// `sni` — домен-декой для `ClientHello` этого сервера; приложение берёт
+    /// его из [`known_servers`] по выбранному `remote_address` (в будущем —
+    /// из бэкенда вместе с остальными полями узла).
     pub fn spawn_session(
         &self,
         remote_address: String,
+        sni: String,
         _tun_fd: Option<i32>,
         cache_dir: String,
         killswitch_enabled: bool,
@@ -130,7 +135,8 @@ impl SessionManager {
             .with_cache_path(&cache_dir)
             .with_killswitch(killswitch_enabled)
             .with_excluded_apps(excluded_apps)
-            .with_excluded_domains(excluded_domains);
+            .with_excluded_domains(excluded_domains)
+            .with_decoy_sni(sni);
 
         #[cfg(any(target_os = "android", target_os = "ios"))]
         {

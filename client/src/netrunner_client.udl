@@ -9,10 +9,11 @@ dictionary VpnTrafficStats {
 
 interface SessionManager {
     constructor();
-    // Добавлены параметры для Killswitch и исключений
+    // Добавлены параметры для Killswitch и исключений, и sni (декой ClientHello)
     Session spawn_session(
-        string remote_address, 
-        i32? tun_fd, 
+        string remote_address,
+        string sni,
+        i32? tun_fd,
         string cache_path,
         boolean killswitch_enabled,
         sequence<string> excluded_apps,
