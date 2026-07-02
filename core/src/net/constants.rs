@@ -151,9 +151,17 @@ pub const NTP_PORT: u16 = 123;
 pub const NETBIOS_PORTS: [u16; 2] = [137, 138];
 
 // ── TLS / stealth ────────────────────────────────────────────────────────────
-/// Hostname used as the SNI in the stealth TLS ClientHello.
-pub const STEALTH_FALLBACK_SNI: &str = "ubuntu.com";
-pub const STEALTH_FALLBACK_HOST: &str = "ubuntu.com:443";
+/// Домен-декой по умолчанию: и SNI клиентского `ClientHello`, и цель
+/// server-side stealth-fallback (см. [`ServerHandler`](crate::net::ServerHandler)).
+/// Оба реальных сервера сейчас настраиваются на лету (CLI-флаг `--decoy-host`
+/// у сервера, [`EngineConfig::with_decoy_sni`](../../../../client/src/net/engine.rs)
+/// у клиента) — это значение только запасной дефолт, если ничего не задано явно.
+///
+/// Раньше здесь был захардкожен `ubuntu.com`: он у Fastly отдаёт `403` без
+/// точного совпадения SNI/Host — ровно тот случай, когда браузер заходит прямо
+/// по IP (SNI для IP-литералов не шлётся вовсе, RFC 6066). `www.debian.org` —
+/// одиночный Apache-ориджин без CDN-роутинга, отдаёт `200` независимо от SNI/Host.
+pub const DEFAULT_DECOY_HOST: &str = "www.debian.org";
 
 // ── Tunnel frame codec ───────────────────────────────────────────────────────
 /// OOM guard: drop the leg if the read buffer grows past this.

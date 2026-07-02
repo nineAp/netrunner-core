@@ -91,10 +91,22 @@ impl TlsGroups {
     pub const X25519: u16 = 0x001d;
     pub const SECP256R1: u16 = 0x0017;
     pub const SECP384R1: u16 = 0x0018;
+    pub const SECP521R1: u16 = 0x0019;
 
     pub const CHROMIUM: Self = Self(&[Self::X25519, Self::SECP256R1, Self::SECP384R1]);
 
     pub const MODERN: Self = Self(&[Self::X25519, Self::SECP256R1]);
+
+    /// Firefox рекламирует более широкий список групп, включая `secp521r1`.
+    pub const FIREFOX: Self = Self(&[
+        Self::X25519,
+        Self::SECP256R1,
+        Self::SECP384R1,
+        Self::SECP521R1,
+    ]);
+
+    /// Safari — тот же набор, что и Chromium.
+    pub const SAFARI: Self = Self(&[Self::X25519, Self::SECP256R1, Self::SECP384R1]);
 }
 
 /// Алгоритмы подписи (`signature_algorithms`). Для нас это «декорация» отпечатка:
@@ -204,6 +216,12 @@ impl<'a> IntoIterator for &'a ExtensionOrder {
 }
 
 impl ExtensionOrder {
+    /// `PADDING` — обязательно последним: у реального Chrome паддинг всегда
+    /// замыкает список расширений (раньше он был пропущен в этом списке, из-за
+    /// чего `BrowserProfile::CHROME_131.target_padding_len` никогда не
+    /// применялся — `ExtensionBuilder::apply_profile` вызывает
+    /// [`padding`](super::extension::ExtensionBuilder::padding) только для id,
+    /// присутствующего в порядке, а его тут не было).
     pub const CHROMIUM_131: Self = Self(&[
         0xaaaa,
         TlsExtensions::SNI,
@@ -221,8 +239,11 @@ impl ExtensionOrder {
         TlsExtensions::COMPRESS_CERT,
         TlsExtensions::SCT,
         TlsExtensions::DELEGATED_CREDENTIAL,
+        TlsExtensions::PADDING,
     ]);
 
+    /// Edge — тот же Chromium-движок, порядок идентичен Chrome с поправкой на
+    /// собственные GREASE-значения (`0x1a1a`/`0x3a3a` вместо `0xaaaa`).
     pub const EDGE_130: Self = Self(&[
         0x1a1a,
         TlsExtensions::SNI,
@@ -242,5 +263,42 @@ impl ExtensionOrder {
         TlsExtensions::DELEGATED_CREDENTIAL,
         TlsExtensions::PADDING,
         0x3a3a,
+    ]);
+
+    /// Firefox: своя собственная последовательность (не Chromium-семейство) —
+    /// без GREASE, без ALPS/`compress_certificate`, `renegotiation_info` рано в
+    /// списке. Раньше эта роль по ошибке была отдана `EDGE_130` (Chromium-порядок
+    /// с ALPS/compress_certificate, которых у Firefox не существует в принципе).
+    pub const FIREFOX_133: Self = Self(&[
+        TlsExtensions::SNI,
+        TlsExtensions::EMS,
+        TlsExtensions::RENEGOTIATION_INFO,
+        TlsExtensions::SUPPORTED_GROUPS,
+        TlsExtensions::EC_POINT_FORMATS,
+        TlsExtensions::SESSION_TICKET,
+        TlsExtensions::ALPN,
+        TlsExtensions::STATUS_REQUEST,
+        TlsExtensions::DELEGATED_CREDENTIAL,
+        TlsExtensions::KEY_SHARE,
+        TlsExtensions::SUPPORTED_VERSIONS,
+        TlsExtensions::SIGNATURE_ALGORITHMS,
+        TlsExtensions::PSK_MODES,
+    ]);
+
+    /// Safari: не Chromium-семейство — без GREASE и без ALPS.
+    pub const SAFARI_17: Self = Self(&[
+        TlsExtensions::SNI,
+        TlsExtensions::EMS,
+        TlsExtensions::RENEGOTIATION_INFO,
+        TlsExtensions::SUPPORTED_GROUPS,
+        TlsExtensions::EC_POINT_FORMATS,
+        TlsExtensions::ALPN,
+        TlsExtensions::STATUS_REQUEST,
+        TlsExtensions::SIGNATURE_ALGORITHMS,
+        TlsExtensions::SCT,
+        TlsExtensions::KEY_SHARE,
+        TlsExtensions::PSK_MODES,
+        TlsExtensions::SUPPORTED_VERSIONS,
+        TlsExtensions::COMPRESS_CERT,
     ]);
 }

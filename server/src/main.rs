@@ -29,13 +29,20 @@ struct Args {
     /// Адрес привязки.
     #[arg(long, default_value = "0.0.0.0")]
     host: String,
+
+    /// Домен-декой: под кого притворяется этот узел для «не наших» подключений
+    /// (stealth-fallback прозрачно проксирует туда трафик сканеров/чужих
+    /// клиентов). Раньше было жёстко зашито на `ubuntu.com` в коде ядра — теперь
+    /// атрибут ноды, можно задавать разный на каждом развёртывании.
+    #[arg(long, default_value = netrunner_core::net::DEFAULT_DECOY_HOST)]
+    decoy_host: String,
 }
 
 fn main() {
     Logger::init("./logs".into(), true);
     Logger::global().set_level("info");
     let args = Args::parse();
-    let net = Network::new(args.host, args.port);
+    let net = Network::new(args.host, args.port, args.decoy_host);
 
     let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
 

@@ -9,8 +9,9 @@
 //!   (поддельный TLS + обмен ключами + auth-кадр) и крутится в [`TunnelEngine`].
 //! - [`ServerHandler`] — серверная сторона. Принимает соединение, проверяет, что
 //!   это валидный Netrunner-`ClientHello`; если нет — **stealth-fallback**:
-//!   прозрачно проксирует трафик на безобидный хост (`ubuntu.com:443`), маскируясь
-//!   под обычный TLS и не выдавая себя сканерам/DPI.
+//!   прозрачно проксирует трафик на безобидный хост (`decoy_host:443`, атрибут
+//!   ноды — задаётся при старте, не константа), маскируясь под обычный TLS и
+//!   не выдавая себя сканерам/DPI.
 //! - [`SessionManager`] — реестр сессий сервера (одна сессия = один [`Muxer`],
 //!   несколько ног).
 //!
@@ -27,10 +28,10 @@ use crate::{
             handler::{RemoteOpener, StreamHandler},
             muxer::{MuxMessage, Muxer},
         },
-        NetworkConfig, DNS_LOOKUP_TIMEOUT, FALLBACK_CONNECT_TIMEOUT, LEG_RECONNECT_DELAY,
-        LEG_STAGGER_DELAY, MAX_TUNNEL_LEGS, NETWORK_WATCHER_INTERVAL, SECURE_HANDSHAKE_TIMEOUT,
-        SESSION_CLEANUP_DELAY, STEALTH_FALLBACK_HOST, STEALTH_FALLBACK_SNI, STREAM_PAUSE_BUDGET,
-        STREAM_PAUSE_RETRY, TLS_HELLO_TIMEOUT, TOPOLOGY_PRINT_INTERVAL,
+        NetworkConfig, DNS_LOOKUP_TIMEOUT, FALLBACK_CONNECT_TIMEOUT, HTTPS_PORT,
+        LEG_RECONNECT_DELAY, LEG_STAGGER_DELAY, MAX_TUNNEL_LEGS, NETWORK_WATCHER_INTERVAL,
+        SECURE_HANDSHAKE_TIMEOUT, SESSION_CLEANUP_DELAY, STREAM_PAUSE_BUDGET, STREAM_PAUSE_RETRY,
+        TLS_HELLO_TIMEOUT, TOPOLOGY_PRINT_INTERVAL,
     },
     nrxp::{Codec, Frame, FrameType, TlsBridge},
     rawcast::{LocalProtocol, RawCastAdapter, RawCastFrame},
@@ -140,14 +141,16 @@ impl ClientHandler {
 
     /// Проводит полный клиентский хендшейк по уже установленному TCP-сокету.
     ///
-    /// Шаги: послать поддельный `ClientHello` (профиль Chrome, SNI=`ubuntu.com`) →
-    /// дождаться `ServerHello` и вывести ключи → зарядить шифр и кодек → отправить
-    /// первый зашифрованный auth-кадр `Heartbeat` с `"session_id:leg_id"`.
-    /// Возвращает половинки сокета и готовые кодеки.
-    pub async fn perform_handshake(
+    /// Шаги: послать поддельный `ClientHello` (профиль браузера по `profile`,
+    /// SNI=`decoy_sni`) → дождаться `ServerHello` и вывести ключи → зарядить
+    /// шифр и кодек → отправить первый зашифрованный auth-кадр `Heartbeat` с
+    /// `"session_id:leg_id"`. Возвращает половинки сокета и готовые кодеки.
+    pub(crate) async fn perform_handshake(
         stream: tokio::net::TcpStream,
         session_id: &str,
         leg_id: u32,
+        profile: &BrowserProfile,
+        decoy_sni: &str,
     ) -> Result<
         (
             OwnedReadHalf,
@@ -160,11 +163,7 @@ impl ClientHandler {
         stream.set_nodelay(true).unwrap_or_default();
         let mut conn = Connection::new(stream);
         let mut session_keys = SessionKeys::new(true);
-        let ch = TlsBridge::wrap_client_hello(
-            &BrowserProfile::CHROME_131,
-            STEALTH_FALLBACK_SNI,
-            &session_keys,
-        );
+        let ch = TlsBridge::wrap_client_hello(profile, decoy_sni, &session_keys);
 
         conn.outbound
             .write_all(&ch)
@@ -249,11 +248,18 @@ impl ClientHandler {
     /// тюнингом буферов, делает хендшейк, регистрирует ногу в muxer и запускает
     /// [`TunnelEngine::run`]. Возвращается только при остановке движка; снаружи
     /// (в [`connect`](ClientHandler::connect)) это уводит ногу на переподключение.
+    ///
+    /// `attempt` выбирает профиль браузера через
+    /// [`BrowserProfile::for_attempt`] — каждый следующий реконнект той же ноги
+    /// маскируется под другой браузер, а не долбит DPI один и тем же
+    /// Chrome-отпечатком (было захардкожено на `CHROME_131` без альтернативы).
     async fn establish_leg(
         remote_proxy_addr: &str,
         leg_id: u32,
         muxer: Arc<Muxer>,
         session_id: &str,
+        attempt: u32,
+        decoy_sni: &Arc<str>,
     ) -> Result<(), AppError> {
         let leg_name = format!("TCP-Leg-{}", leg_id);
 
@@ -295,8 +301,9 @@ impl ClientHandler {
             })?
             .map_err(|e| AppError::new(ERR_INFRA_TIMEOUT, "Сбой сокета", e.to_string()))?;
 
+        let profile = BrowserProfile::for_attempt(attempt);
         let (inbound, outbound, rx_codec, tx_codec) =
-            Self::perform_handshake(stream, session_id, leg_id).await?;
+            Self::perform_handshake(stream, session_id, leg_id, profile, decoy_sni).await?;
 
         let cap = NetworkConfig::global().channel_capacity;
         let (control_tx, control_rx) = mpsc::channel::<MuxMessage>(cap);
@@ -320,6 +327,7 @@ impl ClientHandler {
             remote_addr: remote_proxy_addr.to_string(),
             session_id: session_id.to_string(),
             leg_status: crate::net::connection::engine::LegStatus::Active,
+            decoy_sni: decoy_sni.clone(),
         };
 
         let run_result = engine.run().await;
@@ -347,11 +355,19 @@ impl ClientHandler {
     /// Плюс главный цикл, который переводит локальные [`RawCastFrame`]
     /// (`rx_from_engine`) в потоки/данные туннеля и возвращает ответы обратно
     /// (`tx_to_engine`), с пер-сокетными буферами выгрузки против HOL-блокировки.
+    ///
+    /// `decoy_sni` — хост, под который маскируется наш `ClientHello` (SNI).
+    /// Сейчас это статическое значение атрибута конфигурации вызывающей
+    /// стороны (см. `EngineConfig::decoy_sni` в `client`); в перспективе будет
+    /// приходить динамически со списком серверов, чтобы не расходиться с тем,
+    /// на какой decoy-хост настроен конкретный сервер (`--decoy-host`).
     pub async fn connect(
         remote_proxy_addr: &str,
+        decoy_sni: impl Into<Arc<str>>,
         mut rx_from_engine: mpsc::Receiver<RawCastFrame>,
         tx_to_engine: mpsc::Sender<RawCastFrame>,
     ) -> Result<Arc<Muxer>, AppError> {
+        let decoy_sni: Arc<str> = decoy_sni.into();
         let session_id = SessionManager::generate_id();
         let muxer = Arc::new(Muxer::new(true, session_id.clone()));
         let registry: Arc<DashMap<u32, (u64, Ipv4Addr, u16, LocalProtocol)>> =
@@ -384,11 +400,14 @@ impl ClientHandler {
             let addr = remote_proxy_addr.to_string();
             let m = muxer.clone();
             let sid = session_id.clone();
+            let decoy_sni = decoy_sni.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(LEG_STAGGER_DELAY * id).await;
                 let mut attempt: u32 = 0;
                 loop {
-                    if let Err(e) = Self::establish_leg(&addr, id, m.clone(), &sid).await {
+                    if let Err(e) =
+                        Self::establish_leg(&addr, id, m.clone(), &sid, attempt, &decoy_sni).await
+                    {
                         attempt += 1;
                         error!("Leg {} disconnected: {}. Reconnecting in 2s...", id, e);
                         let rtt =
@@ -699,18 +718,26 @@ impl ClientHandler {
 pub struct ServerHandler {
     pub(crate) conn: Connection,
     pub(crate) session_manager: Arc<SessionManager>,
+    /// Домен-декой для stealth-fallback (атрибут ноды, задаётся при старте
+    /// сервера через `--decoy-host`; раньше был захардкожен на `ubuntu.com`).
+    pub(crate) decoy_host: Arc<str>,
 }
 
 impl ServerHandler {
-    pub fn new(connection: Connection, session_manager: Arc<SessionManager>) -> Self {
+    pub fn new(
+        connection: Connection,
+        session_manager: Arc<SessionManager>,
+        decoy_host: Arc<str>,
+    ) -> Self {
         Self {
             conn: connection,
             session_manager,
+            decoy_host,
         }
     }
 
     /// Stealth-fallback: прозрачно проксирует соединение на безобидный хост
-    /// (`ubuntu.com:443`), когда клиент оказался «не наш».
+    /// `decoy_host:443`, когда клиент оказался «не наш».
     ///
     /// Уже прочитанные байты (`initial_data`) пересылаются первыми, затем
     /// соединение склеивается в обе стороны через `tokio::io::copy`. Снаружи это
@@ -720,11 +747,13 @@ impl ServerHandler {
         mut client_inbound: OwnedReadHalf,
         mut client_outbound: OwnedWriteHalf,
         initial_data: Bytes,
+        decoy_host: &str,
     ) {
-        info!(target = %STEALTH_FALLBACK_HOST, "Stealth fallback: bridging to Target");
+        let decoy_addr = format!("{decoy_host}:{HTTPS_PORT}");
+        info!(target = %decoy_addr, "Stealth fallback: bridging to Target");
         let target_stream = tokio::time::timeout(
             FALLBACK_CONNECT_TIMEOUT,
-            TcpStream::connect(STEALTH_FALLBACK_HOST),
+            TcpStream::connect(&decoy_addr),
         )
         .await;
 
@@ -761,6 +790,7 @@ impl TunnelHandler for ServerHandler {
     async fn run(self) -> Result<(), AppError> {
         info!("Acting as TLS Server with Stealth Fallback");
 
+        let decoy_host = self.decoy_host;
         let Connection {
             mut inbound,
             mut outbound,
@@ -784,7 +814,7 @@ impl TunnelHandler for ServerHandler {
                         }
                         Err(e) => {
                             warn!("❌ Unauthorized/Invalid ClientHello. Triggering Stealth Fallback. Reason: {:?}", e.stage);
-                            Self::handle_stealth_fallback(inbound, outbound, buf_snapshot).await;
+                            Self::handle_stealth_fallback(inbound, outbound, buf_snapshot, &decoy_host).await;
                             return Ok(());
                         }
                     }
@@ -804,14 +834,14 @@ impl TunnelHandler for ServerHandler {
                         Ok(Ok(_)) => continue,
                         _ => {
                             warn!("⏰ TLS_HELLO_TIMEOUT reached. Triggering fallback...");
-                            Self::handle_stealth_fallback(inbound, outbound, buf_snapshot).await;
+                            Self::handle_stealth_fallback(inbound, outbound, buf_snapshot, &decoy_host).await;
                             return Ok(());
                         }
                     }
                 }
                 Err(_) => {
                     warn!("❌ Handshake parse failed (Not a valid TLS probe). Triggering Stealth Fallback.");
-                    Self::handle_stealth_fallback(inbound, outbound, buf_snapshot).await;
+                    Self::handle_stealth_fallback(inbound, outbound, buf_snapshot, &decoy_host).await;
                     return Ok(());
                 }
             }
@@ -913,6 +943,9 @@ impl TunnelHandler for ServerHandler {
             remote_addr: String::new(),
             session_id,
             leg_status: crate::net::connection::engine::LegStatus::Active,
+            // Сервер никогда не реконнектит (см. `attempt_reconnect`'s early
+            // return on empty `remote_addr`), поэтому SNI здесь не используется.
+            decoy_sni: Arc::from(""),
         };
 
         let res = engine.run().await;

@@ -212,14 +212,24 @@ impl ExtensionBuilder {
 
         self.add_extension(TlsExtensions::KEY_SHARE, &list);
     }
+    /// ALPS (`application_settings`): формат идентичен `alpn()` — вектор с
+    /// 2-байтовой длиной, содержащий длину-префиксные имена протоколов.
+    ///
+    /// Раньше здесь писался только `len|proto` без внешней 2-байтовой длины
+    /// списка, а после каждого имени лишний `put_u16(0)` — на проводе это
+    /// давало содержимое вида `02 68 32 00 00`, где Wireshark читает первые
+    /// два байта как длину вектора (`0x0268` = 616) и ругается "too large,
+    /// truncating it to 3". Реальный Chrome шлёт `00 03 02 68 32`.
     pub fn application_settings(&mut self, protocols: &[&str]) {
-        let mut data = BytesMut::new();
+        let mut list_data = BytesMut::new();
         for proto in protocols {
             let p_bytes = proto.as_bytes();
-            data.put_u8(p_bytes.len() as u8);
-            data.put_slice(p_bytes);
-            data.put_u16(0);
+            list_data.put_u8(p_bytes.len() as u8);
+            list_data.put_slice(p_bytes);
         }
+        let mut data = BytesMut::with_capacity(2 + list_data.len());
+        data.put_u16(list_data.len() as u16);
+        data.put_slice(&list_data);
         self.add_extension(TlsExtensions::ALPS, &data);
     }
 

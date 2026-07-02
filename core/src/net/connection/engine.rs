@@ -81,14 +81,24 @@ pub(crate) struct TunnelEngine {
     pub leg_id: u32,
     /// Общий мультиплексор туннеля.
     pub muxer: Arc<crate::net::connection::muxer::Muxer>,
+    /// SNI поддельного `ClientHello` (атрибут, задаётся снаружи —
+    /// [`ClientHandler::connect`](crate::net::connection::ClientHandler::connect));
+    /// нужен для внутреннего реконнекта в [`attempt_reconnect`](Self::attempt_reconnect).
+    pub decoy_sni: Arc<str>,
 }
 
 impl TunnelEngine {
     /// Переподключает ногу: заново резолвит хост (подхватывает смену IP/DNS),
     /// создаёт TCP-сокет с тюнингом буферов и проводит хендшейк заново. Возвращает
     /// свежие половинки сокета и кодеки.
+    ///
+    /// `attempt` выбирает профиль браузера через [`BrowserProfile::for_attempt`]
+    /// (см. [`ClientHandler::establish_leg`](crate::net::connection::ClientHandler::establish_leg)) —
+    /// раньше внутренний реконнект был жёстко зашит на `CHROME_131` и не
+    /// участвовал в fallback-ротации профилей вовсе.
     pub async fn attempt_reconnect(
         &mut self,
+        attempt: u32,
     ) -> Result<(OwnedReadHalf, OwnedWriteHalf, RxCodec, TxCodec), AppError> {
         info!("🔄 Attempting reconnect to {}", self.remote_addr);
 
@@ -115,7 +125,15 @@ impl TunnelEngine {
             .map_err(|_| AppError::new(ERR_INFRA_TIMEOUT, "Сбой сети", "Reconnect timeout"))?
             .map_err(|e| AppError::new(ERR_INFRA_TIMEOUT, "Сбой сети", e.to_string()))?;
 
-        crate::net::ClientHandler::perform_handshake(stream, &self.session_id, self.leg_id).await
+        let profile = crate::tlseng::BrowserProfile::for_attempt(attempt);
+        crate::net::ClientHandler::perform_handshake(
+            stream,
+            &self.session_id,
+            self.leg_id,
+            profile,
+            &self.decoy_sni,
+        )
+        .await
     }
 
     /// Главный цикл ноги: переподключение (при нужде) → запуск reader/writer →
@@ -151,7 +169,7 @@ impl TunnelEngine {
                 }
 
                 self.leg_status = LegStatus::Reconnecting;
-                match self.attempt_reconnect().await {
+                match self.attempt_reconnect(internal_attempt).await {
                     Ok((new_in, new_out, new_rx, new_tx)) => {
                         internal_attempt = 0; // successful reconnect — reset counter
 

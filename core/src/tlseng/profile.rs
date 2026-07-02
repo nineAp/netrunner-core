@@ -63,11 +63,12 @@ impl BrowserProfile {
         target_padding_len: 512,
     };
 
-    /// Отпечаток Firefox 130: без GREASE и ALPS, без паддинга, TLS 1.3+1.2.
-    /// Заготовка-альтернатива Chrome (сейчас в бою используется Chrome).
-    #[allow(dead_code)]
+    /// Отпечаток Firefox 133: без GREASE и ALPS (их у Firefox не бывает), без
+    /// паддинга, TLS 1.3+1.2. Раньше по ошибке ссылался на `ExtensionOrder::EDGE_130`
+    /// (Chromium-порядок с ALPS/compress_certificate) — теперь у него свой порядок
+    /// ([`FIREFOX_133`](ExtensionOrder::FIREFOX_133)) и своя группа `secp521r1`.
     pub const FIREFOX_130: Self = Self {
-        groups: TlsGroups::MODERN,
+        groups: TlsGroups::FIREFOX,
         signatures: TlsSignatures::BROWSER_STANDARD,
         delegated_signatures: TlsSignatures::BROWSER_STANDARD,
         versions: TlsVersions::MODERN,
@@ -77,12 +78,77 @@ impl BrowserProfile {
         cipher_suites: &[0x1301, 0x1302, 0x1303, 0xc02b, 0xc02f, 0xc02c, 0xc030],
 
         alpn: &["h2", "http/1.1"],
-        extension_order: ExtensionOrder::EDGE_130,
+        extension_order: ExtensionOrder::FIREFOX_133,
 
         has_grease: false,
         alps_protocols: &[],
         target_padding_len: 0,
     };
+
+    /// Отпечаток Edge 130: тот же Chromium-движок, что и Chrome (GREASE + ALPS +
+    /// паддинг до 512), отличается только собственными GREASE-значениями
+    /// (`0x1a1a`/`0x3a3a`), как у настоящего Edge.
+    pub const EDGE_130: Self = Self {
+        groups: TlsGroups::CHROMIUM,
+        signatures: TlsSignatures::BROWSER_STANDARD,
+        delegated_signatures: TlsSignatures::BROWSER_STANDARD,
+        versions: TlsVersions::TLS_13_ONLY,
+
+        record_layer_version: ProtocolVersion::Tls10,
+
+        cipher_suites: &[
+            0x1301, 0x1302, 0x1303, 0xc02b, 0xc02f, 0xc02c, 0xc030, 0xcca9, 0xcca8,
+        ],
+
+        alpn: &["h2", "http/1.1"],
+        extension_order: ExtensionOrder::EDGE_130,
+
+        has_grease: true,
+
+        alps_protocols: &["h2"],
+
+        target_padding_len: 512,
+    };
+
+    /// Отпечаток Safari 17: не Chromium — без GREASE, без ALPS, TLS 1.3+1.2,
+    /// без паддинга.
+    pub const SAFARI_17: Self = Self {
+        groups: TlsGroups::SAFARI,
+        signatures: TlsSignatures::BROWSER_STANDARD,
+        delegated_signatures: TlsSignatures::BROWSER_STANDARD,
+        versions: TlsVersions::MODERN,
+
+        record_layer_version: ProtocolVersion::Tls12,
+
+        cipher_suites: &[
+            0x1301, 0x1302, 0x1303, 0xc02c, 0xc02b, 0xc030, 0xc02f, 0xcca9, 0xcca8,
+        ],
+
+        alpn: &["h2", "http/1.1"],
+        extension_order: ExtensionOrder::SAFARI_17,
+
+        has_grease: false,
+        alps_protocols: &[],
+        target_padding_len: 0,
+    };
+
+    /// Пул профилей для fallback-ротации: если нога не смогла установиться
+    /// ([`ClientHandler::establish_leg`](crate::net::connection::ClientHandler::establish_leg)
+    /// повторяет попытки), очередной реконнект берёт следующий профиль отсюда
+    /// вместо того, чтобы вечно долбить DPI одним и тем же Chrome-отпечатком.
+    pub const ALL: &'static [&'static Self] = &[
+        &Self::CHROME_131,
+        &Self::EDGE_130,
+        &Self::FIREFOX_130,
+        &Self::SAFARI_17,
+    ];
+
+    /// Выбирает профиль по номеру попытки переподключения (`0` = первый профиль
+    /// из [`ALL`](Self::ALL), и так по кругу). Чистая функция без состояния —
+    /// вызывающий сам хранит счётчик попыток на ногу.
+    pub fn for_attempt(attempt: u32) -> &'static Self {
+        Self::ALL[attempt as usize % Self::ALL.len()]
+    }
 }
 
 /// Серверный профиль ответа. Поля с префиксом `_` зарезервированы под будущее
@@ -110,6 +176,25 @@ impl ServerProfile {
         record_layer_version: ProtocolVersion::Tls12,
 
         cipher_suites: &[0x1301, 0x1302, 0x1303],
+        _groups: TlsGroups::MODERN,
+        _signatures: TlsSignatures::BROWSER_STANDARD,
+        _alpn: &["h2", "http/1.1"],
+        _session_tickets: true,
+        honor_cipher_order: true,
+    };
+
+    /// Совместимый профиль: те же suite'ы плюс CBC-варианты — на случай, если
+    /// понадобится отвечать клиентам/зондам, которые в своём (настоящем, не
+    /// нашем) `ClientHello` не предлагают ни одного suite из [`MODERN`](Self::MODERN).
+    /// Сейчас не используется по умолчанию (`ServerHandler` берёт `MODERN`),
+    /// заготовлен как второй вариант — так же, как раньше `FIREFOX_130` был
+    /// заготовкой без пути включения.
+    pub const COMPAT: Self = Self {
+        versions: TlsVersions::MODERN,
+
+        record_layer_version: ProtocolVersion::Tls12,
+
+        cipher_suites: &[0x1301, 0x1302, 0x1303, 0xc02b, 0xc02f, 0xc02c, 0xc030],
         _groups: TlsGroups::MODERN,
         _signatures: TlsSignatures::BROWSER_STANDARD,
         _alpn: &["h2", "http/1.1"],

@@ -21,11 +21,18 @@ use crate::diagnostics::{ClientDiagnosticsLogger, ServerDiagnosticsLogger};
 pub struct Network {
     host: String,
     port: u16,
+    /// Домен-декой этой ноды для stealth-fallback (атрибут ноды — задаётся при
+    /// старте через `--decoy-host`, раньше был захардкожен на `ubuntu.com`).
+    decoy_host: Arc<str>,
 }
 
 impl Network {
-    pub fn new(host: String, port: u16) -> Self {
-        Self { host, port }
+    pub fn new(host: String, port: u16, decoy_host: impl Into<Arc<str>>) -> Self {
+        Self {
+            host,
+            port,
+            decoy_host: decoy_host.into(),
+        }
     }
 
     /// Запускает сервер: слушает TCP и обслуживает соединения до отмены `token`.
@@ -83,7 +90,11 @@ impl Network {
                         let conn = Connection::new(stream);
 
                         // Pass the Arc clone down to the ServerHandler
-                        let handler = ServerHandler::new(conn, session_manager.clone());
+                        let handler = ServerHandler::new(
+                            conn,
+                            session_manager.clone(),
+                            self.decoy_host.clone(),
+                        );
 
                     tokio::spawn(async move {
                                 // "Входим" в этот Span. Все логи внутри handler.run() привяжутся к этому IP.

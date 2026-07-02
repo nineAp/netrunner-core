@@ -769,6 +769,12 @@ pub struct EngineConfig {
     pub excluded_apps: Vec<String>,
     /// Домены в обход туннеля.
     pub excluded_domains: Vec<String>,
+    /// SNI поддельного `ClientHello` (домен-декой, под который маскируется
+    /// хендшейк). Пока статический атрибут конфигурации — раньше был
+    /// захардкожен константой глубоко в TLS-слое ядра. В перспективе будет
+    /// приходить динамически со списком серверов (вместе с их собственным
+    /// `--decoy-host`), чтобы клиент и сервер не расходились в выборе decoy-хоста.
+    pub decoy_sni: String,
 }
 
 impl EngineConfig {
@@ -784,7 +790,13 @@ impl EngineConfig {
             killswitch_enabled: true,
             excluded_apps: Vec::new(),
             excluded_domains: Vec::new(),
+            decoy_sni: netrunner_core::net::DEFAULT_DECOY_HOST.to_string(),
         }
+    }
+
+    pub fn with_decoy_sni(mut self, decoy_sni: impl Into<String>) -> Self {
+        self.decoy_sni = decoy_sni.into();
+        self
     }
 
     pub fn with_cache_path(mut self, path: impl Into<String>) -> Self {
@@ -888,6 +900,7 @@ impl EngineBuilder {
         info!("Establishing secure tunnel to proxy server...");
         let muxer = ClientHandler::connect(
             &self.config.remote_address,
+            self.config.decoy_sni.clone(),
             rx_for_client_handler,
             tx_for_client_handler,
         )

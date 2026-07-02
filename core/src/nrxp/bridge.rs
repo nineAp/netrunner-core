@@ -76,6 +76,17 @@ impl HandshakeMessage {
 impl TlsInterceptor for HandshakeMessage {
     type Output = HandshakeMessage;
 
+    /// `record` здесь уже целиком получена с провода (длина взята из заголовка
+    /// TLS-записи и `TlsRecord::parse` дожидается ровно стольких байт). Значит,
+    /// если `HelloHeader`/`ClientHello`/`ServerHello` не смогли разобрать этот
+    /// payload целиком — это не «пришло не всё», а испорченный/чужой hello.
+    ///
+    /// Раньше такой случай тихо возвращал `Ok(None)`, и вызывающий код
+    /// (`ServerHandler::run`) трактовал его как «нужно больше данных» и ждал
+    /// ещё до [`TLS_HELLO_TIMEOUT`](crate::net::TLS_HELLO_TIMEOUT) (10с), хотя
+    /// новых байт для уже полностью прочитанной записи никогда не придёт —
+    /// stealth-fallback запускался с большой задержкой вместо немедленно,
+    /// нарушая заявленный принцип «при малейшем несоответствии — fallback».
     fn handle_record(record: TlsRecord) -> Result<Option<Self::Output>, TlsError> {
         if record.content_type != ContentType::Handshake {
             return Err(TlsError::new(
@@ -85,32 +96,35 @@ impl TlsInterceptor for HandshakeMessage {
             ));
         }
 
+        let malformed = || {
+            TlsError::new(
+                ErrorStage::Handshake("Malformed handshake message"),
+                ErrorAction::Drop,
+                Bytes::new(),
+            )
+        };
+
         let mut payload = BytesMut::from(record.payload.as_ref());
-        if let Some(header) = HelloHeader::parse(&mut payload)? {
-            match header.header_type {
-                HelloType::Client => {
-                    if let Some(hello) = ClientHello::parse(&mut payload)? {
-                        let ext =
-                            ExtensionStack::parse(&mut BytesMut::from(hello.extensions.as_ref()))?
-                                .ok_or_else(|| {
-                                    TlsError::new(ErrorStage::Handshake("Ext Err"), ErrorAction::Drop, Bytes::new())
-                                })?;
-                        return Ok(Some(HandshakeMessage::Client { base: hello, extensions: ext }));
-                    }
-                }
-                HelloType::Server => {
-                    if let Some(hello) = ServerHello::parse(&mut payload)? {
-                        let ext =
-                            ExtensionStack::parse(&mut BytesMut::from(hello.extensions.as_ref()))?
-                                .ok_or_else(|| {
-                                    TlsError::new(ErrorStage::Handshake("Ext Err"), ErrorAction::Drop, Bytes::new())
-                                })?;
-                        return Ok(Some(HandshakeMessage::Server { base: hello, extensions: ext }));
-                    }
-                }
+        let header = HelloHeader::parse(&mut payload)?.ok_or_else(malformed)?;
+
+        match header.header_type {
+            HelloType::Client => {
+                let hello = ClientHello::parse(&mut payload)?.ok_or_else(malformed)?;
+                let ext = ExtensionStack::parse(&mut BytesMut::from(hello.extensions.as_ref()))?
+                    .ok_or_else(|| {
+                        TlsError::new(ErrorStage::Handshake("Ext Err"), ErrorAction::Drop, Bytes::new())
+                    })?;
+                Ok(Some(HandshakeMessage::Client { base: hello, extensions: ext }))
+            }
+            HelloType::Server => {
+                let hello = ServerHello::parse(&mut payload)?.ok_or_else(malformed)?;
+                let ext = ExtensionStack::parse(&mut BytesMut::from(hello.extensions.as_ref()))?
+                    .ok_or_else(|| {
+                        TlsError::new(ErrorStage::Handshake("Ext Err"), ErrorAction::Drop, Bytes::new())
+                    })?;
+                Ok(Some(HandshakeMessage::Server { base: hello, extensions: ext }))
             }
         }
-        Ok(None)
     }
 }
 
