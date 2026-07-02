@@ -45,8 +45,9 @@
 
 - **Anti-domino failover** (`muxer::send_to_network`) — падение ноги не закрывает
   поток: дохлая нога эвиктится, кадр переотправляется на соседнюю.
-- **Graceful pause** (`bridge::run_tcp_bridge`) — если легли все ноги, мост
-  держит чанк и ретраит (TCP backpressure), а не рвёт стрим.
+- **Graceful pause** (`bridge::run_tcp_bridge` на сервере, тот же паттерн в
+  `ClientHandler::connect` на клиенте) — если легли все ноги, TCP-чанк держится
+  и ретраится (`STREAM_PAUSE_BUDGET`), а не рвёт/теряет данные аплоада.
 - **Anti-bufferbloat** — маленькая ёмкость каналов, адаптивные по RTT таймауты и
   размер батча, неблокирующая раздача `dispatch_to_local`.
 - **Stealth-fallback** (`ServerHandler`) — «не наш» клиент прозрачно проксируется

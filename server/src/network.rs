@@ -34,15 +34,17 @@ impl Network {
 
         NetworkConfig::init_global(1450);
 
-        // Start diagnostics logger — writes events to ./netrunner_diagnostics.jsonl
-        Arc::new(ServerDiagnosticsLogger::new(".")).start();
+        // 🔥 CRITICAL FIX: Create ONE global session manager for multiplexing
+        let session_manager = Arc::new(SessionManager::new());
+
+        // Start diagnostics logger — writes events to ./netrunner_diagnostics.jsonl.
+        // Shares the session manager so snapshots report real per-session tunnel
+        // state (active legs, streams) instead of an always-empty placeholder.
+        Arc::new(ServerDiagnosticsLogger::new(".", session_manager.clone())).start();
 
         // Start client-diagnostics logger — saves snapshots shipped by clients
         // over the tunnel into ./netrunner_client_diag_<session>.jsonl
         Arc::new(ClientDiagnosticsLogger::new(".")).start();
-
-        // 🔥 CRITICAL FIX: Create ONE global session manager for multiplexing
-        let session_manager = Arc::new(SessionManager::new());
 
         let sm_clone = session_manager.clone();
         tokio::spawn(async move {

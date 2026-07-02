@@ -67,11 +67,30 @@ impl RemoteOpener {
                             info!(stream_id, "✅ [Remote] Connected in {:?}", start.elapsed());
                             let (r, w) = stream.into_split();
 
+                            // Credit-gated reads (Muxer::consume_credit) were tried here and
+                            // reverted: tying read pacing to a network round-trip produced
+                            // burst-then-stall downloads and jitter on the shared physical leg,
+                            // on top of the local mpsc backpressure that already paced reads
+                            // correctly. The Credit frame/API stays in Muxer for a possible
+                            // future redesign but isn't wired up on this path anymore.
+
                             // 🔥 Защищаем и сам мост токеном отмены
                             tokio::select! {
                                 _ = token.cancelled() => { debug!(stream_id, "🔪 TCP bridge closed by Eviction"); }
                                 _ = run_tcp_bridge(stream_id, r, w, muxer.clone(), v_rx) => {}
                             }
+                            // 🔥 Сообщаем клиенту, что поток завершён — неважно, из-за
+                            // EOF цели, write-timeout ноги, истёкшего STREAM_PAUSE_BUDGET
+                            // или нашей же эвикции по бэклогу. Раньше это отправлялось
+                            // только при неудачном CONNECT: при штатном завершении моста
+                            // клиент никогда не узнавал, что стрим кончился — его
+                            // виртуальный TCP-сокет навсегда застревал в CloseWait (ждёт
+                            // от нас Close, см. server_eof/socket.close() в клиентском
+                            // TcpConnection::poll_and_process), и освобождался только
+                            // 120-секундным idle-таймаутом, попутно замедляя весь движок.
+                            let _ = muxer
+                                .send_control(stream_id, FrameType::Close, Bytes::new())
+                                .await;
                         }
                         _ => {
                             error!(stream_id, "❌ [Remote] Target connection failed: {}", target);
@@ -144,7 +163,7 @@ impl StreamHandler {
                     });
                 } else if payload == b"PONG" {
                     trace!(stream_id, "🤝 [Tunnel] PONG received");
-                    self.muxer.dispatch_to_local(stream_id, frame.payload).await;
+                    self.muxer.dispatch_to_local(stream_id, frame.payload);
                 } else {
                     if self.opener.is_some() {
                         trace!(
@@ -173,13 +192,26 @@ impl StreamHandler {
             }
 
             FrameType::Data | FrameType::UdpData => {
-                // MUST .await — maintains in-order delivery via back-pressure.
-                self.muxer.dispatch_to_local(stream_id, frame.payload).await;
+                // Non-blocking: in-order delivery is guaranteed by the stream's
+                // single persistent backlog-drainer task, not by awaiting here.
+                self.muxer.dispatch_to_local(stream_id, frame.payload);
             }
 
             FrameType::Close => {
                 debug!(stream_id, "🏁 [Tunnel] Peer closed stream");
                 self.muxer.remove_stream(stream_id);
+            }
+
+            FrameType::Credit => {
+                // Сквозной flow control (см. Muxer::consume_credit/grant_credit):
+                // приёмник шлёт "можешь прислать ещё N байт". Синхронно и дёшево —
+                // просто прибавляет к атомарному счётчику и будит ждущего отправителя.
+                if let Ok(bytes) = frame.payload.as_ref().try_into().map(u32::from_be_bytes) {
+                    trace!(stream_id, bytes, "💳 [Tunnel] Credit received");
+                    self.muxer.grant_credit(stream_id, bytes);
+                } else {
+                    warn!(stream_id, "Malformed Credit frame payload, ignoring");
+                }
             }
 
             FrameType::Diag => {
@@ -215,8 +247,15 @@ impl StreamHandler {
             let cap = NetworkConfig::global().channel_capacity;
             let (v_tx, v_rx) = mpsc::channel::<Bytes>(cap);
 
-            // 🔥 Собираем токен для мгновенного обрыва связи при Eviction
-            let cancel_token = self.muxer.register_stream(stream_id, v_tx);
+            // 🔥 Собираем токен для мгновенного обрыва связи при Eviction.
+            // Больший бэклог, чем клиентский дефолт: реальная цель в интернете
+            // медленнее и капризнее локального TUN — аплоаду нужен запас (см.
+            // SERVER_STREAM_BACKLOG_MAX_BYTES).
+            let cancel_token = self.muxer.register_stream_with_backlog_cap(
+                stream_id,
+                v_tx,
+                crate::net::SERVER_STREAM_BACKLOG_MAX_BYTES,
+            );
 
             if is_udp {
                 opener.open_udp(stream_id, target, v_rx, cancel_token).await;

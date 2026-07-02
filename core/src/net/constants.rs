@@ -46,13 +46,63 @@ pub const BRIDGE_STREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 pub const STREAM_PAUSE_BUDGET: Duration = Duration::from_secs(30);
 /// Poll interval while a paused upload stream waits for a leg to come back.
 pub const STREAM_PAUSE_RETRY: Duration = Duration::from_millis(250);
-/// Grace window dispatch_to_local waits when a stream's receive channel is full
-/// before closing that ONE stream. The hot path now uses try_send (no await), so
-/// this applies only to a genuinely backed-up consumer; kept short so a slow or
-/// dead stream (e.g. a finished speedtest socket the app stopped reading) can
-/// never head-of-line-block the shared per-leg reader and freeze every other
-/// download on that leg (was 10 s — caused multi-second download stalls).
-pub const DISPATCH_TO_LOCAL_TIMEOUT: Duration = Duration::from_millis(300);
+/// Memory budget for one stream's local-delivery backlog (see
+/// `Muxer::dispatch_to_local`). When a stream's receive channel is momentarily
+/// full, frames queue here instead of blocking the shared per-leg reader — so a
+/// slow-but-alive consumer (disk write hiccup, TUN backpressure, scheduler
+/// jitter) gets as long as it needs to drain, while a genuinely dead stream
+/// (e.g. a finished speedtest socket the app stopped reading) is caught by
+/// exceeding this bound rather than by guessing a latency. Bytes, not
+/// milliseconds, because "how slow is too slow" has no universal answer but
+/// "how much unread data are we willing to hold for one stalled stream" does.
+pub const STREAM_BACKLOG_MAX_BYTES: usize = 4 * 1024 * 1024;
+/// Same budget, but for server-side streams (tunnel → real internet target,
+/// i.e. the user's upload direction — see `bridge.rs` module docs for the
+/// upload/download naming). Bigger than the client default: a remote target
+/// is inherently slower and more variable than the local TUN device, so
+/// uploads need more slack before a stalled target is judged dead.
+pub const SERVER_STREAM_BACKLOG_MAX_BYTES: usize = 16 * 1024 * 1024;
+/// How often the background backlog reaper (`Muxer::spawn_backlog_reaper`) scans
+/// streams for genuinely stuck consumers. Runs off the hot path entirely — the
+/// dispatch call itself never evicts anything — so this only bounds how far a
+/// dead stream's backlog can overshoot its byte budget between ticks.
+pub const BACKLOG_REAPER_INTERVAL: Duration = Duration::from_millis(500);
+/// Grace window: a stream over its backlog byte budget is evicted only once it
+/// has ALSO made no delivery progress for this long. Separates "backlog is
+/// big because the producer is fast and still draining" from "backlog is big
+/// because the consumer stopped entirely" — a raw byte cap alone can't tell
+/// those apart, and evicting the former destabilizes healthy fast downloads.
+pub const BACKLOG_STUCK_GRACE: Duration = Duration::from_secs(5);
+/// How long a `Muxer` with zero legs and zero streams is kept alive before its
+/// backlog reaper self-terminates. Without this, every session's reaper task
+/// (and the Arc'd registries it keeps alive) would leak forever on a server
+/// that has served many short-lived client sessions.
+pub const BACKLOG_REAPER_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+
+// ── End-to-end credit flow control (Muxer::init_credit/grant_credit/consume_credit) ──
+/// Initial credit window granted to a stream's sender: how many bytes it may
+/// push into the tunnel before it must wait for the receiver to grant more via
+/// a `Credit` frame. Bounds how much can ever be "in flight" for one stream —
+/// unlike the local byte-budget backlog (a last-resort backstop), this stops
+/// the sender from ever producing the excess in the first place, so a slow
+/// receiver never has to buffer-then-give-up.
+pub const STREAM_CREDIT_INITIAL: u32 = 2 * 1024 * 1024;
+/// The receiver batches freed bytes and sends one `Credit` frame per this many
+/// bytes reclaimed, instead of one per delivered frame — same idea as TCP
+/// delayed window updates, avoids flooding tiny control frames. Deliberately
+/// finer than a quarter of the (possibly RTT-scaled, see
+/// `adaptive_credit_window`) sender window: the receiver has no way to know
+/// the sender's actual multiplier, and smaller/more frequent grants keep the
+/// window topped up with less slack regardless of how big it ended up being.
+pub const STREAM_CREDIT_RETURN_THRESHOLD: u32 = STREAM_CREDIT_INITIAL / 8;
+/// How long `consume_credit` waits on each poll before re-checking the balance
+/// (bounds the delay from a `notify` race, not a hard deadline by itself).
+pub const CREDIT_WAIT_POLL: Duration = Duration::from_secs(2);
+/// If the peer hasn't granted any credit at all for this long, treat it as not
+/// speaking the credit protocol (or badly behind) and fall back to unrestricted
+/// sending rather than stalling the stream forever — the byte-budget backlog
+/// and its reaper remain the ultimate backstop either way.
+pub const CREDIT_FALLBACK_AFTER: Duration = Duration::from_secs(10);
 pub const TLS_HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 pub const SECURE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
 pub const FALLBACK_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -111,20 +161,22 @@ pub const TUNNEL_MAX_BUFFER_SIZE: usize = 1024 * 1024;
 /// Bytes reserved in the read buffer before each `read_buf` call.
 pub const TUNNEL_READ_RESERVE: usize = 16 * 1024;
 /// Maximum bytes written per stream in a single interleaved write pass.
+/// Base value; adaptive_batch_chunk multiplies this by (1 + RTT_ms / 250) up to 4×.
+/// At 300+ ms RTT, expect ~64 KB per pass (4× base), batching more frames per syscall.
 pub const TUNNEL_INTERLEAVE_CHUNK: usize = 16 * 1024;
 /// Max bytes a stream bridge reads per pass before producing a data message.
-/// Bounds the size of a single MuxMessage so the per-leg queue is byte-bounded
-/// (CHANNEL_PACKETS × this), keeping post-speedtest bufferbloat small. One NRXP
-/// frame is 16 KB, so reading in 16 KB units also aligns with the wire framing.
-pub const BRIDGE_READ_CHUNK: usize = 16 * 1024;
+/// At high RTT (>300 ms), bigger chunks reduce context switches and improve
+/// coalescing in the writer. Increased to 64 KB: still fits in wire frames
+/// (multiple 16 KB NRXP frames per message) while batching better.
+/// Per-leg queue size = CHANNEL_PACKETS × this ≈ 64 × 64 KB = 4 MB baseline.
+pub const BRIDGE_READ_CHUNK: usize = 64 * 1024;
 
 // ── Tunnel leg TCP socket tuning ─────────────────────────────────────────────
-/// OS-level TCP send buffer for each tunnel leg.  The default (4–8 MB on
-/// Linux/Android) can hold seconds of data at typical mobile speeds, causing
-/// severe jitter.  128 KB limits extra queuing to ~40 ms at 25 Mbit/s per leg
-/// while still providing enough headroom for TCP slow-start.  (Halved from
-/// 256 KB to cut post-speedtest bufferbloat — see CHANNEL_PACKETS.)
-pub const TUNNEL_SOCKET_SNDBUF: u32 = 128 * 1024;
+/// OS-level TCP send buffer for each tunnel leg.  At high RTT (>300 ms),
+/// this must accommodate BDP = bandwidth × RTT. For 300 Mbps and 350 ms,
+/// BDP ≈ 13 MB, so 1 MB per leg is a floor. Scales per-leg: 4 legs × 1 MB = 4 MB
+/// total OS buffer. Matches adaptive_batch_chunk logic (high RTT = bigger writes).
+pub const TUNNEL_SOCKET_SNDBUF: u32 = 1024 * 1024;
 /// OS-level TCP receive buffer for each tunnel leg.  Larger than the send
 /// buffer so the receiver can absorb bursts without dropping packets, but
 /// bounded to keep stale in-flight download data (for already-closed streams)

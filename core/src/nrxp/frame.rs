@@ -35,6 +35,10 @@ pub(crate) enum FrameType {
     /// путь: едет по контрольному каналу, сервер сохраняет его в пер-сессионный
     /// файл. Никогда не маршрутизируется в локальные сокеты.
     Diag = 0x06,
+    /// Кредит потока для сквозного flow-control (payload — `u32` BE, "можешь
+    /// прислать ещё N байт"). Отправляется приёмной стороной по мере
+    /// освобождения локального буфера — см. `Muxer::grant_credit`/`consume_credit`.
+    Credit = 0x07,
 }
 
 /// Разобранный заголовок кадра (25 байт). Поля идут в том же порядке, что и в wire.
@@ -170,6 +174,7 @@ impl Parser for FrameHeader {
             0x04 => FrameType::UdpConnect,
             0x05 => FrameType::UdpData,
             0x06 => FrameType::Diag,
+            0x07 => FrameType::Credit,
             unknown => {
                 // After successful AEAD decryption an unknown frame type means a
                 // protocol version mismatch or data corruption that the cipher

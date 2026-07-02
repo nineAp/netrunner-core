@@ -82,6 +82,17 @@ pub(crate) async fn run_tcp_bridge<R, W>(
                 if buf.capacity() - buf.len() < BRIDGE_READ_CHUNK {
                     buf.reserve(BRIDGE_READ_CHUNK);
                 }
+                // 🔥 NOT credit-gated (tried, reverted): the local mpsc channel
+                // backpressure below (`data_tx.send().await` inside
+                // `send_data_safe`) already throttles this read loop to match the
+                // leg's real drain rate — that signal is local (sub-ms). Gating
+                // reads on a `Credit` frame instead ties pacing to a full network
+                // round-trip: every time the window ran dry the reader had to wait
+                // out (a fraction of) an RTT before resuming, producing exactly the
+                // burst-then-stall pattern users saw as jerky downloads plus
+                // jitter/ping spikes on the same physical leg. See Muxer::consume_credit
+                // for the (currently unused) machinery, kept for a possible future
+                // redesign with a much more generous, non-binding window.
                 tokio::select! {
                     biased;
                     _ = token.cancelled() => break,

@@ -70,15 +70,15 @@ impl NetworkConfig {
 
         // How many messages the Tokio mpsc channels hold.
         //
-        // 🔥 ANTI-BUFFERBLOAT: this is the dominant app-layer queue on every
-        // tunnel leg. A single server→leg data message can be up to one read
-        // buffer (~180 KB), so 128 slots meant up to ~23 MB of in-flight data
-        // QUEUED per leg. After a speedtest that reservoir is full of data for
-        // streams the app already closed; the downlink wastes seconds draining
-        // it (observed: mux_dispatch no_stream ≫ ok, RTT → 1.3 s, tunnel "dies").
-        // 16 slots bounds the per-leg queue ~8× lower so it drains in ~1 s and
-        // RTT stays low, while still keeping the writer fed for full throughput.
-        const CHANNEL_PACKETS: usize = 16;
+        // 🔥 ANTI-BUFFERBLOAT vs HIGH-RTT THROUGHPUT TRADE-OFF:
+        // At low RTT (50 ms), 16 slots = ~3 MB queue drains fast. At high RTT
+        // (300+ ms), BDP = 300 Mbps × 0.35s ≈ 13 MB required for full throughput.
+        // Increased to 64: provides ~11 MB per leg (64 × ~180 KB), matching BDP
+        // at high RTT while still preventing pathological post-speedtest queuing.
+        // Anti-bufferbloat protection remains via per-stream dispatch backpressure
+        // and read-chunk sizing in dispatch_to_local (byte-bounded backlog closes
+        // genuinely stalled streams — see STREAM_BACKLOG_MAX_BYTES).
+        const CHANNEL_PACKETS: usize = 64;
 
         // Payload bytes per segment (no IP/TCP headers in the smoltcp buffer).
         let seg = mtu.saturating_sub(40).max(512); // subtract typical IP+TCP overhead

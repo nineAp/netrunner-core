@@ -5,12 +5,15 @@
 //! событие) с ротацией файла по размеру. Дополнительно пишет стартовый и
 //! периодические heartbeat-снапшоты, чтобы файл всегда существовал и было видно,
 //! что сервер жив. У сервера нет smoltcp-движка, поэтому socket-метрики пусты —
-//! только метрики туннеля.
+//! только метрики туннеля, но они реальные: логгер держит [`SessionManager`] и
+//! на каждый снапшот опрашивает `Muxer` всех живых сессий (см.
+//! [`ServerDiagnosticsLogger::snapshot_all_sessions`]).
 
 use netrunner_core::net::diagnostics::{
     self, DiagnosticsEvent, DiagnosticsSnapshot, DiagnosticsStore, TunnelMetrics,
     current_timestamp_ms,
 };
+use netrunner_core::net::SessionManager;
 use netrunner_logger::{error, info, warn};
 use std::{path::PathBuf, sync::Arc};
 use tokio::{
@@ -34,15 +37,19 @@ const HEARTBEAT_INTERVAL_SECS: u64 = 60;
 pub struct ServerDiagnosticsLogger {
     store: Arc<DiagnosticsStore>,
     log_path: PathBuf,
+    /// Общий реестр сессий сервера — источник правды для реальных метрик
+    /// туннеля (раньше их не было вовсе, снапшот всегда сообщал пустоту).
+    session_manager: Arc<SessionManager>,
 }
 
 impl ServerDiagnosticsLogger {
-    pub fn new(log_dir: impl Into<PathBuf>) -> Self {
+    pub fn new(log_dir: impl Into<PathBuf>, session_manager: Arc<SessionManager>) -> Self {
         let mut path = log_dir.into();
         path.push("netrunner_diagnostics.jsonl");
         Self {
             store: Arc::new(DiagnosticsStore::new(SERVER_MAX_SNAPSHOTS)),
             log_path: path,
+            session_manager,
         }
     }
 
@@ -61,10 +68,9 @@ impl ServerDiagnosticsLogger {
             );
 
             // Write an immediate startup snapshot so the file is created on boot.
-            let startup = logger.build_server_snapshot(DiagnosticsEvent::LegReconnecting {
-                leg_id: 0,
-                attempt: 0,
-            }).await;
+            let startup = logger
+                .build_server_snapshot(DiagnosticsEvent::Heartbeat)
+                .await;
             logger.store.push(startup.clone());
             logger.append_to_file(&startup).await;
 
@@ -86,10 +92,9 @@ impl ServerDiagnosticsLogger {
                     _ = heartbeat.tick() => {
                         // Periodic heartbeat — lets operators confirm the server is
                         // alive even when everything is working perfectly.
-                        let snap = logger.build_server_snapshot(DiagnosticsEvent::LegReconnecting {
-                            leg_id: 0,
-                            attempt: 0,
-                        }).await;
+                        let snap = logger
+                            .build_server_snapshot(DiagnosticsEvent::Heartbeat)
+                            .await;
                         logger.store.push(snap.clone());
                         logger.append_to_file(&snap).await;
                     }
@@ -104,22 +109,49 @@ impl ServerDiagnosticsLogger {
     }
 
     /// Builds a server-side snapshot.  The server has no smoltcp engine, so
-    /// socket metrics are omitted; only tunnel metrics are included.
+    /// socket metrics are omitted; tunnel metrics are real, aggregated across
+    /// every currently connected client session.
     async fn build_server_snapshot(&self, trigger: DiagnosticsEvent) -> DiagnosticsSnapshot {
         DiagnosticsSnapshot {
             timestamp_ms: current_timestamp_ms(),
             trigger,
             engine: None,
-            // Tunnel metrics can be added later if the server gains access to
-            // a specific Muxer.  For now we report an empty structure.
-            tunnel: TunnelMetrics {
-                global_min_rtt_ms: netrunner_core::net::GLOBAL_MIN_RTT
-                    .load(std::sync::atomic::Ordering::Relaxed),
-                active_legs: vec![],
-                total_streams: 0,
-            },
+            tunnel: self.snapshot_all_sessions(),
             sockets: vec![],
             error_totals: diagnostics::DIAG_COUNTERS.snapshot(),
+        }
+    }
+
+    /// Опрашивает `Muxer` каждой живой сессии и сводит их в одну [`TunnelMetrics`]:
+    /// ноги всех сессий (каждая помечена своим `session_id` — иначе `leg_id`
+    /// разных клиентов совпадали бы, они нумеруются независимо 0..MAX_TUNNEL_LEGS)
+    /// и сумма потоков. `global_min_rtt_ms` остаётся процесс-глобальным значением
+    /// ([`GLOBAL_MIN_RTT`](netrunner_core::net::GLOBAL_MIN_RTT)) — это отдельное,
+    /// более глубокое ограничение (RTT не разведён по сессиям нигде в ядре), не
+    /// то же самое, что пустая заглушка активных ног/потоков, которую эта функция
+    /// заменяет.
+    fn snapshot_all_sessions(&self) -> TunnelMetrics {
+        let sessions: Vec<_> = self
+            .session_manager
+            .get_session()
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect();
+
+        let mut active_legs = Vec::new();
+        let mut total_streams = 0;
+        for muxer in &sessions {
+            let m = muxer.snapshot_tunnel_metrics();
+            total_streams += m.total_streams;
+            active_legs.extend(m.active_legs);
+        }
+
+        TunnelMetrics {
+            global_min_rtt_ms: netrunner_core::net::GLOBAL_MIN_RTT
+                .load(std::sync::atomic::Ordering::Relaxed),
+            active_legs,
+            total_streams,
+            session_count: sessions.len(),
         }
     }
 

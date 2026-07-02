@@ -700,6 +700,7 @@ impl Engine {
                 global_min_rtt_ms: 0,
                 active_legs: vec![],
                 total_streams: 0,
+                session_count: 0,
             });
 
         DiagnosticsSnapshot {

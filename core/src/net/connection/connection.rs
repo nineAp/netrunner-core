@@ -17,7 +17,7 @@
 //! Обе роли сходятся на [`TunnelEngine`]: клиент задаёт `remote_addr`
 //! (реконнектит), сервер оставляет его пустым (нога просто завершается).
 
-use std::{net::Ipv4Addr, sync::Arc};
+use std::{net::Ipv4Addr, sync::Arc, time::Instant};
 
 use crate::{
     crypto::{ChaChaCipher, SessionKeys},
@@ -29,8 +29,8 @@ use crate::{
         },
         NetworkConfig, DNS_LOOKUP_TIMEOUT, FALLBACK_CONNECT_TIMEOUT, LEG_RECONNECT_DELAY,
         LEG_STAGGER_DELAY, MAX_TUNNEL_LEGS, NETWORK_WATCHER_INTERVAL, SECURE_HANDSHAKE_TIMEOUT,
-        SESSION_CLEANUP_DELAY, STEALTH_FALLBACK_HOST, STEALTH_FALLBACK_SNI, TLS_HELLO_TIMEOUT,
-        TOPOLOGY_PRINT_INTERVAL,
+        SESSION_CLEANUP_DELAY, STEALTH_FALLBACK_HOST, STEALTH_FALLBACK_SNI, STREAM_PAUSE_BUDGET,
+        STREAM_PAUSE_RETRY, TLS_HELLO_TIMEOUT, TOPOLOGY_PRINT_INTERVAL,
     },
     nrxp::{Codec, Frame, FrameType, TlsBridge},
     rawcast::{LocalProtocol, RawCastAdapter, RawCastFrame},
@@ -508,7 +508,7 @@ impl ClientHandler {
                             let cap = NetworkConfig::global().channel_capacity;
 
                             let (v_tx, mut v_rx) = mpsc::channel::<Bytes>(cap);
-                            muxer_inner.register_stream(global_stream_id, v_tx);
+                            let cancel_token = muxer_inner.register_stream(global_stream_id, v_tx);
 
                             let tx_to_tun = tx_to_engine.clone();
                             let reg = registry.clone();
@@ -569,9 +569,57 @@ impl ClientHandler {
                                     .await;
 
                                 while let Some(data_payload) = up_rx.recv().await {
-                                    let _ = m_clone
-                                        .send_data_safe(global_stream_id, data_payload, is_udp)
-                                        .await;
+                                    if is_udp {
+                                        // UDP has no delivery guarantee — best-effort like
+                                        // run_udp_bridge: drop on a dead tunnel, don't pause.
+                                        let _ = m_clone
+                                            .send_data_safe(global_stream_id, data_payload, true)
+                                            .await;
+                                        continue;
+                                    }
+
+                                    // 🔥 GRACEFUL PAUSE (anti-domino), symmetric to
+                                    // run_tcp_bridge's upload half on the server. send_data_safe
+                                    // already fails over between live legs; it only errors when
+                                    // EVERY leg is down. That used to be silently ignored here
+                                    // (`let _ = ...await`), permanently dropping the chunk and
+                                    // corrupting the upload mid-stream. Now we hold the chunk and
+                                    // retry while the engine reconnects, bounded by
+                                    // STREAM_PAUSE_BUDGET, and bail out immediately if the stream
+                                    // gets torn down from elsewhere (peer Close, backlog
+                                    // eviction) meanwhile.
+                                    let deadline = Instant::now() + STREAM_PAUSE_BUDGET;
+                                    let mut delivered = false;
+                                    loop {
+                                        if m_clone
+                                            .send_data_safe(
+                                                global_stream_id,
+                                                data_payload.clone(),
+                                                false,
+                                            )
+                                            .await
+                                            .is_ok()
+                                        {
+                                            delivered = true;
+                                            break;
+                                        }
+                                        if Instant::now() >= deadline {
+                                            break;
+                                        }
+                                        tokio::select! {
+                                            biased;
+                                            _ = cancel_token.cancelled() => break,
+                                            _ = tokio::time::sleep(STREAM_PAUSE_RETRY) => {}
+                                        }
+                                    }
+                                    if !delivered {
+                                        warn!(
+                                            global_stream_id,
+                                            "Upload stream pause budget exceeded — no leg recovered, dropping stream"
+                                        );
+                                        m_clone.remove_stream(global_stream_id);
+                                        break;
+                                    }
                                 }
                             });
                         }

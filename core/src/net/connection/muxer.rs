@@ -16,8 +16,29 @@
 //!   нет вовсе — и тогда мост делает паузу с буфером, а не сброс (см.
 //!   `send_to_network` и `run_tcp_bridge`).
 //! - **Анти-bufferbloat доставка.** Входящие кадры доставляются неблокирующим
-//!   `try_send` (`dispatch_to_local`), чтобы один медленный потребитель не
-//!   блокировал общий reader ноги (head-of-line).
+//!   `try_send` (`dispatch_to_local`); если канал потока временно полон, кадр
+//!   уходит в его персональный байтовый бэклог вместо ожидания — общий reader
+//!   ноги никогда не блокируется на медленном потребителе (head-of-line) и
+//!   никогда сам не мутирует реестр потоков. Бэклог дренит отдельная
+//!   persistent-задача на поток; закрытие "зависшего" потока — исключительно
+//!   работа фонового `spawn_backlog_reaper` (байтовый бюджет
+//!   [`STREAM_BACKLOG_MAX_BYTES`]/[`crate::net::SERVER_STREAM_BACKLOG_MAX_BYTES`]
+//!   **и** отсутствие прогресса дольше RTT-адаптивного grace-окна —
+//!   [`adaptive_write_timeout`] от [`crate::net::BACKLOG_STUCK_GRACE`], та же
+//!   логика, что и у медленной-но-живой ноги, — фиксированные 5с раньше
+//!   ошибочно убивали, например, upload в реальную цель под высоким RTT) —
+//!   решение никогда не принимается изнутри горячего пути доставки, см.
+//!   докстринг `StreamBacklog`.
+//! - **Credit flow control (сейчас не подключён).** В `Muxer` остаётся API
+//!   (`init_credit`/`grant_credit`/`consume_credit`) и кадр `FrameType::Credit`
+//!   для сквозного окна получатель→отправитель — идея была не дать отправителю
+//!   производить данные быстрее приёмника, вместо того чтобы копить и потом
+//!   эвиктить. На практике привязка паузы к сетевому round-trip (ожидание
+//!   `Credit`-кадра) оказалась хуже уже работавшего локального backpressure
+//!   `data_tx.send().await` (тот реагирует мгновенно, без RTT): давала
+//!   burst-then-stall на скачивании и подрывала джиттер/пинг на общей ноге.
+//!   Отключено в `run_tcp_bridge` (там просто читают без гейта), байтовый
+//!   бэклог + reaper выше остаются единственной защитой.
 //!
 //! ## Адаптация под RTT
 //!
@@ -30,14 +51,19 @@ use arc_swap::ArcSwap;
 use bytes::Bytes;
 use dashmap::DashMap;
 use netrunner_logger::{info, instrument, trace, warn, AppError, ERR_INFRA_TIMEOUT};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc::Sender;
+use tokio::sync::mpsc::{error::TrySendError, Sender};
+use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 use crate::net::diagnostics::{self, DiagnosticsEvent, LegMetrics, TunnelMetrics, DIAG_COUNTERS};
-use crate::net::{DISPATCH_TO_LOCAL_TIMEOUT, MAX_TUNNEL_LEGS};
+use crate::net::{
+    BACKLOG_REAPER_IDLE_TIMEOUT, BACKLOG_REAPER_INTERVAL, BACKLOG_STUCK_GRACE, MAX_TUNNEL_LEGS,
+    STREAM_BACKLOG_MAX_BYTES,
+};
 use crate::net::INITIAL_RTT_MS;
 use crate::nrxp::FrameType;
 
@@ -54,6 +80,91 @@ pub struct LegStats {
 pub struct StreamStats {
     pub tx_bytes: AtomicU64,
     pub rx_bytes: AtomicU64,
+}
+
+/// Байтовый бэклог одного потока на приём.
+///
+/// Когда канал потока временно полон, кадры копятся здесь вместо того, чтобы
+/// блокировать общий ридер ноги (`dispatch_to_local` никогда не ждёт и никогда
+/// не мутирует реестр потоков — только кладёт кадр сюда). Решение "поток
+/// по-настоящему завис, закрыть" принимает ИСКЛЮЧИТЕЛЬНО фоновый
+/// `Muxer::spawn_backlog_reaper`, а не сам вызов доставки: так вызов, держащий
+/// `Ref` в `Muxer::streams`, никогда не пытается сам же удалить свой ключ из
+/// той же шарды DashMap (что раньше приводило к самоблокировке потока ОС —
+/// DashMap не поддерживает реентерабельные локи).
+///
+/// Условие эвикции у ридера — не просто байтовый бюджет (`cap_bytes`), а бюджет
+/// **и** отсутствие прогресса дольше [`BACKLOG_STUCK_GRACE`]: так отличаем
+/// «бэклог большой, потому что источник быстрый и продолжает сливаться» от
+/// «бэклог большой, потому что потребитель встал намертво».
+struct StreamBacklog {
+    queue: Mutex<VecDeque<Bytes>>,
+    bytes: AtomicUsize,
+    cap_bytes: usize,
+    notify: Notify,
+    /// Метка времени (мс, `current_timestamp_ms`) последней успешной доставки
+    /// этому потоку — неважно, быстрым путём или через дренер бэклога.
+    last_progress_ms: AtomicU64,
+}
+
+impl StreamBacklog {
+    fn new(cap_bytes: usize) -> Self {
+        Self {
+            queue: Mutex::new(VecDeque::new()),
+            bytes: AtomicUsize::new(0),
+            cap_bytes,
+            notify: Notify::new(),
+            last_progress_ms: AtomicU64::new(diagnostics::current_timestamp_ms()),
+        }
+    }
+
+    /// Кладёт кадр в бэклог. Никогда не отказывает и не трогает `Muxer::streams` —
+    /// решение "хватит ждать" не отсюда, см. докстринг типа.
+    fn push(&self, data: Bytes, size: u64) {
+        self.bytes.fetch_add(size as usize, Ordering::AcqRel);
+        self.queue.lock().unwrap().push_back(data);
+        self.notify.notify_one();
+    }
+
+    /// Отмечает успешную доставку: сбрасывает счётчик "с каких пор нет прогресса".
+    fn mark_progress(&self) {
+        self.last_progress_ms
+            .store(diagnostics::current_timestamp_ms(), Ordering::Relaxed);
+    }
+}
+
+/// Кредитное окно одного потока на СТОРОНЕ ОТПРАВИТЕЛЯ: сколько байт ещё можно
+/// протолкнуть в туннель, прежде чем ждать `Credit`-кадр от приёмника.
+///
+/// Существует отдельно от `StreamBacklog` (тот — на стороне приёмника, отвечает
+/// за "что делать, если консьюмер не успевает"). Кредит — упреждающая мера:
+/// если он работает как задумано, `StreamBacklog` почти никогда не разрастается,
+/// потому что отправитель сам не производит данные быстрее, чем приёмник может
+/// их принять. `available` — `i64`, а не `usize`, чтобы `fetch_sub` мог уводить
+/// его в отрицательные значения без паники при гонках (`consume_credit` всё
+/// равно трактует `<= 0` как "кредита нет").
+struct CreditState {
+    available: std::sync::atomic::AtomicI64,
+    notify: Notify,
+    /// Метка времени (мс) последнего РЕАЛЬНОГО пополнения — либо `init_credit`,
+    /// либо `grant_credit` от входящего `Credit`-кадра. `consume_credit`
+    /// откатывается на неограниченную отправку, только если с последнего
+    /// такого пополнения прошло больше [`crate::net::CREDIT_FALLBACK_AFTER`] —
+    /// НЕ если истёк дедлайн текущего вызова (это была ошибка: дедлайн
+    /// пересчитывался с нуля на каждый вызов `consume_credit`, поэтому после
+    /// исчерпания стартового окна на высокой скорости отправитель получал
+    /// жалкие `BRIDGE_READ_CHUNK` раз в `CREDIT_FALLBACK_AFTER` — то есть
+    /// credit-контроль топил скачивание СИЛЬНЕЕ, чем если бы его не было
+    /// вовсе, вместо того чтобы просто подождать очередной грант).
+    last_grant_ms: AtomicU64,
+}
+
+/// Регистрационная запись потока в реестре `Muxer::streams`.
+struct StreamSlot {
+    tx: Sender<Bytes>,
+    stats: Arc<StreamStats>,
+    token: CancellationToken,
+    backlog: Arc<StreamBacklog>,
 }
 
 /// Одна нога туннеля = одно физическое TCP+TLS-соединение.
@@ -139,6 +250,24 @@ pub fn adaptive_batch_chunk(base: usize) -> usize {
     base.saturating_mul(factor)
 }
 
+/// Credit window that grows with RTT, same idea as [`adaptive_batch_chunk`].
+///
+/// A stream's credit window should hold roughly one bandwidth-delay product
+/// in flight so the sender never has to stall waiting for a grant under
+/// normal operation. A flat window sized for a healthy path (tens of ms RTT)
+/// would be far too small once RTT climbs into the hundreds/low thousands of
+/// ms (mobile network, as seen in production — `GLOBAL_MIN_RTT` peaks well
+/// past 1 s): the fallback in `consume_credit` prevents that from ever
+/// stalling a stream outright, but scaling the window up front means it
+/// mostly doesn't need to. Wider cap than `adaptive_batch_chunk` (up to 8×,
+/// matching `SERVER_STREAM_BACKLOG_MAX_BYTES` at the top end) since BDP grows
+/// with RTT much faster than a comfortable interleave chunk does.
+pub fn adaptive_credit_window(base: u32) -> u32 {
+    let rtt_ms = GLOBAL_MIN_RTT.load(Ordering::Relaxed) as u32;
+    let factor = (1 + rtt_ms / 250).clamp(1, 8);
+    base.saturating_mul(factor)
+}
+
 /// Мультиплексор туннеля. Дёшево клонируется (всё внутри `Arc`) и шарится между
 /// всеми задачами ног и потоков.
 #[derive(Clone)]
@@ -151,9 +280,13 @@ pub struct Muxer {
     // чтение брало read-guard.
     active_legs_cache: Arc<ArcSwap<Vec<MuxLeg>>>,
 
-    /// Реестр потоков: id → (канал доставки данных, статистика, токен отмены).
-    /// Токен мгновенно убивает связанные с потоком задачи при `remove_stream`.
-    streams: Arc<DashMap<u32, (Sender<Bytes>, Arc<StreamStats>, CancellationToken)>>,
+    /// Реестр потоков: id → регистрационная запись (канал, статистика, токен,
+    /// бэклог). Токен мгновенно убивает связанные с потоком задачи при `remove_stream`.
+    streams: Arc<DashMap<u32, StreamSlot>>,
+    /// Кредитные окна потоков, для которых ЭТА сторона — отправитель (см.
+    /// [`CreditState`]). Отдельная карта от `streams`: та — про приём, эта —
+    /// про то, сколько ещё можно отправить, не дожидаясь `Credit`-кадра.
+    credits: Arc<DashMap<u32, Arc<CreditState>>>,
     /// Sticky-привязка потока к ноге (`stream_id` → `leg_id`).
     stream_bindings: Arc<DashMap<u32, u32>>,
     /// Время отправки PING по каждой ноге — для измерения RTT по PONG.
@@ -170,16 +303,89 @@ pub struct Muxer {
 
 impl Muxer {
     pub fn new(is_client: bool, session_id: String) -> Self {
-        Self {
+        let muxer = Self {
             legs: Arc::new(DashMap::new()),
             active_legs_cache: Arc::new(ArcSwap::from_pointee(Vec::new())),
             streams: Arc::new(DashMap::new()),
+            credits: Arc::new(DashMap::new()),
             stream_bindings: Arc::new(DashMap::new()),
             id_gen: Arc::new(IdGenerator::new(is_client)),
             pending_pings: Arc::new(DashMap::new()),
             session_id: Arc::new(session_id),
             rr_counter: Arc::new(AtomicU32::new(0)),
-        }
+        };
+        muxer.spawn_backlog_reaper();
+        muxer
+    }
+
+    /// Фоновый "ридер" бэклогов: единственное место, которое реально закрывает
+    /// поток за зависший бэклог (см. докстринг [`StreamBacklog`]). Никогда не
+    /// вызывается изнутри `dispatch_to_local` — работает по расписанию, вне
+    /// любых `Ref`-гвардов `Muxer::streams`, поэтому структурно не может
+    /// повторить самоблокировку DashMap.
+    ///
+    /// Держит собственный клон `Muxer` (дёшево — всё внутри `Arc`), поэтому
+    /// самостоятельно завершается, если сессия опустела (нет ног и потоков)
+    /// дольше [`BACKLOG_REAPER_IDLE_TIMEOUT`] — иначе на сервере, обслужившем
+    /// много клиентов, эти задачи копились бы вечно.
+    fn spawn_backlog_reaper(&self) {
+        let muxer = self.clone();
+        tokio::spawn(async move {
+            let mut idle_since: Option<Instant> = None;
+            loop {
+                tokio::time::sleep(BACKLOG_REAPER_INTERVAL).await;
+
+                if muxer.active_legs_count() == 0 && muxer.streams.is_empty() {
+                    let since = *idle_since.get_or_insert_with(Instant::now);
+                    if since.elapsed() >= BACKLOG_REAPER_IDLE_TIMEOUT {
+                        trace!("Backlog reaper: muxer idle, stopping");
+                        return;
+                    }
+                    continue;
+                }
+                idle_since = None;
+
+                let now = diagnostics::current_timestamp_ms();
+                // Same reasoning as adaptive_write_timeout: a stuck-but-alive
+                // consumer under high/variable RTT (e.g. the server writing a
+                // client's uploaded bytes into a slow real target) needs more
+                // than a flat grace window before it's judged dead — a fixed 5 s
+                // was fine for the low-RTT case this was tuned against, but
+                // evicted legitimately-slow-but-recovering streams once RTT (or
+                // its variance) climbed, exactly where this reaper replaced the
+                // old adaptive_write_timeout-only protection on that path.
+                let grace = adaptive_write_timeout(BACKLOG_STUCK_GRACE);
+                let grace_ms = grace.as_millis() as u64;
+                let stuck: Vec<u32> = muxer
+                    .streams
+                    .iter()
+                    .filter_map(|kv| {
+                        let backlog = &kv.value().backlog;
+                        let over_budget = backlog.bytes.load(Ordering::Relaxed) > backlog.cap_bytes;
+                        let stale = now
+                            .saturating_sub(backlog.last_progress_ms.load(Ordering::Relaxed))
+                            >= grace_ms;
+                        (over_budget && stale).then_some(*kv.key())
+                    })
+                    .collect();
+
+                // Evict AFTER the .iter() above is fully dropped (collected into
+                // an owned Vec) — removing a key while iterating the same
+                // DashMap would hold a shard Ref and a write-lock request on it
+                // at once, exactly the self-deadlock this design avoids.
+                for stream_id in stuck {
+                    DIAG_COUNTERS
+                        .mux_dispatch_full_closed
+                        .fetch_add(1, Ordering::Relaxed);
+                    warn!(
+                        stream_id,
+                        "Backlog reaper: over budget with no progress for {:?} — closing stream",
+                        grace
+                    );
+                    muxer.remove_stream(stream_id);
+                }
+            }
+        });
     }
 
     /// Пересобирает lock-free снапшот ног из источника истины (`legs`) и
@@ -414,7 +620,7 @@ impl Muxer {
                         if let Some(stream_ref) = self.streams.get(&stream_id) {
                             stream_ref
                                 .value()
-                                .1
+                                .stats
                                 .tx_bytes
                                 .fetch_add(size, Ordering::Relaxed);
                         }
@@ -463,7 +669,7 @@ impl Muxer {
                         if let Some(stream_ref) = self.streams.get(&stream_id) {
                             stream_ref
                                 .value()
-                                .1
+                                .stats
                                 .tx_bytes
                                 .fetch_add(size, Ordering::Relaxed);
                         }
@@ -481,7 +687,7 @@ impl Muxer {
                         if let Some(stream_ref) = self.streams.get(&stream_id) {
                             stream_ref
                                 .value()
-                                .1
+                                .stats
                                 .tx_bytes
                                 .fetch_add(size, Ordering::Relaxed);
                         }
@@ -566,93 +772,237 @@ impl Muxer {
         .await
     }
 
-    /// Регистрирует поток и возвращает его [`CancellationToken`]. Канал `tx`
-    /// используется для доставки входящих данных потоку (`dispatch_to_local`).
+    /// Регистрирует поток с бэклогом по умолчанию ([`STREAM_BACKLOG_MAX_BYTES`])
+    /// и возвращает его [`CancellationToken`]. Канал `tx` используется для
+    /// доставки входящих данных потоку (`dispatch_to_local`).
     pub fn register_stream(&self, stream_id: u32, tx: Sender<Bytes>) -> CancellationToken {
+        self.register_stream_with_backlog_cap(stream_id, tx, STREAM_BACKLOG_MAX_BYTES)
+    }
+
+    /// Регистрирует поток с явным байтовым бюджетом бэклога. Используется
+    /// сервером для потоков к реальной цели ([`SERVER_STREAM_BACKLOG_MAX_BYTES`]),
+    /// где нужен запас больше дефолтного — см. модульный докстринг.
+    pub fn register_stream_with_backlog_cap(
+        &self,
+        stream_id: u32,
+        tx: Sender<Bytes>,
+        backlog_cap_bytes: usize,
+    ) -> CancellationToken {
         let token = CancellationToken::new();
+        let stats = Arc::new(StreamStats::default());
+        let backlog = Arc::new(StreamBacklog::new(backlog_cap_bytes));
+
+        Self::spawn_backlog_drainer(
+            stream_id,
+            tx.clone(),
+            backlog.clone(),
+            stats.clone(),
+            token.clone(),
+        );
+
         self.streams.insert(
             stream_id,
-            (tx, Arc::new(StreamStats::default()), token.clone()),
+            StreamSlot {
+                tx,
+                stats,
+                token: token.clone(),
+                backlog,
+            },
         );
         token
     }
 
-    /// Удаляет поток, отменяя его токен (мгновенно гасит связанные задачи) и
-    /// снимая привязку к ноге.
+    /// Persistent-задача одного потока: спит на [`Notify`], по пробуждению сливает
+    /// весь накопленный бэклог в реальный канал потребителя блокирующим `send`
+    /// (сколько угодно времени — здесь нет тайм-аута). Ровно одна такая задача на
+    /// поток за всё время его жизни, поэтому порядок доставки внутри потока не
+    /// нарушается, в отличие от спавна задачи на каждый кадр.
+    fn spawn_backlog_drainer(
+        stream_id: u32,
+        tx: Sender<Bytes>,
+        backlog: Arc<StreamBacklog>,
+        stats: Arc<StreamStats>,
+        token: CancellationToken,
+    ) {
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = token.cancelled() => return,
+                    _ = backlog.notify.notified() => {}
+                }
+                loop {
+                    let item = backlog.queue.lock().unwrap().pop_front();
+                    let Some(item) = item else { break };
+                    let len = item.len() as u64;
+                    if tx.send(item).await.is_err() {
+                        // Consumer dropped its receiver — remove_stream elsewhere
+                        // will clean up the entry; nothing more to drain into.
+                        trace!(stream_id, "backlog drainer: consumer channel closed, stopping");
+                        return;
+                    }
+                    backlog.bytes.fetch_sub(len as usize, Ordering::AcqRel);
+                    backlog.mark_progress();
+                    stats.rx_bytes.fetch_add(len, Ordering::Relaxed);
+                    DIAG_COUNTERS.mux_dispatch_ok.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        });
+    }
+
+    /// Удаляет поток, отменяя его токен (мгновенно гасит связанные задачи, включая
+    /// бэклог-дренер) и снимая привязку к ноге.
     pub fn remove_stream(&self, stream_id: u32) {
         // 🔥 Мгновенно убиваем "зомби-задачи", привязанные к стриму!
-        if let Some((_, (_, _, token))) = self.streams.remove(&stream_id) {
-            token.cancel();
+        if let Some((_, slot)) = self.streams.remove(&stream_id) {
+            slot.token.cancel();
         }
         self.stream_bindings.remove(&stream_id);
     }
 
-    // ORDERING CONTRACT: in-order delivery — never spawn a task to deliver data
-    // from this function.
+    // ORDERING CONTRACT: preserved by construction — each stream has exactly one
+    // persistent backlog-drainer task (spawned once, at register_stream), so this
+    // function never spawns per-frame and never reorders within a stream.
     //
-    // HEAD-OF-LINE GUARD: the hot path is a non-blocking try_send, so one slow or
-    // dead stream can NEVER block the shared per-leg reader. (A finished speedtest
-    // socket the app stopped reading used to back its channel up and freeze EVERY
-    // other download on that leg, because the reader awaited here for up to 10 s.)
-    // Only a genuinely-full channel gets a SHORT grace wait (DISPATCH_TO_LOCAL_
-    // TIMEOUT); if it is still full that ONE stream is closed so the leg keeps
-    // serving everyone else.
-    pub async fn dispatch_to_local(&self, stream_id: u32, data: Bytes) {
+    // HEAD-OF-LINE GUARD: this function never awaits. The hot path is a
+    // non-blocking try_send; when the channel is momentarily full, the frame is
+    // queued in the stream's own backlog and the call returns immediately — the
+    // shared per-leg reader can move on to the next frame/stream right away.
+    //
+    // NO Ref HELD ACROSS A MUTATING CALL: the DashMap `Ref` from `streams.get`
+    // is dropped the instant we've cloned the owned handles we need (`tx`,
+    // `stats`, `backlog` — all cheap Arc/Sender clones). This function never
+    // calls anything that mutates `self.streams` for this same key — eviction
+    // is entirely the background reaper's job (see `spawn_backlog_reaper`) —
+    // so there is no risk of a shard read-lock (still held by an outer `Ref`)
+    // deadlocking against that shard's write-lock (DashMap locks are not
+    // reentrant). An earlier version held the `Ref` across a nested
+    // `remove_stream` call here and could self-deadlock the calling task.
+    pub fn dispatch_to_local(&self, stream_id: u32, data: Bytes) {
         let size = data.len() as u64;
 
-        let tx_and_stats = self.streams.get(&stream_id).map(|s| {
-            let val = s.value();
-            (val.0.clone(), val.1.clone())
-        });
-
-        let Some((tx, stats)) = tx_and_stats else {
+        let Some((tx, stats, backlog)) = self.streams.get(&stream_id).map(|entry| {
+            let slot = entry.value();
+            (slot.tx.clone(), slot.stats.clone(), slot.backlog.clone())
+        }) else {
             // No stream registered for this id (already closed / never opened).
             DIAG_COUNTERS
                 .mux_dispatch_no_stream
                 .fetch_add(1, Ordering::Relaxed);
             return;
         };
+        let backlog_empty = backlog.bytes.load(Ordering::Acquire) == 0;
 
-        // Fast path: deliver without awaiting → zero head-of-line blocking.
-        let data = match tx.try_send(data) {
-            Ok(()) => {
-                stats.rx_bytes.fetch_add(size, Ordering::Relaxed);
-                DIAG_COUNTERS.mux_dispatch_ok.fetch_add(1, Ordering::Relaxed);
-                return;
+        // Fast path: nothing queued ahead of this frame, try to hand it straight
+        // to the consumer without ever touching the backlog.
+        if backlog_empty {
+            match tx.try_send(data) {
+                Ok(()) => {
+                    stats.rx_bytes.fetch_add(size, Ordering::Relaxed);
+                    backlog.mark_progress();
+                    DIAG_COUNTERS.mux_dispatch_ok.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+                Err(TrySendError::Closed(_)) => {
+                    DIAG_COUNTERS
+                        .mux_dispatch_recv_closed
+                        .fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+                Err(TrySendError::Full(data)) => {
+                    backlog.push(data, size);
+                }
             }
-            // Receiver already closed — stream gone.
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                DIAG_COUNTERS
-                    .mux_dispatch_recv_closed
-                    .fetch_add(1, Ordering::Relaxed);
-                return;
-            }
-            // Channel full: recover the payload and fall through to a bounded wait.
-            Err(tokio::sync::mpsc::error::TrySendError::Full(data)) => data,
+        } else {
+            backlog.push(data, size);
+        }
+    }
+
+    /// Инициализирует кредитное окно потока: столько байт отправитель (эта
+    /// сторона) может протолкнуть, не дожидаясь `Credit`-кадра от приёмника.
+    /// Вызывает тот, кто НАЧИНАЕТ производить данные для потока (например,
+    /// `RemoteOpener::open_tcp` перед запуском моста к цели).
+    pub fn init_credit(&self, stream_id: u32, initial_bytes: u32) {
+        self.credits.insert(
+            stream_id,
+            Arc::new(CreditState {
+                available: std::sync::atomic::AtomicI64::new(initial_bytes as i64),
+                notify: Notify::new(),
+                last_grant_ms: AtomicU64::new(diagnostics::current_timestamp_ms()),
+            }),
+        );
+    }
+
+    /// Снимает кредитное окно потока. Вызывать при завершении отправки для
+    /// этого потока (симметрично `remove_stream`, но для другой карты —
+    /// `credits` живёт по циклу жизни ОТПРАВКИ, а не приёма).
+    pub fn drop_credit(&self, stream_id: u32) {
+        self.credits.remove(&stream_id);
+    }
+
+    /// Обрабатывает входящий `Credit`-кадр: пополняет окно и будит того, кто
+    /// сейчас ждёт кредит в [`consume_credit`]. No-op, если для этого
+    /// `stream_id` кредит не инициализирован (например, кадр пришёл уже после
+    /// `drop_credit`, или писала сторона, которая credit вообще не считает).
+    pub fn grant_credit(&self, stream_id: u32, bytes: u32) {
+        if let Some(state) = self.credits.get(&stream_id) {
+            let state = state.value();
+            state.available.fetch_add(bytes as i64, Ordering::AcqRel);
+            state
+                .last_grant_ms
+                .store(diagnostics::current_timestamp_ms(), Ordering::Relaxed);
+            state.notify.notify_one();
+        }
+    }
+
+    /// Ждёт, пока для потока не появится кредит, и забирает `min(available, want)`
+    /// байт. Возвращает `want` без ожидания, если credit для этого потока не
+    /// инициализирован (тот, кто вызвал, просто не участвует в этой схеме —
+    /// поведение как до появления credit-контроля).
+    ///
+    /// Не блокирует НАВСЕГДА: если приёмник ни разу не прислал `Credit` дольше
+    /// [`CREDIT_FALLBACK_AFTER`] С МОМЕНТА ПОСЛЕДНЕГО РЕАЛЬНОГО ГРАНТА (не
+    /// понимает кадр, или сильно отстал), считаем credit-контроль неработающим
+    /// для этого потока и откатываемся на неограниченную отправку — байтовый
+    /// бюджет бэклога и его ридер остаются подстраховкой в любом случае.
+    ///
+    /// Дедлайн считается от `last_grant_ms`, а НЕ от момента входа в эту
+    /// функцию: на высокой скорости `consume_credit` вызывается на каждый
+    /// ~64 КБ чанк, и если бы каждый вызов заново отсчитывал полный
+    /// `CREDIT_FALLBACK_AFTER`, окно, работающее штатно, но чуть отстающее от
+    /// потребления, топило бы скачивание до пары кадров в 10 секунд — то есть
+    /// сильнее, чем при полном отсутствии credit-контроля. Пока приёмник шлёт
+    /// гранты хоть с какой-то регулярностью, ожидание прерывается по `notify`
+    /// в течение примерно одного RTT, а не по этому дедлайну.
+    pub async fn consume_credit(&self, stream_id: u32, want: usize) -> usize {
+        let Some(state) = self.credits.get(&stream_id).map(|e| e.value().clone()) else {
+            return want;
         };
 
-        match tokio::time::timeout(DISPATCH_TO_LOCAL_TIMEOUT, tx.send(data)).await {
-            Ok(Ok(_)) => {
-                stats.rx_bytes.fetch_add(size, Ordering::Relaxed);
-                DIAG_COUNTERS.mux_dispatch_ok.fetch_add(1, Ordering::Relaxed);
+        loop {
+            let avail = state.available.load(Ordering::Acquire);
+            if avail > 0 {
+                let take = (avail as usize).min(want);
+                state
+                    .available
+                    .fetch_sub(take as i64, Ordering::AcqRel);
+                return take;
             }
-            Ok(Err(_)) => {
-                DIAG_COUNTERS
-                    .mux_dispatch_recv_closed
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            Err(_) => {
-                // Consumer stayed full past the grace window: close just this one
-                // stream so the leg keeps serving everyone else.
-                DIAG_COUNTERS
-                    .mux_dispatch_full_closed
-                    .fetch_add(1, Ordering::Relaxed);
-                warn!(
+            let since_last_grant = diagnostics::current_timestamp_ms()
+                .saturating_sub(state.last_grant_ms.load(Ordering::Relaxed));
+            if since_last_grant >= crate::net::CREDIT_FALLBACK_AFTER.as_millis() as u64 {
+                trace!(
                     stream_id,
-                    "dispatch_to_local: stream stalled for {:?}, closing", DISPATCH_TO_LOCAL_TIMEOUT
+                    "consume_credit: no grant for {:?} — falling back to unrestricted",
+                    crate::net::CREDIT_FALLBACK_AFTER
                 );
-                self.remove_stream(stream_id);
+                return want;
             }
+            let _ = tokio::time::timeout(
+                crate::net::CREDIT_WAIT_POLL,
+                state.notify.notified(),
+            )
+            .await;
         }
     }
 
@@ -819,8 +1169,8 @@ impl Muxer {
             .map(|kv| {
                 (
                     *kv.key(),
-                    kv.value().1.tx_bytes.load(Ordering::Relaxed),
-                    kv.value().1.rx_bytes.load(Ordering::Relaxed),
+                    kv.value().stats.tx_bytes.load(Ordering::Relaxed),
+                    kv.value().stats.rx_bytes.load(Ordering::Relaxed),
                 )
             })
             .collect();
@@ -889,6 +1239,7 @@ impl Muxer {
                     congestion_factor,
                     data_channel_free: free,
                     data_channel_capacity: cap,
+                    session_id: self.session_id.to_string(),
                 }
             })
             .collect();
@@ -897,6 +1248,7 @@ impl Muxer {
             global_min_rtt_ms: global_min_rtt,
             active_legs,
             total_streams: self.streams.len(),
+            session_count: 1,
         }
     }
 }
