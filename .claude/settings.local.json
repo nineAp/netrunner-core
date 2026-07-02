@@ -85,7 +85,11 @@
       "Bash(wsl -d ubuntu-22.04 -- bash -c \"cd /home/kirill/netrunner-proxy && ~/.cargo/bin/cargo check --workspace --exclude netrunner-client 2>&1 | grep -E '^error'\")",
       "Bash(git config *)",
       "Bash(git add *)",
-      "Bash(git commit -m 'refactor: improve networking layer with enhanced engine, muxer, and diagnostics *)"
+      "Bash(git commit -m 'refactor: improve networking layer with enhanced engine, muxer, and diagnostics *)",
+      "Bash(cd \"\\\\\\\\wsl.localhost\\\\ubuntu-22.04\\\\home\\\\kirill\\\\netrunner-proxy\")",
+      "Bash(cargo build *)",
+      "Bash(cargo --version)",
+      "Bash(rustc --version)"
     ]
   }
 }

@@ -117,7 +117,7 @@ impl SessionManager {
         excluded_domains: Vec<String>,
     ) -> Arc<Session> {
         netrunner_logger::Logger::init(None, false);
-        netrunner_logger::Logger::global().set_level("info");
+        netrunner_logger::Logger::global().set_level("error");
 
         let runtime = get_runtime();
         let cancel_token = CancellationToken::new();

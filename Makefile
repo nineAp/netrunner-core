@@ -1,6 +1,7 @@
 -include .env
 # Настройки
 SERVER_IP := $(strip $(SERVER_IP))
+DEV_IP :=$(strip $(DEV_IP))
 REMOTE_USER := $(strip $(REMOTE_USER))
 REMOTE_PATH := $(strip $(REMOTE_PATH))
 SERVICE_NAME := $(strip $(SERVICE_NAME))
@@ -98,6 +99,27 @@ deploy-server: build-server
 	
 	@echo "--- [4/4] Перезапуск сервиса ---"
 	ssh $(SSH_OPTS) $(REMOTE_USER)@$(SERVER_IP) "\
+		systemctl daemon-reload && \
+		systemctl enable $(SERVICE_NAME) && \
+		systemctl start $(SERVICE_NAME)"
+	@echo "--- Деплой завершен успешно! ---"
+
+
+deploy-dev: build-server
+	@echo "--- [1/4] Остановка сервиса и очистка зависших процессов DEV ---"
+	ssh $(SSH_OPTS) $(REMOTE_USER)@$(DEV_IP) "\
+		systemctl stop $(SERVICE_NAME) || true; \
+		pkill -9 $(SERVICE_NAME) || true; \
+		rm -f $(REMOTE_PATH)/$(SERVICE_NAME).tmp"
+	
+	@echo "--- [2/4] Копирование бинарника (rsync) ---"
+	rsync $(RSYNC_OPTS) target/release/netrunner-server $(REMOTE_USER)@$(DEV_IP):$(REMOTE_PATH)/
+	
+	@echo "--- [3/4] Обновление конфигурации systemd ---"
+	rsync $(RSYNC_OPTS) server/netrunner-server.dev.service $(REMOTE_USER)@$(DEV_IP):/etc/systemd/system/
+	
+	@echo "--- [4/4] Перезапуск сервиса ---"
+	ssh $(SSH_OPTS) $(REMOTE_USER)@$(DEV_IP) "\
 		systemctl daemon-reload && \
 		systemctl enable $(SERVICE_NAME) && \
 		systemctl start $(SERVICE_NAME)"

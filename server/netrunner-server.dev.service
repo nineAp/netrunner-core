@@ -1,0 +1,14 @@
+[Unit]
+Description=Netrunner Remote Proxy
+After=network.target
+
+[Service]
+User=root
+WorkingDirectory=/root/netr-core
+ExecStart=/root/netr-core/netrunner-server --host=0.0.0.0 --port=443
+Restart=always
+RestartSec=3
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
