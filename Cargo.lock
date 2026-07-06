@@ -1623,6 +1623,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "netrunner-loadtest"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "clap",
+ "libc",
+ "netrunner-core",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "netrunner-logger"
 version = "0.1.0"
 dependencies = [

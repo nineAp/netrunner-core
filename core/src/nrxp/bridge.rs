@@ -112,17 +112,31 @@ impl TlsInterceptor for HandshakeMessage {
                 let hello = ClientHello::parse(&mut payload)?.ok_or_else(malformed)?;
                 let ext = ExtensionStack::parse(&mut BytesMut::from(hello.extensions.as_ref()))?
                     .ok_or_else(|| {
-                        TlsError::new(ErrorStage::Handshake("Ext Err"), ErrorAction::Drop, Bytes::new())
+                        TlsError::new(
+                            ErrorStage::Handshake("Ext Err"),
+                            ErrorAction::Drop,
+                            Bytes::new(),
+                        )
                     })?;
-                Ok(Some(HandshakeMessage::Client { base: hello, extensions: ext }))
+                Ok(Some(HandshakeMessage::Client {
+                    base: hello,
+                    extensions: ext,
+                }))
             }
             HelloType::Server => {
                 let hello = ServerHello::parse(&mut payload)?.ok_or_else(malformed)?;
                 let ext = ExtensionStack::parse(&mut BytesMut::from(hello.extensions.as_ref()))?
                     .ok_or_else(|| {
-                        TlsError::new(ErrorStage::Handshake("Ext Err"), ErrorAction::Drop, Bytes::new())
+                        TlsError::new(
+                            ErrorStage::Handshake("Ext Err"),
+                            ErrorAction::Drop,
+                            Bytes::new(),
+                        )
                     })?;
-                Ok(Some(HandshakeMessage::Server { base: hello, extensions: ext }))
+                Ok(Some(HandshakeMessage::Server {
+                    base: hello,
+                    extensions: ext,
+                }))
             }
         }
     }
@@ -143,6 +157,26 @@ impl TlsInterceptor for ApplicationData {
             _len: record.payload.len(),
             payload: record.payload,
         }))
+    }
+}
+
+/// Маркер «фиктивная запись ChangeCipherSpec прочитана и вырезана из буфера» —
+/// см. [`TlsBridge::build_middlebox_ccs`]/[`TlsBridge::unpack_middlebox_ccs`].
+/// Сама запись не несёт полезной нагрузки, поэтому у типа нет полей.
+struct ChangeCipherSpecMarker;
+
+impl TlsInterceptor for ChangeCipherSpecMarker {
+    type Output = ChangeCipherSpecMarker;
+
+    fn handle_record(record: TlsRecord) -> Result<Option<Self::Output>, TlsError> {
+        if record.content_type != ContentType::ChangeCipherSpec {
+            return Err(TlsError::new(
+                ErrorStage::Tls("Expected ChangeCipherSpec record"),
+                ErrorAction::Drop,
+                record.serialize(),
+            ));
+        }
+        Ok(Some(ChangeCipherSpecMarker))
     }
 }
 
@@ -171,15 +205,26 @@ impl TlsBridge {
     /// Порядок критичен: сначала проверяется auth-тег из `session_id`
     /// (16 байт со смещения 16) — неверный тег ⇒ отказ ещё до любых
     /// криптоопераций; затем выводятся ключи сессии и формируется ответ.
+    ///
+    /// Возвращает вместе с готовым `ServerHello` заявленную клиентом версию
+    /// протокола (`session_id[0]`, см. [`crate::PROTOCOL_VERSION`]) — вызывающий
+    /// код использует её, чтобы решить, какое версионно-зависимое поведение
+    /// (например, обмен `ChangeCipherSpec`) включать именно для этого клиента.
     pub fn wrap_server_hello(
         client_msg: &HandshakeMessage,
         keys: &mut SessionKeys,
         profile: &ServerProfile,
-    ) -> Result<Bytes, TlsError> {
+    ) -> Result<(Bytes, u8), TlsError> {
         if let HandshakeMessage::Client { base, extensions } = client_msg {
             if base.session_id.len() != 32 {
-                return Err(TlsError::new(ErrorStage::Handshake("Invalid SessionID len"), ErrorAction::Drop, Bytes::new()));
+                return Err(TlsError::new(
+                    ErrorStage::Handshake("Invalid SessionID len"),
+                    ErrorAction::Drop,
+                    Bytes::new(),
+                ));
             }
+
+            let peer_version = base.session_id[0];
 
             let mut received_tag = [0u8; 16];
             received_tag.copy_from_slice(&base.session_id[16..32]);
@@ -188,24 +233,56 @@ impl TlsBridge {
             let auth = SessionAuth::new(keys.get_auth_key());
             if !auth.verify_tag(&received_tag) {
                 netrunner_logger::warn!("Unauthorized ClientHello: Auth Tag mismatch");
-                return Err(TlsError::new(ErrorStage::Handshake("Auth Failed"), ErrorAction::Drop, Bytes::new()));
+                return Err(TlsError::new(
+                    ErrorStage::Handshake("Auth Failed"),
+                    ErrorAction::Drop,
+                    Bytes::new(),
+                ));
             }
 
-            keys.update_keys(base.random, extensions, true).map_err(|e| {
-                netrunner_logger::error!(error = %e, "Server failed key update");
-                TlsError::new(ErrorStage::Handshake("Key Exchange Failed"), ErrorAction::Drop, Bytes::new())
-            })?;
+            keys.update_keys(base.random, extensions, true)
+                .map_err(|e| {
+                    netrunner_logger::error!(error = %e, "Server failed key update");
+                    TlsError::new(
+                        ErrorStage::Handshake("Key Exchange Failed"),
+                        ErrorAction::Drop,
+                        Bytes::new(),
+                    )
+                })?;
 
             let server_pub_key = keys.public_key_bytes();
 
-            Ok(ServerHello::make_server_hello(base, &server_pub_key, keys.local_salt(), profile))
+            let hello =
+                ServerHello::make_server_hello(base, &server_pub_key, keys.local_salt(), profile);
+
+            Ok((hello, peer_version))
         } else {
-            Err(TlsError::new(ErrorStage::Handshake("Expected ClientHello"), ErrorAction::Drop, Bytes::new()))
+            Err(TlsError::new(
+                ErrorStage::Handshake("Expected ClientHello"),
+                ErrorAction::Drop,
+                Bytes::new(),
+            ))
         }
     }
-    
+
     /// Обернуть готовый шифртекст кадра в TLS-запись `ApplicationData` (`0x17`).
     pub fn pack_app_data(buffer: Bytes) -> Bytes {
         TlsRecord::build_application_data(buffer)
+    }
+
+    /// Байты фиктивной записи `ChangeCipherSpec` — обе наши стороны шлют её
+    /// сразу после своего Hello ради middlebox-совместимости TLS 1.3 (RFC 8446
+    /// Appendix D.4), как это делают настоящие браузеры (см. doc на
+    /// [`ContentType::ChangeCipherSpec`](crate::tlseng::ContentType)).
+    pub fn build_middlebox_ccs() -> Bytes {
+        TlsRecord::build_change_cipher_spec()
+    }
+
+    /// Дождаться (если нужно больше байт — `Ok(None)`) и вырезать из буфера
+    /// `ChangeCipherSpec`, присланный пиром сразу после его Hello. Пир — наша
+    /// же реализация на другом конце, поэтому запись всегда присутствует;
+    /// её отсутствие/искажение — рассинхрон протокола ([`ErrorAction::Drop`]).
+    pub fn unpack_middlebox_ccs(buffer: &mut BytesMut) -> Result<Option<()>, TlsError> {
+        Ok(ChangeCipherSpecMarker::start_process(buffer)?.map(|_| ()))
     }
 }

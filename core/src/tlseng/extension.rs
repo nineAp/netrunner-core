@@ -48,6 +48,33 @@ impl ExtensionStack {
             .find(|e| e.etype == etype)
             .map(|e| e.data.clone())
     }
+
+    /// Достаёт hostname из расширения SNI (`server_name`), если оно есть и
+    /// синтаксически хорошо сформировано. Формат данных: `list_len(2) |
+    /// name_type(1)=0x00 | name_len(2) | name`.
+    ///
+    /// Нужен серверной stealth-fallback ветке ([`ServerHandler`](crate::net::connection::ServerHandler)):
+    /// проксировать «чужого» клиента (невалидный auth-тег) именно на тот хост,
+    /// который он сам запросил в SNI, а не всегда на один и тот же фиксированный
+    /// decoy — иначе активное зондирование с разными SNI на одном IP всегда
+    /// получает одинаковый ответ, что само по себе выдаёт нестандартный прокси.
+    /// Возвращаемая строка — сырой ввод удалённой стороны: вызывающий код
+    /// обязан провалидировать её (см. `is_plausible_hostname` в `net::connection`)
+    /// перед использованием в исходящем сетевом запросе.
+    pub fn server_name(&self) -> Option<String> {
+        let data = self.find_by_type(TlsExtensions::SNI)?;
+        if data.len() < 2 {
+            return None;
+        }
+        let list_len = u16::from_be_bytes([data[0], data[1]]) as usize;
+        let list = data.get(2..2 + list_len)?;
+        if list.len() < 3 || list[0] != TYPE_HOST_NAME {
+            return None;
+        }
+        let name_len = u16::from_be_bytes([list[1], list[2]]) as usize;
+        let name_bytes = list.get(3..3 + name_len)?;
+        std::str::from_utf8(name_bytes).ok().map(|s| s.to_string())
+    }
 }
 
 /// Разбор блока расширений. Сначала «холостым» проходом суммируются длины всех
@@ -371,5 +398,108 @@ impl ExtensionBuilder {
     /// Завершает сборку и отдаёт готовый блок расширений (zero-copy `freeze`).
     pub fn build(&mut self) -> Bytes {
         self.payload.split().freeze()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tlseng::profile::BrowserProfile;
+
+    const FAKE_PUB_KEY: [u8; 32] = [0x7A; 32];
+
+    fn build_for(profile: &BrowserProfile, host: &str) -> ExtensionStack {
+        let mut builder = ExtensionBuilder::new();
+        builder.apply_profile(profile, host, &FAKE_PUB_KEY, 0);
+        let bytes = builder.build();
+        ExtensionStack::parse(&mut BytesMut::from(bytes.as_ref()))
+            .unwrap()
+            .unwrap()
+    }
+
+    #[test]
+    fn every_browser_profile_round_trips_and_exposes_server_name() {
+        for profile in BrowserProfile::ALL {
+            let stack = build_for(profile, "example.com");
+            assert_eq!(
+                stack.server_name().as_deref(),
+                Some("example.com"),
+                "SNI must round-trip for every profile"
+            );
+
+            let key_share = stack
+                .find_by_type(TlsExtensions::KEY_SHARE)
+                .expect("every profile writes a KeyShare extension");
+            // entry: group(2) | key_len(2) | key(32), внутри list_len(2) — итого 4+32=36 после первых 2.
+            assert!(key_share.len() >= 36);
+            assert_eq!(&key_share[key_share.len() - 32..], &FAKE_PUB_KEY[..]);
+        }
+    }
+
+    #[test]
+    fn server_name_handles_longer_hostnames() {
+        let stack = build_for(&BrowserProfile::CHROME_131, "dev.netrunner-vpn.com");
+        assert_eq!(
+            stack.server_name().as_deref(),
+            Some("dev.netrunner-vpn.com")
+        );
+    }
+
+    #[test]
+    fn server_name_is_none_when_extension_absent() {
+        let stack = ExtensionStack { extensions: vec![] };
+        assert_eq!(stack.server_name(), None);
+    }
+
+    #[test]
+    fn server_name_is_none_when_extension_malformed() {
+        // list_len врёт про длину — данных после него меньше заявленного.
+        let mut data = BytesMut::new();
+        data.put_u16(100); // list_len = 100, но данных нет вообще
+        let stack = ExtensionStack {
+            extensions: vec![Extension::new(TlsExtensions::SNI, data.freeze())],
+        };
+        assert_eq!(stack.server_name(), None);
+    }
+
+    #[test]
+    fn server_name_is_none_for_non_utf8_hostname() {
+        let mut data = BytesMut::new();
+        let name = [0xFFu8, 0xFE, 0xFD];
+        data.put_u16((1 + 2 + name.len()) as u16); // list_len
+        data.put_u8(TYPE_HOST_NAME);
+        data.put_u16(name.len() as u16);
+        data.put_slice(&name);
+        let stack = ExtensionStack {
+            extensions: vec![Extension::new(TlsExtensions::SNI, data.freeze())],
+        };
+        assert_eq!(stack.server_name(), None);
+    }
+
+    #[test]
+    fn padding_extension_hits_target_size() {
+        let mut builder = ExtensionBuilder::new();
+        builder.server_name("example.com");
+        let before = builder.payload.len();
+        builder.padding(512, 0);
+        let after = builder.payload.len();
+        assert_eq!(
+            after, 512,
+            "total size (incl. padding's own 4-byte header) must hit target exactly"
+        );
+        assert!(after > before);
+    }
+
+    #[test]
+    fn padding_extension_skipped_when_already_over_target() {
+        let mut builder = ExtensionBuilder::new();
+        builder.server_name("a-very-long-hostname-that-eats-the-budget.example.com");
+        let before = builder.payload.len();
+        builder.padding(10, 0); // target already exceeded
+        assert_eq!(
+            builder.payload.len(),
+            before,
+            "must not add negative padding"
+        );
     }
 }

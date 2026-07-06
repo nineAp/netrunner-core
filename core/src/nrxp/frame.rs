@@ -99,15 +99,17 @@ impl Frame {
     /// Сериализует кадр в [`BytesMut`], готовый к шифрованию на месте.
     ///
     /// `auth_key` здесь — это уже готовый 16-байтовый тег (имя историческое),
-    /// который кладётся в начало заголовка. Для `Data`/`UdpData` padding не
-    /// добавляется (throughput важнее), для остальных типов — 0..255 случайных
-    /// байт. Буфер выделяется один раз точно под итоговый размер; заголовок
-    /// собирается на стеке и пишется одним `copy_from_slice`.
+    /// который кладётся в начало заголовка. Для `Data`/`UdpData` — выравнивание
+    /// до ближайшего бакета из [`bucket_padding`] (throughput всё ещё важнее,
+    /// поэтому кадры, уже близкие к максимальному размеру, не паддятся вовсе),
+    /// для остальных типов — 0..255 случайных байт. Буфер выделяется один раз
+    /// точно под итоговый размер; заголовок собирается на стеке и пишется
+    /// одним `copy_from_slice`.
     #[inline]
     pub(crate) fn into_bytes(mut self, auth_key: &[u8; 16]) -> BytesMut {
         // 🔥 ОПТИМИЗАЦИЯ: Быстрая побитовая маска (& 0xFF) вместо дорогого деления с остатком (%)
         let padding_len = match self.header.frame_type {
-            FrameType::Data | FrameType::UdpData => 0,
+            FrameType::Data | FrameType::UdpData => Self::bucket_padding(self.payload.len()),
             _ => (rand::rng().next_u32() & 0xFF) as u16,
         };
 
@@ -138,6 +140,29 @@ impl Frame {
         }
 
         buf
+    }
+
+    /// Длина паддинга для выравнивания `Data`/`UdpData` кадра до ближайшего
+    /// "круглого" бакета вместо точной длины полезной нагрузки.
+    ///
+    /// Не паддит кадры, уже близкие к [`MAX_FRAME_PAYLOAD`] (крупные бакеты
+    /// закачек) — это почти весь трафик объёмных передач, где паддинг только
+    /// снижал бы throughput без выигрыша в приватности (снаружи и так виден
+    /// кадр максимального размера, угадывать в нём нечего). Именно маленькие
+    /// кадры (запросы, интерактив, начало HTTP-ответа) — то место, где по
+    /// точной длине конкретного пакета легче всего строить атаки
+    /// website/traffic fingerprinting поверх уже неотличимого от HTTPS
+    /// хендшейка, поэтому их выравнивание даёт больше всего эффекта за
+    /// наименьшие накладные расходы.
+    #[inline]
+    fn bucket_padding(payload_len: usize) -> u16 {
+        const BUCKETS: [usize; 6] = [256, 512, 1024, 2048, 4096, 8192];
+        for &bucket in &BUCKETS {
+            if payload_len <= bucket {
+                return (bucket - payload_len) as u16;
+            }
+        }
+        0
     }
 }
 
@@ -241,5 +266,121 @@ impl Parser for Frame {
         bytes.advance(pad_len);
 
         Ok(Some(Self { header, payload }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const AUTH_KEY: [u8; 16] = [0x42; 16];
+
+    fn round_trip(frame_type: FrameType, payload: &[u8]) -> Frame {
+        let frame = Frame::new(7, frame_type, Bytes::copy_from_slice(payload));
+        let mut wire = frame.into_bytes(&AUTH_KEY);
+        Frame::parse(&mut wire).unwrap().unwrap()
+    }
+
+    #[test]
+    fn round_trip_preserves_payload_and_metadata() {
+        let parsed = round_trip(FrameType::Data, b"some tunnel payload");
+        assert_eq!(parsed.header.stream_id, 7);
+        assert_eq!(parsed.header.frame_type, FrameType::Data);
+        assert_eq!(&parsed.payload[..], b"some tunnel payload");
+        assert_eq!(parsed.header.auth_tag, AUTH_KEY);
+    }
+
+    #[test]
+    fn control_frames_get_random_padding_0_to_255() {
+        for frame_type in [
+            FrameType::Connect,
+            FrameType::Close,
+            FrameType::Heartbeat,
+            FrameType::UdpConnect,
+            FrameType::Diag,
+            FrameType::Credit,
+        ] {
+            let frame = Frame::new(1, frame_type, Bytes::from_static(b"x"));
+            let wire = frame.into_bytes(&AUTH_KEY);
+            // padding_len живёт в байтах 23..25 заголовка.
+            let padding_len = u16::from_be_bytes([wire[23], wire[24]]);
+            assert!(
+                padding_len <= 255,
+                "{:?} padding {} exceeds the 0..=255 range",
+                frame_type,
+                padding_len
+            );
+            assert_eq!(
+                wire.len(),
+                FRAME_HEADER_SIZE as usize + 1 + padding_len as usize
+            );
+        }
+    }
+
+    #[test]
+    fn data_frames_never_get_legacy_unbounded_padding() {
+        // Регрессия: раньше Data/UdpData вообще не паддились (padding_len == 0
+        // всегда). Теперь бакетное выравнивание — здесь просто фиксируем, что
+        // поведение осознанно изменилось, а не просто "иногда 0".
+        let frame = Frame::new(1, FrameType::Data, Bytes::copy_from_slice(&[0u8; 100]));
+        let wire = frame.into_bytes(&AUTH_KEY);
+        let padding_len = u16::from_be_bytes([wire[23], wire[24]]);
+        assert_eq!(padding_len, (256 - 100) as u16);
+    }
+
+    #[test]
+    fn bucket_padding_boundaries() {
+        // На границе бакета — паддинг 0 (уже ровно на бакете).
+        assert_eq!(Frame::bucket_padding(256), 0);
+        assert_eq!(Frame::bucket_padding(512), 0);
+        assert_eq!(Frame::bucket_padding(8192), 0);
+        // На единицу больше границы — едет в следующий бакет.
+        assert_eq!(Frame::bucket_padding(257), 512 - 257);
+        assert_eq!(Frame::bucket_padding(2049), 4096 - 2049);
+        // Пустой payload — паддится до первого бакета.
+        assert_eq!(Frame::bucket_padding(0), 256);
+        // Крупные кадры (около MAX_FRAME_PAYLOAD) — без паддинга вовсе,
+        // throughput объёмных закачек не должен страдать.
+        assert_eq!(Frame::bucket_padding(8193), 0);
+        assert_eq!(Frame::bucket_padding(MAX_FRAME_PAYLOAD), 0);
+    }
+
+    #[test]
+    fn data_and_udpdata_frames_are_bucketed_identically() {
+        for frame_type in [FrameType::Data, FrameType::UdpData] {
+            let frame = Frame::new(1, frame_type, Bytes::copy_from_slice(&[0u8; 300]));
+            let wire = frame.into_bytes(&AUTH_KEY);
+            let padding_len = u16::from_be_bytes([wire[23], wire[24]]);
+            assert_eq!(padding_len, (512 - 300) as u16);
+        }
+    }
+
+    #[test]
+    fn parse_skips_padding_without_exposing_it() {
+        let frame = Frame::new(3, FrameType::Heartbeat, Bytes::from_static(b"auth-payload"));
+        let mut wire = frame.into_bytes(&AUTH_KEY);
+
+        let parsed = Frame::parse(&mut wire).unwrap().unwrap();
+        assert_eq!(&parsed.payload[..], b"auth-payload");
+        assert!(
+            wire.is_empty(),
+            "parse must advance past payload AND padding (random 0..=255 for control frames), leaving nothing behind"
+        );
+    }
+
+    #[test]
+    fn incomplete_frame_is_none() {
+        let frame = Frame::new(1, FrameType::Data, Bytes::copy_from_slice(&[0u8; 50]));
+        let mut wire = frame.into_bytes(&AUTH_KEY);
+        wire.truncate(wire.len() - 1);
+        assert!(Frame::parse(&mut wire).unwrap().is_none());
+    }
+
+    #[test]
+    fn unknown_frame_type_byte_is_an_error() {
+        let frame = Frame::new(1, FrameType::Data, Bytes::copy_from_slice(&[0u8; 10]));
+        let mut wire = frame.into_bytes(&AUTH_KEY);
+        wire[20] = 0xEE; // frame_type byte — не входит ни в один известный вариант
+        assert!(Frame::parse(&mut wire).is_err());
     }
 }

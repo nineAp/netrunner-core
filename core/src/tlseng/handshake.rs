@@ -121,14 +121,21 @@ impl ClientHello {
 
     /// Высокоуровневая сборка готового к отправке `ClientHello` (в TLS-записи).
     ///
-    /// Кладёт соль в `random`, формирует `session_id` = `[16 random | 16 auth-tag]`,
-    /// затем через [`ExtensionBuilder`] собирает расширения по профилю (включая
-    /// SNI=`host` и KeyShare с публичным ключом). `total_overhead` нужен билдеру,
-    /// чтобы посчитать padding до целевого размера отпечатка.
+    /// Кладёт соль в `random`, формирует `session_id` =
+    /// `[1 версия протокола | 15 random | 16 auth-tag]`, затем через
+    /// [`ExtensionBuilder`] собирает расширения по профилю (включая SNI=`host`
+    /// и KeyShare с публичным ключом). `total_overhead` нужен билдеру, чтобы
+    /// посчитать padding до целевого размера отпечатка.
     pub fn make_client_hello(profile: &BrowserProfile, host: &str, keys: &SessionKeys) -> Bytes {
         let tls_random = keys.local_salt();
         let mut session_id_bytes = [0u8; 32];
-        OsRng.fill_bytes(&mut session_id_bytes[..16]);
+
+        // session_id[0] — заявленная версия протокола (см. crate::PROTOCOL_VERSION):
+        // не влияет на JA3/JA4 (значение session_id в отпечаток не входит, только
+        // его длина), позволяет серверу узнать, какое "протокольное" поведение
+        // клиент способен понять, до того как что-либо ему отправить.
+        session_id_bytes[0] = crate::PROTOCOL_VERSION;
+        OsRng.fill_bytes(&mut session_id_bytes[1..16]);
 
         // session_id[16..32] = текущий time-based auth-тег: сервер проверит его
         // первым делом и отвергнет ClientHello без валидного тега.
@@ -450,5 +457,110 @@ impl Parser for ServerHello {
             cipher_suite,
             extensions,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::SessionKeys;
+    use crate::tlseng::ExtensionStack;
+
+    fn parse_client_hello_record(wire: &Bytes) -> (ClientHello, ExtensionStack) {
+        let mut record_buf = BytesMut::from(&wire[..]);
+        let record = TlsRecord::parse(&mut record_buf).unwrap().unwrap();
+        let mut body = BytesMut::from(record.payload.as_ref());
+        HelloHeader::parse(&mut body).unwrap().unwrap();
+        let hello = ClientHello::parse(&mut body).unwrap().unwrap();
+        let ext = ExtensionStack::parse(&mut BytesMut::from(hello.extensions.as_ref()))
+            .unwrap()
+            .unwrap();
+        (hello, ext)
+    }
+
+    fn parse_server_hello_record(wire: &Bytes) -> (ServerHello, ExtensionStack) {
+        let mut record_buf = BytesMut::from(&wire[..]);
+        let record = TlsRecord::parse(&mut record_buf).unwrap().unwrap();
+        let mut body = BytesMut::from(record.payload.as_ref());
+        HelloHeader::parse(&mut body).unwrap().unwrap();
+        let hello = ServerHello::parse(&mut body).unwrap().unwrap();
+        let ext = ExtensionStack::parse(&mut BytesMut::from(hello.extensions.as_ref()))
+            .unwrap()
+            .unwrap();
+        (hello, ext)
+    }
+
+    /// Полный цикл "как в проде": клиент строит ClientHello → сервер его
+    /// разбирает и строит ServerHello → клиент разбирает ServerHello. Обе
+    /// стороны должны вывести идентичные AEAD-параметры (крест-накрест: tx
+    /// одной стороны == rx другой) и общий auth_key.
+    #[test]
+    fn full_handshake_round_trip_derives_matching_keys() {
+        for profile in BrowserProfile::ALL {
+            let client_keys = SessionKeys::new(true);
+            let ch_wire = ClientHello::make_client_hello(profile, "example.com", &client_keys);
+            let (client_hello, client_ext) = parse_client_hello_record(&ch_wire);
+
+            assert_eq!(client_hello.session_id.len(), 32);
+            assert_eq!(client_hello.session_id[0], crate::PROTOCOL_VERSION);
+            assert_eq!(client_hello.cipher_suites, profile.cipher_suites);
+
+            let mut server_keys = SessionKeys::new(false);
+            server_keys
+                .update_keys(client_hello.random, &client_ext, true)
+                .expect("server key derivation must succeed from a real ClientHello");
+            let server_pub = server_keys.public_key_bytes();
+            let sh_wire = ServerHello::make_server_hello(
+                &client_hello,
+                &server_pub,
+                server_keys.local_salt(),
+                &ServerProfile::MODERN,
+            );
+
+            let (server_hello, server_ext) = parse_server_hello_record(&sh_wire);
+            assert_eq!(&server_hello.session_id[..], &client_hello.session_id[..]);
+
+            let mut client_keys = client_keys;
+            client_keys
+                .update_keys(server_hello.random, &server_ext, false)
+                .expect("client key derivation must succeed from a real ServerHello");
+
+            let (c_tx_k, c_tx_iv, c_rx_k, c_rx_iv) = client_keys.get_aead_parameters();
+            let (s_tx_k, s_tx_iv, s_rx_k, s_rx_iv) = server_keys.get_aead_parameters();
+
+            assert_eq!(c_tx_k, s_rx_k, "client tx key must equal server rx key");
+            assert_eq!(c_tx_iv, s_rx_iv, "client tx iv must equal server rx iv");
+            assert_eq!(c_rx_k, s_tx_k, "client rx key must equal server tx key");
+            assert_eq!(c_rx_iv, s_tx_iv, "client rx iv must equal server tx iv");
+            assert_eq!(
+                client_keys.get_auth_key(),
+                server_keys.get_auth_key(),
+                "both sides must derive the same auth_key"
+            );
+        }
+    }
+
+    #[test]
+    fn tampered_auth_tag_in_session_id_is_rejected_by_server() {
+        use crate::crypto::SessionAuth;
+
+        let client_keys = SessionKeys::new(true);
+        let ch_wire = ClientHello::make_client_hello(
+            &BrowserProfile::CHROME_131,
+            "example.com",
+            &client_keys,
+        );
+        let (client_hello, _ext) = parse_client_hello_record(&ch_wire);
+
+        let mut tampered = client_hello.session_id.to_vec();
+        tampered[20] ^= 0xFF; // flip a byte inside the auth tag (bytes 16..32)
+
+        let auth = SessionAuth::new(client_keys.get_auth_key());
+        let mut received_tag = [0u8; 16];
+        received_tag.copy_from_slice(&tampered[16..32]);
+        assert!(
+            !auth.verify_tag(&received_tag),
+            "a tampered auth tag must not verify"
+        );
     }
 }

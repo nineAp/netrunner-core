@@ -204,3 +204,112 @@ impl Codec {
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::ChaChaCipher;
+
+    const AUTH_KEY: [u8; 32] = [0x11; 32];
+    const KEY_A: [u8; 32] = [0xAA; 32];
+    const IV_A: [u8; 12] = [0x01; 12];
+    const KEY_B: [u8; 32] = [0xBB; 32];
+    const IV_B: [u8; 12] = [0x02; 12];
+
+    /// Пара codec'ов "клиент+сервер" с ключами, зеркальными друг другу — так же,
+    /// как их реально назначает `SessionKeys::generate_keys` по ролям (tx одной
+    /// стороны == rx другой).
+    fn client_server_pair() -> ((RxCodec, TxCodec), (RxCodec, TxCodec)) {
+        let mut client_cipher = ChaChaCipher::new();
+        client_cipher.set_keys(KEY_A, IV_A, KEY_B, IV_B); // tx=A, rx=B
+        let mut server_cipher = ChaChaCipher::new();
+        server_cipher.set_keys(KEY_B, IV_B, KEY_A, IV_A); // tx=B, rx=A
+
+        (
+            Codec::new(client_cipher, AUTH_KEY).split(),
+            Codec::new(server_cipher, AUTH_KEY).split(),
+        )
+    }
+
+    #[test]
+    fn client_to_server_round_trip() {
+        let ((_client_rx, mut client_tx), (mut server_rx, _server_tx)) = client_server_pair();
+
+        let wire = client_tx
+            .encode_frame(
+                5,
+                FrameType::Data,
+                Bytes::from_static(b"payload from client"),
+            )
+            .unwrap();
+
+        let mut buf = BytesMut::from(&wire[..]);
+        let frame = server_rx.decode_inbound(&mut buf).unwrap().unwrap();
+
+        assert_eq!(frame.header.stream_id, 5);
+        assert_eq!(frame.header.frame_type, FrameType::Data);
+        assert_eq!(&frame.payload[..], b"payload from client");
+    }
+
+    #[test]
+    fn server_to_client_round_trip() {
+        let ((mut client_rx, _client_tx), (_server_rx, mut server_tx)) = client_server_pair();
+
+        let wire = server_tx
+            .encode_frame(6, FrameType::Heartbeat, Bytes::from_static(b"pong"))
+            .unwrap();
+
+        let mut buf = BytesMut::from(&wire[..]);
+        let frame = client_rx.decode_inbound(&mut buf).unwrap().unwrap();
+        assert_eq!(&frame.payload[..], b"pong");
+    }
+
+    #[test]
+    fn sequential_frames_keep_nonce_counters_in_sync() {
+        let ((_client_rx, mut client_tx), (mut server_rx, _server_tx)) = client_server_pair();
+
+        for i in 0..20u32 {
+            let payload = format!("frame-{i}");
+            let wire = client_tx
+                .encode_frame(1, FrameType::Data, Bytes::from(payload.clone()))
+                .unwrap();
+            let mut buf = BytesMut::from(&wire[..]);
+            let frame = server_rx.decode_inbound(&mut buf).unwrap().unwrap();
+            assert_eq!(&frame.payload[..], payload.as_bytes());
+        }
+    }
+
+    #[test]
+    fn tampered_ciphertext_fails_aead_and_drops() {
+        let ((_client_rx, mut client_tx), (mut server_rx, _server_tx)) = client_server_pair();
+
+        let wire = client_tx
+            .encode_frame(1, FrameType::Data, Bytes::from_static(b"secret"))
+            .unwrap();
+
+        let mut tampered = BytesMut::from(&wire[..]);
+        let last = tampered.len() - 1;
+        tampered[last] ^= 0xFF; // flip a byte inside the AEAD tag
+
+        let result = server_rx.decode_inbound(&mut tampered);
+        assert!(result.is_err(), "tampered ciphertext must not decrypt");
+    }
+
+    #[test]
+    fn replayed_frame_desyncs_nonce_and_fails() {
+        // Кадр расшифровывается один раз успешно; повторная подача ТЕХ ЖЕ байт
+        // получателю с уже продвинувшимся счётчиком nonce должна провалиться —
+        // это и есть встроенная защита от replay на уровне AEAD-потока.
+        let ((_client_rx, mut client_tx), (mut server_rx, _server_tx)) = client_server_pair();
+
+        let wire = client_tx
+            .encode_frame(1, FrameType::Data, Bytes::from_static(b"once"))
+            .unwrap();
+
+        let mut first = BytesMut::from(&wire[..]);
+        assert!(server_rx.decode_inbound(&mut first).unwrap().is_some());
+
+        let mut replay = BytesMut::from(&wire[..]);
+        assert!(server_rx.decode_inbound(&mut replay).is_err());
+    }
+}

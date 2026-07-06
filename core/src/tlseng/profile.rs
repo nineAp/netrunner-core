@@ -132,10 +132,8 @@ impl BrowserProfile {
         target_padding_len: 0,
     };
 
-    /// Пул профилей для fallback-ротации: если нога не смогла установиться
-    /// ([`ClientHandler::establish_leg`](crate::net::connection::ClientHandler::establish_leg)
-    /// повторяет попытки), очередной реконнект берёт следующий профиль отсюда
-    /// вместо того, чтобы вечно долбить DPI одним и тем же Chrome-отпечатком.
+    /// Пул профилей для ротации между разными туннельными сессиями — чтобы не
+    /// долбить DPI вечно одним и тем же Chrome-отпечатком.
     pub const ALL: &'static [&'static Self] = &[
         &Self::CHROME_131,
         &Self::EDGE_130,
@@ -143,11 +141,31 @@ impl BrowserProfile {
         &Self::SAFARI_17,
     ];
 
-    /// Выбирает профиль по номеру попытки переподключения (`0` = первый профиль
-    /// из [`ALL`](Self::ALL), и так по кругу). Чистая функция без состояния —
-    /// вызывающий сам хранит счётчик попыток на ногу.
-    pub fn for_attempt(attempt: u32) -> &'static Self {
-        Self::ALL[attempt as usize % Self::ALL.len()]
+    /// Выбирает профиль детерминированно по `session_id` — один и тот же
+    /// стабильный отпечаток браузера на все ноги и все переподключения одной
+    /// туннельной сессии.
+    ///
+    /// Раньше выбор шёл по номеру попытки реконнекта
+    /// ([`ClientHandler::establish_leg`](crate::net::connection::ClientHandler::establish_leg)/
+    /// [`TunnelEngine::attempt_reconnect`](crate::net::connection::engine::TunnelEngine::attempt_reconnect)):
+    /// при нескольких быстрых реконнектах одной и той же ноги (сетевая
+    /// нестабильность, экспоненциальный backoff в несколько секунд) с одного и
+    /// того же клиентского IP на один и тот же серверный IP летели ClientHello
+    /// с разными отпечатками браузеров подряд — Chrome, затем Edge, затем
+    /// Firefox. Ни один настоящий браузер так себя не ведёт: смена «личности»
+    /// TLS-стека на лету с того же адреса — сама по себе аномалия для
+    /// корреляции по 5-tuple, более заметная, чем константный отпечаток,
+    /// который эта ротация была призвана скрыть. Привязка к `session_id`
+    /// (генерируется один раз на весь туннель в
+    /// [`ClientHandler::connect`](crate::net::connection::ClientHandler::connect))
+    /// даёт ту же цель (разные клиенты/сессии выглядят по-разному), не создавая
+    /// эту внутрисессионную «смену браузера».
+    pub fn for_session(session_id: &str) -> &'static Self {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        session_id.hash(&mut hasher);
+        let idx = (hasher.finish() as usize) % Self::ALL.len();
+        Self::ALL[idx]
     }
 }
 
@@ -201,4 +219,39 @@ impl ServerProfile {
         _session_tickets: true,
         honor_cipher_order: true,
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn for_session_is_deterministic_for_the_same_session_id() {
+        let sid = "abc123deadbeef";
+        let p1 = BrowserProfile::for_session(sid) as *const BrowserProfile;
+        let p2 = BrowserProfile::for_session(sid) as *const BrowserProfile;
+        assert_eq!(
+            p1, p2,
+            "same session_id must always pick the same profile — that's the whole point (stable fingerprint for the life of a tunnel session)"
+        );
+    }
+
+    #[test]
+    fn for_session_spreads_across_many_distinct_session_ids() {
+        // Не строгая гарантия равномерности, но при 200 разных session_id все
+        // 4 профиля из пула должны хоть раз да встретиться — иначе это не
+        // ротация, а фиксированный выбор под видом ротации.
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..200u32 {
+            let sid = format!("session-{i}");
+            let chosen = BrowserProfile::for_session(&sid) as *const BrowserProfile;
+            seen.insert(chosen);
+        }
+        assert_eq!(
+            seen.len(),
+            BrowserProfile::ALL.len(),
+            "expected all {} profiles to appear across 200 distinct sessions",
+            BrowserProfile::ALL.len()
+        );
+    }
 }

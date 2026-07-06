@@ -42,7 +42,7 @@ use dashmap::DashMap;
 use netrunner_logger::{
     debug, error, info, warn, AppError, ERR_AUTH_FAILED, ERR_INFRA_TIMEOUT, ERR_NET_TLS_TAMPER,
 };
-use rand::Rng;
+use rand::{Rng, RngExt};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{
@@ -127,6 +127,116 @@ impl Connection {
     }
 }
 
+/// Грубая синтаксическая проверка SNI-хоста перед тем, как вообще пытаться
+/// его резолвить для stealth-fallback. Отсеивает: пустую строку, аномально
+/// длинные значения (реальные hostname не длиннее 253 байт по RFC 1035), и
+/// буквальные IP-адреса — SNI по стандарту несёт hostname, а не IP; разрешать
+/// IP-литерал означал бы дать удалённой стороне впрямую выбрать адрес нашего
+/// исходящего соединения безо всякого DNS-резолва между ними.
+fn is_plausible_hostname(host: &str) -> bool {
+    if host.is_empty() || host.len() > 253 {
+        return false;
+    }
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return false;
+    }
+    host.bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+}
+
+/// `true`, если по этому IP безопасно пустить исходящее TCP-соединение сервера
+/// в ответ на данные, присланные недоверенной удалённой стороной (SNI из
+/// невалидного `ClientHello`). Блокирует loopback/private/link-local (в т.ч.
+/// `169.254.169.254` — облачный metadata-эндпоинт)/multicast/unspecified —
+/// защита от SSRF на внутреннюю сеть ноды через подставной SNI.
+fn is_safe_decoy_ip(ip: &std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            !(v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_multicast()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_documentation())
+        }
+        std::net::IpAddr::V6(v6) => {
+            let segments = v6.segments();
+            let is_unique_local = (segments[0] & 0xfe00) == 0xfc00; // fc00::/7
+            let is_link_local = (segments[0] & 0xffc0) == 0xfe80; // fe80::/10
+            !(v6.is_loopback()
+                || v6.is_multicast()
+                || v6.is_unspecified()
+                || is_unique_local
+                || is_link_local)
+        }
+    }
+}
+
+/// Резолвит `host:port` и возвращает первый адрес, прошедший
+/// [`is_safe_decoy_ip`] — `None`, если хост не резолвится вовсе или резолвится
+/// только в небезопасные (внутренние/локальные) адреса.
+async fn resolve_safe_decoy_addr(host: &str, port: u16) -> Option<std::net::SocketAddr> {
+    let addrs = tokio::time::timeout(
+        FALLBACK_CONNECT_TIMEOUT,
+        tokio::net::lookup_host((host, port)),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    addrs.into_iter().find(|a| is_safe_decoy_ip(&a.ip()))
+}
+
+/// Дожидается и вырезает из буфера фиктивную запись `ChangeCipherSpec`,
+/// которую наш пир (мы же на другом конце — клиент или сервер) всегда шлёт
+/// сразу вслед за своим Hello (см. [`TlsBridge::build_middlebox_ccs`]) ради
+/// middlebox-совместимости TLS 1.3. Переиспользуется и клиентской, и
+/// серверной стороной хендшейка — обе ждут её одинаково.
+async fn consume_middlebox_ccs(
+    inbound: &mut OwnedReadHalf,
+    read_buf: &mut BytesMut,
+) -> Result<(), AppError> {
+    loop {
+        match TlsBridge::unpack_middlebox_ccs(read_buf) {
+            Ok(Some(())) => return Ok(()),
+            Ok(None) => {
+                let res = tokio::time::timeout(TLS_HELLO_TIMEOUT, inbound.read_buf(read_buf)).await;
+                match res {
+                    Ok(Ok(0)) => {
+                        return Err(AppError::new(
+                            ERR_INFRA_TIMEOUT,
+                            "Разрыв соединения",
+                            "EOF while waiting for ChangeCipherSpec",
+                        ))
+                    }
+                    Ok(Ok(_)) => continue,
+                    Ok(Err(e)) => {
+                        return Err(AppError::new(
+                            ERR_INFRA_TIMEOUT,
+                            "Ошибка чтения",
+                            e.to_string(),
+                        ))
+                    }
+                    Err(_) => {
+                        return Err(AppError::new(
+                            ERR_INFRA_TIMEOUT,
+                            "Таймаут handshake",
+                            "Timeout waiting for ChangeCipherSpec",
+                        ))
+                    }
+                }
+            }
+            Err(e) => {
+                return Err(AppError::new(
+                    ERR_NET_TLS_TAMPER,
+                    "Ошибка TLS",
+                    format!("TLS error while reading ChangeCipherSpec: {:?}", e.stage),
+                ))
+            }
+        }
+    }
+}
+
 /// Клиентская сторона туннеля (набор статических операций).
 pub struct ClientHandler;
 impl ClientHandler {
@@ -167,6 +277,15 @@ impl ClientHandler {
 
         conn.outbound
             .write_all(&ch)
+            .await
+            .map_err(|e| AppError::new(ERR_INFRA_TIMEOUT, "Сбой сети", e.to_string()))?;
+
+        // Реальные браузеры шлют фиктивный ChangeCipherSpec сразу после
+        // ClientHello (RFC 8446 Appendix D.4) — повторяем и это, не только сам
+        // хендшейк, иначе последовательность типов TLS-записей выдаёт
+        // нестандартный стек даже при идеальном JA3/JA4-отпечатке ClientHello.
+        conn.outbound
+            .write_all(&TlsBridge::build_middlebox_ccs())
             .await
             .map_err(|e| AppError::new(ERR_INFRA_TIMEOUT, "Сбой сети", e.to_string()))?;
 
@@ -217,6 +336,10 @@ impl ClientHandler {
             }
         }
 
+        // Сервер тоже шлёт фиктивный ChangeCipherSpec сразу после ServerHello —
+        // вычитываем и отбрасываем её здесь же, до перехода в data-фазу.
+        consume_middlebox_ccs(&mut conn.inbound, &mut conn.read_buf).await?;
+
         let (tx_key, tx_iv, rx_key, rx_iv) = session_keys.get_aead_parameters();
         let mut cipher = ChaChaCipher::new();
         cipher.set_keys(tx_key, tx_iv, rx_key, rx_iv);
@@ -249,16 +372,16 @@ impl ClientHandler {
     /// [`TunnelEngine::run`]. Возвращается только при остановке движка; снаружи
     /// (в [`connect`](ClientHandler::connect)) это уводит ногу на переподключение.
     ///
-    /// `attempt` выбирает профиль браузера через
-    /// [`BrowserProfile::for_attempt`] — каждый следующий реконнект той же ноги
-    /// маскируется под другой браузер, а не долбит DPI один и тем же
-    /// Chrome-отпечатком (было захардкожено на `CHROME_131` без альтернативы).
+    /// Профиль браузера выбирается через [`BrowserProfile::for_session`] —
+    /// один стабильный отпечаток на всю туннельную сессию (все ноги, все
+    /// переподключения), а не по номеру попытки: см. doc на `for_session` про
+    /// то, почему ротация профиля между ретраями одной и той же ноги была
+    /// хуже, чем константный отпечаток.
     async fn establish_leg(
         remote_proxy_addr: &str,
         leg_id: u32,
         muxer: Arc<Muxer>,
         session_id: &str,
-        attempt: u32,
         decoy_sni: &Arc<str>,
     ) -> Result<(), AppError> {
         let leg_name = format!("TCP-Leg-{}", leg_id);
@@ -301,7 +424,7 @@ impl ClientHandler {
             })?
             .map_err(|e| AppError::new(ERR_INFRA_TIMEOUT, "Сбой сокета", e.to_string()))?;
 
-        let profile = BrowserProfile::for_attempt(attempt);
+        let profile = BrowserProfile::for_session(session_id);
         let (inbound, outbound, rx_codec, tx_codec) =
             Self::perform_handshake(stream, session_id, leg_id, profile, decoy_sni).await?;
 
@@ -406,7 +529,7 @@ impl ClientHandler {
                 let mut attempt: u32 = 0;
                 loop {
                     if let Err(e) =
-                        Self::establish_leg(&addr, id, m.clone(), &sid, attempt, &decoy_sni).await
+                        Self::establish_leg(&addr, id, m.clone(), &sid, &decoy_sni).await
                     {
                         attempt += 1;
                         error!("Leg {} disconnected: {}. Reconnecting in 2s...", id, e);
@@ -659,7 +782,8 @@ impl ClientHandler {
                                         Ok(_) => {}
                                         Err(mpsc::error::TrySendError::Closed(_)) => {}
                                         Err(mpsc::error::TrySendError::Full(p)) => {
-                                            let mut q = std::collections::VecDeque::with_capacity(16);
+                                            let mut q =
+                                                std::collections::VecDeque::with_capacity(16);
                                             q.push_back(p);
                                             pending_upload.insert(local_socket_id, q);
                                         }
@@ -736,8 +860,21 @@ impl ServerHandler {
         }
     }
 
-    /// Stealth-fallback: прозрачно проксирует соединение на безобидный хост
-    /// `decoy_host:443`, когда клиент оказался «не наш».
+    /// Stealth-fallback: прозрачно проксирует соединение на безобидный хост,
+    /// когда клиент оказался «не наш».
+    ///
+    /// `requested_sni` — hostname из SNI невалидного `ClientHello`, если он
+    /// удалось разобрать (`None`, если хендшейк вообще не распарсился/не
+    /// дождались данных). Раньше fallback всегда шёл на один и тот же
+    /// фиксированный `decoy_host` независимо от того, какой SNI прислал
+    /// зонд — активное зондирование с разными SNI на один и тот же IP всегда
+    /// получало одинаковый ответ, что само по себе выдавало нестандартный
+    /// прокси. Теперь при валидном `requested_sni` проксируем именно на него
+    /// (резолвится и проверяется через [`resolve_safe_decoy_addr`] — только
+    /// публичные IP, чтобы SNI, присланный атакующим, не мог заставить ноду
+    /// самой законнектиться на внутреннюю инфраструктуру, SSRF), а на
+    /// `decoy_host` — только если SNI нет, невалиден или резолвится
+    /// небезопасно.
     ///
     /// Уже прочитанные байты (`initial_data`) пересылаются первыми, затем
     /// соединение склеивается в обе стороны через `tokio::io::copy`. Снаружи это
@@ -748,14 +885,32 @@ impl ServerHandler {
         mut client_outbound: OwnedWriteHalf,
         initial_data: Bytes,
         decoy_host: &str,
+        requested_sni: Option<&str>,
     ) {
-        let decoy_addr = format!("{decoy_host}:{HTTPS_PORT}");
-        info!(target = %decoy_addr, "Stealth fallback: bridging to Target");
-        let target_stream = tokio::time::timeout(
-            FALLBACK_CONNECT_TIMEOUT,
-            TcpStream::connect(&decoy_addr),
-        )
-        .await;
+        let sni_target = requested_sni.filter(|h| is_plausible_hostname(h));
+
+        let target_addr = match sni_target {
+            Some(host) => match resolve_safe_decoy_addr(host, HTTPS_PORT).await {
+                Some(addr) => {
+                    info!(sni = %host, %addr, "Stealth fallback: bridging to requested SNI");
+                    Some(addr)
+                }
+                None => {
+                    warn!(sni = %host, "Stealth fallback: SNI resolved unsafely or failed, using decoy_host");
+                    resolve_safe_decoy_addr(decoy_host, HTTPS_PORT).await
+                }
+            },
+            None => resolve_safe_decoy_addr(decoy_host, HTTPS_PORT).await,
+        };
+
+        let Some(target_addr) = target_addr else {
+            warn!("Stealth fallback: no safe target address available, dropping connection.");
+            return;
+        };
+
+        info!(target = %target_addr, "Stealth fallback: bridging to Target");
+        let target_stream =
+            tokio::time::timeout(FALLBACK_CONNECT_TIMEOUT, TcpStream::connect(target_addr)).await;
 
         if let Ok(Ok(target_server)) = target_stream {
             let (mut server_read, mut server_write) = target_server.into_split();
@@ -798,7 +953,7 @@ impl TunnelHandler for ServerHandler {
         } = self.conn;
         let mut session_keys = SessionKeys::new(false);
 
-        let hello = loop {
+        let (hello, peer_version) = loop {
             let buf_snapshot = read_buf.clone().freeze();
 
             match TlsBridge::unpack_handshake(&mut read_buf) {
@@ -808,13 +963,24 @@ impl TunnelHandler for ServerHandler {
                         &mut session_keys,
                         &ServerProfile::MODERN,
                     ) {
-                        Ok(sh) => {
-                            info!("✅ Valid Netrunner ClientHello detected");
-                            break sh;
+                        Ok((sh, peer_version)) => {
+                            info!(peer_version, "✅ Valid Netrunner ClientHello detected");
+                            break (sh, peer_version);
                         }
                         Err(e) => {
                             warn!("❌ Unauthorized/Invalid ClientHello. Triggering Stealth Fallback. Reason: {:?}", e.stage);
-                            Self::handle_stealth_fallback(inbound, outbound, buf_snapshot, &decoy_host).await;
+                            // Невалидный (например, чужой) ClientHello всё равно разобрался
+                            // синтаксически — достаём его SNI, чтобы fallback проксировал
+                            // именно на запрошенный хост, а не всегда на один и тот же decoy.
+                            let requested_sni = client_msg.extensions().server_name();
+                            Self::handle_stealth_fallback(
+                                inbound,
+                                outbound,
+                                buf_snapshot,
+                                &decoy_host,
+                                requested_sni.as_deref(),
+                            )
+                            .await;
                             return Ok(());
                         }
                     }
@@ -834,23 +1000,65 @@ impl TunnelHandler for ServerHandler {
                         Ok(Ok(_)) => continue,
                         _ => {
                             warn!("⏰ TLS_HELLO_TIMEOUT reached. Triggering fallback...");
-                            Self::handle_stealth_fallback(inbound, outbound, buf_snapshot, &decoy_host).await;
+                            Self::handle_stealth_fallback(
+                                inbound,
+                                outbound,
+                                buf_snapshot,
+                                &decoy_host,
+                                None,
+                            )
+                            .await;
                             return Ok(());
                         }
                     }
                 }
                 Err(_) => {
                     warn!("❌ Handshake parse failed (Not a valid TLS probe). Triggering Stealth Fallback.");
-                    Self::handle_stealth_fallback(inbound, outbound, buf_snapshot, &decoy_host).await;
+                    Self::handle_stealth_fallback(
+                        inbound,
+                        outbound,
+                        buf_snapshot,
+                        &decoy_host,
+                        None,
+                    )
+                    .await;
                     return Ok(());
                 }
             }
         };
 
+        // Обмен CCS — только с клиентами, заявившими версию протокола, которая
+        // его понимает (crate::MIN_VERSION_FOR_CCS). Старый клиент (версия ниже)
+        // ничего не знает про CCS и с обеих сторон получает досемверсионное
+        // поведение — иначе апгрейд сервера порвал бы соединения с ещё не
+        // обновлёнными клиентскими сборками.
+        let use_ccs = peer_version >= crate::MIN_VERSION_FOR_CCS;
+
+        if use_ccs {
+            // Клиент шлёт свой ChangeCipherSpec сразу после ClientHello —
+            // вычитываем и отбрасываем её здесь же (см. TlsBridge::build_middlebox_ccs).
+            consume_middlebox_ccs(&mut inbound, &mut read_buf).await?;
+        }
+
+        // Небольшой случайный джиттер перед ответом: мгновенный, идеально
+        // детерминированный ServerHello сам по себе отличает наш стек от
+        // бэкенда настоящего сайта с обычным серверным временем обработки.
+        let jitter_ms = rand::rng().random_range(5..=40u64);
+        tokio::time::sleep(std::time::Duration::from_millis(jitter_ms)).await;
+
         outbound
             .write_all(&hello)
             .await
             .map_err(|e| AppError::new(ERR_INFRA_TIMEOUT, "Ошибка отправки", e.to_string()))?;
+
+        if use_ccs {
+            // ...и сами отвечаем своим ChangeCipherSpec сразу после ServerHello —
+            // по той же причине, что и клиент.
+            outbound
+                .write_all(&TlsBridge::build_middlebox_ccs())
+                .await
+                .map_err(|e| AppError::new(ERR_INFRA_TIMEOUT, "Ошибка отправки", e.to_string()))?;
+        }
 
         let (tx_key, tx_iv, rx_key, rx_iv) = session_keys.get_aead_parameters();
         let mut cipher = ChaChaCipher::new();
@@ -964,5 +1172,234 @@ impl TunnelHandler for ServerHandler {
             });
         }
         res
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---------- is_plausible_hostname ----------
+
+    #[test]
+    fn plausible_hostnames_are_accepted() {
+        for host in [
+            "example.com",
+            "dev.netrunner-vpn.com",
+            "a.b.c.d.e.example.org",
+            "xn--80ak6aa92e.com", // punycode — только ascii-alnum/./-
+        ] {
+            assert!(is_plausible_hostname(host), "{host} should be plausible");
+        }
+    }
+
+    #[test]
+    fn ip_literals_are_rejected() {
+        for host in [
+            "127.0.0.1",
+            "8.8.8.8",
+            "::1",
+            "2001:db8::1",
+            "169.254.169.254",
+        ] {
+            assert!(
+                !is_plausible_hostname(host),
+                "{host} is an IP, not a hostname"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_and_oversized_hostnames_are_rejected() {
+        assert!(!is_plausible_hostname(""));
+        let too_long = "a".repeat(254);
+        assert!(!is_plausible_hostname(&too_long));
+        let just_ok = "a".repeat(253);
+        assert!(is_plausible_hostname(&just_ok));
+    }
+
+    #[test]
+    fn hostnames_with_unexpected_characters_are_rejected() {
+        for host in [
+            "exa mple.com",
+            "example.com/../etc",
+            "example.com\0",
+            "user@example.com",
+            "example.com:8080",
+            "http://example.com",
+        ] {
+            assert!(!is_plausible_hostname(host), "{host} has invalid chars");
+        }
+    }
+
+    // ---------- is_safe_decoy_ip ----------
+
+    #[test]
+    fn public_ipv4_is_safe() {
+        assert!(is_safe_decoy_ip(&"8.8.8.8".parse().unwrap()));
+        assert!(is_safe_decoy_ip(&"1.1.1.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn private_and_special_ipv4_ranges_are_blocked() {
+        for ip in [
+            "127.0.0.1",       // loopback
+            "10.0.0.1",        // private
+            "172.16.0.1",      // private
+            "192.168.1.1",     // private
+            "169.254.169.254", // link-local / cloud metadata endpoint
+            "224.0.0.1",       // multicast
+            "0.0.0.0",         // unspecified
+            "255.255.255.255", // broadcast
+            "192.0.2.1",       // documentation (TEST-NET-1)
+        ] {
+            let addr: std::net::IpAddr = ip.parse().unwrap();
+            assert!(!is_safe_decoy_ip(&addr), "{ip} must be blocked");
+        }
+    }
+
+    #[test]
+    fn public_ipv6_is_safe() {
+        // 2606:4700:4700::1111 — Cloudflare public resolver.
+        assert!(is_safe_decoy_ip(&"2606:4700:4700::1111".parse().unwrap()));
+    }
+
+    #[test]
+    fn private_and_special_ipv6_ranges_are_blocked() {
+        for ip in [
+            "::1",          // loopback
+            "::",           // unspecified
+            "fe80::1",      // link-local
+            "fc00::1",      // unique local
+            "fd12:3456::1", // unique local (fd.. subset)
+            "ff02::1",      // multicast
+        ] {
+            let addr: std::net::IpAddr = ip.parse().unwrap();
+            assert!(!is_safe_decoy_ip(&addr), "{ip} must be blocked");
+        }
+    }
+
+    // ---------- resolve_safe_decoy_addr ----------
+
+    #[tokio::test]
+    async fn resolve_safe_decoy_addr_accepts_public_ip_literal() {
+        let addr = resolve_safe_decoy_addr("93.184.216.34", 443).await;
+        assert_eq!(addr, Some("93.184.216.34:443".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn resolve_safe_decoy_addr_rejects_private_ip_literal() {
+        // "host" здесь буквально IP из приватного диапазона — резолв тривиален
+        // (без сети), но результат всё равно должен быть отфильтрован.
+        let addr = resolve_safe_decoy_addr("10.0.0.5", 443).await;
+        assert_eq!(addr, None);
+    }
+
+    #[tokio::test]
+    async fn resolve_safe_decoy_addr_rejects_metadata_endpoint() {
+        let addr = resolve_safe_decoy_addr("169.254.169.254", 443).await;
+        assert_eq!(
+            addr, None,
+            "cloud metadata endpoint must never be reachable via decoy fallback"
+        );
+    }
+
+    // ---------- полный хендшейк клиент↔сервер по настоящему TCP ----------
+
+    /// Легитимный хендшейк: клиент шлёт настоящий ClientHello+CCS, сервер
+    /// проверяет auth-тег, отвечает ServerHello+CCS, клиент шлёт auth-кадр —
+    /// всё по реальному TCP-сокету (не в памяти), с реальными таймингами и
+    /// разбиением на TCP-чтения. Проверяет именно то, что не покрывают чисто
+    /// байтовые юнит-тесты: что CCS/версия/хендшейк действительно
+    /// синхронизируются через настоящий сокет, а не только в идеальном
+    /// одноразовом буфере.
+    #[tokio::test]
+    async fn legitimate_handshake_succeeds_over_real_tcp() {
+        NetworkConfig::init_global(1500);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let conn = Connection::new(stream);
+            let handler = ServerHandler::new(
+                conn,
+                Arc::new(SessionManager::new()),
+                Arc::from("example.com"),
+            );
+            // run() продолжает в muxer/engine после хендшейка и вернётся сам,
+            // как только клиент закроет сокет (наш тест-клиент не шлёт
+            // ничего сверх auth-кадра) — достаточно не повиснуть навсегда.
+            handler.run().await
+        });
+
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let session_id = SessionManager::generate_id();
+        let handshake = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            ClientHandler::perform_handshake(
+                stream,
+                &session_id,
+                0,
+                BrowserProfile::for_session(&session_id),
+                &Arc::<str>::from("example.com"),
+            ),
+        )
+        .await
+        .expect("handshake must not hang")
+        .expect("legitimate handshake must succeed");
+
+        let (_inbound, _outbound, _rx_codec, _tx_codec) = handshake;
+        drop(_inbound);
+        drop(_outbound);
+
+        // Сервер должен либо уже завершиться, либо завершиться вскоре после
+        // того, как клиент уронил сокет (EOF в движке туннеля) — не повиснуть.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), server_task).await;
+    }
+
+    /// Мусорный (не-NRXP) ClientHello должен уводить сервер в stealth-fallback,
+    /// а не в панику/зависание. decoy_host намеренно указывает на
+    /// незарезолвливаемое имя — тест офлайновый, реальный интернет не нужен;
+    /// нас интересует, что сервер аккуратно завершает соединение, а не падает
+    /// и не висит вечно.
+    #[tokio::test]
+    async fn garbage_client_hello_triggers_fallback_without_hanging() {
+        NetworkConfig::init_global(1500);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let conn = Connection::new(stream);
+            let handler = ServerHandler::new(
+                conn,
+                Arc::new(SessionManager::new()),
+                Arc::from("this-host-does-not-resolve.invalid"),
+            );
+            handler.run().await
+        });
+
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        // Валидная по форме TLS Handshake-запись (content_type=0x16, версия,
+        // длина=5, ровно 5 байт тела), но тело — мусор, не ClientHello/ServerHello.
+        // Это специально ОТЛИЧАЕТСЯ от "просто разорвал соединение": здесь
+        // сервер должен дойти до Err(_) в unpack_handshake (парсинг записи
+        // прошёл, разбор hello — нет) и сразу уйти в fallback, а не ждать
+        // TLS_HELLO_TIMEOUT из-за "недостаточно данных".
+        stream
+            .write_all(&[0x16, 0x03, 0x03, 0x00, 0x05, 0xDE, 0xAD, 0xBE, 0xEF, 0x00])
+            .await
+            .unwrap();
+        drop(stream);
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(15), server_task).await;
+        assert!(
+            result.is_ok(),
+            "server must not hang forever on a non-NRXP ClientHello"
+        );
+        // handle_stealth_fallback возвращает Ok(()) даже если decoy недостижим —
+        // соединение просто тихо закрывается, как и было задумано.
+        assert!(matches!(result.unwrap().unwrap(), Ok(())));
     }
 }

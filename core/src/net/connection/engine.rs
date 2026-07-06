@@ -92,13 +92,13 @@ impl TunnelEngine {
     /// создаёт TCP-сокет с тюнингом буферов и проводит хендшейк заново. Возвращает
     /// свежие половинки сокета и кодеки.
     ///
-    /// `attempt` выбирает профиль браузера через [`BrowserProfile::for_attempt`]
-    /// (см. [`ClientHandler::establish_leg`](crate::net::connection::ClientHandler::establish_leg)) —
-    /// раньше внутренний реконнект был жёстко зашит на `CHROME_131` и не
-    /// участвовал в fallback-ротации профилей вовсе.
+    /// Профиль браузера выбирается через [`BrowserProfile::for_session`] по
+    /// `self.session_id` — тот же стабильный отпечаток, что и при первичном
+    /// установлении ноги в
+    /// [`ClientHandler::establish_leg`](crate::net::connection::ClientHandler::establish_leg),
+    /// а не новый на каждую попытку реконнекта (см. doc на `for_session`).
     pub async fn attempt_reconnect(
         &mut self,
-        attempt: u32,
     ) -> Result<(OwnedReadHalf, OwnedWriteHalf, RxCodec, TxCodec), AppError> {
         info!("🔄 Attempting reconnect to {}", self.remote_addr);
 
@@ -125,7 +125,7 @@ impl TunnelEngine {
             .map_err(|_| AppError::new(ERR_INFRA_TIMEOUT, "Сбой сети", "Reconnect timeout"))?
             .map_err(|e| AppError::new(ERR_INFRA_TIMEOUT, "Сбой сети", e.to_string()))?;
 
-        let profile = crate::tlseng::BrowserProfile::for_attempt(attempt);
+        let profile = crate::tlseng::BrowserProfile::for_session(&self.session_id);
         crate::net::ClientHandler::perform_handshake(
             stream,
             &self.session_id,
@@ -169,7 +169,7 @@ impl TunnelEngine {
                 }
 
                 self.leg_status = LegStatus::Reconnecting;
-                match self.attempt_reconnect(internal_attempt).await {
+                match self.attempt_reconnect().await {
                     Ok((new_in, new_out, new_rx, new_tx)) => {
                         internal_attempt = 0; // successful reconnect — reset counter
 
@@ -547,7 +547,10 @@ impl TunnelEngine {
 
         if packets.len() == 1 {
             let write_future = outbound.write_all(&packets[0]);
-            if tokio::time::timeout(write_timeout, write_future).await.is_err() {
+            if tokio::time::timeout(write_timeout, write_future)
+                .await
+                .is_err()
+            {
                 return Err(stuck());
             }
         } else if !packets.is_empty() {
@@ -557,7 +560,10 @@ impl TunnelEngine {
                 batch.extend_from_slice(pkt);
             }
             let write_future = outbound.write_all(&batch);
-            if tokio::time::timeout(write_timeout, write_future).await.is_err() {
+            if tokio::time::timeout(write_timeout, write_future)
+                .await
+                .is_err()
+            {
                 return Err(stuck());
             }
         }

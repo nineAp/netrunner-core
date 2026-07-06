@@ -4,3 +4,6 @@ hosts_cache.txt
 /gen
 .env
 repomix-output.xml
+/logs
+netrunner_diagnostics.jsonl
+netrunner_client_diag_*.jsonl

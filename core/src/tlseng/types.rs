@@ -7,12 +7,18 @@
 //! - наборы для отпечатка: [`TlsGroups`], [`TlsSignatures`], [`TlsVersions`],
 //!   [`TlsExtensions`], [`ExtensionOrder`].
 
-/// Тип TLS-записи (первый байт на проводе). Мы используем три из них:
+/// Тип TLS-записи (первый байт на проводе). Мы используем четыре из них:
 /// `Handshake` для hello-сообщений, `ApplicationData` для кадров NRXP,
-/// `Alert` распознаём для совместимости.
+/// `Alert` распознаём для совместимости, `ChangeCipherSpec` — фиктивная запись
+/// middlebox-совместимости TLS 1.3 (RFC 8446 Appendix D.4): настоящие браузеры
+/// шлют её сразу после своего Hello, и её отсутствие в последовательности
+/// типов TLS-записей само по себе отличает нестандартный TLS-стек от
+/// браузерного трафика — криптографически в TLS 1.3 она ничего не значит.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ContentType {
+    ChangeCipherSpec = 0x14,
+
     Handshake = 0x16,
 
     ApplicationData = 0x17,
@@ -25,6 +31,7 @@ impl TryFrom<u8> for ContentType {
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
+            0x14 => Ok(ContentType::ChangeCipherSpec),
             0x16 => Ok(ContentType::Handshake),
             0x17 => Ok(ContentType::ApplicationData),
             0x15 => Ok(ContentType::Alert),
