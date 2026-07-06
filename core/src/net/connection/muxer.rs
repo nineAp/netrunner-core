@@ -299,6 +299,19 @@ pub struct Muxer {
     /// so a burst of new streams spreads across legs instead of all binding to
     /// the single current-best one (thundering herd).
     rr_counter: Arc<AtomicU32>,
+    /// Байты ног, которые уже отцеплены (реконнект/эвикт) — без этого
+    /// `total_bytes()` был бы не монотонным: у новой ноги счётчик стартует с
+    /// нуля, и частые переподключения занижали бы расход трафика для лимитов
+    /// (см. `total_bytes`/`fold_removed_leg`).
+    cumulative_tx: Arc<AtomicU64>,
+    cumulative_rx: Arc<AtomicU64>,
+    /// Идентификатор юзера-владельца сессии для отчёта о расходе трафика
+    /// прокси-серверу (`None` — авторизация выключена или это клиентская
+    /// сторона муксера, отчёты о трафике шлёт только сервер).
+    quota_user_id: Arc<ArcSwap<Option<String>>>,
+    /// Сколько байт (tx+rx) уже было отчитано бэкенду по этой сессии —
+    /// следующий тик репортит только дельту сверх этого значения.
+    quota_reported_bytes: Arc<AtomicU64>,
 }
 
 impl Muxer {
@@ -313,9 +326,63 @@ impl Muxer {
             pending_pings: Arc::new(DashMap::new()),
             session_id: Arc::new(session_id),
             rr_counter: Arc::new(AtomicU32::new(0)),
+            cumulative_tx: Arc::new(AtomicU64::new(0)),
+            cumulative_rx: Arc::new(AtomicU64::new(0)),
+            quota_user_id: Arc::new(ArcSwap::from_pointee(None)),
+            quota_reported_bytes: Arc::new(AtomicU64::new(0)),
         };
         muxer.spawn_backlog_reaper();
         muxer
+    }
+
+    /// Складывает байты ноги, которая уходит из `legs` (эвикт/реконнект), в
+    /// сессионный кумулятивный счётчик — вызывать сразу после `DashMap::remove`.
+    fn fold_removed_leg(&self, leg: &MuxLeg) {
+        self.cumulative_tx
+            .fetch_add(leg.stats.tx_bytes.load(Ordering::Relaxed), Ordering::Relaxed);
+        self.cumulative_rx
+            .fetch_add(leg.stats.rx_bytes.load(Ordering::Relaxed), Ordering::Relaxed);
+    }
+
+    /// Суммарный трафик сессии (все ноги, включая уже отцепленные) — источник
+    /// истины для отчётов о расходе прокси-серверу бэкенду.
+    pub fn total_bytes(&self) -> (u64, u64) {
+        let mut tx = self.cumulative_tx.load(Ordering::Relaxed);
+        let mut rx = self.cumulative_rx.load(Ordering::Relaxed);
+        for leg in self.active_legs_cache.load_full().iter() {
+            tx += leg.stats.tx_bytes.load(Ordering::Relaxed);
+            rx += leg.stats.rx_bytes.load(Ordering::Relaxed);
+        }
+        (tx, rx)
+    }
+
+    /// Привязывает сессию к юзеру бэкенда — вызывается один раз при успешной
+    /// проверке auth-токена первой ноги сессии (см. `ServerHandler::run`).
+    pub fn set_quota_user(&self, user_id: String) {
+        self.quota_user_id.store(Arc::new(Some(user_id)));
+    }
+
+    pub fn quota_user_id(&self) -> Option<String> {
+        self.quota_user_id.load_full().as_ref().clone()
+    }
+
+    /// Дельта трафика с прошлого репорта и (не блокирующий) сдвиг базовой
+    /// точки — вызывающий обязан либо реально отправить дельту бэкенду, либо
+    /// не звать этот метод (в отличие от `store`, здесь нет отмены на ошибку:
+    /// невозможность связаться с бэкендом не должна накапливать неограниченно
+    /// растущую "недоотчитанную" дельту).
+    pub fn take_usage_delta(&self) -> u64 {
+        let (tx, rx) = self.total_bytes();
+        let total = tx + rx;
+        let last = self.quota_reported_bytes.swap(total, Ordering::Relaxed);
+        total.saturating_sub(last)
+    }
+
+    /// Откатывает базовую точку назад на `delta` — вызывать, если репорт
+    /// бэкенду не удался, чтобы не потерять дельту навсегда.
+    pub fn rollback_usage_delta(&self, delta: u64) {
+        self.quota_reported_bytes
+            .fetch_sub(delta.min(self.quota_reported_bytes.load(Ordering::Relaxed)), Ordering::Relaxed);
     }
 
     /// Фоновый "ридер" бэклогов: единственное место, которое реально закрывает
@@ -443,7 +510,9 @@ impl Muxer {
             .get(&leg_id)
             .map_or(false, |leg| leg.control_tx.same_channel(tx));
         if should_remove {
-            self.legs.remove(&leg_id);
+            if let Some((_, leg)) = self.legs.remove(&leg_id) {
+                self.fold_removed_leg(&leg);
+            }
             // Unbind streams BEFORE refreshing the cache so a concurrent
             // select_leg never re-binds a stream to the leg we are evicting.
             self.clear_bindings_for_leg(leg_id);
@@ -457,7 +526,8 @@ impl Muxer {
 
     /// Безусловно удаляет ногу (без сверки канала) — при выходе её движка.
     pub fn force_remove_leg(&self, leg_id: u32) {
-        if self.legs.remove(&leg_id).is_some() {
+        if let Some((_, leg)) = self.legs.remove(&leg_id) {
+            self.fold_removed_leg(&leg);
             self.clear_bindings_for_leg(leg_id);
             self.update_legs_cache();
             info!(leg_id, "MUXER: TCP leg force-removed on engine exit");
@@ -466,6 +536,9 @@ impl Muxer {
 
     /// Сбрасывает все ноги и привязки (полная остановка туннеля).
     pub fn remove_all_legs(&self) {
+        for entry in self.legs.iter() {
+            self.fold_removed_leg(entry.value());
+        }
         self.legs.clear();
         self.stream_bindings.clear();
         self.update_legs_cache();
@@ -1119,8 +1192,7 @@ impl Muxer {
             self.session_id
         ));
 
-        let mut total_tx = 0;
-        let mut total_rx = 0;
+        let (total_tx, total_rx) = self.total_bytes();
         let mut legs_info = Vec::new();
 
         let cached_legs = self.active_legs_cache.load_full();
@@ -1128,8 +1200,6 @@ impl Muxer {
             let tx = leg.stats.tx_bytes.load(Ordering::Relaxed);
             let rx = leg.stats.rx_bytes.load(Ordering::Relaxed);
             let rtt = leg.stats.rtt_ms.load(Ordering::Relaxed);
-            total_tx += tx;
-            total_rx += rx;
 
             let rtt_str = if rtt == 0 {
                 "N/A".to_string()

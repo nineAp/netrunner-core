@@ -120,6 +120,7 @@ impl SessionManager {
         killswitch_enabled: bool,
         excluded_apps: Vec<String>,
         excluded_domains: Vec<String>,
+        auth_token: Option<String>,
     ) -> Arc<Session> {
         netrunner_logger::Logger::init(None, false);
         netrunner_logger::Logger::global().set_level("error");
@@ -136,7 +137,8 @@ impl SessionManager {
             .with_killswitch(killswitch_enabled)
             .with_excluded_apps(excluded_apps)
             .with_excluded_domains(excluded_domains)
-            .with_decoy_sni(sni);
+            .with_decoy_sni(sni)
+            .with_auth_token(auth_token);
 
         #[cfg(any(target_os = "android", target_os = "ios"))]
         {

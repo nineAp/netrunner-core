@@ -10,12 +10,16 @@
 // Workaround for rustc 1.94 ICE in check_mod_deathness (dead-code MIR pass).
 #![allow(dead_code)]
 
+mod backend_client;
 mod diagnostics;
 mod network;
 use clap::Parser;
+use netrunner_core::net::AuthValidator;
 use netrunner_logger::Logger;
+use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
+use crate::backend_client::BackendClient;
 use crate::network::Network;
 
 /// Аргументы командной строки сервера.
@@ -36,13 +40,37 @@ struct Args {
     /// атрибут ноды, можно задавать разный на каждом развёртывании.
     #[arg(long, default_value = netrunner_core::net::DEFAULT_DECOY_HOST)]
     decoy_host: String,
+
+    /// Требовать валидный Bearer-токен (выданный `netrunner-backend`) от
+    /// каждого клиента и отчитываться о расходе трафика для динамических
+    /// лимитов. Выключено по умолчанию — включается по инстансу, не меняя
+    /// поведение уже развёрнутых нод без этого флага.
+    #[arg(long, default_value_t = false)]
+    require_auth: bool,
+
+    /// URL control-plane бэкенда для проверки токенов/отчётов о трафике.
+    /// Обязателен, только если передан `--require-auth`.
+    #[arg(long)]
+    backend_url: Option<String>,
 }
 
 fn main() {
     Logger::init("./logs".into(), true);
     Logger::global().set_level("info");
     let args = Args::parse();
-    let net = Network::new(args.host, args.port, args.decoy_host);
+
+    let auth: Option<Arc<dyn AuthValidator>> = if args.require_auth {
+        let backend_url = args
+            .backend_url
+            .expect("--require-auth требует --backend-url");
+        let internal_secret = std::env::var("PROXY_INTERNAL_SECRET")
+            .expect("--require-auth требует переменную окружения PROXY_INTERNAL_SECRET");
+        Some(Arc::new(BackendClient::new(backend_url, internal_secret)))
+    } else {
+        None
+    };
+
+    let net = Network::new(args.host, args.port, args.decoy_host, auth);
 
     let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
 

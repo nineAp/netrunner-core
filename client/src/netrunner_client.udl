@@ -17,7 +17,8 @@ interface SessionManager {
         string cache_path,
         boolean killswitch_enabled,
         sequence<string> excluded_apps,
-        sequence<string> excluded_domains
+        sequence<string> excluded_domains,
+        string? auth_token
     );
     VpnTrafficStats get_traffic_stats();
 };

@@ -775,6 +775,11 @@ pub struct EngineConfig {
     /// приходить динамически со списком серверов (вместе с их собственным
     /// `--decoy-host`), чтобы клиент и сервер не расходились в выборе decoy-хоста.
     pub decoy_sni: String,
+    /// Bearer-токен клиента (JWT, выданный `netrunner-backend` при логине) —
+    /// отправляется серверу в auth-кадре. `None`, если сервер не запущен с
+    /// `--require-auth` или приложение ещё не залогинено (Ghost Protocol seed
+    /// генерируется/логинится в фоне почти сразу, см. `netrunner-app/src/lib/api.ts`).
+    pub auth_token: Option<String>,
 }
 
 impl EngineConfig {
@@ -791,11 +796,17 @@ impl EngineConfig {
             excluded_apps: Vec::new(),
             excluded_domains: Vec::new(),
             decoy_sni: netrunner_core::net::DEFAULT_DECOY_HOST.to_string(),
+            auth_token: None,
         }
     }
 
     pub fn with_decoy_sni(mut self, decoy_sni: impl Into<String>) -> Self {
         self.decoy_sni = decoy_sni.into();
+        self
+    }
+
+    pub fn with_auth_token(mut self, auth_token: Option<String>) -> Self {
+        self.auth_token = auth_token;
         self
     }
 
@@ -901,6 +912,7 @@ impl EngineBuilder {
         let muxer = ClientHandler::connect(
             &self.config.remote_address,
             self.config.decoy_sni.clone(),
+            self.config.auth_token.clone(),
             rx_for_client_handler,
             tx_for_client_handler,
         )

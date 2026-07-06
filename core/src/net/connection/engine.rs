@@ -85,6 +85,9 @@ pub(crate) struct TunnelEngine {
     /// [`ClientHandler::connect`](crate::net::connection::ClientHandler::connect));
     /// нужен для внутреннего реконнекта в [`attempt_reconnect`](Self::attempt_reconnect).
     pub decoy_sni: Arc<str>,
+    /// Bearer-токен клиента (пусто — авторизация выключена/не залогинен),
+    /// нужен для того же внутреннего реконнекта, что и `decoy_sni` выше.
+    pub auth_token: Arc<str>,
 }
 
 impl TunnelEngine {
@@ -132,6 +135,7 @@ impl TunnelEngine {
             self.leg_id,
             profile,
             &self.decoy_sni,
+            &self.auth_token,
         )
         .await
     }

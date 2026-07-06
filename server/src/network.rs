@@ -7,10 +7,10 @@
 //! спавнит `ServerHandler::run` из ядра под отдельным tracing-span клиента.
 
 use netrunner_core::net::{
-    Connection, NetworkConfig, ServerHandler, SessionManager, TunnelHandler,
+    AuthValidator, Connection, NetworkConfig, ServerHandler, SessionManager, TunnelHandler,
     TOPOLOGY_PRINT_INTERVAL,
 };
-use netrunner_logger::{error, info};
+use netrunner_logger::{error, info, warn};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
@@ -24,14 +24,23 @@ pub struct Network {
     /// Домен-декой этой ноды для stealth-fallback (атрибут ноды — задаётся при
     /// старте через `--decoy-host`, раньше был захардкожен на `ubuntu.com`).
     decoy_host: Arc<str>,
+    /// `None` — `--require-auth` не передан, авторизация и лимиты трафика
+    /// выключены на этом инстансе целиком (поведение как до этой фичи).
+    auth: Option<Arc<dyn AuthValidator>>,
 }
 
 impl Network {
-    pub fn new(host: String, port: u16, decoy_host: impl Into<Arc<str>>) -> Self {
+    pub fn new(
+        host: String,
+        port: u16,
+        decoy_host: impl Into<Arc<str>>,
+        auth: Option<Arc<dyn AuthValidator>>,
+    ) -> Self {
         Self {
             host,
             port,
             decoy_host: decoy_host.into(),
+            auth,
         }
     }
 
@@ -54,6 +63,7 @@ impl Network {
         Arc::new(ClientDiagnosticsLogger::new(".")).start();
 
         let sm_clone = session_manager.clone();
+        let quota_auth = self.auth.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(TOPOLOGY_PRINT_INTERVAL).await;
@@ -72,6 +82,44 @@ impl Network {
                 }
 
                 sm_clone.print_all_sessions();
+
+                // Динамические лимиты трафика: только сессии с проверенным
+                // владельцем (`--require-auth` включён и хендшейк прошёл
+                // валидацию токена, см. `ServerHandler::run`). Бэкенд читает
+                // текущий лимит из БД на каждый вызов — админ меняет его в
+                // любой момент, следующий тик подхватит новое значение без
+                // перезапуска прокси.
+                if let Some(validator) = &quota_auth {
+                    for entry in sm_clone.get_session().iter() {
+                        let muxer = entry.value().clone();
+                        let Some(user_id) = muxer.quota_user_id() else {
+                            continue;
+                        };
+                        let delta = muxer.take_usage_delta();
+                        if delta == 0 {
+                            continue;
+                        }
+                        match validator.report_usage(&user_id, delta).await {
+                            Ok(report) if report.over_limit => {
+                                warn!(
+                                    user_id,
+                                    used = report.used_bytes,
+                                    limit = ?report.limit_bytes,
+                                    "🚫 Traffic limit exceeded, tearing down session"
+                                );
+                                muxer.remove_all_legs();
+                                sm_clone.remove(muxer.session_id());
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                // Бэкенд недоступен/ошибка — не терять дельту
+                                // навсегда, отчитаемся вместе со следующим тиком.
+                                muxer.rollback_usage_delta(delta);
+                                warn!(user_id, error = %e, "Usage report failed, will retry");
+                            }
+                        }
+                    }
+                }
             }
         });
         info!("🌐 Netrunner Server: Listening on {}", addr);
@@ -94,6 +142,7 @@ impl Network {
                             conn,
                             session_manager.clone(),
                             self.decoy_host.clone(),
+                            self.auth.clone(),
                         );
 
                     tokio::spawn(async move {

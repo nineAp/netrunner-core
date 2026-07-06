@@ -1651,9 +1651,13 @@ dependencies = [
 name = "netrunner-server"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "clap",
+ "dashmap",
  "netrunner-core",
  "netrunner-logger",
+ "reqwest",
+ "serde",
  "serde_json",
  "tokio",
  "tokio-util",

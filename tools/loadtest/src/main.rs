@@ -194,10 +194,15 @@ async fn run_virtual_user(
 
     let started = Instant::now();
 
-    let muxer =
-        match ClientHandler::connect(&server_addr, "example.com", rx_from_engine, tx_to_engine)
-            .await
-        {
+    let muxer = match ClientHandler::connect(
+        &server_addr,
+        "example.com",
+        None,
+        rx_from_engine,
+        tx_to_engine,
+    )
+    .await
+    {
             Ok(m) => m,
             Err(_) => {
                 stats.handshake_failures.fetch_add(1, Relaxed);

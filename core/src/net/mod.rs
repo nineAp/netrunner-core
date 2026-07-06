@@ -35,11 +35,13 @@
 //! хендлеры/менеджер сессий (через `connection`) и [`Muxer`] с глобальной оценкой
 //! [`GLOBAL_MIN_RTT`], а также все константы.
 
+mod auth;
 mod config;
 mod connection;
 mod constants;
 pub mod diagnostics;
 
+pub use auth::{AuthValidator, UsageReport, UserQuota};
 pub use config::NetworkConfig;
 pub use connection::{
     ClientHandler, Connection, Muxer, ServerHandler, SessionManager, TunnelHandler, GLOBAL_MIN_RTT,

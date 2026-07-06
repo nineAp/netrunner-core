@@ -254,13 +254,15 @@ impl ClientHandler {
     /// Шаги: послать поддельный `ClientHello` (профиль браузера по `profile`,
     /// SNI=`decoy_sni`) → дождаться `ServerHello` и вывести ключи → зарядить
     /// шифр и кодек → отправить первый зашифрованный auth-кадр `Heartbeat` с
-    /// `"session_id:leg_id"`. Возвращает половинки сокета и готовые кодеки.
+    /// `"session_id:leg_id:auth_token"` (третий сегмент может быть пустым).
+    /// Возвращает половинки сокета и готовые кодеки.
     pub(crate) async fn perform_handshake(
         stream: tokio::net::TcpStream,
         session_id: &str,
         leg_id: u32,
         profile: &BrowserProfile,
         decoy_sni: &str,
+        auth_token: &str,
     ) -> Result<
         (
             OwnedReadHalf,
@@ -346,7 +348,10 @@ impl ClientHandler {
         let codec = Codec::new(cipher, session_keys.get_auth_key());
         let (rx_codec, mut tx_codec) = codec.split();
 
-        let auth_payload = Bytes::from(format!("{}:{}", session_id, leg_id));
+        // Третий сегмент — Bearer-токен клиента (пусто, если `--require-auth`
+        // выключен на этом развёртывании или приложение ещё не залогинено).
+        // Сервер игнорирует его целиком, если сам не запущен с `--require-auth`.
+        let auth_payload = Bytes::from(format!("{}:{}:{}", session_id, leg_id, auth_token));
         let encrypted_auth = tx_codec
             .encode_frame(0, FrameType::Heartbeat, auth_payload)
             .map_err(|e| {
@@ -383,6 +388,7 @@ impl ClientHandler {
         muxer: Arc<Muxer>,
         session_id: &str,
         decoy_sni: &Arc<str>,
+        auth_token: &Arc<str>,
     ) -> Result<(), AppError> {
         let leg_name = format!("TCP-Leg-{}", leg_id);
 
@@ -426,7 +432,8 @@ impl ClientHandler {
 
         let profile = BrowserProfile::for_session(session_id);
         let (inbound, outbound, rx_codec, tx_codec) =
-            Self::perform_handshake(stream, session_id, leg_id, profile, decoy_sni).await?;
+            Self::perform_handshake(stream, session_id, leg_id, profile, decoy_sni, auth_token)
+                .await?;
 
         let cap = NetworkConfig::global().channel_capacity;
         let (control_tx, control_rx) = mpsc::channel::<MuxMessage>(cap);
@@ -451,6 +458,7 @@ impl ClientHandler {
             session_id: session_id.to_string(),
             leg_status: crate::net::connection::engine::LegStatus::Active,
             decoy_sni: decoy_sni.clone(),
+            auth_token: auth_token.clone(),
         };
 
         let run_result = engine.run().await;
@@ -487,10 +495,12 @@ impl ClientHandler {
     pub async fn connect(
         remote_proxy_addr: &str,
         decoy_sni: impl Into<Arc<str>>,
+        auth_token: Option<String>,
         mut rx_from_engine: mpsc::Receiver<RawCastFrame>,
         tx_to_engine: mpsc::Sender<RawCastFrame>,
     ) -> Result<Arc<Muxer>, AppError> {
         let decoy_sni: Arc<str> = decoy_sni.into();
+        let auth_token: Arc<str> = auth_token.unwrap_or_default().into();
         let session_id = SessionManager::generate_id();
         let muxer = Arc::new(Muxer::new(true, session_id.clone()));
         let registry: Arc<DashMap<u32, (u64, Ipv4Addr, u16, LocalProtocol)>> =
@@ -524,12 +534,14 @@ impl ClientHandler {
             let m = muxer.clone();
             let sid = session_id.clone();
             let decoy_sni = decoy_sni.clone();
+            let auth_token = auth_token.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(LEG_STAGGER_DELAY * id).await;
                 let mut attempt: u32 = 0;
                 loop {
                     if let Err(e) =
-                        Self::establish_leg(&addr, id, m.clone(), &sid, &decoy_sni).await
+                        Self::establish_leg(&addr, id, m.clone(), &sid, &decoy_sni, &auth_token)
+                            .await
                     {
                         attempt += 1;
                         error!("Leg {} disconnected: {}. Reconnecting in 2s...", id, e);
@@ -845,6 +857,10 @@ pub struct ServerHandler {
     /// Домен-декой для stealth-fallback (атрибут ноды, задаётся при старте
     /// сервера через `--decoy-host`; раньше был захардкожен на `ubuntu.com`).
     pub(crate) decoy_host: Arc<str>,
+    /// `None` — авторизация выключена на этом инстансе (`--require-auth` не
+    /// передан), поведение как до этой фичи. `Some` — токен клиента
+    /// обязателен и проверяется бэкендом при установке первой ноги сессии.
+    pub(crate) auth: Option<Arc<dyn crate::net::AuthValidator>>,
 }
 
 impl ServerHandler {
@@ -852,11 +868,13 @@ impl ServerHandler {
         connection: Connection,
         session_manager: Arc<SessionManager>,
         decoy_host: Arc<str>,
+        auth: Option<Arc<dyn crate::net::AuthValidator>>,
     ) -> Self {
         Self {
             conn: connection,
             session_manager,
             decoy_host,
+            auth,
         }
     }
 
@@ -1067,17 +1085,18 @@ impl TunnelHandler for ServerHandler {
         let codec = Codec::new(cipher, session_keys.get_auth_key());
         let (mut rx_codec, tx_codec) = codec.split();
 
-        let (session_id, leg_id) = loop {
+        let (session_id, leg_id, auth_token) = loop {
             match rx_codec.decode_inbound(&mut read_buf) {
                 Ok(Some(frame)) => {
                     if frame.header.frame_type == FrameType::Heartbeat {
                         let payload_str = std::str::from_utf8(&frame.payload).unwrap_or("");
-                        let parts: Vec<&str> = payload_str.split(':').collect();
-                        if parts.len() == 2 && parts[1].parse::<u32>().is_ok() {
+                        let parts: Vec<&str> = payload_str.splitn(3, ':').collect();
+                        if parts.len() == 3 && parts[1].parse::<u32>().is_ok() {
                             let sid = parts[0].to_string();
                             let lid: u32 = parts[1].parse().unwrap();
+                            let token = parts[2].to_string();
                             info!("🤝 Secure Auth verified! Session: {}, Leg: {}", sid, lid);
-                            break (sid, lid);
+                            break (sid, lid, token);
                         }
                     }
                     return Err(AppError::new(
@@ -1122,6 +1141,19 @@ impl TunnelHandler for ServerHandler {
         };
 
         let muxer = self.session_manager.get_or_create(&session_id);
+
+        // Проверка личности клиента у бэкенда — только если этот инстанс
+        // запущен с `--require-auth`. До этой точки соединение прошло
+        // Netrunner-хендшейк (не сканер/чужой TLS-клиент), поэтому отказ здесь
+        // — обычный разрыв, а не stealth-fallback (светить уже нечего).
+        if let Some(validator) = &self.auth {
+            let quota = validator.validate(&auth_token).await.map_err(|e| {
+                warn!("❌ Backend rejected client token: {}", e.internal_msg);
+                AppError::new(ERR_AUTH_FAILED, "Доступ запрещен", e.internal_msg)
+            })?;
+            muxer.set_quota_user(quota.user_id);
+        }
+
         let cap = NetworkConfig::global().channel_capacity;
         let (control_tx, control_rx) = mpsc::channel::<MuxMessage>(cap);
         let (data_tx, data_rx) = mpsc::channel::<MuxMessage>(cap);
@@ -1152,8 +1184,9 @@ impl TunnelHandler for ServerHandler {
             session_id,
             leg_status: crate::net::connection::engine::LegStatus::Active,
             // Сервер никогда не реконнектит (см. `attempt_reconnect`'s early
-            // return on empty `remote_addr`), поэтому SNI здесь не используется.
+            // return on empty `remote_addr`), поэтому SNI/токен здесь не используются.
             decoy_sni: Arc::from(""),
+            auth_token: Arc::from(""),
         };
 
         let res = engine.run().await;
@@ -1326,6 +1359,7 @@ mod tests {
                 conn,
                 Arc::new(SessionManager::new()),
                 Arc::from("example.com"),
+                None,
             );
             // run() продолжает в muxer/engine после хендшейка и вернётся сам,
             // как только клиент закроет сокет (наш тест-клиент не шлёт
@@ -1343,6 +1377,7 @@ mod tests {
                 0,
                 BrowserProfile::for_session(&session_id),
                 &Arc::<str>::from("example.com"),
+                "",
             ),
         )
         .await
@@ -1376,6 +1411,7 @@ mod tests {
                 conn,
                 Arc::new(SessionManager::new()),
                 Arc::from("this-host-does-not-resolve.invalid"),
+                None,
             );
             handler.run().await
         });
