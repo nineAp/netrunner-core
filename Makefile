@@ -123,7 +123,12 @@ deploy-dev: build-server
 	rsync $(RSYNC_OPTS) target/release/netrunner-server $(REMOTE_USER)@$(DEV_IP):$(REMOTE_PATH)/
 	
 	@echo "--- [3/4] Обновление конфигурации systemd ---"
-	rsync $(RSYNC_OPTS) server/netrunner-server.dev.service $(REMOTE_USER)@$(DEV_IP):/etc/systemd/system/
+	# Локальный файл называется *.dev.service (чтобы не путать с прод-юнитом в
+	# репозитории), но systemctl start $(SERVICE_NAME) ищет ровно
+	# "$(SERVICE_NAME).service" — без явного целевого имени rsync клал файл
+	# под своим исходным именем, и юнит с новым портом/конфигом никогда не
+	# подхватывался (systemctl тихо продолжал использовать старый файл).
+	rsync $(RSYNC_OPTS) server/netrunner-server.dev.service $(REMOTE_USER)@$(DEV_IP):/etc/systemd/system/$(SERVICE_NAME).service
 	
 	@echo "--- [4/4] Перезапуск сервиса ---"
 	ssh $(SSH_OPTS) $(REMOTE_USER)@$(DEV_IP) "\
