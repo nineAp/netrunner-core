@@ -29,6 +29,6 @@ accept TCP → core::ServerHandler::run:
 
 ## Запуск и деплой
 
-Локально: `make debug-server` (биндится на `0.0.0.0:4443`). Релиз/деплой:
+Локально: `make debug-server` (биндится на `0.0.0.0:8443`). Релиз/деплой:
 `make build-server` → `make deploy-server` (systemd-сервис на VPS, см.
 `server/netrunner-server.service` и `Makefile`).

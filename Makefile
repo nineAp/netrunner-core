@@ -6,10 +6,15 @@ REMOTE_USER := $(strip $(REMOTE_USER))
 REMOTE_PATH := $(strip $(REMOTE_PATH))
 SERVICE_NAME := $(strip $(SERVICE_NAME))
 
-# Безопасное получение путей из ENV или дефолтов
+# Безопасное олучение путей из ENV или дефолтов
 ANDROID_ADB_HOST := $(strip $(ANDROID_ADB_HOST))
 ANDROID_BUILD_SRC := $(strip $(ANDROID_BUILD_SRC))
 ANDROID_PROJECT_LIBS := $(strip $(ANDROID_PROJECT_LIBS))
+
+# Дев-авторизация прокси (см. netrunner-proxy/.env) — секрет общий с
+# netrunner-backend/.env.dev, адрес — дев-стек backend (make dev там).
+PROXY_INTERNAL_SECRET := $(strip $(PROXY_INTERNAL_SECRET))
+DEV_BACKEND_URL := $(strip $(DEV_BACKEND_URL))
 # Опции для стабильного SSH/Rsync в условиях плохого коннекта
 # IPQoS=throughput помогает проталкивать пакеты через тайские магистрали
 SSH_OPTS = -o IPQoS=throughput -o ServerAliveInterval=30
@@ -50,8 +55,10 @@ debug-client:
 debug-server:
 	@echo "--- Сборка сервера (Debug) ---"
 	cargo build --bin netrunner-server
-	@echo "--- Запуск сервера локально ---"
-	sudo ./target/debug/netrunner-server --port=4443 --host=0.0.0.0
+	@echo "--- Запуск сервера локально (с авторизацией против дев-бэкенда) ---"
+	sudo PROXY_INTERNAL_SECRET=$(PROXY_INTERNAL_SECRET) ./target/debug/netrunner-server \
+		--port=8443 --host=0.0.0.0 \
+		--require-auth --backend-url $(DEV_BACKEND_URL)
 
 ABIS = arm64-v8a armeabi-v7a x86_64 x86
 
