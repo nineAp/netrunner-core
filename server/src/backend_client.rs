@@ -9,27 +9,105 @@
 use async_trait::async_trait;
 use dashmap::DashMap;
 use netrunner_core::net::{AuthValidator, UsageReport, UserQuota};
-use netrunner_logger::AppError;
+use netrunner_logger::{warn, AppError};
 use serde::{Deserialize, Serialize};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 const VALIDATE_CACHE_TTL: Duration = Duration::from_secs(60);
+
+/// Таймаут одного HTTP-запроса к бэкенду. Без него `reqwest::Client` ждёт
+/// ответ неограниченно долго на зависшем (не упавшем — именно зависшем)
+/// бэкенде: каждая проверка токена на КАЖДОМ новом клиенте висела бы, блокируя
+/// подключение новых пользователей, а не только тех, чей токен уже в кеше.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// После скольких подряд неудач (сетевая ошибка/таймаут/5xx — НЕ 4xx, отказ
+/// по конкретному токену не значит, что бэкенд нездоров) размыкаем цепь.
+const FAILURE_THRESHOLD: u32 = 5;
+/// Сколько цепь остаётся разомкнутой (запросы отклоняются мгновенно, без
+/// попытки реального HTTP-вызова и его таймаута) перед следующей пробой.
+const CIRCUIT_OPEN_COOLDOWN: Duration = Duration::from_secs(10);
+
+#[derive(Default)]
+struct CircuitState {
+    consecutive_failures: u32,
+    open_until: Option<Instant>,
+}
+
+/// Простейший circuit breaker: без внешней библиотеки, состояние — один
+/// `Mutex` с редкими короткими блокировками (проверка/запись пары полей,
+/// не сам HTTP-вызов). Цель — не ждать `REQUEST_TIMEOUT` на каждом клиенте
+/// подряд, если бэкенд уже несколько раз подряд не ответил, а быстро
+/// отказывать, пока не пройдёт cooldown.
+struct Circuit {
+    state: Mutex<CircuitState>,
+}
+
+impl Circuit {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(CircuitState::default()),
+        }
+    }
+
+    /// `true`, если цепь разомкнута прямо сейчас — вызывающий код должен
+    /// отказать быстро, не делая реальный HTTP-запрос.
+    fn is_open(&self) -> bool {
+        let state = self.state.lock().unwrap();
+        matches!(state.open_until, Some(until) if Instant::now() < until)
+    }
+
+    fn record_success(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.consecutive_failures = 0;
+        state.open_until = None;
+    }
+
+    /// Считать неудачей только сетевые ошибки/таймауты/5xx — HTTP 401/403 на
+    /// конкретный невалидный токен НЕ признак нездоровья бэкенда.
+    fn record_failure(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.consecutive_failures += 1;
+        if state.consecutive_failures >= FAILURE_THRESHOLD {
+            state.open_until = Some(Instant::now() + CIRCUIT_OPEN_COOLDOWN);
+            warn!(
+                failures = state.consecutive_failures,
+                "Circuit breaker разомкнут: бэкенд не отвечает {} раз подряд",
+                state.consecutive_failures
+            );
+        }
+    }
+}
 
 pub struct BackendClient {
     http: reqwest::Client,
     base_url: String,
     internal_secret: String,
     validate_cache: DashMap<String, (UserQuota, Instant)>,
+    circuit: Circuit,
 }
 
 impl BackendClient {
     pub fn new(base_url: String, internal_secret: String) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .timeout(REQUEST_TIMEOUT)
+                .build()
+                .expect("Failed to build reqwest client"),
             base_url: base_url.trim_end_matches('/').to_string(),
             internal_secret,
             validate_cache: DashMap::new(),
+            circuit: Circuit::new(),
         }
+    }
+
+    fn circuit_open_error() -> AppError {
+        AppError::new(
+            netrunner_logger::ERR_INFRA_TIMEOUT,
+            "Бэкенд недоступен",
+            "Circuit breaker open: backend недавно не отвечал несколько раз подряд, короткий отказ без повторной попытки",
+        )
     }
 }
 
@@ -76,6 +154,10 @@ impl AuthValidator for BackendClient {
             }
         }
 
+        if self.circuit.is_open() {
+            return Err(Self::circuit_open_error());
+        }
+
         let resp = self
             .http
             .post(format!("{}/api/v1/internal/validate", self.base_url))
@@ -84,6 +166,7 @@ impl AuthValidator for BackendClient {
             .send()
             .await
             .map_err(|e| {
+                self.circuit.record_failure();
                 AppError::new(
                     netrunner_logger::ERR_INFRA_TIMEOUT,
                     "Бэкенд недоступен",
@@ -91,6 +174,12 @@ impl AuthValidator for BackendClient {
                 )
             })?;
 
+        // 5xx — признак нездоровья самого бэкенда, считается неудачей для
+        // circuit breaker'а. 4xx (например 401 на невалидный токен) — это
+        // ожидаемый легитимный ответ на конкретный запрос, не поломка бэкенда.
+        if resp.status().is_server_error() {
+            self.circuit.record_failure();
+        }
         if !resp.status().is_success() {
             return Err(AppError::new(
                 netrunner_logger::ERR_AUTH_FAILED,
@@ -107,6 +196,7 @@ impl AuthValidator for BackendClient {
             )
         })?;
 
+        self.circuit.record_success();
         let quota = UserQuota {
             user_id: body.user_id,
             limit_bytes: body.limit_bytes,
@@ -118,6 +208,10 @@ impl AuthValidator for BackendClient {
     }
 
     async fn report_usage(&self, user_id: &str, delta_bytes: u64) -> Result<UsageReport, AppError> {
+        if self.circuit.is_open() {
+            return Err(Self::circuit_open_error());
+        }
+
         let resp = self
             .http
             .post(format!("{}/api/v1/internal/usage", self.base_url))
@@ -129,6 +223,7 @@ impl AuthValidator for BackendClient {
             .send()
             .await
             .map_err(|e| {
+                self.circuit.record_failure();
                 AppError::new(
                     netrunner_logger::ERR_INFRA_TIMEOUT,
                     "Бэкенд недоступен",
@@ -136,6 +231,9 @@ impl AuthValidator for BackendClient {
                 )
             })?;
 
+        if resp.status().is_server_error() {
+            self.circuit.record_failure();
+        }
         if !resp.status().is_success() {
             return Err(AppError::new(
                 netrunner_logger::ERR_INFRA_TIMEOUT,
@@ -152,6 +250,7 @@ impl AuthValidator for BackendClient {
             )
         })?;
 
+        self.circuit.record_success();
         Ok(UsageReport {
             used_bytes: body.used_bytes,
             limit_bytes: body.limit_bytes,
