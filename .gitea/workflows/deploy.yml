@@ -19,8 +19,10 @@
 # провижининге через netrunner-backend, см. NodeService::provision_node_via_ssh):
 # - PROXY_NODES_SSH_KEY — приватный SSH-ключ (root на все ноды)
 # - PROXY_INTERNAL_SECRET — тот же секрет, что и PROXY_INTERNAL_SECRET у бэкенда
-# - BACKEND_URL — публичный адрес control plane (WEB_APP_BASE_URL у бэкенда)
 # - GHCR_TOKEN — тот же, что и в build.yml
+#
+# Repo Variable (vars.*, не secret — публичный URL, не даёт доступа сам по себе):
+# - BACKEND_URL — публичный адрес control plane (WEB_APP_BASE_URL у бэкенда)
 name: Deploy Proxy Nodes
 
 on:
@@ -96,7 +98,7 @@ jobs:
               --port "${{ matrix.proxy_port }}" \
               --decoy-host "${{ matrix.decoy_host }}" \
               --require-auth \
-              --backend-url "${{ secrets.BACKEND_URL }}" \
+              --backend-url "${{ vars.BACKEND_URL }}" \
               --health-port 9091
 
             docker image prune -f
