@@ -175,7 +175,9 @@ impl Network {
                             self.auth.clone(),
                         );
 
-                        active_connections.fetch_add(1, Ordering::Relaxed);
+                        let active_now = active_connections.fetch_add(1, Ordering::Relaxed) + 1;
+                        metrics::gauge!("netrunner_connections_active").set(active_now as f64);
+                        metrics::counter!("netrunner_connections_total").increment(1);
                         let conn_counter = active_connections.clone();
                     tokio::spawn(async move {
                                 // "Входим" в этот Span. Все логи внутри handler.run() привяжутся к этому IP.
@@ -185,7 +187,8 @@ impl Network {
                         if let Err(e) = handler.run().await {
                             error!(error = %e, "⚠️ Server handler terminated with error");
                         }
-                        conn_counter.fetch_sub(1, Ordering::Relaxed);
+                        let active_now = conn_counter.fetch_sub(1, Ordering::Relaxed) - 1;
+                        metrics::gauge!("netrunner_connections_active").set(active_now as f64);
                         });
                     }
                 }
@@ -207,6 +210,9 @@ impl Network {
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
-        info!("✅ Drain завершён, соединений осталось: {}", active_connections.load(Ordering::Relaxed));
+        info!(
+            "✅ Drain завершён, соединений осталось: {}",
+            active_connections.load(Ordering::Relaxed)
+        );
     }
 }

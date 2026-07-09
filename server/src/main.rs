@@ -13,6 +13,7 @@
 mod backend_client;
 mod diagnostics;
 mod health;
+mod metrics_server;
 mod network;
 use clap::Parser;
 use netrunner_core::net::AuthValidator;
@@ -88,6 +89,13 @@ struct Args {
     /// этой же машине). Не задан — health-эндпоинт выключен.
     #[arg(long)]
     health_port: Option<u16>,
+
+    /// Порт для `/metrics` (Prometheus text exposition) — в отличие от
+    /// `--health-port`, биндится на 0.0.0.0 (нужен для скрейпа удалённым
+    /// центральным Prometheus), ОБЯЗАТЕЛЬНО зафайрволить на IP
+    /// observability-VPS. Не задан — метрики выключены.
+    #[arg(long)]
+    metrics_port: Option<u16>,
 }
 
 fn main() {
@@ -106,8 +114,15 @@ fn main() {
         None
     };
 
+    // Регистрируется один раз, до первого metrics::counter!/gauge!/histogram! —
+    // если --metrics-port не задан, вызовы макросов молча уходят в
+    // no-op recorder по умолчанию (штатное поведение крейта metrics).
+    let metrics_handle = args
+        .metrics_port
+        .map(|_| metrics_server::install_recorder());
+
     let net = Network::new(
-        args.host,
+        args.host.clone(),
         args.port,
         args.decoy_host,
         auth,
@@ -127,6 +142,16 @@ fn main() {
         let run_handle = tokio::spawn(async move {
             net.run(run_token).await;
         });
+
+        if let (Some(port), Some(handle)) = (args.metrics_port, metrics_handle) {
+            let metrics_token = token.clone();
+            tokio::spawn(metrics_server::run(
+                "0.0.0.0".to_string(),
+                port,
+                handle,
+                metrics_token,
+            ));
+        }
 
         shutdown_signal(token).await;
         if let Err(e) = run_handle.await {

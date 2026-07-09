@@ -62,6 +62,7 @@ impl Circuit {
         let mut state = self.state.lock().unwrap();
         state.consecutive_failures = 0;
         state.open_until = None;
+        metrics::gauge!("netrunner_circuit_breaker_open").set(0.0);
     }
 
     /// Считать неудачей только сетевые ошибки/таймауты/5xx — HTTP 401/403 на
@@ -71,6 +72,7 @@ impl Circuit {
         state.consecutive_failures += 1;
         if state.consecutive_failures >= FAILURE_THRESHOLD {
             state.open_until = Some(Instant::now() + CIRCUIT_OPEN_COOLDOWN);
+            metrics::gauge!("netrunner_circuit_breaker_open").set(1.0);
             warn!(
                 failures = state.consecutive_failures,
                 "Circuit breaker разомкнут: бэкенд не отвечает {} раз подряд",
@@ -140,6 +142,7 @@ struct UsageResponse {
 impl AuthValidator for BackendClient {
     async fn validate(&self, token: &str) -> Result<UserQuota, AppError> {
         if token.is_empty() {
+            metrics::counter!("netrunner_auth_failures_total").increment(1);
             return Err(AppError::new(
                 netrunner_logger::ERR_AUTH_FAILED,
                 "Доступ запрещен",
@@ -158,6 +161,7 @@ impl AuthValidator for BackendClient {
             return Err(Self::circuit_open_error());
         }
 
+        let request_start = Instant::now();
         let resp = self
             .http
             .post(format!("{}/api/v1/internal/validate", self.base_url))
@@ -173,6 +177,8 @@ impl AuthValidator for BackendClient {
                     e.to_string(),
                 )
             })?;
+        metrics::histogram!("netrunner_auth_validate_duration_seconds")
+            .record(request_start.elapsed().as_secs_f64());
 
         // 5xx — признак нездоровья самого бэкенда, считается неудачей для
         // circuit breaker'а. 4xx (например 401 на невалидный токен) — это
@@ -181,6 +187,7 @@ impl AuthValidator for BackendClient {
             self.circuit.record_failure();
         }
         if !resp.status().is_success() {
+            metrics::counter!("netrunner_auth_failures_total").increment(1);
             return Err(AppError::new(
                 netrunner_logger::ERR_AUTH_FAILED,
                 "Доступ запрещен",

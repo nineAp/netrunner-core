@@ -10,8 +10,8 @@
 //! [`ServerDiagnosticsLogger::snapshot_all_sessions`]).
 
 use netrunner_core::net::diagnostics::{
-    self, DiagnosticsEvent, DiagnosticsSnapshot, DiagnosticsStore, TunnelMetrics,
-    current_timestamp_ms,
+    self, current_timestamp_ms, DiagnosticsEvent, DiagnosticsSnapshot, DiagnosticsStore,
+    TunnelMetrics,
 };
 use netrunner_core::net::SessionManager;
 use netrunner_logger::{error, info, warn};
@@ -192,10 +192,7 @@ impl ServerDiagnosticsLogger {
                 let mut rotated = self.log_path.clone();
                 rotated.set_extension("jsonl.1");
                 tokio::fs::rename(&self.log_path, &rotated).await?;
-                info!(
-                    "Diagnostics log rotated → {}",
-                    rotated.display()
-                );
+                info!("Diagnostics log rotated → {}", rotated.display());
             }
             _ => {}
         }

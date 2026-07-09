@@ -23,6 +23,15 @@
 #
 # Repo Variable (vars.*, не secret — публичный URL, не даёт доступа сам по себе):
 # - BACKEND_URL — публичный адрес control plane (WEB_APP_BASE_URL у бэкенда)
+#
+# Job update-observability-targets (см. ниже) обновляет список scrape-таргетов
+# для центрального Prometheus (netrunner-data/docker-compose.observability.yml,
+# job "netrunner-proxy-nodes") при КАЖДОМ прогоне (независимо от input target,
+# т.к. использует полный nodes.json) — ему нужны СВОИ копии секретов/vars
+# VPS с данными, продублировать в Settings этого репозитория (те же значения,
+# что уже есть в netrunner-data):
+# - vars.DATA_VPS_IP
+# - secrets.DATA_SSH_PRIVATE_KEY
 name: Deploy Proxy Nodes
 
 on:
@@ -99,7 +108,37 @@ jobs:
               --decoy-host "${{ matrix.decoy_host }}" \
               --require-auth \
               --backend-url "${{ vars.BACKEND_URL }}" \
-              --health-port 9091
+              --health-port 9091 \
+              --metrics-port 9093
 
             docker image prune -f
             echo "✅ ${{ matrix.name }} обновлена."
+
+  # Независимо от того, какая конкретно нода деплоилась (target может быть
+  # одной нодой, не "all") — список scrape-таргетов всегда генерится из ПОЛНОГО
+  # nodes.json, чтобы центральный Prometheus не терял из виду остальные ноды.
+  update-observability-targets:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate targets/nodes.json from nodes.json
+        run: node scripts/generate-prometheus-targets.mjs nodes.json > nodes.targets.json
+
+      - name: Upload to observability VPS
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ vars.DATA_VPS_IP }}
+          username: root
+          key: ${{ secrets.DATA_SSH_PRIVATE_KEY }}
+          source: "nodes.targets.json"
+          target: "/root/netrunner-data/observability/targets"
+          strip_components: 0
+
+      - name: Rename to nodes.json (file_sd_configs ждёт именно это имя)
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ vars.DATA_VPS_IP }}
+          username: root
+          key: ${{ secrets.DATA_SSH_PRIVATE_KEY }}
+          script: mv /root/netrunner-data/observability/targets/nodes.targets.json /root/netrunner-data/observability/targets/nodes.json
