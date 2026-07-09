@@ -12,15 +12,45 @@
 
 mod backend_client;
 mod diagnostics;
+mod health;
 mod network;
 use clap::Parser;
 use netrunner_core::net::AuthValidator;
-use netrunner_logger::Logger;
+use netrunner_logger::{error, info, Logger};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 use crate::backend_client::BackendClient;
 use crate::network::Network;
+
+/// Ждёт SIGTERM (docker stop/systemctl stop) или SIGINT (Ctrl+C) и отменяет
+/// токен — раньше этой функции не было вообще: сервер получал сигнал прямо
+/// от ОС мимо CancellationToken'а, и вся drain-логика в `Network::run` была
+/// мертва, ни разу не срабатывая на реальном шатдауне.
+async fn shutdown_signal(token: CancellationToken) {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("Не удалось установить обработчик Ctrl+C");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("Не удалось установить обработчик SIGTERM")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => info!("🛑 Получен SIGINT (Ctrl+C). Останавливаемся..."),
+        _ = terminate => info!("🛑 Получен SIGTERM. Останавливаемся..."),
+    }
+    token.cancel();
+}
 
 /// Аргументы командной строки сервера.
 #[derive(Parser, Debug)]
@@ -52,6 +82,12 @@ struct Args {
     /// Обязателен, только если передан `--require-auth`.
     #[arg(long)]
     backend_url: Option<String>,
+
+    /// Порт для внутреннего HTTP `/health` (биндится только на 127.0.0.1 —
+    /// не для публичного доступа, только supervisor/docker healthcheck на
+    /// этой же машине). Не задан — health-эндпоинт выключен.
+    #[arg(long)]
+    health_port: Option<u16>,
 }
 
 fn main() {
@@ -70,11 +106,31 @@ fn main() {
         None
     };
 
-    let net = Network::new(args.host, args.port, args.decoy_host, auth);
+    let net = Network::new(
+        args.host,
+        args.port,
+        args.decoy_host,
+        auth,
+        args.health_port,
+    );
 
     let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
 
     rt.block_on(async {
-        net.run(CancellationToken::new()).await;
+        let token = CancellationToken::new();
+        let run_token = token.clone();
+        // net.run() спавним отдельной задачей и дожидаемся её ПОСЛЕ сигнала —
+        // tokio::select! между сигналом и run() тут не подходит: select
+        // дропает недовершившуюся ветку целиком, оборвав drain-фазу в
+        // Network::run в момент получения самого сигнала, вместо того чтобы
+        // дать ей отработать.
+        let run_handle = tokio::spawn(async move {
+            net.run(run_token).await;
+        });
+
+        shutdown_signal(token).await;
+        if let Err(e) = run_handle.await {
+            error!(error = ?e, "Задача сервера завершилась с паникой при остановке");
+        }
     });
 }

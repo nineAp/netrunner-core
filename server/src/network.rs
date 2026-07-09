@@ -11,11 +11,19 @@ use netrunner_core::net::{
     TOPOLOGY_PRINT_INTERVAL,
 };
 use netrunner_logger::{error, info, warn};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
 use crate::diagnostics::{ClientDiagnosticsLogger, ServerDiagnosticsLogger};
+use crate::health;
+
+/// Сколько ждём при остановке, пока уже принятые соединения сами закроются,
+/// прежде чем отпустить рантайм (который при Drop абортит все задачи разом,
+/// без предупреждения клиентам).
+const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Параметры прослушивания сервера.
 pub struct Network {
@@ -27,6 +35,9 @@ pub struct Network {
     /// `None` — `--require-auth` не передан, авторизация и лимиты трафика
     /// выключены на этом инстансе целиком (поведение как до этой фичи).
     auth: Option<Arc<dyn AuthValidator>>,
+    /// `None` — health-эндпоинт выключен (по умолчанию для обратной
+    /// совместимости с уже развёрнутыми нодами без этого флага).
+    health_port: Option<u16>,
 }
 
 impl Network {
@@ -35,12 +46,14 @@ impl Network {
         port: u16,
         decoy_host: impl Into<Arc<str>>,
         auth: Option<Arc<dyn AuthValidator>>,
+        health_port: Option<u16>,
     ) -> Self {
         Self {
             host,
             port,
             decoy_host: decoy_host.into(),
             auth,
+            health_port,
         }
     }
 
@@ -125,6 +138,23 @@ impl Network {
         info!("🌐 Netrunner Server: Listening on {}", addr);
         let listener = TcpListener::bind(&addr).await.expect("Server bind failed");
 
+        // Число реально обслуживаемых физических соединений прямо сейчас — не
+        // "процесс жив", а "сколько клиентов на нём висит". Отдаётся в /health
+        // и используется ниже, чтобы дождаться отключения клиентов при
+        // остановке вместо мгновенного разрыва при drop рантайма.
+        let active_connections = Arc::new(AtomicU64::new(0));
+
+        if let Some(health_port) = self.health_port {
+            let health_token = token.clone();
+            let health_connections = active_connections.clone();
+            tokio::spawn(health::run(
+                "127.0.0.1".to_string(),
+                health_port,
+                health_connections,
+                health_token,
+            ));
+        }
+
         loop {
             tokio::select! {
                 _ = token.cancelled() => {
@@ -145,6 +175,8 @@ impl Network {
                             self.auth.clone(),
                         );
 
+                        active_connections.fetch_add(1, Ordering::Relaxed);
+                        let conn_counter = active_connections.clone();
                     tokio::spawn(async move {
                                 // "Входим" в этот Span. Все логи внутри handler.run() привяжутся к этому IP.
                         let _enter = span.enter();
@@ -153,10 +185,28 @@ impl Network {
                         if let Err(e) = handler.run().await {
                             error!(error = %e, "⚠️ Server handler terminated with error");
                         }
+                        conn_counter.fetch_sub(1, Ordering::Relaxed);
                         });
                     }
                 }
             }
         }
+
+        // Graceful drain: приём новых соединений уже остановлен (цикл выше
+        // прерван), но уже принятые клиенты продолжают жить как detached-задачи
+        // рантайма. Без этого ожидания следующий за `run()` выход из
+        // `rt.block_on` уронит рантайм и оборвёт их все разом без предупреждения.
+        let drain_start = tokio::time::Instant::now();
+        while active_connections.load(Ordering::Relaxed) > 0 {
+            if drain_start.elapsed() > SHUTDOWN_DRAIN_TIMEOUT {
+                warn!(
+                    remaining = active_connections.load(Ordering::Relaxed),
+                    "Drain timeout истёк, принудительно завершаем оставшиеся соединения"
+                );
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        info!("✅ Drain завершён, соединений осталось: {}", active_connections.load(Ordering::Relaxed));
     }
 }

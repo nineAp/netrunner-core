@@ -5,10 +5,13 @@ After=network.target
 [Service]
 User=root
 WorkingDirectory=/root/netr-core
-ExecStart=/root/netr-core/netrunner-server --host=0.0.0.0 --port=8443
+ExecStart=/root/netr-core/netrunner-server --host=0.0.0.0 --port=8443 --health-port=9092
 Restart=always
 RestartSec=3
 LimitNOFILE=65535
+# systemctl stop/restart шлёт SIGTERM — теперь сервер ловит его сам и
+# дожидается отключения активных клиентов вместо мгновенного обрыва.
+TimeoutStopSec=35
 
 [Install]
 WantedBy=multi-user.target
