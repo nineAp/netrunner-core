@@ -3,12 +3,12 @@
     "name": "nl-1",
     "host": "147.45.43.70",
     "proxy_port": 443,
-    "decoy_host": "www.debian.org"
+    "decoy_host": "ubuntu.com"
   },
   {
     "name": "fr-1",
     "host": "203.0.113.10",
     "proxy_port": 8443,
-    "decoy_host": "ubuntu.com"
+    "decoy_host": "www.debian.org"
   }
 ]
