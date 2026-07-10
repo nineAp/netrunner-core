@@ -1,13 +1,13 @@
 [
   {
     "name": "nl-1",
-    "host": "CHANGE_ME_IP_1",
+    "host": "147.45.43.70",
     "proxy_port": 443,
     "decoy_host": "www.debian.org"
   },
   {
-    "name": "sg-1",
-    "host": "CHANGE_ME_IP_2",
+    "name": "fr-1",
+    "host": "203.0.113.10",
     "proxy_port": 8443,
     "decoy_host": "ubuntu.com"
   }
