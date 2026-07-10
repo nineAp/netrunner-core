@@ -19,7 +19,7 @@
 # провижининге через netrunner-backend, см. NodeService::provision_node_via_ssh):
 # - PROXY_NODES_SSH_KEY — приватный SSH-ключ (root на все ноды)
 # - PROXY_INTERNAL_SECRET — тот же секрет, что и PROXY_INTERNAL_SECRET у бэкенда
-# - GITEA_REGISTRY_TOKEN — тот же, что и в build.yml (Container Registry Gitea,
+# - GT_REGISTRY_TOKEN — тот же, что и в build.yml (Container Registry Gitea,
 #   не ghcr.io — каждая нода тянет образ напрямую с gitea.netrunner-vpn.com)
 #
 # Repo Variable (vars.*, не secret — публичный URL, не даёт доступа сам по себе):
@@ -90,7 +90,7 @@ jobs:
             set -e
             echo "🚀 Деплой на ${{ matrix.name }} (${{ matrix.host }}:${{ matrix.proxy_port }})"
 
-            echo "${{ secrets.GITEA_REGISTRY_TOKEN }}" | docker login gitea.netrunner-vpn.com -u ${{ github.actor }} --password-stdin
+            echo "${{ secrets.GT_REGISTRY_TOKEN }}" | docker login gitea.netrunner-vpn.com -u ${{ github.actor }} --password-stdin
             docker pull gitea.netrunner-vpn.com/nineap/netrunner-proxy:latest
 
             docker stop netrunner-proxy 2>/dev/null || true

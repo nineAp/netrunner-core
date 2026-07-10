@@ -4,7 +4,7 @@
 # готовый target/release/netrunner-server (см. Dockerfile), поэтому cargo
 # build идёт отдельным шагом перед docker build, не внутри него.
 #
-# Нужен секрет GITEA_REGISTRY_TOKEN — токен Gitea с правом write:package,
+# Нужен секрет GT_REGISTRY_TOKEN — токен Gitea с правом write:package,
 # тот же, что и в netrunner-backend/netrunner-landing (пакеты в Gitea
 # принадлежат аккаунту, не репозиторию, но значение нужно продублировать в
 # Settings каждого из репозиториев).
@@ -39,7 +39,7 @@ jobs:
         with:
           registry: gitea.netrunner-vpn.com
           username: ${{ github.actor }}
-          password: ${{ secrets.GITEA_REGISTRY_TOKEN }}
+          password: ${{ secrets.GT_REGISTRY_TOKEN }}
 
       - name: Build and push
         uses: docker/build-push-action@v6
