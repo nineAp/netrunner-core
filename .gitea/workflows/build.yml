@@ -1,8 +1,10 @@
 # Собирает netrunner-server (release-бинарник) и пушит Docker-образ во
 # встроенный Container Registry самой Gitea (gitea.netrunner-vpn.com), не
-# ghcr.io. Dockerfile сам не компилирует Rust — он просто копирует уже
-# готовый target/release/netrunner-server (см. Dockerfile), поэтому cargo
-# build идёт отдельным шагом перед docker build, не внутри него.
+# ghcr.io. Dockerfile теперь компилирует Rust ВНУТРИ себя (multi-stage,
+# см. Dockerfile) — раньше бинарник собирался отдельным шагом прямо на
+# CI-раннере (glibc раннера) и просто копировался в рантайм-образ
+# (glibc bookworm-slim), рассинхрон версий ронял прод: "GLIBC_2.38 not
+# found". Раздельная сборка на раннере убрана — только docker build.
 #
 # Нужен секрет GT_REGISTRY_TOKEN — токен Gitea с правом write:package,
 # тот же, что и в netrunner-backend/netrunner-landing (пакеты в Gitea
@@ -22,15 +24,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-
-      - name: Build release binary
-        run: cargo build --release -p netrunner-server
-
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -48,3 +41,8 @@ jobs:
           file: ./Dockerfile
           push: true
           tags: gitea.netrunner-vpn.com/nineap/netrunner-proxy:latest
+          # type=gha требует GitHub Actions Cache — self-hosted act_runner его
+          # не реализует (см. аналогичный фикс в netrunner-backend/build.yml
+          # этой же сессии); type=registry работает везде без спецсервиса.
+          cache-from: type=registry,ref=gitea.netrunner-vpn.com/nineap/netrunner-proxy:cache
+          cache-to: type=registry,ref=gitea.netrunner-vpn.com/nineap/netrunner-proxy:cache,mode=max
