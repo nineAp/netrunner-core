@@ -8,7 +8,7 @@
   {
     "name": "fr-1",
     "host": "203.0.113.10",
-    "proxy_port": 8443,
-    "decoy_host": "www.debian.org"
+    "proxy_port": 443,
+    "decoy_host": "www.cloudflare.com"
   }
 ]
