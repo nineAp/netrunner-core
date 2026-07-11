@@ -1,0 +1,6 @@
+# wasm32-unknown-unknown build config for the edge/Cloudflare Workers client
+# (see client-edge/). getrandom 0.3+ needs an explicit backend selection cfg
+# for wasm targets even with the "wasm_js" feature enabled in Cargo.toml —
+# see https://docs.rs/getrandom/latest/getrandom/#webassembly-support.
+[target.wasm32-unknown-unknown]
+rustflags = ["--cfg", "getrandom_backend=\"wasm_js\""]

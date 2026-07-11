@@ -12,23 +12,39 @@ hkdf = "0.12"
 hmac = "0.12"
 sha2 = "0.10"
 bytes = "1.5"
-# core uses tokio's net/time/io/macros/rt/sync directly, so it must declare these
-# features itself instead of relying on feature-unification from sibling crates
-# (otherwise `cargo check -p netrunner-core` in isolation fails). Minimal set that
-# compiles standalone:
-#   ["rt", "rt-multi-thread", "macros", "net", "time", "io-util", "sync"]
-# "full" is used to stay consistent with the client crate; features are additive,
-# so this does not change the whole-workspace build.
-tokio = { version = "1.49.0", features = ["full"] }
+# `net::connection` (tokio net/rt/socket-driven tunnel orchestration) is
+# compiled only for non-wasm targets — see the `#[cfg]` in `core/src/net/mod.rs`.
+# wasm32-unknown-unknown has no tokio net driver at all, so both tokio's "full"
+# feature and the OS-socket-tuning crates below (socket2, libc) only make sense
+# there; the base feature set here is the minimum `edge`/`nrxp`/`crypto`/`tlseng`
+# need on every target (macros for async fns in tests, sync for mpsc types used
+# by call sites outside this crate).
+tokio = { version = "1.49.0", default-features = false, features = ["macros", "sync"] }
 rand = "0.10.0"
+# Transitive random-number backend, pulled in (in several major versions, via
+# rand/x25519-dalek/aead) for X25519 ephemeral keys, salts and NRXP padding.
+# On wasm32-unknown-unknown there's no OS RNG syscall, so every major version
+# in the dependency graph needs its JS-backed feature enabled explicitly —
+# Cargo unifies these onto the same transitive crate. Harmless on native
+# targets (the feature is a no-op there).
+getrandom = { version = "0.2", features = ["js"] }
+getrandom3 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
+getrandom4 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
 hex = "0.4.3"
-tokio-util = { version = "0.7", features = ["rt"] }
 async-trait = "0.1.89"
 dashmap = "6.1.0"
 arc-swap = "1"
-socket2 = { version = "0.5", features = ["all"] }
-libc = "0.2"
 netrunner-logger = { path = "../tools/log" }
 tracing = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# Pulled in only for the tokio::net-based tunnel orchestration (`net::connection`),
+# which is unavailable on wasm32-unknown-unknown. Kept target-gated so `cargo
+# check --target wasm32-unknown-unknown -p netrunner-core` (used by the edge/
+# Cloudflare Workers client) doesn't try to build mio/socket2/libc for wasm.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { version = "1.49.0", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+socket2 = { version = "0.5", features = ["all"] }
+libc = "0.2"

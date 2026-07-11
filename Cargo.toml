@@ -2,6 +2,7 @@
 members = [
     "core",
     "client",
+    "client-edge",
     "server",
     "tools/bindgen",
     "tools/log",

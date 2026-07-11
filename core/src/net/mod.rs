@@ -37,12 +37,20 @@
 
 mod auth;
 mod config;
+// `connection` — оркестровка живых TCP-ног туннеля через `tokio::net`. Этот
+// стек недоступен на `wasm32-unknown-unknown` (у tokio там нет сетевого
+// драйвера), поэтому модуль целиком выключен из wasm-сборок. Лёгкий
+// протокольный клиент для таких рантаймов (например, Cloudflare Workers) —
+// см. [`crate::edge`], которая переиспользует `nrxp`/`crypto`/`tlseng` без
+// какого-либо `tokio::net`.
+#[cfg(not(target_arch = "wasm32"))]
 mod connection;
 mod constants;
 pub mod diagnostics;
 
 pub use auth::{AuthValidator, UsageReport, UserQuota};
 pub use config::NetworkConfig;
+#[cfg(not(target_arch = "wasm32"))]
 pub use connection::{
     ClientHandler, Connection, Muxer, ServerHandler, SessionManager, TunnelHandler, GLOBAL_MIN_RTT,
 };

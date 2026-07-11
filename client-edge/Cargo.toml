@@ -1,0 +1,30 @@
+[package]
+name = "netrunner-client-edge"
+version = "0.1.0"
+edition = "2021"
+description = "Netrunner NRXP client for Cloudflare Workers (wasm32-unknown-unknown) — bridges an inbound WebSocket to the VPN node's masqueraded-TLS tunnel protocol."
+
+# Cloudflare Workers load a `cdylib`; `rlib` is kept so `cargo check`/tooling on
+# non-wasm hosts (CI, editors) still work for anything target-agnostic.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Only the pure-protocol `edge` module is used from here (see core/src/edge.rs);
+# `net::connection` (tokio::net-based) is compiled out for wasm32-unknown-unknown
+# by netrunner-core's own #[cfg], so this dependency stays small on this target.
+netrunner-core = { path = "../core" }
+worker = "0.6"
+bytes = "1.5"
+# `worker::Socket` implements tokio::io::{AsyncRead, AsyncWrite}; only the
+# buffer/macro utilities are needed here, never a tokio runtime/reactor (the
+# Workers JS event loop drives everything via wasm-bindgen-futures instead).
+tokio = { version = "1.49", default-features = false, features = ["macros", "io-util"] }
+futures-util = "0.3"
+console_error_panic_hook = "0.1"
+
+# wasm size/perf tuning (e.g. [profile.release] lto = true, opt-level = "s")
+# has to live in the workspace-root Cargo.toml — Cargo ignores profile tables
+# in member manifests — and would apply to every crate in the workspace, so
+# it's deliberately left at Cargo defaults here rather than changing the
+# native binaries' release characteristics along with it.

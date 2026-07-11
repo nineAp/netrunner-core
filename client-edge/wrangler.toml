@@ -1,0 +1,24 @@
+name = "netrunner-edge"
+main = "build/worker/shim.mjs"
+compatibility_date = "2024-09-23"
+compatibility_flags = ["nodejs_compat"]
+
+[build]
+command = "cargo install -q worker-build --version ^0.1 && worker-build --release"
+
+# Outbound TCP (the Cloudflare Sockets API used by worker::Socket to reach
+# VPN_NODE_ADDR) needs no binding — it's available by default at the
+# `connect()` global; see https://developers.cloudflare.com/workers/runtime-apis/tcp-sockets/.
+
+[vars]
+# host:port of your netrunner-server (VPN node) — the ClientHello target.
+VPN_NODE_ADDR = "203.0.113.10:443"
+# host:port the node should open on Connect (the actual backend behind it).
+BACKEND_ADDR = "203.0.113.20:8443"
+# Decoy SNI for the masqueraded ClientHello — must resolve and answer 200 for
+# the fingerprint to hold up (see ARCH.md, core::net::DEFAULT_DECOY_HOST).
+DECOY_SNI = "www.debian.org"
+
+# AUTH_TOKEN is a secret, not a var — set it out-of-band and do not commit it:
+#   npx wrangler secret put AUTH_TOKEN
+# Only required if the VPN node runs with --require-auth.

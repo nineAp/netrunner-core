@@ -82,6 +82,7 @@ pub(crate) const PROTOCOL_VERSION: u8 = 1;
 pub(crate) const MIN_VERSION_FOR_CCS: u8 = 1;
 
 mod crypto;
+pub mod edge;
 pub mod net;
 pub mod nrxp;
 pub mod parser;
