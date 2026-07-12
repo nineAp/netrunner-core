@@ -102,6 +102,7 @@ jobs:
               --network host \
               --cap-add NET_ADMIN --cap-add NET_RAW --cap-add DAC_OVERRIDE \
               --device /dev/net/tun:/dev/net/tun \
+              --ulimit nofile=1048576:1048576 \
               -e PROXY_INTERNAL_SECRET="${{ secrets.PROXY_INTERNAL_SECRET }}" \
               gitea.netrunner-vpn.com/nineap/netrunner-proxy:latest \
               ./netrunner-proxy \
