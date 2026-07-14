@@ -21,7 +21,7 @@ SSH_OPTS = -o IPQoS=throughput -o ServerAliveInterval=30
 RSYNC_OPTS = -avz --inplace --progress -e "ssh $(SSH_OPTS)"
 
 
-.PHONY: debug-client debug-server build-android build-server deploy-server logs ssh setup-server release-all
+.PHONY: debug-client debug-server build-android build-server build-edge deploy-server logs ssh setup-server release-all
 
 # --- Релизный цикл ---
 # --- Релизный цикл ---
@@ -81,7 +81,17 @@ build-android:
 
 build-server:
 	@echo "--- Сборка сервера (Release) ---"
-	cargo build --bin netrunner-server --release 
+	cargo build --bin netrunner-server --release
+
+# Сборка wasm-клиента для Cloudflare Workers (client-edge/) — тот же
+# worker-build, что и wrangler.toml::[build].command запускает сам при
+# `wrangler deploy`, только локально, без деплоя, чтобы проверить, что
+# крейт вообще собирается. worker-build сам находит .cargo/config.toml с
+# нужным `getrandom_backend="wasm_js"` и кладёт shim.mjs в client-edge/build/.
+build-edge:
+	@echo "--- Сборка edge-клиента (Cloudflare Workers, wasm32) ---"
+	@command -v worker-build >/dev/null 2>&1 || cargo install -q worker-build --version ^0.1
+	cd client-edge && worker-build --release
 
 setup-server:
 	@echo "--- Подготовка сервера ---"

@@ -16,6 +16,13 @@ crate-type = ["cdylib", "rlib"]
 netrunner-core = { path = "../core" }
 worker = "0.6"
 bytes = "1.5"
+# Закреплено ровно на версию, которую вендорит CLI worker-build 0.1.x (см.
+# wrangler.toml::[build].command — оно ставит именно этот major). Без
+# явного пина Cargo резолвил бы вообще любую свежую 0.2.x (транзитивно
+# через worker/wasm-bindgen-futures) — а worker-build 0.1 требует ТОЧНОГО
+# совпадения схемы бандлера с той, на которую слинкован .wasm-файл, иначе
+# `wasm-bindgen` падает с "schema version mismatch" на этапе постпроцессинга.
+wasm-bindgen = "=0.2.105"
 # `worker::Socket` implements tokio::io::{AsyncRead, AsyncWrite}; only the
 # buffer/macro utilities are needed here, never a tokio runtime/reactor (the
 # Workers JS event loop drives everything via wasm-bindgen-futures instead).
