@@ -56,6 +56,35 @@ const EDGE_STREAM_ID: u32 = 1;
 /// Размер буфера чтения одного `Socket::read`/TCP-чтения с ноги до ноды.
 const SOCKET_READ_CHUNK: usize = 16 * 1024;
 
+/// Дефолтная страница nginx — то, что видит буквально любой, кто когда-либо
+/// открывал IP/домен с только что поднятым веб-сервером без настроенного
+/// контента. Максимально частая, ничем не примечательная картина в интернете —
+/// ровно то, что нужно decoy-ответу на не-WS-запрос (см. `fetch` выше).
+const DECOY_PAGE_HTML: &str = r#"<!DOCTYPE html>
+<html>
+<head>
+<title>Welcome to nginx!</title>
+<style>
+html { color-scheme: light dark; }
+body { width: 35em; margin: 0 auto;
+font-family: Tahoma, Verdana, Arial, sans-serif; }
+</style>
+</head>
+<body>
+<h1>Welcome to nginx!</h1>
+<p>If you see this page, the nginx web server is successfully installed and
+working. Further configuration is required.</p>
+
+<p>For online documentation and support please refer to
+<a href="http://nginx.org/">nginx.org</a>.<br/>
+Commercial support is available at
+<a href="http://nginx.com/">nginx.com</a>.</p>
+
+<p><em>Thank you for using nginx.</em></p>
+</body>
+</html>
+"#;
+
 #[event(fetch)]
 async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
     console_error_panic_hook::set_once();
@@ -67,9 +96,12 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         .unwrap_or(false);
 
     if !is_upgrade {
-        // Незамаскированный прямой запрос (не WS-апгрейд) — не наш случай
-        // использования; отвечаем нейтрально, ничего не выдавая о протоколе.
-        return Response::ok("netrunner edge relay");
+        // Незамаскированный прямой запрос (сканер DPI/случайный визит браузером,
+        // не WS-апгрейд) — та же логика маскировки, что и decoy SNI на самой
+        // ноде: отдаём максимально банальную, ничем не примечательную страницу,
+        // а не голую строку, которая сама по себе выглядит подозрительно
+        // (нормальные сайты так не отвечают).
+        return Response::from_html(DECOY_PAGE_HTML);
     }
 
     let vpn_node = env.var("VPN_NODE_ADDR")?.to_string();

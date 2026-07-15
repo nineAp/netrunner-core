@@ -1,0 +1,4 @@
+# Wrangler's local-only secrets file (untracked — see .gitignore). Copy this
+# to `.dev.vars` in this same directory and fill in a real value; wrangler
+# dev loads it automatically, no `wrangler secret put` needed for local runs.
+AUTH_TOKEN=paste_your_nrxp_token_here
