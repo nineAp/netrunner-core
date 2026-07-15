@@ -48,3 +48,11 @@ tokio = { version = "1.49.0", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 socket2 = { version = "0.5", features = ["all"] }
 libc = "0.2"
+
+# `std::time::SystemTime::now()` panics on wasm32-unknown-unknown ("time not
+# implemented on this platform" — no OS clock syscall there). web-time is an
+# API-compatible drop-in backed by JS Date.now() on wasm32; see
+# crypto/session.rs::now_unix_secs, the only place this crate reads wall time
+# on a path client-edge (Cloudflare Workers) actually exercises.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+web-time = "1.1"

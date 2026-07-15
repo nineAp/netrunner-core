@@ -280,6 +280,32 @@ impl SessionKeys {
 /// AUTH_TIME_STEP`. Тег меняется каждые `AUTH_TIME_STEP` секунд, поэтому
 /// записанный ранее DPI-перехват нельзя «переиграть» позже — окно валидности
 /// уезжает. Допуск на рассинхрон часов задаётся `AUTH_WINDOW_SIZE`.
+/// Текущее unix-время в секундах — `std::time::SystemTime::now()` panics with
+/// "time not implemented on this platform" on wasm32-unknown-unknown (no OS
+/// clock syscall there), which is exactly the target `client-edge`
+/// (Cloudflare Workers) builds for. `web-time` is an API-compatible drop-in
+/// backed by JS `Date.now()` on that target only; native targets keep using
+/// `std::time` unchanged.
+#[cfg(target_arch = "wasm32")]
+fn now_unix_secs() -> u64 {
+    web_time::SystemTime::now()
+        .duration_since(web_time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        // NTP step-back can make this return Err; saturate to 0. Both call
+        // sites tolerate this: generate_current_tag just produces a tag for
+        // step 0, and verify_tag's window comparison will simply fail and
+        // log AUTH MISMATCH rather than panicking.
+        .unwrap_or_default()
+        .as_secs()
+}
+
 #[derive(Clone, Copy)]
 pub struct SessionAuth {
     auth_key: [u8; 32],
@@ -304,14 +330,7 @@ impl SessionAuth {
 
     /// Тег для текущего момента времени — кладётся в исходящий кадр.
     pub fn generate_current_tag(&self) -> [u8; 16] {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            // NTP step-back can make this return Err; saturate to 0 so the
-            // writer task doesn't panic.  The peer's verify_tag will accept
-            // tags up to AUTH_WINDOW_SIZE steps away, so a brief clock skew
-            // is tolerated without a reconnect.
-            .unwrap_or_default()
-            .as_secs();
+        let now = now_unix_secs();
 
         Self::compute_tag(&self.auth_key, now / AUTH_TIME_STEP)
     }
@@ -326,12 +345,7 @@ impl SessionAuth {
     /// времени сравнение: длительность `verify_tag` не зависит от того, какой шаг
     /// (и совпал ли вообще) подошёл, иначе по таймингу можно подбирать тег.
     pub fn verify_tag(&self, received_tag: &[u8; 16]) -> bool {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            // NTP step-back can make duration_since return an error. Saturate to 0
-            // rather than panic; the tag comparison will fail and we log AUTH MISMATCH.
-            .unwrap_or_default()
-            .as_secs();
+        let now = now_unix_secs();
 
         let current_step = now / AUTH_TIME_STEP;
 
