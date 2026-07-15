@@ -86,7 +86,9 @@ impl Network {
                 for entry in sm_clone.get_session().iter() {
                     active_muxers.push(entry.value().clone());
                 }
-                for muxer in active_muxers {
+                // Заимствуем, а не потребляем `active_muxers` — он ещё нужен
+                // ниже, для отчёта об использовании трафика.
+                for muxer in &active_muxers {
                     if muxer.active_legs_count() > 0 {
                         let m = muxer.clone();
                         tokio::spawn(async move {
@@ -103,9 +105,18 @@ impl Network {
                 // текущий лимит из БД на каждый вызов — админ меняет его в
                 // любой момент, следующий тик подхватит новое значение без
                 // перезапуска прокси.
+                //
+                // Переиспользуем уже собранный `active_muxers` (owned Vec, см.
+                // выше), а не свежий `sm_clone.get_session().iter()` — тот
+                // держит shard-лок DashMap на всё тело цикла, включая этот
+                // `.await` к бэкенду. Реальный инцидент: вторая нога той же
+                // сессии регистрируется через `SessionManager::get_or_create`,
+                // которому нужен write-лок НА ТОТ ЖЕ шард — блокировалась,
+                // пока тут не освобождался read-лок, и хвостом вешался весь
+                // тред (в т.ч. этот же периодический таск, который потом сам
+                // не мог провернуть следующий тик).
                 if let Some(validator) = &quota_auth {
-                    for entry in sm_clone.get_session().iter() {
-                        let muxer = entry.value().clone();
+                    for muxer in &active_muxers {
                         let Some(user_id) = muxer.quota_user_id() else {
                             continue;
                         };
