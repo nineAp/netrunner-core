@@ -145,8 +145,11 @@ async fn run_bridge(
         .await
         .map_err(|e| format!("write auth heartbeat: {e}"))?;
 
-    let connect_frame =
-        tunnel.encode_frame(EDGE_STREAM_ID, EdgeFrameKind::Connect, Bytes::from(backend_addr))?;
+    let connect_frame = tunnel.encode_frame(
+        EDGE_STREAM_ID,
+        EdgeFrameKind::Connect,
+        Bytes::from(backend_addr),
+    )?;
     socket
         .write_all(&connect_frame)
         .await
@@ -189,6 +192,14 @@ async fn run_bridge(
                     return Err("vpn node closed the tunnel leg".to_string());
                 }
                 for frame in tunnel.feed(&sock_buf[..n])? {
+                    if frame.stream_id == 0 && frame.kind == EdgeFrameKind::Close {
+                        // Явный отказ ноды (см. connection.rs: провал validator.validate()
+                        // при --require-auth), не голый TCP EOF — stream_id=0 никогда не
+                        // используется реальным Connect-потоком (см. EDGE_STREAM_ID),
+                        // это служебный канал наравне с heartbeat/diag.
+                        let reason = String::from_utf8_lossy(&frame.payload[..]).into_owned();
+                        return Err(format!("vpn node rejected connection: {reason}"));
+                    }
                     if frame.stream_id != EDGE_STREAM_ID {
                         continue; // heartbeat/диагностика ноды — эту ногу не обслуживает более одного потока
                     }

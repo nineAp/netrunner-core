@@ -1087,7 +1087,7 @@ impl TunnelHandler for ServerHandler {
         cipher.set_keys(tx_key, tx_iv, rx_key, rx_iv);
 
         let codec = Codec::new(cipher, session_keys.get_auth_key());
-        let (mut rx_codec, tx_codec) = codec.split();
+        let (mut rx_codec, mut tx_codec) = codec.split();
 
         let (session_id, leg_id, auth_token) = loop {
             match rx_codec.decode_inbound(&mut read_buf) {
@@ -1151,11 +1151,33 @@ impl TunnelHandler for ServerHandler {
         // Netrunner-хендшейк (не сканер/чужой TLS-клиент), поэтому отказ здесь
         // — обычный разрыв, а не stealth-fallback (светить уже нечего).
         if let Some(validator) = &self.auth {
-            let quota = validator.validate(&auth_token).await.map_err(|e| {
-                warn!("❌ Backend rejected client token: {}", e.internal_msg);
-                AppError::new(ERR_AUTH_FAILED, "Доступ запрещен", e.internal_msg)
-            })?;
-            muxer.set_quota_user(quota.user_id);
+            match validator.validate(&auth_token).await {
+                Ok(quota) => muxer.set_quota_user(quota.user_id),
+                Err(e) => {
+                    warn!("❌ Backend rejected client token: {}", e.internal_msg);
+                    // Раньше клиент видел только голый TCP EOF на отказ — неотличимо
+                    // от сбоя сети/недоступной цели (см. client-edge: "vpn node
+                    // closed the tunnel leg" без единой подсказки, почему). Шлём
+                    // явный сигнал ДО закрытия: Close-кадр на служебном stream_id=0
+                    // (0 уже зарезервирован под heartbeat/diag — см. muxer.rs,
+                    // ни один реальный Connect-поток туда никогда не попадает), с
+                    // текстовой причиной. Crypto-хендшейк уже завершён, поэтому
+                    // кадр кодируется тем же codec'ом, что и всё остальное — клиент
+                    // (edge и толстый) видит его как обычный кадр в своём цикле чтения.
+                    if let Ok(reject_frame) = tx_codec.encode_frame(
+                        0,
+                        FrameType::Close,
+                        Bytes::from(format!("auth_rejected: {}", e.internal_msg)),
+                    ) {
+                        let _ = outbound.write_all(&reject_frame).await;
+                    }
+                    return Err(AppError::new(
+                        ERR_AUTH_FAILED,
+                        "Доступ запрещен",
+                        e.internal_msg,
+                    ));
+                }
+            }
         }
 
         let cap = NetworkConfig::global().channel_capacity;
