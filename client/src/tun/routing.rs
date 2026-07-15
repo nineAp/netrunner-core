@@ -19,6 +19,19 @@ use std::io;
 
 use std::process::Command;
 
+/// Скрывает консольное окно на Windows для дочернего процесса (`CREATE_NO_WINDOW`).
+/// Единая точка для всех внешних вызовов в этом модуле — чтобы не дублировать
+/// флаг в каждом месте, где строится `Command`.
+#[cfg(target_os = "windows")]
+fn hide_console(cmd: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    // 0x08000000 — это флаг CREATE_NO_WINDOW
+    cmd.creation_flags(0x08000000);
+}
+
+#[cfg(not(target_os = "windows"))]
+fn hide_console(_cmd: &mut Command) {}
+
 /// Выполняет внешнюю команду (через `shlex`-разбор строки).
 ///
 /// `ignore_errors` — не падать на ненулевом коде возврата (для идемпотентных
@@ -34,14 +47,7 @@ pub fn run_cmd_ext(full_cmd: &str, ignore_errors: bool) -> io::Result<()> {
 
     let mut cmd = Command::new(&parts[0]);
     cmd.args(&parts[1..]);
-
-    // Добавляем логику для скрытия окна на Windows
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        // 0x08000000 — это флаг CREATE_NO_WINDOW
-        cmd.creation_flags(0x08000000);
-    }
+    hide_console(&mut cmd);
 
     let status = cmd.status()?;
 
@@ -55,16 +61,16 @@ pub fn run_cmd_ext(full_cmd: &str, ignore_errors: bool) -> io::Result<()> {
 
 #[cfg(target_os = "windows")]
 fn get_adapter_index(name: &str) -> Option<u32> {
-    let output = Command::new("powershell")
-        .args([
-            "-Command",
-            &format!(
-                "(Get-NetIPInterface -InterfaceAlias '{}' -AddressFamily IPv4).ifIndex",
-                name
-            ),
-        ])
-        .output()
-        .ok()?;
+    let mut cmd = Command::new("powershell");
+    cmd.args([
+        "-Command",
+        &format!(
+            "(Get-NetIPInterface -InterfaceAlias '{}' -AddressFamily IPv4).ifIndex",
+            name
+        ),
+    ]);
+    hide_console(&mut cmd);
+    let output = cmd.output().ok()?;
 
     String::from_utf8_lossy(&output.stdout)
         .trim()
@@ -74,10 +80,10 @@ fn get_adapter_index(name: &str) -> Option<u32> {
 
 #[cfg(target_os = "windows")]
 fn get_default_gateway() -> Option<String> {
-    let output = Command::new("route")
-        .args(["print", "0.0.0.0"])
-        .output()
-        .ok()?;
+    let mut cmd = Command::new("route");
+    cmd.args(["print", "0.0.0.0"]);
+    hide_console(&mut cmd);
+    let output = cmd.output().ok()?;
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     stdout
