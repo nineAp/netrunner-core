@@ -90,7 +90,14 @@ build-server:
 # нужным `getrandom_backend="wasm_js"` и кладёт shim.mjs в client-edge/build/.
 build-edge:
 	@echo "--- Сборка edge-клиента (Cloudflare Workers, wasm32) ---"
-	@command -v worker-build >/dev/null 2>&1 || cargo install -q worker-build --version ^0.1
+	@# Раньше проверялось только "command -v worker-build" (бинарь ЕСТЬ), а не
+	@# версия — если worker-build 0.8.x стоит глобально (например, для другого
+	@# проекта или после `cargo install worker-build` без пина), сборка тут
+	@# падает на "Unsupported version worker@0.6.7" / конфликте wasm-bindgen,
+	@# потому что этот крейт закреплён на worker=0.6 + wasm-bindgen=0.2.105
+	@# (см. комментарий в client-edge/Cargo.toml) — схему бандлера worker-build
+	@# 0.1.x. Проверяем ИМЕННО версию, не только факт установки.
+	@cargo install --list | grep -q '^worker-build v0\.1\.' || cargo install -q worker-build --version ^0.1 --force
 	cd client-edge && worker-build --release
 
 setup-server:
