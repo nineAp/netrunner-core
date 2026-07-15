@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 
 use crate::diagnostics::{ClientDiagnosticsLogger, ServerDiagnosticsLogger};
 use crate::health;
@@ -179,17 +180,25 @@ impl Network {
                         metrics::gauge!("netrunner_connections_active").set(active_now as f64);
                         metrics::counter!("netrunner_connections_total").increment(1);
                         let conn_counter = active_connections.clone();
-                    tokio::spawn(async move {
-                                // "Входим" в этот Span. Все логи внутри handler.run() привяжутся к этому IP.
-                        let _enter = span.enter();
-
-                        info!("🔌 New physical connection accepted");
-                        if let Err(e) = handler.run().await {
-                            error!(error = %e, "⚠️ Server handler terminated with error");
-                        }
-                        let active_now = conn_counter.fetch_sub(1, Ordering::Relaxed) - 1;
-                        metrics::gauge!("netrunner_connections_active").set(active_now as f64);
-                        });
+                        // `span.enter()` держит guard синхронно — `.enter()` НЕЛЬЗЯ
+                        // держать через `.await` в async-коде (сам `tracing` явно
+                        // документирует это как ошибку): у соединения, живущего
+                        // часами (весь VPN-сеанс), это на многопоточном рантайме
+                        // ломает thread-local стек спанов ЧУЖИХ задач, деля с этой
+                        // один воркер-поток между поллингами — отсюда и снежный ком
+                        // из вложенных "client_conn" в каждой JSON-строке лога
+                        // (реальный инцидент: 24ГБ логов за сутки, диск в 100%,
+                        // прокси зависал без падения). `.instrument(span)` на
+                        // самом future — единственный async-safe способ.
+                        let conn_future = async move {
+                            info!("🔌 New physical connection accepted");
+                            if let Err(e) = handler.run().await {
+                                error!(error = %e, "⚠️ Server handler terminated with error");
+                            }
+                            let active_now = conn_counter.fetch_sub(1, Ordering::Relaxed) - 1;
+                            metrics::gauge!("netrunner_connections_active").set(active_now as f64);
+                        };
+                        tokio::spawn(conn_future.instrument(span));
                     }
                 }
             }
