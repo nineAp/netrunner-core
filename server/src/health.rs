@@ -43,12 +43,23 @@ pub async fn run(
             res = listener.accept() => {
                 let Ok((mut stream, _)) = res else { continue };
                 let active = active_connections.load(Ordering::Relaxed);
+                // Проверяем не только "процесс жив", но и что периодический
+                // таск (health-check ног + отчёты) реально тикает — именно он
+                // дважды зависал без падения самого процесса (см. doc-комментарий
+                // на `LAST_PERIODIC_TICK_UNIX_SECS`), а этот отдельный листенер
+                // продолжал бы бодро отвечать "ok" всё это время.
+                let healthy = crate::network::periodic_task_is_healthy();
                 tokio::spawn(async move {
-                    let body = format!(
-                        r#"{{"status":"ok","active_connections":{active}}}"#
-                    );
+                    let status = if healthy { "ok" } else { "stalled" };
+                    let body =
+                        format!(r#"{{"status":"{status}","active_connections":{active}}}"#);
+                    let status_line = if healthy {
+                        "HTTP/1.1 200 OK"
+                    } else {
+                        "HTTP/1.1 503 Service Unavailable"
+                    };
                     let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                         body.len(),
                         body
                     );

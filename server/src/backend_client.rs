@@ -8,7 +8,7 @@
 
 use async_trait::async_trait;
 use dashmap::DashMap;
-use netrunner_core::net::{AuthValidator, UsageReport, UserQuota};
+use netrunner_core::net::{AuthValidator, NodeHealthReport, UsageReport, UserQuota};
 use netrunner_logger::{warn, AppError};
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
@@ -263,5 +263,37 @@ impl AuthValidator for BackendClient {
             limit_bytes: body.limit_bytes,
             over_limit: body.over_limit,
         })
+    }
+
+    /// Пушит агрегированный, полностью анонимный снимок состояния ноды на
+    /// control-plane — единая точка сбора вместо локальных файлов на диске
+    /// ноды (см. doc-комментарий на `NodeHealthReport`). Best-effort: не идёт
+    /// через circuit breaker и не ретраит — телеметрия, а не критичный путь;
+    /// пропуск одного тика ничего не ломает, а следующий тик придёт через
+    /// TOPOLOGY_PRINT_INTERVAL.
+    async fn report_node_health(&self, report: NodeHealthReport) -> Result<(), AppError> {
+        let resp = self
+            .http
+            .post(format!("{}/api/v1/internal/node-health", self.base_url))
+            .header("X-Internal-Secret", &self.internal_secret)
+            .json(&report)
+            .send()
+            .await
+            .map_err(|e| {
+                AppError::new(
+                    netrunner_logger::ERR_INFRA_TIMEOUT,
+                    "Бэкенд недоступен",
+                    e.to_string(),
+                )
+            })?;
+
+        if !resp.status().is_success() {
+            return Err(AppError::new(
+                netrunner_logger::ERR_INFRA_TIMEOUT,
+                "Ошибка бэкенда",
+                format!("Node health report rejected: HTTP {}", resp.status()),
+            ));
+        }
+        Ok(())
     }
 }

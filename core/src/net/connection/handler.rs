@@ -13,7 +13,7 @@
 //! потока мост и установка соединения мгновенно обрываются.
 
 use bytes::Bytes;
-use netrunner_logger::{debug, error, info, trace, warn};
+use netrunner_logger::{debug, trace, warn};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::{TcpStream, UdpSocket};
@@ -53,7 +53,10 @@ impl RemoteOpener {
     ) {
         let muxer = self.muxer.clone();
         tokio::spawn(async move {
-            info!(stream_id, "🌐 [Remote] Connecting to {}", target);
+            // Приватность: НЕ логируем `target` (хост, к которому идёт пользователь)
+            // — это ровно та информация о его активности, которую прокси не должен
+            // хранить нигде. `stream_id` достаточно для локальной корреляции.
+            debug!(stream_id, "🌐 [Remote] Connecting");
             let start = Instant::now();
 
             tokio::select! {
@@ -64,7 +67,7 @@ impl RemoteOpener {
                 connect_res = tokio::time::timeout(Duration::from_secs(7), TcpStream::connect(&target)) => {
                     match connect_res {
                         Ok(Ok(stream)) => {
-                            info!(stream_id, "✅ [Remote] Connected in {:?}", start.elapsed());
+                            debug!(stream_id, elapsed_ms = start.elapsed().as_millis() as u64, "✅ [Remote] Connected");
                             let (r, w) = stream.into_split();
 
                             // Credit-gated reads (Muxer::consume_credit) were tried here and
@@ -93,7 +96,7 @@ impl RemoteOpener {
                                 .await;
                         }
                         _ => {
-                            error!(stream_id, "❌ [Remote] Target connection failed: {}", target);
+                            warn!(stream_id, "❌ [Remote] Target connection failed");
                             let _ = muxer.send_control(stream_id, FrameType::Close, Bytes::new()).await;
                         }
                     }
@@ -114,7 +117,7 @@ impl RemoteOpener {
     ) {
         let muxer = self.muxer.clone();
         tokio::spawn(async move {
-            info!(stream_id, "🚀 [Remote] Binding UDP for {}", target);
+            debug!(stream_id, "🚀 [Remote] Binding UDP");
             tokio::select! {
                 _ = token.cancelled() => { return; }
                 _ = async {

@@ -99,7 +99,12 @@ struct Args {
 }
 
 fn main() {
-    Logger::init("./logs".into(), true);
+    // Приватность/стабильность: НЕ пишем JSON-лог на диск ноды — раньше это
+    // (`Some("./logs")`) дважды забивало диск и вешало прокси (см. историю
+    // инцидентов на proxy-fr1). JSON уходит в stdout — виден через
+    // `docker logs`, централизованный сбор состояния тоннеля идёт отдельным
+    // push-каналом на control-plane (см. `report_node_health` в network.rs).
+    Logger::init(None, true);
     Logger::global().set_level("info");
     let args = Args::parse();
 

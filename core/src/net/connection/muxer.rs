@@ -60,11 +60,11 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 use crate::net::diagnostics::{self, DiagnosticsEvent, LegMetrics, TunnelMetrics, DIAG_COUNTERS};
+use crate::net::INITIAL_RTT_MS;
 use crate::net::{
     BACKLOG_REAPER_IDLE_TIMEOUT, BACKLOG_REAPER_INTERVAL, BACKLOG_STUCK_GRACE, MAX_TUNNEL_LEGS,
     STREAM_BACKLOG_MAX_BYTES,
 };
-use crate::net::INITIAL_RTT_MS;
 use crate::nrxp::FrameType;
 
 /// Атомарная статистика одной ноги: переданные/принятые байты и сглаженный RTT.
@@ -338,10 +338,14 @@ impl Muxer {
     /// Складывает байты ноги, которая уходит из `legs` (эвикт/реконнект), в
     /// сессионный кумулятивный счётчик — вызывать сразу после `DashMap::remove`.
     fn fold_removed_leg(&self, leg: &MuxLeg) {
-        self.cumulative_tx
-            .fetch_add(leg.stats.tx_bytes.load(Ordering::Relaxed), Ordering::Relaxed);
-        self.cumulative_rx
-            .fetch_add(leg.stats.rx_bytes.load(Ordering::Relaxed), Ordering::Relaxed);
+        self.cumulative_tx.fetch_add(
+            leg.stats.tx_bytes.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        self.cumulative_rx.fetch_add(
+            leg.stats.rx_bytes.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
     }
 
     /// Суммарный трафик сессии (все ноги, включая уже отцепленные) — источник
@@ -381,8 +385,10 @@ impl Muxer {
     /// Откатывает базовую точку назад на `delta` — вызывать, если репорт
     /// бэкенду не удался, чтобы не потерять дельту навсегда.
     pub fn rollback_usage_delta(&self, delta: u64) {
-        self.quota_reported_bytes
-            .fetch_sub(delta.min(self.quota_reported_bytes.load(Ordering::Relaxed)), Ordering::Relaxed);
+        self.quota_reported_bytes.fetch_sub(
+            delta.min(self.quota_reported_bytes.load(Ordering::Relaxed)),
+            Ordering::Relaxed,
+        );
     }
 
     /// Фоновый "ридер" бэклогов: единственное место, которое реально закрывает
@@ -497,7 +503,8 @@ impl Muxer {
     /// removed leg force `select_leg` to re-balance each affected stream onto a
     /// healthy leg on its next send, instead of repeatedly probing the dead one.
     fn clear_bindings_for_leg(&self, leg_id: u32) {
-        self.stream_bindings.retain(|_, bound_leg| *bound_leg != leg_id);
+        self.stream_bindings
+            .retain(|_, bound_leg| *bound_leg != leg_id);
     }
 
     /// Безопасно эвиктит ногу, но только если её текущий `control_tx` совпадает с
@@ -603,8 +610,7 @@ impl Muxer {
         let selected_leg = if candidates.is_empty() {
             None
         } else {
-            let idx =
-                self.rr_counter.fetch_add(1, Ordering::Relaxed) as usize % candidates.len();
+            let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) as usize % candidates.len();
             Some(candidates[idx].clone())
         };
 
@@ -911,13 +917,18 @@ impl Muxer {
                     if tx.send(item).await.is_err() {
                         // Consumer dropped its receiver — remove_stream elsewhere
                         // will clean up the entry; nothing more to drain into.
-                        trace!(stream_id, "backlog drainer: consumer channel closed, stopping");
+                        trace!(
+                            stream_id,
+                            "backlog drainer: consumer channel closed, stopping"
+                        );
                         return;
                     }
                     backlog.bytes.fetch_sub(len as usize, Ordering::AcqRel);
                     backlog.mark_progress();
                     stats.rx_bytes.fetch_add(len, Ordering::Relaxed);
-                    DIAG_COUNTERS.mux_dispatch_ok.fetch_add(1, Ordering::Relaxed);
+                    DIAG_COUNTERS
+                        .mux_dispatch_ok
+                        .fetch_add(1, Ordering::Relaxed);
                 }
             }
         });
@@ -973,7 +984,9 @@ impl Muxer {
                 Ok(()) => {
                     stats.rx_bytes.fetch_add(size, Ordering::Relaxed);
                     backlog.mark_progress();
-                    DIAG_COUNTERS.mux_dispatch_ok.fetch_add(1, Ordering::Relaxed);
+                    DIAG_COUNTERS
+                        .mux_dispatch_ok
+                        .fetch_add(1, Ordering::Relaxed);
                     return;
                 }
                 Err(TrySendError::Closed(_)) => {
@@ -1056,9 +1069,7 @@ impl Muxer {
             let avail = state.available.load(Ordering::Acquire);
             if avail > 0 {
                 let take = (avail as usize).min(want);
-                state
-                    .available
-                    .fetch_sub(take as i64, Ordering::AcqRel);
+                state.available.fetch_sub(take as i64, Ordering::AcqRel);
                 return take;
             }
             let since_last_grant = diagnostics::current_timestamp_ms()
@@ -1071,11 +1082,8 @@ impl Muxer {
                 );
                 return want;
             }
-            let _ = tokio::time::timeout(
-                crate::net::CREDIT_WAIT_POLL,
-                state.notify.notified(),
-            )
-            .await;
+            let _ =
+                tokio::time::timeout(crate::net::CREDIT_WAIT_POLL, state.notify.notified()).await;
         }
     }
 

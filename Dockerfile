@@ -25,8 +25,10 @@ RUN cargo build --release -p netrunner-server
 FROM debian:bookworm-slim
 WORKDIR /app
 
-# Ставим системные сертификаты, чтобы прокси мог работать с сетью по HTTPS
-RUN apt-get update && apt-get install -y ca-certificates libssl3 && rm -rf /var/lib/apt/lists/*
+# ca-certificates — сетевые HTTPS-запросы прокси. wget — единственная цель:
+# HEALTHCHECK ниже дёргает локальный /health (см. server/src/health.rs) —
+# без него в образе нечем сделать HTTP-запрос для докеровской проверки.
+RUN apt-get update && apt-get install -y ca-certificates libssl3 wget && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/target/release/netrunner-server /app/netrunner-proxy
 

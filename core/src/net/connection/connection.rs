@@ -907,14 +907,18 @@ impl ServerHandler {
     ) {
         let sni_target = requested_sni.filter(|h| is_plausible_hostname(h));
 
+        // Приватность: не логируем ни запрошенный SNI, ни разрешённый адрес —
+        // это то же самое "куда идёт клиент", просто на пути анти-DPI decoy'я,
+        // а не обычного туннеля. Достаточно знать, свой ли SNI использован или
+        // пришлось падать на decoy_host.
         let target_addr = match sni_target {
             Some(host) => match resolve_safe_decoy_addr(host, HTTPS_PORT).await {
                 Some(addr) => {
-                    info!(sni = %host, %addr, "Stealth fallback: bridging to requested SNI");
+                    debug!("Stealth fallback: bridging to requested SNI");
                     Some(addr)
                 }
                 None => {
-                    warn!(sni = %host, "Stealth fallback: SNI resolved unsafely or failed, using decoy_host");
+                    debug!("Stealth fallback: SNI resolved unsafely or failed, using decoy_host");
                     resolve_safe_decoy_addr(decoy_host, HTTPS_PORT).await
                 }
             },
@@ -926,7 +930,7 @@ impl ServerHandler {
             return;
         };
 
-        info!(target = %target_addr, "Stealth fallback: bridging to Target");
+        debug!("Stealth fallback: bridging to decoy target");
         let target_stream =
             tokio::time::timeout(FALLBACK_CONNECT_TIMEOUT, TcpStream::connect(target_addr)).await;
 
@@ -961,7 +965,7 @@ impl ServerHandler {
 #[async_trait::async_trait]
 impl TunnelHandler for ServerHandler {
     async fn run(self) -> Result<(), AppError> {
-        info!("Acting as TLS Server with Stealth Fallback");
+        debug!("Acting as TLS Server with Stealth Fallback");
 
         let decoy_host = self.decoy_host;
         let Connection {
@@ -982,7 +986,7 @@ impl TunnelHandler for ServerHandler {
                         &ServerProfile::MODERN,
                     ) {
                         Ok((sh, peer_version)) => {
-                            info!(peer_version, "✅ Valid Netrunner ClientHello detected");
+                            debug!(peer_version, "✅ Valid Netrunner ClientHello detected");
                             break (sh, peer_version);
                         }
                         Err(e) => {
@@ -1095,7 +1099,7 @@ impl TunnelHandler for ServerHandler {
                             let sid = parts[0].to_string();
                             let lid: u32 = parts[1].parse().unwrap();
                             let token = parts[2].to_string();
-                            info!("🤝 Secure Auth verified! Session: {}, Leg: {}", sid, lid);
+                            debug!("🤝 Secure Auth verified! Session: {}, Leg: {}", sid, lid);
                             break (sid, lid, token);
                         }
                     }

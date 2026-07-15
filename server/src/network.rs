@@ -7,16 +7,55 @@
 //! спавнит `ServerHandler::run` из ядра под отдельным tracing-span клиента.
 
 use netrunner_core::net::{
-    AuthValidator, Connection, NetworkConfig, ServerHandler, SessionManager, TunnelHandler,
-    TOPOLOGY_PRINT_INTERVAL,
+    AuthValidator, Connection, NetworkConfig, NodeHealthReport, ServerHandler, SessionManager,
+    TunnelHandler, TOPOLOGY_PRINT_INTERVAL,
 };
-use netrunner_logger::{error, info, warn};
+use netrunner_logger::{debug, error, info, warn};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
+
+/// Локальный, ничего не значащий вне этого процесса счётчик соединений —
+/// только для корреляции строк одного и того же соединения в логе, не
+/// идентификатор клиента (см. `Network::run`).
+static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(0);
+
+/// Момент старта процесса — для `uptime_secs` в `NodeHealthReport`.
+static START_TIME: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+
+/// Unix-время (сек) последнего успешного прохода периодического таска
+/// (health-check ног + отчёты). `/health` считает ноду нездоровой, если этот
+/// таск не отмечался дольше пары интервалов — defense-in-depth: именно этот
+/// таск дважды виновато зависал (см. фиксы `.enter()`-через-`.await` и
+/// DashMap-итератора через `.await`), и раньше зависание одной корутины
+/// внутри него было невидимо снаружи (health-эндпоинт — отдельная задача,
+/// продолжал отвечать "ok", пока сам процесс не зависал целиком).
+static LAST_PERIODIC_TICK_UNIX_SECS: AtomicU64 = AtomicU64::new(0);
+
+fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Публичная, доступная из `health.rs` проверка: не завис ли периодический
+/// таск. `true` — нода жива с точки зрения этого сигнала.
+pub(crate) fn periodic_task_is_healthy() -> bool {
+    let last = LAST_PERIODIC_TICK_UNIX_SECS.load(Ordering::Relaxed);
+    if last == 0 {
+        // Ещё ни разу не отметился — либо только что стартовали (в пределах
+        // первого интервала это нормально), либо таск не запущен вовсе.
+        return START_TIME
+            .get()
+            .map(|t| t.elapsed() < TOPOLOGY_PRINT_INTERVAL * 3)
+            .unwrap_or(true);
+    }
+    now_unix_secs().saturating_sub(last) < (TOPOLOGY_PRINT_INTERVAL * 3).as_secs()
+}
 
 use crate::diagnostics::{ClientDiagnosticsLogger, ServerDiagnosticsLogger};
 use crate::health;
@@ -61,26 +100,29 @@ impl Network {
     /// Запускает сервер: слушает TCP и обслуживает соединения до отмены `token`.
     pub async fn run(&self, token: CancellationToken) {
         let addr = format!("{}:{}", self.host, self.port);
+        START_TIME.get_or_init(Instant::now);
 
         NetworkConfig::init_global(1450);
 
         // 🔥 CRITICAL FIX: Create ONE global session manager for multiplexing
         let session_manager = Arc::new(SessionManager::new());
 
-        // Start diagnostics logger — writes events to ./netrunner_diagnostics.jsonl.
-        // Shares the session manager so snapshots report real per-session tunnel
-        // state (active legs, streams) instead of an always-empty placeholder.
-        Arc::new(ServerDiagnosticsLogger::new(".", session_manager.clone())).start();
+        // Диагностика — только ограниченный in-memory store, без файлов на
+        // диске ноды (см. diagnostics.rs). Делит SessionManager, чтобы снапшоты
+        // отражали реальное состояние тоннеля (активные ноги/потоки), а не
+        // всегда-пустую заглушку.
+        Arc::new(ServerDiagnosticsLogger::new(session_manager.clone())).start();
 
-        // Start client-diagnostics logger — saves snapshots shipped by clients
-        // over the tunnel into ./netrunner_client_diag_<session>.jsonl
-        Arc::new(ClientDiagnosticsLogger::new(".")).start();
+        // Дренирует произвольную клиентскую само-диагностику — не сохраняется
+        // нигде (см. doc-комментарий на ClientDiagnosticsLogger).
+        Arc::new(ClientDiagnosticsLogger::new()).start();
 
         let sm_clone = session_manager.clone();
         let quota_auth = self.auth.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(TOPOLOGY_PRINT_INTERVAL).await;
+                LAST_PERIODIC_TICK_UNIX_SECS.store(now_unix_secs(), Ordering::Relaxed);
 
                 let mut active_muxers = Vec::new();
                 for entry in sm_clone.get_session().iter() {
@@ -145,6 +187,38 @@ impl Network {
                         }
                     }
                 }
+
+                // Единая точка сбора состояния ноды — вместо локальных файлов
+                // на диске (см. `Logger::init`/diagnostics.rs). Полностью
+                // анонимный агрегат: ни IP, ни хостов назначения, ни user_id.
+                if let Some(validator) = &quota_auth {
+                    let mut active_legs = 0usize;
+                    let mut total_streams = 0usize;
+                    let mut bytes_up_total_mb = 0.0;
+                    let mut bytes_down_total_mb = 0.0;
+                    for muxer in &active_muxers {
+                        let m = muxer.snapshot_tunnel_metrics();
+                        total_streams += m.total_streams;
+                        active_legs += m.active_legs.len();
+                        for leg in &m.active_legs {
+                            bytes_up_total_mb += leg.tx_mb;
+                            bytes_down_total_mb += leg.rx_mb;
+                        }
+                    }
+
+                    let report = NodeHealthReport {
+                        active_sessions: active_muxers.len(),
+                        active_legs,
+                        active_streams: total_streams,
+                        bytes_up_total_mb,
+                        bytes_down_total_mb,
+                        error_totals: netrunner_core::net::diagnostics::DIAG_COUNTERS.snapshot(),
+                        uptime_secs: START_TIME.get().map(|t| t.elapsed().as_secs()).unwrap_or(0),
+                    };
+                    if let Err(e) = validator.report_node_health(report).await {
+                        debug!(error = %e, "Node health report failed, will retry next tick");
+                    }
+                }
             }
         });
         info!("🌐 Netrunner Server: Listening on {}", addr);
@@ -174,8 +248,15 @@ impl Network {
                     break;
                 }
                 res = listener.accept() => {
-                    if let Ok((stream, client_addr)) = res {
-                        let span = tracing::info_span!("client_conn", ip = %client_addr);
+                    if let Ok((stream, _client_addr)) = res {
+                        // Приватность: НЕ привязываем IP клиента к спану — раньше
+                        // `ip = %client_addr` попадал в КАЖДУЮ последующую лог-строку
+                        // этого соединения (span-поля наследуются), деанонимизируя
+                        // весь журнал. Для корреляции строк одного соединения
+                        // достаточно локального счётчика — он ничего не говорит о
+                        // том, кто и откуда подключился, только "какое по счёту".
+                        let conn_id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
+                        let span = tracing::info_span!("client_conn", conn_id);
 
                         let conn = Connection::new(stream);
 
@@ -202,7 +283,7 @@ impl Network {
                         // прокси зависал без падения). `.instrument(span)` на
                         // самом future — единственный async-safe способ.
                         let conn_future = async move {
-                            info!("🔌 New physical connection accepted");
+                            debug!("🔌 New physical connection accepted");
                             if let Err(e) = handler.run().await {
                                 error!(error = %e, "⚠️ Server handler terminated with error");
                             }

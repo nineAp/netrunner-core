@@ -72,8 +72,12 @@ impl RawCastAdapter {
             FrameType::Data | FrameType::UdpData => RawCastEvent::Data,
             FrameType::Close => RawCastEvent::Close,
             FrameType::Heartbeat => return Err("Heartbeat should be handled by muxer".into()),
-            FrameType::Diag => return Err("Diag frame is handled by diagnostics, not the bridge".into()),
-            FrameType::Credit => return Err("Credit frame is handled by muxer, not the bridge".into()),
+            FrameType::Diag => {
+                return Err("Diag frame is handled by diagnostics, not the bridge".into())
+            }
+            FrameType::Credit => {
+                return Err("Credit frame is handled by muxer, not the bridge".into())
+            }
         };
 
         Ok(RawCastFrame {

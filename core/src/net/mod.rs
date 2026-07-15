@@ -48,7 +48,7 @@ mod connection;
 mod constants;
 pub mod diagnostics;
 
-pub use auth::{AuthValidator, UsageReport, UserQuota};
+pub use auth::{AuthValidator, NodeHealthReport, UsageReport, UserQuota};
 pub use config::NetworkConfig;
 #[cfg(not(target_arch = "wasm32"))]
 pub use connection::{

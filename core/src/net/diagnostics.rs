@@ -18,9 +18,8 @@
 use std::{
     collections::VecDeque,
     sync::{
-        OnceLock,
         atomic::{AtomicU64, Ordering},
-        Mutex,
+        Mutex, OnceLock,
     },
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -325,16 +324,16 @@ impl DiagnosticsStore {
     pub fn get_all_json(&self) -> String {
         let q = self.snapshots.lock().unwrap();
         let items: Vec<&DiagnosticsSnapshot> = q.iter().collect();
-        serde_json::to_string_pretty(&items)
-            .unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}"))
+        serde_json::to_string_pretty(&items).unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}"))
     }
 
     /// Returns only the most recent snapshot as pretty-printed JSON, or `"null"`.
     pub fn get_latest_json(&self) -> String {
         let q = self.snapshots.lock().unwrap();
         match q.back() {
-            Some(s) => serde_json::to_string_pretty(s)
-                .unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}")) ,
+            Some(s) => {
+                serde_json::to_string_pretty(s).unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}"))
+            }
             None => "null".to_string(),
         }
     }

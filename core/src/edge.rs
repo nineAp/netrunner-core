@@ -266,7 +266,9 @@ mod tests {
         // Клиент оставил в буфере свой фиктивный CCS — серверу до него дела нет
         // в этом тесте (сервер не гоняет полный цикл ClientHandler::perform_handshake),
         // достаточно того, что клиент действительно его отправил.
-        assert!(TlsBridge::unpack_middlebox_ccs(&mut wire).unwrap().is_some());
+        assert!(TlsBridge::unpack_middlebox_ccs(&mut wire)
+            .unwrap()
+            .is_some());
 
         let (s_tx_key, s_tx_iv, s_rx_key, s_rx_iv) = server_keys.get_aead_parameters();
         let mut server_cipher = ChaChaCipher::new();

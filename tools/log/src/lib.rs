@@ -22,11 +22,11 @@ use std::sync::{Once, OnceLock};
 pub use tracing::{debug, error, info, instrument, span, trace, warn, Event};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{
-    fmt,
-    layer::{Context, SubscriberExt},
+    fmt::{self, MakeWriter},
+    layer::SubscriberExt,
     reload::Handle,
     util::SubscriberInitExt,
-    EnvFilter, Layer, Registry,
+    EnvFilter, Registry,
 };
 
 pub use error::{
@@ -46,31 +46,77 @@ pub struct Logger {
 static INIT: Once = Once::new();
 static LOGGER: OnceLock<Logger> = OnceLock::new();
 
-/// Слой маскировки PII (сейчас — заготовка; regex для IP готов к использованию).
-#[allow(dead_code)]
-struct PiiRedactorLayer {
+/// `Write`-обёртка: вычищает IPv4-адреса из каждого записываемого куска байт
+/// ПЕРЕД тем, как они дойдут до реального writer'а (файл/stdout). Основная
+/// защита — вообще не логировать такие данные (см. call sites в
+/// `netrunner-proxy`, где IP/hostname убраны из полей и текста событий) —
+/// это только defense-in-depth на случай регресса (кто-то в будущем случайно
+/// подставит адрес прямо в текст сообщения).
+///
+/// `tracing`'s `fmt::layer()` пишет одно событие = один вызов `write()` с уже
+/// полностью отформatированной строкой, поэтому построчного/потокового
+/// разбора не нужно — regex просто прогоняется по каждому куску целиком.
+#[derive(Clone)]
+struct RedactingWriter<W> {
+    inner: W,
     ip_regex: Regex,
 }
 
-impl PiiRedactorLayer {
-    fn new() -> Self {
-        Self {
-            ip_regex: Regex::new(r"\b(?:\d{1,3}\.){3}\d{1,3}\b").unwrap(),
+impl<W: std::io::Write> std::io::Write for RedactingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match std::str::from_utf8(buf) {
+            Ok(s) => {
+                let redacted = self.ip_regex.replace_all(s, "[redacted]");
+                self.inner.write_all(redacted.as_bytes())?;
+                Ok(buf.len())
+            }
+            // Не текст (не должно случаться для JSON/fmt-слоя) — пишем как есть,
+            // чем терять данные лога целиком из-за одной небинарной строки.
+            Err(_) => self.inner.write(buf),
         }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
     }
 }
 
-impl<S: tracing::Subscriber> Layer<S> for PiiRedactorLayer {
-    fn on_event(&self, _event: &Event<'_>, _ctx: Context<'_, S>) {
-        // В продакшн-версии здесь можно реализовать Visitor для глубокой очистки полей.
-        // Сейчас слой присутствует в стеке для фильтрации перед записью.
+fn pii_ip_regex() -> Regex {
+    Regex::new(r"\b(?:\d{1,3}\.){3}\d{1,3}\b").unwrap()
+}
+
+/// `MakeWriter`-обёртка, оборачивающая каждый созданный writer в
+/// [`RedactingWriter`] — так `RedactingWriter` можно навесить на любой слой
+/// (`with_writer`), включая `NonBlocking` файлового аппендера.
+struct RedactingMakeWriter<M> {
+    inner: M,
+    ip_regex: Regex,
+}
+
+impl<'a, M: MakeWriter<'a>> MakeWriter<'a> for RedactingMakeWriter<M> {
+    type Writer = RedactingWriter<M::Writer>;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        RedactingWriter {
+            inner: self.inner.make_writer(),
+            ip_regex: self.ip_regex.clone(),
+        }
     }
 }
 
 impl Logger {
     /// Инициализирует глобальный логгер (идемпотентно — только первый вызов
-    /// действует). `is_production` выбирает JSON-в-файл + перехват паник против
-    /// цветного вывода в консоль; `log_dir` — куда писать файлы в прод-режиме.
+    /// действует). `is_production` выбирает JSON + перехват паник против
+    /// цветного вывода в консоль.
+    ///
+    /// `log_dir` раньше означал "писать JSON-файлы прямо на диск ноды" — это
+    /// было дебаг-решением: неограниченный локальный файл на проде уже дважды
+    /// приводил к забитому диску и зависанию прокси (см. историю инцидентов
+    /// на proxy-fr1). Теперь параметр сохранён только для дев/ручной
+    /// диагностики (запуск локально с явным путём) — прод (`main.rs`) всегда
+    /// зовёт `init(None, true)`: JSON уходит в stdout (его читает `docker logs`
+    /// и, если нужно централизованно, promtail/аналог), файла на диске ноды
+    /// не остаётся вообще.
     pub fn init(log_dir: Option<&str>, is_production: bool) {
         INIT.call_once(|| {
             // 1. Настройка динамического фильтра
@@ -78,28 +124,28 @@ impl Logger {
                 EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
             let (filter_layer, handle) = tracing_subscriber::reload::Layer::new(filter);
 
-            // 2. Слой маскировки
-            let redactor_layer = PiiRedactorLayer::new();
-
-            // 3. Базовый реестр
-            let registry = tracing_subscriber::registry()
-                .with(filter_layer)
-                .with(redactor_layer);
+            // 2. Базовый реестр
+            let registry = tracing_subscriber::registry().with(filter_layer);
 
             let mut file_guard = None;
 
             if is_production {
-                // Прод режим: JSON + Файл
+                // Прод: JSON, PII-фильтр на writer'е — на файл (если явно
+                // попросили, дев-путь) или на stdout (обычный прод-путь).
                 if let Some(path) = log_dir {
                     let file_appender = tracing_appender::rolling::daily(path, "netrunner.json");
                     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+                    let redacting_writer = RedactingMakeWriter {
+                        inner: non_blocking,
+                        ip_regex: pii_ip_regex(),
+                    };
 
                     let json_layer = fmt::layer()
                         .json()
                         .flatten_event(true)
                         .with_current_span(true)
                         .with_span_list(true)
-                        .with_writer(non_blocking)
+                        .with_writer(redacting_writer)
                         .with_ansi(false);
 
                     registry.with(json_layer).init();
@@ -114,7 +160,18 @@ impl Logger {
                         );
                     }));
                 } else {
-                    registry.with(fmt::layer().json().with_ansi(false)).init();
+                    let redacting_writer = RedactingMakeWriter {
+                        inner: std::io::stdout,
+                        ip_regex: pii_ip_regex(),
+                    };
+                    registry
+                        .with(
+                            fmt::layer()
+                                .json()
+                                .with_writer(redacting_writer)
+                                .with_ansi(false),
+                        )
+                        .init();
                 }
             } else {
                 // Дебаг режим: Красивый вывод в консоль
