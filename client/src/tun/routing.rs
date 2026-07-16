@@ -103,6 +103,18 @@ pub fn get_default_gateway_linux() -> Option<String> {
     stdout.split_whitespace().nth(2).map(|s| s.to_string())
 }
 
+/// Добавляет уже разрешённый (через публичный DNS, см. dns.rs) реальный IP
+/// исключённого домена в nftables-set `excluded_ips`, созданный в
+/// [`setup_platform_routing`] — вызывается фоновой задачей в engine.rs по мере
+/// резолва каждого домена, во время работы туннеля (сам set до этого пуст).
+#[cfg(target_os = "linux")]
+pub fn allow_excluded_ip_linux(ip: &str) {
+    let cmd = format!("nft add element ip netrunner excluded_ips {{ {} }}", ip);
+    if let Err(e) = run_cmd_ext(&cmd, true) {
+        netrunner_logger::warn!("Failed to add {} to excluded_ips set: {}", ip, e);
+    }
+}
+
 /// Ставит платформенные правила маршрутизации: весь трафic → TUN, доступ к
 /// прокси сохраняется, при `killswitch` всё прочее блокируется. `excluded_apps`
 /// (на Linux — UID) проходят мимо туннеля (split-tunneling).
@@ -148,14 +160,37 @@ pub fn setup_platform_routing(
             }
         }
 
-        // 2. Базовая маркировка трафика для отправки в TUN
+        // 2. Исключённые домены (split-tunneling по доменам, см. dns.rs/engine.rs):
+        // именованный set, который фоновая задача в engine.rs пополняет во время
+        // работы (allow_excluded_ip_linux) по мере резолва каждого исключённого
+        // домена через публичный DNS. Плюс фиксированный адрес самого публичного
+        // резолвера (1.1.1.1) — без этого исключения резолвер сам попал бы под
+        // маркировку ниже и ушёл бы в туннель, а не наружу напрямую.
+        // Обе rule стоят ДО общей маркировки и ДО killswitch-блока: `accept` —
+        // терминальный вердикт, так что пакет никогда не доходит ни до
+        // mark-правила, ни до итогового `drop` killswitch'а — исключение
+        // работает одинаково и с killswitch включённым, и выключенным.
+        run_cmd_ext(
+            "nft add set ip netrunner excluded_ips { type ipv4_addr; }",
+            true,
+        )?;
+        run_cmd_ext(
+            "nft add rule ip netrunner output ip daddr 1.1.1.1 accept",
+            false,
+        )?;
+        run_cmd_ext(
+            "nft add rule ip netrunner output ip daddr @excluded_ips accept",
+            false,
+        )?;
+
+        // 3. Базовая маркировка трафика для отправки в TUN
         let mark_rule = format!(
             "nft add rule ip netrunner output ip daddr != {} oifname != \"netr0\" mark set 0x1",
             proxy_ip
         );
         run_cmd_ext(&mark_rule, false)?;
 
-        // 3. KILLSWITCH
+        // 4. KILLSWITCH
         if killswitch {
             netrunner_logger::info!("🔒 Killswitch ENABLED (Linux)");
             // Исключения для локальной сети (крайне важно для сохранения доступа к роутеру)
@@ -181,14 +216,12 @@ pub fn setup_platform_routing(
             run_cmd_ext("nft add rule ip netrunner output drop", false)?;
         }
 
-        let mark_rule = format!(
-            "nft add rule ip netrunner output ip daddr != {} oifname != \"netr0\" mark set 0x1",
-            proxy_ip
-        );
-        run_cmd_ext(&mark_rule, false)?;
-
+        // Публичный резолвер (1.1.1.1) исключён и здесь: иначе прямой UDP-запрос
+        // `resolve_via_public_dns` (dns.rs) сам попал бы под этот DNAT и вернулся
+        // бы обратно в наш же fake-DNS обработчик по кругу, так и не дойдя до
+        // настоящего 1.1.1.1.
         let dns_redir = format!(
-            "nft add rule ip netrunner nat_out udp dport 53 ip daddr != {} dnat to 10.0.0.2:53",
+            "nft add rule ip netrunner nat_out udp dport 53 ip daddr != {{ {}, 1.1.1.1 }} dnat to 10.0.0.2:53",
             proxy_ip
         );
         run_cmd_ext(&dns_redir, false)?;
@@ -210,6 +243,19 @@ pub fn setup_platform_routing(
             &format!(
                 "route add {} mask 255.255.255.255 {} metric 1",
                 proxy_ip, gateway
+            ),
+            true,
+        )?;
+
+        // Тот же приём для публичного DNS-резолвера (1.1.1.1) — фоновая задача
+        // в engine.rs (`resolve_via_public_dns`, см. dns.rs) резолвит исключённые
+        // домены напрямую через него; без явного host route этот запрос попал
+        // бы под общий маршрут "весь трафик -> TUN" ниже и ушёл бы в туннель,
+        // а не наружу через физический интерфейс.
+        run_cmd_ext(
+            &format!(
+                "route add 1.1.1.1 mask 255.255.255.255 {} metric 1",
+                gateway
             ),
             true,
         )?;
@@ -270,6 +316,8 @@ pub fn reset_platform_routing(_proxy_ip: Option<&str>, _was_killswitch: bool) ->
         if let Some(ip) = _proxy_ip {
             let _ = run_cmd_ext(&format!("route delete {}", ip), true);
         }
+
+        let _ = run_cmd_ext("route delete 1.1.1.1", true);
 
         let _ = run_cmd_ext(
             "netsh interface ipv4 set dnsservers name=\"netr0\" source=dhcp",

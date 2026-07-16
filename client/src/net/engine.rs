@@ -927,6 +927,11 @@ impl EngineBuilder {
 
         let excluded_domains = self.config.excluded_domains.clone();
         if !excluded_domains.is_empty() {
+            // Карта, куда пишем результат резолва — тот же `Arc`, который
+            // синхронно читает `handle_query` при ответе на DNS-запросы
+            // исключённых доменов (см. dns.rs). Клонируем `Arc` ДО того,
+            // как `dns_handler` ниже уйдёт по значению в `Engine::new`.
+            let resolved_excluded = dns_handler.resolved_excluded_map();
             tokio::spawn(async move {
                 #[cfg(target_os = "linux")]
                 let phys_gw = crate::tun::routing::get_default_gateway_linux()
@@ -935,29 +940,41 @@ impl EngineBuilder {
                 let phys_gw = "192.168.1.1";
 
                 for domain in excluded_domains {
-                    if let Ok(addrs) = tokio::net::lookup_host(format!("{}:443", domain)).await {
-                        for addr in addrs {
-                            if let std::net::IpAddr::V4(ipv4) = addr.ip() {
-                                debug!(
-                                    "Adding exception route for domain {} -> IP {}",
-                                    domain, ipv4
-                                );
-                                #[cfg(target_os = "linux")]
-                                let _ = crate::tun::routing::run_cmd_ext(
-                                    &format!("ip route add {} via {}", ipv4, phys_gw),
-                                    true,
-                                );
-                                #[cfg(target_os = "windows")]
-                                let _ = crate::tun::routing::run_cmd_ext(
-                                    &format!(
-                                        "route add {} mask 255.255.255.255 {}",
-                                        ipv4, phys_gw
-                                    ),
-                                    true,
-                                );
-                            }
-                        }
+                    // Раньше здесь стоял `tokio::net::lookup_host` — но пока
+                    // туннель активен, системный резолвер сам смотрит на
+                    // тот же fake-DNS обработчик (см. `resolvectl domain
+                    // netr0 ~.` в routing.rs), так что такой запрос уходил
+                    // по кругу в этот же процесс и никогда не резолвился.
+                    // `resolve_via_public_dns` обходит это, запрашивая
+                    // публичный резолвер напрямую по UDP; сам этот резолвер
+                    // явно выведен из-под захвата туннелем в routing.rs.
+                    let Some(ipv4) = crate::net::dns::resolve_via_public_dns(&domain).await else {
+                        warn!(
+                            "Failed to resolve excluded domain {} via public DNS, bypass route not added",
+                            domain
+                        );
+                        continue;
+                    };
+
+                    debug!(
+                        "Adding exception route for domain {} -> IP {}",
+                        domain, ipv4
+                    );
+                    resolved_excluded.insert(domain.to_lowercase(), ipv4);
+
+                    #[cfg(target_os = "linux")]
+                    {
+                        let _ = crate::tun::routing::run_cmd_ext(
+                            &format!("ip route add {} via {}", ipv4, phys_gw),
+                            true,
+                        );
+                        crate::tun::routing::allow_excluded_ip_linux(&ipv4.to_string());
                     }
+                    #[cfg(target_os = "windows")]
+                    let _ = crate::tun::routing::run_cmd_ext(
+                        &format!("route add {} mask 255.255.255.255 {}", ipv4, phys_gw),
+                        true,
+                    );
                 }
             });
         }
