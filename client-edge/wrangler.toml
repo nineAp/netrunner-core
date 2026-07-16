@@ -14,7 +14,7 @@ command = "cargo install -q worker-build --version ^0.1 && worker-build --releas
 # host:port of your netrunner-server (VPN node) — the ClientHello target.
 VPN_NODE_ADDR = "203.0.113.10:443"
 # host:port the node should open on Connect (the actual backend behind it).
-BACKEND_ADDR = "203.0.113.20:8443"
+BACKEND_ADDR = "account.netrunner-vpn.com:443"
 # Decoy SNI for the masqueraded ClientHello — must resolve and answer 200 for
 # the fingerprint to hold up (see ARCH.md, core::net::DEFAULT_DECOY_HOST).
 DECOY_SNI = "www.debian.org"
