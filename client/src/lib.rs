@@ -37,9 +37,33 @@ use crate::{
     },
 };
 use netrunner_logger::{error, info};
-use std::sync::{Arc, OnceLock};
+use std::sync::{
+    Arc, OnceLock,
+    atomic::{AtomicU8, Ordering},
+};
 use tokio::runtime::Runtime;
 use tokio_util::sync::CancellationToken;
+
+/// Числовые коды состояния подключения (см. [`CONNECTION_STATE`]).
+pub const CONN_IDLE: u8 = 0;
+pub const CONN_CONNECTING: u8 = 1;
+pub const CONN_CONNECTED: u8 = 2;
+pub const CONN_FAILED: u8 = 3;
+
+/// Состояние текущей/последней попытки подключения.
+///
+/// Движок поднимается в отдельной tokio-задаче ([`SessionManager::spawn_session`]),
+/// поэтому её отказ (нет прав на TUN, не удалось поднять туннель и т.п.) раньше
+/// «терялся»: приложение оптимистично показывало `connected`, а из-за
+/// `panic = "abort"` в release-профиле приложения любой `panic` в этой задаче
+/// вообще ронял процесс. Теперь задача не паникует, а публикует сюда исход,
+/// который desktop-плагин опрашивает и превращает в статус UI.
+pub static CONNECTION_STATE: AtomicU8 = AtomicU8::new(CONN_IDLE);
+
+/// Снимок [`CONNECTION_STATE`] для приложения/плагина.
+pub fn connection_state() -> u8 {
+    CONNECTION_STATE.load(Ordering::Relaxed)
+}
 
 /// Глобальный многопоточный tokio-рантайм, общий для всех сессий.
 pub static RUNTIME: OnceLock<Runtime> = OnceLock::new();
@@ -129,8 +153,23 @@ impl SessionManager {
         let cancel_token = CancellationToken::new();
         let session_token = cancel_token.clone();
 
-        let addr: std::net::SocketAddr = remote_address.parse().expect("Invalid address format");
-        let remote_proxy_ip = addr.ip().to_string();
+        // Начинаем попытку подключения — сбрасываем прошлый исход.
+        CONNECTION_STATE.store(CONN_CONNECTING, Ordering::Relaxed);
+
+        let remote_proxy_ip = match remote_address.parse::<std::net::SocketAddr>() {
+            Ok(addr) => addr.ip().to_string(),
+            Err(e) => {
+                // Раньше был `.expect(...)` в вызывающем потоке — с panic=abort
+                // это ронял всё приложение. Отдаём неактивную сессию и failed.
+                error!("Invalid remote address '{}': {}", remote_address, e);
+                CONNECTION_STATE.store(CONN_FAILED, Ordering::Relaxed);
+                return Arc::new(Session {
+                    cancel_token: session_token,
+                    proxy_ip: String::new(),
+                    killswitch_enabled,
+                });
+            }
+        };
 
         let mut config = EngineConfig::new(&remote_address)
             .with_cache_path(&cache_dir)
@@ -156,11 +195,21 @@ impl SessionManager {
         runtime.spawn(async move {
             info!("Starting VPN Engine thread...");
 
-            let tun_device = {
+            // TUN создаётся привилегированной операцией (TUNSETIFF, нужен
+            // CAP_NET_ADMIN/root). Раньше здесь стоял `.expect(...)`, и на
+            // десктопе без прав он паниковал → panic=abort → всё приложение
+            // падало ровно «при попытке подключиться». Теперь обрабатываем
+            // отказ штатно и публикуем CONN_FAILED.
+            let tun_result: std::io::Result<Tun> = {
                 #[cfg(any(target_os = "android", target_os = "ios"))]
                 {
-                    Tun::from_fd(_tun_fd.expect("TUN FD required on mobile"))
-                        .expect("Failed to init TUN from FD")
+                    match _tun_fd {
+                        Some(fd) => Tun::from_fd(fd),
+                        None => Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "TUN FD required on mobile",
+                        )),
+                    }
                 }
                 #[cfg(target_os = "linux")]
                 {
@@ -172,14 +221,24 @@ impl SessionManager {
                             .mtu(config.mtu as u16)
                             .up();
                     })
-                    .expect("Failed to init TUN")
                 }
                 #[cfg(target_os = "windows")]
                 {
                     Tun::create(|tun_cfg| {
                         tun_cfg.tun_name("netr0");
                     })
-                    .expect("Failed to init TUN")
+                }
+            };
+
+            let tun_device = match tun_result {
+                Ok(tun) => tun,
+                Err(e) => {
+                    error!(
+                        "Failed to create TUN device (нужны права CAP_NET_ADMIN/root?): {}",
+                        e
+                    );
+                    CONNECTION_STATE.store(CONN_FAILED, Ordering::Relaxed);
+                    return;
                 }
             };
 
@@ -191,6 +250,7 @@ impl SessionManager {
             match builder_result {
                 Ok((mut engine, tun)) => {
                     info!("Engine built successfully, starting loop...");
+                    CONNECTION_STATE.store(CONN_CONNECTED, Ordering::Relaxed);
 
                     tokio::select! {
                         _ = engine.run(tun) => {
@@ -200,9 +260,12 @@ impl SessionManager {
                             info!("Engine task shutting down via token");
                         }
                     }
+                    // Цикл завершился (штатно или по отмене) — больше не connected.
+                    CONNECTION_STATE.store(CONN_IDLE, Ordering::Relaxed);
                 }
                 Err(e) => {
                     error!("Failed to build VPN Engine: {}", e);
+                    CONNECTION_STATE.store(CONN_FAILED, Ordering::Relaxed);
                 }
             }
         });

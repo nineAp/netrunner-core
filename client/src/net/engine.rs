@@ -20,11 +20,11 @@
 
 use bytes::Bytes;
 use netrunner_core::net::ClientHandler;
-use netrunner_core::net::NetworkConfig;
 use netrunner_core::net::Muxer;
+use netrunner_core::net::NetworkConfig;
 use netrunner_core::net::diagnostics::{
-    self, DiagnosisRx, DiagnosticsEvent, DiagnosticsSnapshot, DiagnosticsStore,
-    EngineMetrics, SocketMetrics, current_timestamp_ms,
+    self, DiagnosisRx, DiagnosticsEvent, DiagnosticsSnapshot, DiagnosticsStore, EngineMetrics,
+    SocketMetrics, current_timestamp_ms,
 };
 use netrunner_core::rawcast::{RawCastEvent, RawCastFrame};
 use smoltcp::iface::PollResult;
@@ -173,7 +173,15 @@ impl Engine {
     /// модуля. `tun` забирается во владение и расщепляется на половины.
     pub async fn run(&mut self, tun: Tun) {
         info!("Current routes: {:?}", self.interface.routes());
-        let (writer, reader) = tun.split().expect("Failed to split TUN");
+        let (writer, reader) = match tun.split() {
+            Ok(pair) => pair,
+            Err(e) => {
+                // panic=abort в release-профиле приложения превратил бы любой
+                // panic здесь в падение всего процесса — выходим штатно.
+                error!("Failed to split TUN device, aborting engine loop: {}", e);
+                return;
+            }
+        };
 
         // Bounded: TUN reader blocks when engine is overloaded → kernel TUN
         // buffer fills → natural backpressure to the OS.
@@ -365,8 +373,7 @@ impl Engine {
                 // climb while TunDevice ↓ is flat, the stall is at the smoltcp/app
                 // boundary; if they stay ~0, look upstream (muxer/leg dispatch).
                 let pending_sockets = self.pending_download.len();
-                let pending_frames: usize =
-                    self.pending_download.values().map(|q| q.len()).sum();
+                let pending_frames: usize = self.pending_download.values().map(|q| q.len()).sum();
                 let worst_backlog = self
                     .pending_download
                     .values()
@@ -727,13 +734,17 @@ impl Engine {
         self.interface.routes_mut().remove_default_ipv4_route();
     }
 
-    pub fn set_default_gateway(&mut self, gateway: smoltcp::wire::Ipv4Address) {
+    pub fn set_default_gateway(
+        &mut self,
+        gateway: smoltcp::wire::Ipv4Address,
+    ) -> Result<(), String> {
         info!("Setting default IPv4 gateway to: {}", gateway);
         self.interface.routes_mut().remove_default_ipv4_route();
         self.interface
             .routes_mut()
             .add_default_ipv4_route(gateway)
-            .expect("Failed to set default gateway");
+            .map_err(|e| format!("Failed to set default gateway: {:?}", e))?;
+        Ok(())
     }
 
     pub fn activate(&mut self) {
@@ -995,7 +1006,7 @@ impl EngineBuilder {
         if self.config.transparent_mode {
             engine.set_transparent_mode();
         }
-        engine.set_default_gateway(self.config.default_gateway);
+        engine.set_default_gateway(self.config.default_gateway)?;
         engine.activate();
 
         info!(
