@@ -21,6 +21,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -47,54 +48,59 @@ jobs:
           cache-from: type=registry,ref=gitea.netrunner-vpn.com/nineap/netrunner-proxy:cache
           cache-to: type=registry,ref=gitea.netrunner-vpn.com/nineap/netrunner-proxy:cache,mode=max
 
+  # Собирает netrunner-client + netrunner-logger (обе — отдельные cdylib, см.
+  # комментарий в Makefile::build-android) на все 4 Android ABI + генерит
+  # uniffi Kotlin-биндинги, публикует generic-пакетом в Package Registry самой
+  # Gitea (scripts/publish-android-client-libs.mjs) — оттуда их забирает
+  # netrunner-app в СВОЁМ CI (fetch-client-libs.mjs). Раньше этот джоб ссылался
+  # на scripts/gitea-publish-release.mjs, которого в ЭТОМ репозитории вообще
+  # нет (скопирован по недоразумению из netrunner-app) — джоба падала на
+  # последнем шаге, ни разу не публикуя ничего. Плюс `--bin netrunner-client`
+  # вместо `-p ... --lib` не производил cdylib вообще (см. Makefile).
   build-android-libs:
     runs-on: ubuntu-24.04
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
 
-      # 1. Корректная установка Rust
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android,i686-linux-android
 
-      # 2. Установка Android NDK
-      - name: Install Android NDK
-        id: setup-ndk
-        uses: nttld/setup-ndk@v1
+      # Тот же проверенный на этом раннере способ поставить NDK, что уже
+      # работает в netrunner-app/.gitea/workflows/release.yml (build-android) —
+      # android-actions/setup-android@v3 экспортирует ANDROID_NDK_ROOT в env
+      # для последующих шагов.
+      - uses: actions/setup-java@v4
         with:
-          ndk-version: r26b
+          distribution: temurin
+          java-version: 17
 
-      # 3. Установка инструментов
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android NDK
+        run: sdkmanager "ndk;26.1.10909125"
+
       - name: Install cargo-ndk
-        run: cargo install cargo-ndk
+        run: command -v cargo-ndk >/dev/null || cargo install cargo-ndk
 
-      # 4. Сборка Native Libs
-      - name: Build Native Libs
+      - name: Build Android client libs (4 ABI) + uniffi Kotlin bindings
         env:
-          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_ROOT }}
         run: |
-          ABIS="arm64-v8a armeabi-v7a x86_64 x86"
-          for abi in $ABIS; do
-            cargo ndk -t $abi -o ./gen build --bin netrunner-client --release
+          set -e
+          for abi in arm64-v8a armeabi-v7a x86_64 x86; do
+            cargo ndk -t "$abi" -o ./gen build --release -p netrunner-client -p netrunner-logger --lib
           done
+          cargo run --bin bindgen-tool generate \
+            --library gen/arm64-v8a/libnetrunner_client.so \
+            --language kotlin --no-format --out-dir gen
 
-          # Генерация биндингов
-          cargo run --bin bindgen-tool generate --library gen/arm64-v8a/libnetrunner_client.so --language kotlin --no-format --out-dir gen
-
-      # 5. Подготовка папки для скрипта публикации (скрипт ждет папку artifacts/)
-      - name: Prepare artifacts
-        run: |
-          mkdir -p artifacts-libs
-          tar -czf artifacts-libs/android-libs.tar.gz gen/
-
-      # 6. Загрузка в Gitea
-      # Важно: используйте тот же секрет GITEA_TOKEN, что и в скрипте публикации
-      - name: Upload to Gitea
+      - name: Publish to Gitea package registry
         env:
           GITEA_TOKEN: ${{ secrets.GT_REGISTRY_TOKEN }}
           GITEA_SERVER_URL: ${{ vars.GITEA_SERVER_URL }}
-          GITEA_REPO: ${{ github.repository }}
-          RELEASE_VERSION: ${{ github.ref_name }}
-        run: |
-          node scripts/gitea-publish-release.mjs artifacts-libs/
+          GITEA_OWNER: nineap
+        run: node scripts/publish-android-client-libs.mjs gen

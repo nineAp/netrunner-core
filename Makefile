@@ -62,10 +62,20 @@ debug-server:
 
 ABIS = arm64-v8a armeabi-v7a x86_64 x86
 
+# ВАЖНО: `--bin netrunner-client` (как было раньше) НЕ собирает cdylib вообще —
+# client/src/main.rs это отдельная, самодостаточная точка входа (свой mod net;
+# mod tun;, не `use netrunner_client::...`), поэтому `cargo build --bin X`
+# компилирует ТОЛЬКО бинарь и не выпускает libnetrunner_client.so (проверено
+# напрямую: `cargo build --bin netrunner-client --release` не создаёт .so,
+# `cargo build --lib` — создаёт). Именно эта команда должна была собирать
+# либы для мобилки, а на деле никогда их не производила. `-p` x2 + `--lib`
+# собирает ИМЕННО библиотеки (netrunner-client И netrunner-logger — оба
+# отдельные cdylib, второй сам по себе не строится просто как транзитивная
+# зависимость первого), без бесполезной для мобилки Linux-десктопной CLI.
 build-android:
 	@for abi in $(ABIS); do \
 		echo "Building for $$abi..."; \
-		cargo ndk -t $$abi -o ./gen build --bin netrunner-client --release; \
+		cargo ndk -t $$abi -o ./gen build --release -p netrunner-client -p netrunner-logger --lib; \
 	done
 	cargo run --bin bindgen-tool generate \
 		--library gen/arm64-v8a/libnetrunner_client.so \
