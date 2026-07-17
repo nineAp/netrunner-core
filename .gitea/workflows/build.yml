@@ -118,6 +118,11 @@ jobs:
       - name: Publish to Gitea package registry
         env:
           GITEA_TOKEN: ${{ secrets.GT_REGISTRY_TOKEN }}
-          GITEA_SERVER_URL: ${{ vars.GITEA_SERVER_URL }}
+          # Захардкожено (не vars.GITEA_SERVER_URL): переменная не заведена в
+          # Settings этого репозитория — упало с "GITEA_SERVER_URL обязательна".
+          # Значение публичное, не секрет (сам этот файл уже хардкодит тот же
+          # домен для Docker-логина/тега образа выше) — заводить ради него
+          # ещё один per-repo var смысла нет.
+          GITEA_SERVER_URL: https://gitea.netrunner-vpn.com
           GITEA_OWNER: nineap
         run: node scripts/publish-android-client-libs.mjs gen
