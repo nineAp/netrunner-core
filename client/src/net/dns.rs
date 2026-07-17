@@ -68,7 +68,10 @@ pub struct FakeIpStore {
 
 impl FakeIpStore {
     pub fn new() -> Self {
-        info!("Initializing FakeIpStore starting at {}", Ipv4Addr::from(FAKE_IP_START));
+        info!(
+            "Initializing FakeIpStore starting at {}",
+            Ipv4Addr::from(FAKE_IP_START)
+        );
         Self {
             cache: LruCache::new(NonZeroUsize::new(FAKE_IP_CACHE_SIZE).unwrap()),
             rev_cache: LruCache::new(NonZeroUsize::new(FAKE_IP_CACHE_SIZE).unwrap()),

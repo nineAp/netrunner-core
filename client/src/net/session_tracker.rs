@@ -31,12 +31,16 @@ use tokio::sync::{OwnedSemaphorePermit, mpsc};
 
 use crate::net::connection::{TcpConnection, UdpConnection};
 
+/// Канал доставки входящих данных до логического сокета + флаг backpressure
+/// ("получатель захлёбывается, придержи новые пакеты").
+type InboundChannel = (mpsc::Sender<Bytes>, Arc<std::sync::atomic::AtomicBool>);
+
 /// Состояние всех виртуальных соединений и их маппингов на хендлы smoltcp.
 pub struct SessionTracker {
     last_activity: HashMap<SocketHandle, StdInstant>,
     active_tcp: HashMap<SocketHandle, TcpConnection>,
     active_udp: HashMap<SocketHandle, UdpConnection>,
-    pub inbound_tx: Arc<DashMap<u64, (mpsc::Sender<Bytes>, Arc<std::sync::atomic::AtomicBool>)>>,
+    pub inbound_tx: Arc<DashMap<u64, InboundChannel>>,
     handle_to_id: HashMap<SocketHandle, u64>,
 
     id_to_handle: HashMap<u64, SocketHandle>,
@@ -112,10 +116,10 @@ impl SessionTracker {
         socket_set: &SocketSet,
     ) -> bool {
         socket_set.iter().any(|(_, s)| {
-            if let Socket::Tcp(tcp) = s {
-                if let Some(remote) = tcp.remote_endpoint() {
-                    return remote.addr == src_addr && remote.port == src_port;
-                }
+            if let Socket::Tcp(tcp) = s
+                && let Some(remote) = tcp.remote_endpoint()
+            {
+                return remote.addr == src_addr && remote.port == src_port;
             }
             false
         })

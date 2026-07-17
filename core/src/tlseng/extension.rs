@@ -167,10 +167,8 @@ impl ExtensionBuilder {
     }
 
     pub fn apply_generic_extension(&mut self, etype: u16, _profile: &BrowserProfile) {
-        match etype {
-            _ => {
-                netrunner_logger::trace!(etype, "Applying generic or unknown extension");
-            }
+        {
+            netrunner_logger::trace!(etype, "Applying generic or unknown extension");
         }
     }
 

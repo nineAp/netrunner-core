@@ -10,9 +10,8 @@
 //! congestion control = BBR.
 
 use netrunner_core::net::{
-    BUFFERBLOAT_WARN_THRESHOLD, HTTPS_PORT, HTTP_ALT_PORT, HTTP_PORT, ICMP_BUFFER_SIZE,
-    ICMP_META_SLOTS, MAX_SOCKETS, NTP_PORT, RDP_PORT, RTMP_PORT, SSH_PORT, VNC_PORT, NetworkConfig,
-    DNS_PORT,
+    BUFFERBLOAT_WARN_THRESHOLD, DNS_PORT, HTTP_ALT_PORT, HTTP_PORT, HTTPS_PORT, ICMP_BUFFER_SIZE,
+    ICMP_META_SLOTS, MAX_SOCKETS, NTP_PORT, NetworkConfig, RDP_PORT, RTMP_PORT, SSH_PORT, VNC_PORT,
 };
 use netrunner_logger::{info, warn};
 use smoltcp::{
@@ -139,50 +138,50 @@ impl SocketProvider for SmolSocketFactory {
         get_app_pending: &dyn Fn(smoltcp::iface::SocketHandle) -> usize,
     ) {
         for (handle, socket) in sockets.iter() {
-            if let smoltcp::socket::Socket::Tcp(tcp_socket) = socket {
-                if tcp_socket.is_active() {
-                    // 1. Статистика стека (facing the browser)
-                    let tcp_rx_len = tcp_socket.recv_queue(); // Данные от браузера к нам
-                    let tcp_rx_cap = tcp_socket.recv_capacity();
+            if let smoltcp::socket::Socket::Tcp(tcp_socket) = socket
+                && tcp_socket.is_active()
+            {
+                // 1. Статистика стека (facing the browser)
+                let tcp_rx_len = tcp_socket.recv_queue(); // Данные от браузера к нам
+                let tcp_rx_cap = tcp_socket.recv_capacity();
 
-                    let tcp_tx_len = tcp_socket.send_queue(); // Данные от нас к браузеру
-                    let tcp_tx_cap = tcp_socket.send_capacity();
+                let tcp_tx_len = tcp_socket.send_queue(); // Данные от нас к браузеру
+                let tcp_tx_cap = tcp_socket.send_capacity();
 
-                    // 2. Статистика приложения (теневая очередь из туннеля)
-                    // Это данные, которые уже прилетели из Германии/Финляндии,
-                    // но еще не влезли в tcp_socket.send_slice()
-                    let app_pending_len = get_app_pending(handle);
+                // 2. Статистика приложения (теневая очередь из туннеля)
+                // Это данные, которые уже прилетели из Германии/Финляндии,
+                // но еще не влезли в tcp_socket.send_slice()
+                let app_pending_len = get_app_pending(handle);
 
-                    let state = tcp_socket.state();
+                let state = tcp_socket.state();
 
-                    // Выбираем иконку для статуса
-                    let status_icon = match state {
-                        tcp::State::Established => "✅",
-                        tcp::State::CloseWait => "⏳", // Сервер закрылся, мы дочищаем хвосты
-                        tcp::State::FinWait1 | tcp::State::FinWait2 => "👋",
-                        _ => "ℹ️ ",
-                    };
+                // Выбираем иконку для статуса
+                let status_icon = match state {
+                    tcp::State::Established => "✅",
+                    tcp::State::CloseWait => "⏳", // Сервер закрылся, мы дочищаем хвосты
+                    tcp::State::FinWait1 | tcp::State::FinWait2 => "👋",
+                    _ => "ℹ️ ",
+                };
 
-                    // Логируем одной строкой для удобства чтения в Logcat
-                    info!(
-                        "📊 [TCP {}] {:<12} {} | RX_BR: {:>4}/{} KB | TX_BR: {:>4}/{} KB | APP_WAIT: {:>4} KB",
+                // Логируем одной строкой для удобства чтения в Logcat
+                info!(
+                    "📊 [TCP {}] {:<12} {} | RX_BR: {:>4}/{} KB | TX_BR: {:>4}/{} KB | APP_WAIT: {:>4} KB",
+                    handle,
+                    format!("{:?}", state),
+                    status_icon,
+                    tcp_rx_len / 1024,
+                    tcp_rx_cap / 1024, // Пришло от браузера
+                    tcp_tx_len / 1024,
+                    tcp_tx_cap / 1024,      // Ушло браузеру (из стека)
+                    app_pending_len / 1024  // Ждет входа в стек (из туннеля)
+                );
+
+                if app_pending_len > BUFFERBLOAT_WARN_THRESHOLD {
+                    warn!(
+                        "⚠️ [TCP {}] Bufferbloat detected! Application queue is > {} KB",
                         handle,
-                        format!("{:?}", state),
-                        status_icon,
-                        tcp_rx_len / 1024,
-                        tcp_rx_cap / 1024, // Пришло от браузера
-                        tcp_tx_len / 1024,
-                        tcp_tx_cap / 1024,      // Ушло браузеру (из стека)
-                        app_pending_len / 1024  // Ждет входа в стек (из туннеля)
+                        BUFFERBLOAT_WARN_THRESHOLD / 1024
                     );
-
-                    if app_pending_len > BUFFERBLOAT_WARN_THRESHOLD {
-                        warn!(
-                            "⚠️ [TCP {}] Bufferbloat detected! Application queue is > {} KB",
-                            handle,
-                            BUFFERBLOAT_WARN_THRESHOLD / 1024
-                        );
-                    }
                 }
             }
         }

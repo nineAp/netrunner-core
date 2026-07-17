@@ -14,6 +14,7 @@
 //! - [`bridge`] — проксирование данных между потоком туннеля и реальным TCP/UDP-сокетом цели.
 
 mod bridge;
+#[allow(clippy::module_inception)]
 mod connection;
 mod engine;
 mod handler;

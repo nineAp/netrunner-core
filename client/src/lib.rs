@@ -22,7 +22,6 @@
 #![allow(dead_code)]
 
 use netrunner_core::net::NetworkConfig;
-use uniffi;
 uniffi::setup_scaffolding!();
 
 mod net;
@@ -135,6 +134,7 @@ impl SessionManager {
     /// `sni` — домен-декой для `ClientHello` этого сервера; приложение берёт
     /// его из [`known_servers`] по выбранному `remote_address` (в будущем —
     /// из бэкенда вместе с остальными полями узла).
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn_session(
         &self,
         remote_address: String,
@@ -273,7 +273,7 @@ impl SessionManager {
         Arc::new(Session {
             cancel_token: session_token,
             proxy_ip: remote_proxy_ip,
-            killswitch_enabled: killswitch_enabled,
+            killswitch_enabled,
         })
     }
     pub fn get_traffic_stats(&self) -> VpnTrafficStats {

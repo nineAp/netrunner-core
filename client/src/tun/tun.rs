@@ -22,7 +22,7 @@ impl Tun {
             Ok(device) => Ok(Self { device }),
             Err(e) => {
                 error!("Failed to create TUN device: {}", e);
-                Err(io::Error::new(io::ErrorKind::Other, e))
+                Err(io::Error::other(e))
             }
         }
     }

@@ -107,7 +107,7 @@ fn read_rss_kb(pid: u32) -> Option<u64> {
     let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
     for line in status.lines() {
         if let Some(rest) = line.strip_prefix("VmRSS:") {
-            return rest.trim().split_whitespace().next()?.parse().ok();
+            return rest.split_whitespace().next()?.parse().ok();
         }
     }
     None
@@ -203,12 +203,12 @@ async fn run_virtual_user(
     )
     .await
     {
-            Ok(m) => m,
-            Err(_) => {
-                stats.handshake_failures.fetch_add(1, Relaxed);
-                return;
-            }
-        };
+        Ok(m) => m,
+        Err(_) => {
+            stats.handshake_failures.fetch_add(1, Relaxed);
+            return;
+        }
+    };
 
     // connect() возвращается сразу же, спавнит фоновые задачи и не ждёт, пока
     // реально поднимется хоть одна нога — Connect-кадр, отправленный раньше,
@@ -270,13 +270,9 @@ async fn run_virtual_user(
     });
 
     let payload = bytes::Bytes::from(vec![0xABu8; chunk_size]);
-    let interval = if rate_bps == 0 {
-        None
-    } else {
-        Some(Duration::from_millis(
-            (chunk_size as u64 * 1000 / rate_bps).max(1),
-        ))
-    };
+    let interval = (chunk_size as u64 * 1000)
+        .checked_div(rate_bps)
+        .map(|ms| Duration::from_millis(ms.max(1)));
 
     let end = Instant::now() + duration;
     while Instant::now() < end {

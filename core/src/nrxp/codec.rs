@@ -119,7 +119,7 @@ impl RxCodec {
             // any prior plaintext that is still waiting for a parse attempt.
             let mut data_to_decrypt = self.staging.split_off(start_idx);
 
-            if let Err(_) = self.crypto.decrypt(&mut data_to_decrypt) {
+            if self.crypto.decrypt(&mut data_to_decrypt).is_err() {
                 // AEAD failure after a successful TCP delivery means key/nonce
                 // mismatch or tampering.  Clear staging to avoid feeding garbled
                 // plaintext into the parser on the next call, then signal Drop so

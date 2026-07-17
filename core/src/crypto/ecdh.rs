@@ -14,6 +14,7 @@ use x25519_dalek::{EphemeralSecret, PublicKey};
 /// `private_key` обёрнут в [`Option`], потому что [`EphemeralSecret`] потребляется
 /// при вычислении общего секрета (`diffie_hellman` забирает `self` по значению).
 /// После [`ECDH::get_shared`] поле становится `None` и повторный обмен невозможен.
+#[allow(clippy::upper_case_acronyms)]
 pub(crate) struct ECDH {
     /// Публичный ключ, который отправляется удалённой стороне в KeyShare.
     pub public_key: PublicKey,
@@ -24,7 +25,7 @@ pub(crate) struct ECDH {
 impl ECDH {
     /// Генерирует свежую эфемерную пару ключей из системного ГСЧ ([`OsRng`]).
     pub(crate) fn new() -> Self {
-        let secret = EphemeralSecret::random_from_rng(&mut OsRng);
+        let secret = EphemeralSecret::random_from_rng(OsRng);
         let public = PublicKey::from(&secret);
         Self {
             private_key: Some(secret),
@@ -39,7 +40,7 @@ impl ECDH {
     /// (т.е. приватного ключа больше нет) — защита от повторного использования.
     pub(crate) fn get_shared(&mut self, public: &PublicKey) -> Option<[u8; 32]> {
         let private_key = self.private_key.take()?;
-        let shared = private_key.diffie_hellman(&public);
+        let shared = private_key.diffie_hellman(public);
         Some(*shared.as_bytes())
     }
 }

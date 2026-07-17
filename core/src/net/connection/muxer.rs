@@ -263,7 +263,7 @@ pub fn adaptive_batch_chunk(base: usize) -> usize {
 /// matching `SERVER_STREAM_BACKLOG_MAX_BYTES` at the top end) since BDP grows
 /// with RTT much faster than a comfortable interleave chunk does.
 pub fn adaptive_credit_window(base: u32) -> u32 {
-    let rtt_ms = GLOBAL_MIN_RTT.load(Ordering::Relaxed) as u32;
+    let rtt_ms = GLOBAL_MIN_RTT.load(Ordering::Relaxed);
     let factor = (1 + rtt_ms / 250).clamp(1, 8);
     base.saturating_mul(factor)
 }
@@ -515,7 +515,7 @@ impl Muxer {
         let should_remove = self
             .legs
             .get(&leg_id)
-            .map_or(false, |leg| leg.control_tx.same_channel(tx));
+            .is_some_and(|leg| leg.control_tx.same_channel(tx));
         if should_remove {
             if let Some((_, leg)) = self.legs.remove(&leg_id) {
                 self.fold_removed_leg(&leg);
@@ -596,7 +596,7 @@ impl Muxer {
             rtt * (1.0 + leg.congestion_factor())
         };
 
-        let best = legs.iter().map(|l| score(l)).fold(f64::MAX, f64::min);
+        let best = legs.iter().map(&score).fold(f64::MAX, f64::min);
 
         // Candidate set = every leg within 2× of the best score. Drastically
         // worse (slow / bufferbloated) legs are excluded; near-equal legs are all
@@ -987,13 +987,11 @@ impl Muxer {
                     DIAG_COUNTERS
                         .mux_dispatch_ok
                         .fetch_add(1, Ordering::Relaxed);
-                    return;
                 }
                 Err(TrySendError::Closed(_)) => {
                     DIAG_COUNTERS
                         .mux_dispatch_recv_closed
                         .fetch_add(1, Ordering::Relaxed);
-                    return;
                 }
                 Err(TrySendError::Full(data)) => {
                     backlog.push(data, size);
@@ -1159,7 +1157,7 @@ impl Muxer {
                     let still_same = self
                         .legs
                         .get(&leg_id)
-                        .map_or(false, |l| l.control_tx.same_channel(&tx));
+                        .is_some_and(|l| l.control_tx.same_channel(&tx));
                     if still_same {
                         warn!(leg_id, "❌ TCP Leg Health Check FAIL/Timeout - Evicting");
                         self.remove_leg(leg_id, &tx);

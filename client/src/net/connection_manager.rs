@@ -77,7 +77,7 @@ impl TargetResolver {
     pub fn resolve_destination(&self, addr: IpAddress, port: u16) -> (std::net::Ipv4Addr, String) {
         match addr {
             IpAddress::Ipv4(ip) => {
-                let std_ip = std::net::Ipv4Addr::from(ip);
+                let std_ip = ip;
                 if let Some(domain) = self.fake_ip_store.lookup_by_ip(&std_ip) {
                     (std_ip, format!("{}:{}", domain, port))
                 } else {
@@ -135,21 +135,17 @@ impl ConnectionManager {
     pub fn start_listening(&mut self, socket_set: &mut SocketSet) {
         for (_, socket) in socket_set.iter_mut() {
             match socket {
-                Socket::Tcp(tcp) => {
-                    if !tcp.is_open() && tcp.local_endpoint().is_none() {
-                        let _ = tcp.listen(IpListenEndpoint {
-                            addr: None,
-                            port: HTTPS_PORT,
-                        });
-                    }
+                Socket::Tcp(tcp) if !tcp.is_open() && tcp.local_endpoint().is_none() => {
+                    let _ = tcp.listen(IpListenEndpoint {
+                        addr: None,
+                        port: HTTPS_PORT,
+                    });
                 }
-                Socket::Udp(udp) => {
-                    if !udp.is_open() && udp.endpoint().port == 0 {
-                        let _ = udp.bind(IpListenEndpoint {
-                            addr: None,
-                            port: DNS_PORT,
-                        });
-                    }
+                Socket::Udp(udp) if !udp.is_open() && udp.endpoint().port == 0 => {
+                    let _ = udp.bind(IpListenEndpoint {
+                        addr: None,
+                        port: DNS_PORT,
+                    });
                 }
                 _ => {}
             }
@@ -246,11 +242,11 @@ impl ConnectionManager {
 
         if !self.tracker.has_connection_from(f.src, f.src_p, socket_set) {
             // 🔥 ИСПРАВЛЕНИЕ: Проверяем лимит и очищаем место ДО запроса к семафору
-            if socket_set.iter().count() >= MAX_SOCKETS {
-                if !self.tracker.evict_oldest_socket(socket_set) {
-                    warn!("🔥 TCP Socket limit reached and eviction failed! Dropping SYN.");
-                    return;
-                }
+            if socket_set.iter().count() >= MAX_SOCKETS
+                && !self.tracker.evict_oldest_socket(socket_set)
+            {
+                warn!("🔥 TCP Socket limit reached and eviction failed! Dropping SYN.");
+                return;
             }
 
             let permit = match self.connection_limiter.clone().try_acquire_owned() {
@@ -285,11 +281,10 @@ impl ConnectionManager {
             return;
         }
 
-        if socket_set.iter().count() >= MAX_SOCKETS {
-            if !self.tracker.evict_oldest_socket(socket_set) {
-                warn!("🔥 UDP Socket limit reached and eviction failed! Dropping packet.");
-                return;
-            }
+        if socket_set.iter().count() >= MAX_SOCKETS && !self.tracker.evict_oldest_socket(socket_set)
+        {
+            warn!("🔥 UDP Socket limit reached and eviction failed! Dropping packet.");
+            return;
         }
 
         let socket_id = self.tracker.next_id();
@@ -347,35 +342,35 @@ impl ConnectionManager {
             return;
         }
 
-        if state == tcp::State::Established && self.tracker.should_init_tcp(handle) {
-            if let (Some(local), Some(remote)) = (socket.local_endpoint(), socket.remote_endpoint())
-            {
-                let key = (remote.addr, remote.port, local.addr, local.port);
-                self.pending_connects.remove(&key);
+        if state == tcp::State::Established
+            && self.tracker.should_init_tcp(handle)
+            && let (Some(local), Some(remote)) = (socket.local_endpoint(), socket.remote_endpoint())
+        {
+            let key = (remote.addr, remote.port, local.addr, local.port);
+            self.pending_connects.remove(&key);
 
-                let permit = self
-                    .tracker
-                    .pop_pending_permit(handle)
-                    .expect("Permit must exist for pending TCP connection");
+            let permit = self
+                .tracker
+                .pop_pending_permit(handle)
+                .expect("Permit must exist for pending TCP connection");
 
-                let socket_id = self.tracker.next_id();
-                let (dst_ip, target) = self.resolver.resolve_destination(local.addr, local.port);
+            let socket_id = self.tracker.next_id();
+            let (dst_ip, target) = self.resolver.resolve_destination(local.addr, local.port);
 
-                let (conn, rx_smol, tx_smol, handshake_tx, is_saturated) =
-                    TcpConnection::new(handle, permit);
-                self.tracker
-                    .register_tcp(handle, socket_id, conn, tx_smol, is_saturated);
+            let (conn, rx_smol, tx_smol, handshake_tx, is_saturated) =
+                TcpConnection::new(handle, permit);
+            self.tracker
+                .register_tcp(handle, socket_id, conn, tx_smol, is_saturated);
 
-                TcpConnection::spawn(
-                    socket_id,
-                    dst_ip,
-                    local.port,
-                    target,
-                    rx_smol,
-                    handshake_tx,
-                    self.tx_to_tunnel.clone(),
-                );
-            }
+            TcpConnection::spawn(
+                socket_id,
+                dst_ip,
+                local.port,
+                target,
+                rx_smol,
+                handshake_tx,
+                self.tx_to_tunnel.clone(),
+            );
         }
         // Refresh the LRU/idle timestamp ONLY when real data moved, so an active
         // connection keeps a fresh activity time and is never reaped as "idle"

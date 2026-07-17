@@ -367,7 +367,7 @@ impl TunnelEngine {
 
                             let chunk_msg = MuxMessage {
                                 stream_id: msg.stream_id,
-                                frame_type: msg.frame_type.clone(),
+                                frame_type: msg.frame_type,
                                 data: chunk_data,
                             };
                             let chunk_sid = chunk_msg.stream_id;
@@ -496,7 +496,7 @@ impl TunnelEngine {
                 let chunk_size = std::cmp::min(data.len(), MAX_FRAME_PAYLOAD);
                 let chunk = data.split_to(chunk_size);
 
-                match tx_codec.encode_frame(stream_id, frame_type.clone(), chunk) {
+                match tx_codec.encode_frame(stream_id, frame_type, chunk) {
                     Ok(pkt) => packets.push(pkt),
                     Err(e) => {
                         error!(stream_id, error = ?e, "Encryption failed for TCP chunk");
@@ -509,7 +509,7 @@ impl TunnelEngine {
                 }
             }
         } else {
-            match tx_codec.encode_frame(stream_id, frame_type.clone(), data) {
+            match tx_codec.encode_frame(stream_id, frame_type, data) {
                 Ok(pkt) => packets.push(pkt),
                 Err(e) => {
                     error!(stream_id, error = ?e, "Encryption failed for control/udp frame");

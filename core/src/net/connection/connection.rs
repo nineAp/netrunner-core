@@ -57,6 +57,12 @@ pub struct SessionManager {
     sessions: DashMap<String, Arc<Muxer>>,
 }
 
+impl Default for SessionManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SessionManager {
     pub fn new() -> Self {
         Self {
@@ -308,7 +314,7 @@ impl ClientHandler {
                             return Err(AppError::new(
                                 ERR_INFRA_TIMEOUT,
                                 "Разрыв соединения",
-                                format!("EOF on handshake"),
+                                "EOF on handshake".to_string(),
                             ))
                         }
                         Ok(Ok(_)) => continue,
@@ -808,7 +814,7 @@ impl ClientHandler {
                                 // stream; other streams were already flushed at the loop top.
                                 let over_cap = pending_upload
                                     .get(&local_socket_id)
-                                    .map_or(false, |q| q.len() > UPLOAD_PENDING_CAP);
+                                    .is_some_and(|q| q.len() > UPLOAD_PENDING_CAP);
                                 if over_cap {
                                     let front = pending_upload
                                         .get_mut(&local_socket_id)
@@ -937,10 +943,8 @@ impl ServerHandler {
         if let Ok(Ok(target_server)) = target_stream {
             let (mut server_read, mut server_write) = target_server.into_split();
 
-            if !initial_data.is_empty() {
-                if server_write.write_all(&initial_data).await.is_err() {
-                    return;
-                }
+            if !initial_data.is_empty() && server_write.write_all(&initial_data).await.is_err() {
+                return;
             }
 
             let client_to_server = tokio::io::copy(&mut client_inbound, &mut server_write);

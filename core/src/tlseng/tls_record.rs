@@ -99,10 +99,8 @@ impl Parser for TlsRecord {
 
         let record_len = u16::from_be_bytes([bytes[3], bytes[4]]) as usize;
 
-        if content_type == ContentType::ApplicationData as u8 {
-            if record_len < 17 {
-                return false;
-            }
+        if content_type == ContentType::ApplicationData as u8 && record_len < 17 {
+            return false;
         }
 
         bytes.len() >= 5 + record_len

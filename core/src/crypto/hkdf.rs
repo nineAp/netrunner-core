@@ -14,6 +14,7 @@ use hkdf::Hkdf;
 use sha2::Sha256;
 
 /// Безсостоятельная обёртка над `hkdf::Hkdf<Sha256>` с двумя удобными методами.
+#[allow(clippy::upper_case_acronyms)]
 pub(crate) struct HKDF;
 
 impl HKDF {
@@ -23,8 +24,7 @@ impl HKDF {
     /// Возвращает готовый к фазе expand экстрактор. Соль здесь — это
     /// объединённые локальная+удалённая соли сторон (см. `SaltPair::get_total`).
     pub(crate) fn extract_key(salt: &[u8], ikm: &[u8]) -> Hkdf<Sha256> {
-        let extracted_key = Hkdf::<Sha256>::new(Some(salt), ikm);
-        extracted_key
+        Hkdf::<Sha256>::new(Some(salt), ikm)
     }
 
     /// Фаза **expand**: выводит ключ длины `N` байт под меткой `mark`.

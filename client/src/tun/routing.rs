@@ -54,7 +54,7 @@ pub fn run_cmd_ext(full_cmd: &str, ignore_errors: bool) -> io::Result<()> {
     if !status.success() && !ignore_errors {
         let err = format!("Command failed: {} with status {}", full_cmd, status);
         error!("{}", err);
-        return Err(io::Error::new(io::ErrorKind::Other, err));
+        return Err(io::Error::other(err));
     }
     Ok(())
 }

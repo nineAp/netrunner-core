@@ -84,7 +84,7 @@ impl NetworkConfig {
         let seg = mtu.saturating_sub(40).max(512); // subtract typical IP+TCP overhead
 
         // Round up to the nearest 4 KB for alignment.
-        let round = |n: usize| ((n + 4095) / 4096) * 4096;
+        let round = |n: usize| n.div_ceil(4096) * 4096;
 
         let tcp_heavy = round(seg * BULK_WINDOW_SEGMENTS);
         let tcp_light = round(seg * LIGHT_WINDOW_SEGMENTS);

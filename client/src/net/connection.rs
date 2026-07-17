@@ -28,7 +28,10 @@ use smoltcp::{
         Ipv6Address,
     },
 };
-use std::{sync::{Arc, atomic::{AtomicBool, Ordering}}};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use tokio::sync::{OwnedSemaphorePermit, mpsc, oneshot};
 
 use netrunner_logger::{debug, info, instrument};
@@ -49,7 +52,12 @@ pub struct ConnectionCore<T> {
 impl<T> ConnectionCore<T> {
     pub fn new(
         handle: SocketHandle,
-    ) -> (Self, mpsc::Receiver<T>, mpsc::Sender<Bytes>, Arc<AtomicBool>) {
+    ) -> (
+        Self,
+        mpsc::Receiver<T>,
+        mpsc::Sender<Bytes>,
+        Arc<AtomicBool>,
+    ) {
         let cap = NetworkConfig::global().channel_capacity;
         let (tx_to_net, rx_from_smol) = mpsc::channel::<T>(cap);
         let (tx_to_smol, rx_from_net) = mpsc::channel::<Bytes>(cap);
@@ -409,8 +417,7 @@ impl TcpConnection {
                 }
             }
 
-            let close_frame =
-                RawCastFrame::close(LocalProtocol::Tcp, socket_id, dst_ip, dst_port);
+            let close_frame = RawCastFrame::close(LocalProtocol::Tcp, socket_id, dst_ip, dst_port);
             let _ = tx_tunnel.send(close_frame).await;
             debug!("🏁 [TCP {}] Spawned task finished", socket_id);
         });
@@ -436,7 +443,12 @@ impl UdpConnection {
         handle: SocketHandle,
         client_addr: IpAddress,
         client_port: u16,
-    ) -> (Self, mpsc::Receiver<UdpPacketTarget>, mpsc::Sender<Bytes>, Arc<AtomicBool>) {
+    ) -> (
+        Self,
+        mpsc::Receiver<UdpPacketTarget>,
+        mpsc::Sender<Bytes>,
+        Arc<AtomicBool>,
+    ) {
         let (core, rx_from_smol, tx_to_smol, is_saturated) = ConnectionCore::new(handle);
         let conn = Self {
             core,
@@ -447,8 +459,7 @@ impl UdpConnection {
     }
 
     pub fn has_client(&self, port: u16) -> bool {
-        self.last_client_endpoint
-            .map_or(false, |ep| ep.port == port)
+        self.last_client_endpoint.is_some_and(|ep| ep.port == port)
     }
 
     pub fn tick(&mut self, socket: &mut udp::Socket, timestamp: smoltcp::time::Instant) -> bool {
@@ -461,7 +472,7 @@ impl UdpConnection {
             while let Ok((data, metadata)) = socket.recv(timestamp) {
                 if let IpAddress::Ipv4(ip) = metadata.endpoint.addr {
                     self.last_client_endpoint = Some(metadata.endpoint);
-                    let target_ip = std::net::Ipv4Addr::from(ip);
+                    let target_ip = ip;
                     let target_port = metadata.endpoint.port;
                     let payload = (Bytes::copy_from_slice(data), target_ip, target_port);
 
@@ -518,8 +529,7 @@ impl UdpConnection {
                 }
             }
 
-            let close_frame =
-                RawCastFrame::close(LocalProtocol::Udp, socket_id, dst_ip, dst_port);
+            let close_frame = RawCastFrame::close(LocalProtocol::Udp, socket_id, dst_ip, dst_port);
             let _ = tx_tunnel.send(close_frame).await;
             info!("🛑 [UDP {}] Task stopped", socket_id);
         });
@@ -551,27 +561,27 @@ impl IcmpResponder {
     }
 
     fn reply_v4(socket: &mut icmp::Socket, mut payload: Vec<u8>, src: IpAddress) {
-        if let Ok(pkt) = Icmpv4Packet::new_checked(&payload) {
-            if pkt.msg_type() == Icmpv4Message::EchoRequest {
-                let mut reply_pkt = Icmpv4Packet::new_unchecked(&mut payload);
-                reply_pkt.set_msg_type(Icmpv4Message::EchoReply);
-                reply_pkt.fill_checksum();
-                let _ = socket.send_slice(&payload, src);
-                info!("🏓 [ICMPv4] Echo Reply -> {}", src);
-            }
+        if let Ok(pkt) = Icmpv4Packet::new_checked(&payload)
+            && pkt.msg_type() == Icmpv4Message::EchoRequest
+        {
+            let mut reply_pkt = Icmpv4Packet::new_unchecked(&mut payload);
+            reply_pkt.set_msg_type(Icmpv4Message::EchoReply);
+            reply_pkt.fill_checksum();
+            let _ = socket.send_slice(&payload, src);
+            info!("🏓 [ICMPv4] Echo Reply -> {}", src);
         }
     }
 
     fn reply_v6(socket: &mut icmp::Socket, mut payload: Vec<u8>, src: Ipv6Address) {
-        if let Ok(pkt) = Icmpv6Packet::new_checked(&payload) {
-            if pkt.msg_type() == Icmpv6Message::EchoRequest {
-                let mut reply_pkt = Icmpv6Packet::new_unchecked(&mut payload);
-                reply_pkt.set_msg_type(Icmpv6Message::EchoReply);
-                let gateway = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
-                reply_pkt.fill_checksum(&gateway, &src);
-                let _ = socket.send_slice(&payload, src.into());
-                info!("🏓 [ICMPv6] Echo Reply -> {}", src);
-            }
+        if let Ok(pkt) = Icmpv6Packet::new_checked(&payload)
+            && pkt.msg_type() == Icmpv6Message::EchoRequest
+        {
+            let mut reply_pkt = Icmpv6Packet::new_unchecked(&mut payload);
+            reply_pkt.set_msg_type(Icmpv6Message::EchoReply);
+            let gateway = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
+            reply_pkt.fill_checksum(&gateway, &src);
+            let _ = socket.send_slice(&payload, src.into());
+            info!("🏓 [ICMPv6] Echo Reply -> {}", src);
         }
     }
 }

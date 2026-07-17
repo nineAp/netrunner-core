@@ -264,7 +264,7 @@ impl Engine {
                     if self
                         .pending_download
                         .get(&sid)
-                        .map_or(false, |q| q.is_empty())
+                        .is_some_and(|q| q.is_empty())
                     {
                         self.pending_download.remove(&sid);
                     }
@@ -277,28 +277,23 @@ impl Engine {
             // directions share this single engine task and must take turns. Leftover
             // frames are picked up next iteration (work_done forces a prompt re-loop).
             let mut dl_processed = 0;
-            loop {
-                match rx_tunnel.try_recv() {
-                    Ok(frame) => {
-                        work_done = true;
-                        if frame.event == RawCastEvent::Close {
-                            local_cache.remove(&frame.socket_id);
-                            inbound_map.remove(&frame.socket_id);
-                            self.pending_download.remove(&frame.socket_id);
-                        } else if frame.event == RawCastEvent::Data {
-                            self.route_download(
-                                frame.socket_id,
-                                frame.payload,
-                                &mut local_cache,
-                                &inbound_map,
-                            );
-                        }
-                        dl_processed += 1;
-                        if dl_processed >= MAX_PACKETS_PER_TICK {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
+            while let Ok(frame) = rx_tunnel.try_recv() {
+                work_done = true;
+                if frame.event == RawCastEvent::Close {
+                    local_cache.remove(&frame.socket_id);
+                    inbound_map.remove(&frame.socket_id);
+                    self.pending_download.remove(&frame.socket_id);
+                } else if frame.event == RawCastEvent::Data {
+                    self.route_download(
+                        frame.socket_id,
+                        frame.payload,
+                        &mut local_cache,
+                        &inbound_map,
+                    );
+                }
+                dl_processed += 1;
+                if dl_processed >= MAX_PACKETS_PER_TICK {
+                    break;
                 }
             }
 
@@ -398,20 +393,15 @@ impl Engine {
             // Take the receiver out (ends the borrow on self), drain events,
             // build snapshots (needs &mut self for stats), then put it back.
             if let Some(mut diag_rx) = self.diag_rx.take() {
-                loop {
-                    match diag_rx.try_recv() {
-                        Ok(event) => {
-                            let snap = self.build_snapshot(event);
-                            // Queue a compact JSON copy for upload to the server,
-                            // then keep the snapshot in the local ring buffer.
-                            if self.diag_outbox.len() >= DIAG_OUTBOX_CAP {
-                                self.diag_outbox.pop_front();
-                            }
-                            self.diag_outbox.push_back(Bytes::from(snap.to_json_line()));
-                            self.diag_store.push(snap);
-                        }
-                        Err(_) => break,
+                while let Ok(event) = diag_rx.try_recv() {
+                    let snap = self.build_snapshot(event);
+                    // Queue a compact JSON copy for upload to the server,
+                    // then keep the snapshot in the local ring buffer.
+                    if self.diag_outbox.len() >= DIAG_OUTBOX_CAP {
+                        self.diag_outbox.pop_front();
                     }
+                    self.diag_outbox.push_back(Bytes::from(snap.to_json_line()));
+                    self.diag_store.push(snap);
                 }
                 self.diag_rx = Some(diag_rx);
             }
@@ -421,18 +411,17 @@ impl Engine {
             // is up to carry it. send_diag_report is a non-blocking try_send under
             // the hood, so the await is cheap; on failure (no leg accepted it) we
             // re-queue the snapshot and retry on a later tick.
-            if !self.diag_outbox.is_empty() {
-                if let Some(muxer) = self.muxer.clone() {
-                    if muxer.active_legs_count() > 0 {
-                        for _ in 0..DIAG_FLUSH_PER_TICK {
-                            let Some(line) = self.diag_outbox.pop_front() else {
-                                break;
-                            };
-                            if !muxer.send_diag_report(line.clone()).await {
-                                self.diag_outbox.push_front(line);
-                                break;
-                            }
-                        }
+            if !self.diag_outbox.is_empty()
+                && let Some(muxer) = self.muxer.clone()
+                && muxer.active_legs_count() > 0
+            {
+                for _ in 0..DIAG_FLUSH_PER_TICK {
+                    let Some(line) = self.diag_outbox.pop_front() else {
+                        break;
+                    };
+                    if !muxer.send_diag_report(line.clone()).await {
+                        self.diag_outbox.push_front(line);
+                        break;
                     }
                 }
             }
@@ -662,17 +651,17 @@ impl Engine {
             .socket_set
             .iter()
             .filter_map(|(handle, socket)| {
-                if let smoltcp::socket::Socket::Tcp(tcp) = socket {
-                    if tcp.is_active() {
-                        return Some(SocketSnap {
-                            handle_str: format!("{}", handle),
-                            state: format!("{:?}", tcp.state()),
-                            send_queue: tcp.send_queue(),
-                            send_cap: tcp.send_capacity(),
-                            recv_queue: tcp.recv_queue(),
-                            recv_cap: tcp.recv_capacity(),
-                        });
-                    }
+                if let smoltcp::socket::Socket::Tcp(tcp) = socket
+                    && tcp.is_active()
+                {
+                    return Some(SocketSnap {
+                        handle_str: format!("{}", handle),
+                        state: format!("{:?}", tcp.state()),
+                        send_queue: tcp.send_queue(),
+                        send_cap: tcp.send_capacity(),
+                        recv_queue: tcp.recv_queue(),
+                        recv_cap: tcp.recv_capacity(),
+                    });
                 }
                 None
             })

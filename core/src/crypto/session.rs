@@ -94,12 +94,15 @@ impl SaltPair {
     }
 }
 
+/// `(tx_key, tx_iv, rx_key, rx_iv)` — выведенные AEAD-ключи уже с учётом роли
+/// (клиент/сервер), готовые отдать напрямую в
+/// [`ChaChaCipher::set_keys`](super::chacha::ChaChaCipher::set_keys).
+type DirectionalAeadKeys = ([u8; 32], [u8; 12], [u8; 32], [u8; 12]);
+
 /// Полное состояние криптографического хендшейка одной стороны.
 ///
 /// Держит свою соль, эфемерный ECDH и — после [`update_keys`](SessionKeys::update_keys) —
-/// выведенные ключи. Кортеж `current_aead` упакован как
-/// `(tx_key, tx_iv, rx_key, rx_iv)` уже с учётом роли: его можно напрямую отдать
-/// в [`ChaChaCipher::set_keys`](super::chacha::ChaChaCipher::set_keys).
+/// выведенные ключи (см. [`DirectionalAeadKeys`]).
 pub struct SessionKeys {
     /// Пара солей (локальная + удалённая) для HKDF.
     salt: SaltPair,
@@ -108,7 +111,7 @@ pub struct SessionKeys {
     /// Ключ для time-based аутентификации кадров (HMAC). Заполняется в HKDF-фазе.
     auth_key: [u8; 32],
     /// Выведенные AEAD-параметры `(tx_key, tx_iv, rx_key, rx_iv)`; `None` до хендшейка.
-    current_aead: Option<([u8; 32], [u8; 12], [u8; 32], [u8; 12])>,
+    current_aead: Option<DirectionalAeadKeys>,
 }
 
 impl SessionKeys {
@@ -139,12 +142,13 @@ impl SessionKeys {
     /// 32 байта); у клиента `ServerHello` отдаёт ровно один ключ по фиксированному
     /// смещению. Любая аномалия (короткий буфер, нет KeyShare, нулевой ключ)
     /// трактуется как [`ERR_NET_TLS_TAMPER`] — признак вмешательства/несовместимости.
+    #[allow(clippy::result_large_err)]
     pub(crate) fn update_keys(
         &mut self,
         salt: [u8; 32],
         extensions: &ExtensionStack,
         is_server: bool,
-    ) -> Result<([u8; 32], [u8; 12], [u8; 32], [u8; 12]), AppError> {
+    ) -> Result<DirectionalAeadKeys, AppError> {
         self.salt.set_remote_salt(salt);
 
         netrunner_logger::debug!(
@@ -221,11 +225,12 @@ impl SessionKeys {
     /// Затем `is_server` назначает направления: для сервера tx=`server_*`,
     /// rx=`client_*`, для клиента — наоборот. Так одна и та же пара ключей
     /// у клиента служит на запись, а у сервера — на чтение, и наоборот.
+    #[allow(clippy::result_large_err)]
     fn generate_keys(
         &mut self,
         public_key: &PublicKey,
         is_server: bool,
-    ) -> Result<([u8; 32], [u8; 12], [u8; 32], [u8; 12]), AppError> {
+    ) -> Result<DirectionalAeadKeys, AppError> {
         let shared_key = self
             .ecdh
             .get_shared(public_key)

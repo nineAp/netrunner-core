@@ -10,4 +10,5 @@
 
 pub mod device;
 pub mod routing;
+#[allow(clippy::module_inception)]
 pub mod tun;
