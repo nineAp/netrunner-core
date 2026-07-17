@@ -60,6 +60,7 @@ jobs:
 
       # 2. Установка Android NDK
       - name: Install Android NDK
+        id: setup-ndk
         uses: nttld/setup-ndk@v1
         with:
           ndk-version: r26b
@@ -70,6 +71,8 @@ jobs:
 
       # 4. Сборка Native Libs
       - name: Build Native Libs
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: |
           ABIS="arm64-v8a armeabi-v7a x86_64 x86"
           for abi in $ABIS; do
