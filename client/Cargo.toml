@@ -9,7 +9,7 @@ crate-type = ["cdylib", "rlib", "staticlib"]
 
 [dependencies]
 netrunner-core = { path = "../core" }
-smoltcp = { git = "https://github.com/nineAp/nxrp-smoltcp.git", default-features = false, features = [
+smoltcp = { git = "https://gitea.netrunner-vpn.com/nineap/nxrp-smoltcp.git", branch = "main", default-features = false, features = [
     "std",
     "log",
     "medium-ip",
