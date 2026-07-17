@@ -46,3 +46,43 @@ jobs:
           # этой же сессии); type=registry работает везде без спецсервиса.
           cache-from: type=registry,ref=gitea.netrunner-vpn.com/nineap/netrunner-proxy:cache
           cache-to: type=registry,ref=gitea.netrunner-vpn.com/nineap/netrunner-proxy:cache,mode=max
+  build-android-libs:
+  runs-on: ubuntu-24.04
+  steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Android NDK
+      uses: nttld/setup-ndk@v1
+      with:
+        ndk-version: r26b # Укажите версию, которая нужна вашему проекту
+
+    - name: Install Rust targets
+      run: |
+        rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android i686-linux-android
+        cargo install cargo-ndk
+
+    - name: Build Native Libs
+      run: |
+        # ВАШ MAKEFILE TARGEY
+        # Предположим, вы вынесли команды из makefile сюда
+        ABIS="arm64-v8a armeabi-v7a x86_64 x86"
+        for abi in $ABIS; do
+          cargo ndk -t $abi -o ./gen build --bin netrunner-client --release
+        done
+
+        # Генерация биндингов
+        cargo run --bin bindgen-tool generate --library gen/arm64-v8a/libnetrunner_client.so --language kotlin --no-format --out-dir gen
+
+    - name: Package artifacts
+      run: tar -czf android-libs.tar.gz gen/
+
+    - name: Upload to Gitea
+      env:
+        GITEA_TOKEN: ${{ secrets.GITEA_TOKEN }}
+        GITEA_SERVER_URL: ${{ vars.GITEA_SERVER_URL }}
+        REPO: ${{ github.repository }}
+        VERSION: ${{ github.ref_name }}
+      run: |
+        # Используем ваш же скрипт публикации, который вы прислали ранее
+        node scripts/gitea-publish-release.mjs artifacts-libs/ 
+        # (предварительно положив туда android-libs.tar.gz)
