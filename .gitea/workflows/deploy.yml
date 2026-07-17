@@ -6,31 +6,31 @@
 # nodes.json (поле "name") или "all" для обновления сразу всех. Job "resolve"
 # фильтрует список по этому параметру и отдаёт job'у "deploy" как matrix —
 # каждая нода тогда видна в прогоне отдельной строкой, с отдельным логом.
-# GH/Gitea Actions не поддерживают выпадающий список (type: choice) с
-# вариантами из файла — только статичные в самом yaml, а список нод меняется
-# независимо от workflow, поэтому просто текстовое поле, значение — точное
-# имя из nodes.json.
 #
 # Каждый деплой пересоздаёт контейнер (pull нового образа + rm + run) — не
 # просто restart, иначе новый образ не подхватится, раз контейнер уже создан
 # со старым слоем.
 #
+# ВАЖНО (почему не appleboy/ssh-action): раньше здесь стояли готовые экшены
+# appleboy/ssh-action и appleboy/scp-action — это Docker-container actions.
+# Self-hosted Gitea-раннер (act_runner) не умеет запускать вложенные
+# docker-контейнеры экшенов так, как GitHub, поэтому джоба деплоя молча падала
+# при живой сборке (build.yml гоняет docker напрямую и работает). Заменено на
+# голые ssh/scp — обычные shell-шаги, которые раннер выполняет как и всё
+# остальное.
+#
 # Секреты (общие на все ноды — один master-ключ, как и при первичном
 # провижининге через netrunner-backend, см. NodeService::provision_node_via_ssh):
 # - PROXY_NODES_SSH_KEY — приватный SSH-ключ (root на все ноды)
 # - PROXY_INTERNAL_SECRET — тот же секрет, что и PROXY_INTERNAL_SECRET у бэкенда
-# - GT_REGISTRY_TOKEN — тот же, что и в build.yml (Container Registry Gitea,
-#   не ghcr.io — каждая нода тянет образ напрямую с gitea.netrunner-vpn.com)
+# - GT_REGISTRY_TOKEN — тот же, что и в build.yml (Container Registry Gitea)
 #
 # Repo Variable (vars.*, не secret — публичный URL, не даёт доступа сам по себе):
 # - BACKEND_URL — публичный адрес control plane (WEB_APP_BASE_URL у бэкенда)
 #
-# Job update-observability-targets (см. ниже) обновляет список scrape-таргетов
-# для центрального Prometheus (netrunner-data/docker-compose.observability.yml,
-# job "netrunner-proxy-nodes") при КАЖДОМ прогоне (независимо от input target,
-# т.к. использует полный nodes.json) — ему нужны СВОИ копии секретов/vars
-# VPS с данными, продублировать в Settings этого репозитория (те же значения,
-# что уже есть в netrunner-data):
+# Job update-observability-targets обновляет список scrape-таргетов центрального
+# Prometheus при КАЖДОМ прогоне (из полного nodes.json). Нужны свои копии
+# секретов/vars VPS с данными:
 # - vars.DATA_VPS_IP
 # - secrets.DATA_SSH_PRIVATE_KEY
 name: Deploy Proxy Nodes
@@ -81,44 +81,56 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Deploy to ${{ matrix.name }} (${{ matrix.host }})
-        uses: appleboy/ssh-action@v1
-        with:
-          host: ${{ matrix.host }}
-          username: root
-          key: ${{ secrets.PROXY_NODES_SSH_KEY }}
-          script: |
-            set -e
-            echo "🚀 Деплой на ${{ matrix.name }} (${{ matrix.host }}:${{ matrix.proxy_port }})"
+        run: |
+          set -euo pipefail
+          command -v ssh >/dev/null 2>&1 || { apt-get update && apt-get install -y openssh-client; }
 
-            echo "${{ secrets.GT_REGISTRY_TOKEN }}" | docker login gitea.netrunner-vpn.com -u ${{ github.actor }} --password-stdin
-            docker pull gitea.netrunner-vpn.com/nineap/netrunner-proxy:latest
+          # Приватный ключ во временный файл с правами 600.
+          install -m 600 /dev/null deploy_key
+          cat > deploy_key <<'SSHKEY'
+          ${{ secrets.PROXY_NODES_SSH_KEY }}
+          SSHKEY
 
-            docker stop netrunner-proxy 2>/dev/null || true
-            docker rm netrunner-proxy 2>/dev/null || true
+          # Скрипт разворачивания уходит на ноду в stdin `bash -s`. Значения
+          # ${{ ... }} подставляет сам движок Actions ДО запуска шелла, поэтому
+          # одинарные кавычки heredoc'а (SSH-экспансию глушим) им не мешают.
+          ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+              -o ConnectTimeout=20 -i deploy_key "root@${{ matrix.host }}" 'bash -s' <<'REMOTE'
+          set -e
+          echo "🚀 Деплой на ${{ matrix.name }} (${{ matrix.host }}:${{ matrix.proxy_port }})"
 
-            docker run -d \
-              --name netrunner-proxy \
-              --restart always \
-              --network host \
-              --cap-add NET_ADMIN --cap-add NET_RAW --cap-add DAC_OVERRIDE \
-              --device /dev/net/tun:/dev/net/tun \
-              --ulimit nofile=1048576:1048576 \
-              -e PROXY_INTERNAL_SECRET="${{ secrets.PROXY_INTERNAL_SECRET }}" \
-              gitea.netrunner-vpn.com/nineap/netrunner-proxy:latest \
-              ./netrunner-proxy \
-              --port "${{ matrix.proxy_port }}" \
-              --decoy-host "${{ matrix.decoy_host }}" \
-              --require-auth \
-              --backend-url "${{ vars.BACKEND_URL }}" \
-              --health-port 9091 \
-              --metrics-port 9093
+          echo "${{ secrets.GT_REGISTRY_TOKEN }}" | docker login gitea.netrunner-vpn.com -u "${{ github.actor }}" --password-stdin
+          docker pull gitea.netrunner-vpn.com/nineap/netrunner-proxy:latest
 
-            docker image prune -f
-            echo "✅ ${{ matrix.name }} обновлена."
+          docker stop netrunner-proxy 2>/dev/null || true
+          docker rm netrunner-proxy 2>/dev/null || true
 
-  # Независимо от того, какая конкретно нода деплоилась (target может быть
-  # одной нодой, не "all") — список scrape-таргетов всегда генерится из ПОЛНОГО
-  # nodes.json, чтобы центральный Prometheus не терял из виду остальные ноды.
+          docker run -d \
+            --name netrunner-proxy \
+            --restart always \
+            --network host \
+            --cap-add NET_ADMIN --cap-add NET_RAW --cap-add DAC_OVERRIDE \
+            --device /dev/net/tun:/dev/net/tun \
+            --ulimit nofile=1048576:1048576 \
+            -e PROXY_INTERNAL_SECRET="${{ secrets.PROXY_INTERNAL_SECRET }}" \
+            gitea.netrunner-vpn.com/nineap/netrunner-proxy:latest \
+            ./netrunner-proxy \
+            --port "${{ matrix.proxy_port }}" \
+            --decoy-host "${{ matrix.decoy_host }}" \
+            --require-auth \
+            --backend-url "${{ vars.BACKEND_URL }}" \
+            --health-port 9091 \
+            --metrics-port 9093
+
+          docker image prune -f
+          echo "✅ ${{ matrix.name }} обновлена."
+          REMOTE
+
+          rm -f deploy_key
+
+  # Список scrape-таргетов всегда генерится из ПОЛНОГО nodes.json, независимо
+  # от того, какую ноду деплоили, чтобы центральный Prometheus не терял из
+  # виду остальные ноды.
   update-observability-targets:
     runs-on: ubuntu-24.04
     steps:
@@ -128,19 +140,20 @@ jobs:
         run: node scripts/generate-prometheus-targets.mjs nodes.json > nodes.targets.json
 
       - name: Upload to observability VPS
-        uses: appleboy/scp-action@v0.1.7
-        with:
-          host: ${{ vars.DATA_VPS_IP }}
-          username: root
-          key: ${{ secrets.DATA_SSH_PRIVATE_KEY }}
-          source: "nodes.targets.json"
-          target: "/root/netrunner-data/observability/targets"
-          strip_components: 0
+        run: |
+          set -euo pipefail
+          command -v ssh >/dev/null 2>&1 || { apt-get update && apt-get install -y openssh-client; }
 
-      - name: Rename to nodes.json (file_sd_configs ждёт именно это имя)
-        uses: appleboy/ssh-action@v1
-        with:
-          host: ${{ vars.DATA_VPS_IP }}
-          username: root
-          key: ${{ secrets.DATA_SSH_PRIVATE_KEY }}
-          script: mv /root/netrunner-data/observability/targets/nodes.targets.json /root/netrunner-data/observability/targets/nodes.json
+          install -m 600 /dev/null data_key
+          cat > data_key <<'SSHKEY'
+          ${{ secrets.DATA_SSH_PRIVATE_KEY }}
+          SSHKEY
+
+          # scp прямо в конечное имя nodes.json (file_sd_configs ждёт именно
+          # его) — отдельный шаг переименования больше не нужен.
+          scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+              -o ConnectTimeout=20 -i data_key \
+              nodes.targets.json \
+              "root@${{ vars.DATA_VPS_IP }}:/root/netrunner-data/observability/targets/nodes.json"
+
+          rm -f data_key
