@@ -68,10 +68,6 @@ jobs:
         with:
           targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android,i686-linux-android
 
-      # Тот же проверенный на этом раннере способ поставить NDK, что уже
-      # работает в netrunner-app/.gitea/workflows/release.yml (build-android) —
-      # android-actions/setup-android@v3 экспортирует ANDROID_NDK_ROOT в env
-      # для последующих шагов.
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -83,12 +79,33 @@ jobs:
       - name: Install Android NDK
         run: sdkmanager "ndk;26.1.10909125"
 
+      # ВАЖНО: `${{ env.ANDROID_NDK_ROOT }}` (как в netrunner-app) здесь пуст —
+      # реальный прогон падал "Error detecting NDK version for path" (путь был
+      # пустой строкой). android-actions/setup-android@v3 не экспортирует
+      # ANDROID_NDK_ROOT в этом раннере/версии; в netrunner-app это, похоже,
+      # никогда и не было load-bearing (Tauri находит NDK сам через свои
+      # средства, независимо от этой переменной) — а для cargo-ndk путь
+      # обязателен. Вычисляем и проверяем путь сами, не полагаясь на угаданное
+      # имя переменной от стороннего action'а.
+      - name: Resolve NDK path
+        id: ndk
+        run: |
+          set -e
+          NDK_PATH="$ANDROID_HOME/ndk/26.1.10909125"
+          if [ ! -d "$NDK_PATH" ]; then
+            echo "NDK не найден по ожидаемому пути: $NDK_PATH" >&2
+            echo "Содержимое \$ANDROID_HOME/ndk:" >&2
+            ls "$ANDROID_HOME/ndk" >&2 || true
+            exit 1
+          fi
+          echo "path=$NDK_PATH" >> "$GITHUB_OUTPUT"
+
       - name: Install cargo-ndk
         run: command -v cargo-ndk >/dev/null || cargo install cargo-ndk
 
       - name: Build Android client libs (4 ABI) + uniffi Kotlin bindings
         env:
-          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_ROOT }}
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.path }}
         run: |
           set -e
           for abi in arm64-v8a armeabi-v7a x86_64 x86; do
