@@ -52,7 +52,7 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use netrunner_logger::{info, instrument, trace, warn, AppError, ERR_INFRA_TIMEOUT};
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{error::TrySendError, Sender};
@@ -312,6 +312,14 @@ pub struct Muxer {
     /// Сколько байт (tx+rx) уже было отчитано бэкенду по этой сессии —
     /// следующий тик репортит только дельту сверх этого значения.
     quota_reported_bytes: Arc<AtomicU64>,
+    /// Клиент: сервер безоговорочно отверг токен (`ERR_AUTH_FAILED` —
+    /// см. `ClientHandler::connect`'s per-leg loop) — это не сетевой сбой,
+    /// повторные попытки с тем же токеном обречены (например, аккаунт удалён
+    /// на бэкенде). Once set, ноги перестают реконнектиться, а верхний
+    /// движок клиента (`Engine::run`) видит [`Muxer::is_fatal`] и завершает
+    /// сессию сам — без этого приложение молча висело в статусе "connected"
+    /// с мёртвым туннелем, пока пользователь вручную не выключит VPN.
+    fatal: Arc<AtomicBool>,
 }
 
 impl Muxer {
@@ -330,9 +338,21 @@ impl Muxer {
             cumulative_rx: Arc::new(AtomicU64::new(0)),
             quota_user_id: Arc::new(ArcSwap::from_pointee(None)),
             quota_reported_bytes: Arc::new(AtomicU64::new(0)),
+            fatal: Arc::new(AtomicBool::new(false)),
         };
         muxer.spawn_backlog_reaper();
         muxer
+    }
+
+    /// Помечает сессию как безвозвратно проваленную (сервер отверг токен) —
+    /// см. поле [`fatal`](Self::fatal).
+    pub fn mark_fatal(&self) {
+        self.fatal.store(true, Ordering::Relaxed);
+    }
+
+    /// `true`, если сессию нужно завершать, а не реконнектить (см. [`mark_fatal`](Self::mark_fatal)).
+    pub fn is_fatal(&self) -> bool {
+        self.fatal.load(Ordering::Relaxed)
     }
 
     /// Складывает байты ноги, которая уходит из `legs` (эвикт/реконнект), в

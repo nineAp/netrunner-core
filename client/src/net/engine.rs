@@ -208,6 +208,20 @@ impl Engine {
         > = std::collections::HashMap::new();
 
         loop {
+            // Сервер безоговорочно отверг наш токен (см. `Muxer::mark_fatal`,
+            // выставляется per-leg циклом в `ClientHandler::connect`, когда
+            // сервер шлёт `auth_rejected` — например, аккаунт удалён/забанен).
+            // Реконнект с тем же токеном не поможет, а бесконечный внутренний
+            // ретрай раньше держал этот цикл живым вечно: приложение видело
+            // `CONN_CONNECTED` и не подозревало, что трафик уходит в мёртвый
+            // туннель. Выходим сами — вызывающий код (`spawn_session`) увидит
+            // завершение `run()` и переведёт статус в idle, что уронит Session
+            // (Drop) и откатит маршрутизацию/kill-switch.
+            if self.muxer.as_ref().is_some_and(|m| m.is_fatal()) {
+                error!("Session marked fatal (server rejected auth token) — shutting down engine");
+                return;
+            }
+
             let now = Self::current_time();
             let mut work_done = false;
 

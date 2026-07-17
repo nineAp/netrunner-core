@@ -545,10 +545,29 @@ impl ClientHandler {
                 tokio::time::sleep(LEG_STAGGER_DELAY * id).await;
                 let mut attempt: u32 = 0;
                 loop {
+                    if m.is_fatal() {
+                        // Другая нога уже поймала ERR_AUTH_FAILED (тот же токен
+                        // невалиден для всех ног одинаково) — не долбимся дальше.
+                        info!("Leg {} stopping: session marked fatal", id);
+                        return;
+                    }
                     if let Err(e) =
                         Self::establish_leg(&addr, id, m.clone(), &sid, &decoy_sni, &auth_token)
                             .await
                     {
+                        if e.code == ERR_AUTH_FAILED {
+                            // Сервер безоговорочно отверг токен (см. `validate`
+                            // в establish_leg) — это не сетевой сбой, повторные
+                            // попытки с тем же токеном обречены (аккаунт
+                            // удалён/забанен/подписка истекла). Останавливаем
+                            // ЭТУ ногу и просим верхний движок клиента
+                            // (`Engine::run`, видит `Muxer::is_fatal`) завершить
+                            // сессию целиком, а не висеть в "connected" вечно.
+                            error!("Leg {} auth rejected by server, giving up: {}", id, e);
+                            m.mark_fatal();
+                            return;
+                        }
+
                         attempt += 1;
                         error!("Leg {} disconnected: {}. Reconnecting in 2s...", id, e);
                         let rtt =

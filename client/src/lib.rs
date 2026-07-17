@@ -64,6 +64,23 @@ pub fn connection_state() -> u8 {
     CONNECTION_STATE.load(Ordering::Relaxed)
 }
 
+/// То же самое, но экспортировано через UniFFI для Kotlin/Swift (десктопный
+/// плагин — тот же Rust-крейт, поэтому дёргает [`connection_state`] напрямую;
+/// мобильным приложениям через FFI-границу нужна явно экспортированная
+/// функция). Возвращает строку вместо магических чисел, чтобы не дублировать
+/// маппинг `CONN_*` в каждом биндинге — тот же набор строк, что и в
+/// `desktop.rs`: "idle" | "connecting" | "connected" | "failed".
+#[uniffi::export]
+pub fn connection_status_string() -> String {
+    match connection_state() {
+        CONN_CONNECTED => "connected",
+        CONN_CONNECTING => "connecting",
+        CONN_FAILED => "failed",
+        _ => "idle",
+    }
+    .to_string()
+}
+
 /// Глобальный многопоточный tokio-рантайм, общий для всех сессий.
 pub static RUNTIME: OnceLock<Runtime> = OnceLock::new();
 
@@ -146,7 +163,11 @@ impl SessionManager {
         excluded_domains: Vec<String>,
         auth_token: Option<String>,
     ) -> Arc<Session> {
-        netrunner_logger::Logger::init(None, false);
+        // На мобильных Logger::init здесь — первый и единственный вызов (нет
+        // отдельного main.rs), поэтому production-флаг должен зависеть от
+        // профиля сборки, а не быть жёстко `false` (иначе релизная сборка
+        // печатала дев-баннер "Mode: DEBUG" вместо тихого JSON-лога).
+        netrunner_logger::Logger::init(None, !cfg!(debug_assertions));
         netrunner_logger::Logger::global().set_level("error");
 
         let runtime = get_runtime();
