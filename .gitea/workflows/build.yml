@@ -52,20 +52,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # 1. Корректная установка Rust
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android,i686-linux-android
+
+      # 2. Установка Android NDK
       - name: Install Android NDK
         uses: nttld/setup-ndk@v1
         with:
-          ndk-version: r26b # Укажите версию, которая нужна вашему проекту
+          ndk-version: r26b
 
-      - name: Install Rust targets
-        run: |
-          rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android i686-linux-android
-          cargo install cargo-ndk
+      # 3. Установка инструментов
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk
 
+      # 4. Сборка Native Libs
       - name: Build Native Libs
         run: |
-          # ВАШ MAKEFILE TARGEY
-          # Предположим, вы вынесли команды из makefile сюда
           ABIS="arm64-v8a armeabi-v7a x86_64 x86"
           for abi in $ABIS; do
             cargo ndk -t $abi -o ./gen build --bin netrunner-client --release
@@ -74,16 +79,19 @@ jobs:
           # Генерация биндингов
           cargo run --bin bindgen-tool generate --library gen/arm64-v8a/libnetrunner_client.so --language kotlin --no-format --out-dir gen
 
-      - name: Package artifacts
-        run: tar -czf android-libs.tar.gz gen/
+      # 5. Подготовка папки для скрипта публикации (скрипт ждет папку artifacts/)
+      - name: Prepare artifacts
+        run: |
+          mkdir -p artifacts-libs
+          tar -czf artifacts-libs/android-libs.tar.gz gen/
 
+      # 6. Загрузка в Gitea
+      # Важно: используйте тот же секрет GITEA_TOKEN, что и в скрипте публикации
       - name: Upload to Gitea
         env:
-          GITEA_TOKEN: ${{ secrets.GITEA_TOKEN }}
+          GITEA_TOKEN: ${{ secrets.GT_REGISTRY_TOKEN }}
           GITEA_SERVER_URL: ${{ vars.GITEA_SERVER_URL }}
-          REPO: ${{ github.repository }}
-          VERSION: ${{ github.ref_name }}
+          GITEA_REPO: ${{ github.repository }}
+          RELEASE_VERSION: ${{ github.ref_name }}
         run: |
-          # Используем ваш же скрипт публикации, который вы прислали ранее
-          node scripts/gitea-publish-release.mjs artifacts-libs/ 
-          # (предварительно положив туда android-libs.tar.gz)
+          node scripts/gitea-publish-release.mjs artifacts-libs/
