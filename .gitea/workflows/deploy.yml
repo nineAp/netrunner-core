@@ -46,6 +46,7 @@ on:
 jobs:
   resolve:
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     outputs:
       targets: ${{ steps.filter.outputs.targets }}
     steps:
@@ -79,6 +80,7 @@ jobs:
       matrix:
         include: ${{ fromJson(needs.resolve.outputs.targets) }}
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - name: Deploy to ${{ matrix.name }} (${{ matrix.host }})
         run: |
@@ -133,6 +135,7 @@ jobs:
   # виду остальные ноды.
   update-observability-targets:
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
