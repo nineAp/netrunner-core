@@ -245,6 +245,10 @@ impl SessionManager {
                 }
                 #[cfg(target_os = "windows")]
                 {
+                    // См. docstring cleanup_stale_adapter: без этого падаем на
+                    // "WintunStartSession failed ... уже проведена (0x4DF)",
+                    // если предыдущий процесс убили без штатного завершения.
+                    crate::tun::tun::cleanup_stale_adapter("netr0");
                     Tun::create(|tun_cfg| {
                         tun_cfg.tun_name("netr0");
                     })

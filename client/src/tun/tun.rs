@@ -10,6 +10,42 @@ use netrunner_logger::error;
 use std::io;
 use tun::{AsyncDevice, Configuration, DeviceReader, DeviceWriter, create_as_async};
 
+/// Windows-only: закрывает зависший Wintun-адаптер с именем `name`, если он
+/// остался от предыдущего процесса, убитого без штатного завершения (Drop у
+/// `tun`-крейта, закрывающий сессию, тогда не отрабатывает). Без этого
+/// следующий запуск переиспользует тот же адаптер (`Adapter::open` внутри
+/// `tun` крейта успевает раньше, чем понадобилось бы `create`) и падает на
+/// `start_session` с `WintunStartSession failed ... ERROR_ALREADY_INITIALIZED
+/// (0x4DF)`, потому что на нём уже висит незакрытая сессия. Используем
+/// отдельный крейт `wintun` (не `wintun-bindings`, на котором построен сам
+/// `tun`) — обе биндинги грузят один и тот же `wintun.dll` и работают с одним
+/// и тем же состоянием драйвера, так что закрытие через одну видно другой.
+/// Best-effort: если тут что-то пошло не так (адаптера нет, DLL не нашлась и
+/// т.п.) — просто логируем и идём дальше, `create_as_async` ниже создаст
+/// адаптер с нуля сам, если найдёт его свободным.
+#[cfg(target_os = "windows")]
+pub fn cleanup_stale_adapter(name: &str) {
+    let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        let wintun = unsafe { wintun::load()? };
+        if let Ok(adapter) = wintun::Adapter::open(&wintun, name) {
+            match std::sync::Arc::try_unwrap(adapter) {
+                Ok(adapter) => adapter.delete()?,
+                // Кто-то ещё держит Arc — маловероятно (мы только что его
+                // открыли в этой же функции), но на всякий случай не рушим
+                // best-effort очистку паникой на try_unwrap.
+                Err(_) => return Err("adapter handle still referenced".into()),
+            }
+        }
+        Ok(())
+    })();
+    if let Err(e) = result {
+        error!(
+            "Не удалось очистить старый Wintun-адаптер {}: {} (не критично, пробуем создать заново)",
+            name, e
+        );
+    }
+}
+
 /// Асинхронное TUN-устройство.
 pub struct Tun {
     device: AsyncDevice,
