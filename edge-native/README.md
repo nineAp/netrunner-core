@@ -90,16 +90,25 @@ Owner-эндпоинтом бэкенда, и кладётся в `.env` это�
 намеренно разделены):
 
 ```bash
-curl -X POST https://<backend>/admin/staff/edge-tokens \
+curl -X POST https://<backend>/api/v1/admin/staff/owner/edge-tokens \
   -H "Content-Type: application/json" \
   -H "Cookie: <owner-сессия>" \
   -d '{"label": "paris-decoy-vds-1"}'
 # -> {"id": "...", "label": "paris-decoy-vds-1", "token": "edge_ab12...ef90"}
 ```
 
+Путь именно такой — `/api/v1/admin/staff/owner/edge-tokens`, а не короче:
+эти роуты живут в `owner_router()` (только Owner, не Owner+Moderator), а он
+подключён в `api.rs` через `.nest("/staff/owner", staff_ctrl::owner_router(...))`
+внутри `.nest("/api/v1/admin", admin_routes_v1)` — оба сегмента обязательны.
+Более короткий путь ни на что не смотрит (не 404 — тут же поднят SPA-фронт
+на `fallback_service`, тот же роутер тогда молча пытается отдать статику и
+на любой метод, кроме GET/HEAD, честно отвечает 405 — легко принять за
+сломанный роут на бэке, хотя сам роут работает штатно).
+
 `token` — тот самый `AUTH_TOKEN`. Он показывается ровно один раз в этом
 ответе (репозиторий хранит только его SHA256); потерялся — выпускайте новый
-и отзывайте старый (`POST /admin/staff/edge-tokens/{id}/revoke`).
+и отзывайте старый (`POST /api/v1/admin/staff/owner/edge-tokens/{id}/revoke`).
 `limit_bytes` в теле запроса — необязательное ограничение трафика для этого
 токена, по умолчанию безлимит (осознанно, соответствует "открытый прокси без
 контроля" — включайте лимит явно, если он всё же нужен).
