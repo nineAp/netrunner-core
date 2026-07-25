@@ -18,3 +18,14 @@ futures-util = "0.3"
 rand = "0.10.0"
 clap = { version = "4.4", features = ["derive"] }
 tracing = "0.1"
+# Реальный TLS-клиент для внутренней ноги (эта VDS -> настоящий бэкенд ЧЕРЕЗ
+# уже установленный NRXP-туннель до ноды) — см. tunnel_stream.rs/proxy_http.rs.
+# Не путать с NRXP-маскировкой под TLS у внешней ноги (эта VDS -> нода) —
+# это НАСТОЯЩИЙ TLS до реального BACKEND_ADDR, ядру протокола он не нужен.
+tokio-rustls = "0.26"
+rustls-pki-types = "1"
+webpki-roots = "1"
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

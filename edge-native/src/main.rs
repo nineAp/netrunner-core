@@ -2,12 +2,21 @@
 //!
 //! Та же роль, что и у [`client-edge`](../client-edge) (Cloudflare Worker),
 //! но как самостоятельный tokio-бинарь для произвольной VDS, а не привязанный
-//! к рантайму Cloudflare Workers:
+//! к рантайму Cloudflare Workers. Два независимых входа в один и тот же
+//! NRXP-туннель до ноды:
 //!
 //! ```text
-//!   пользователь            netrunner-edge (этот бинарь, на арендованной VDS)         VPN-нода                бэкенд
-//!   (WS-клиент) ──WSS──▶  axum: WS ⇄ NRXP-мост (bridge.rs, ядро — edge.rs)   ──NRXP/TCP──▶  netrunner-server  ──▶  BACKEND_ADDR
+//!   WS-клиент  ──WSS──▶  axum: WS ⇄ NRXP-мост (bridge.rs)          ──┐
+//!                                                                     ├──NRXP/TCP──▶  netrunner-server  ──▶  BACKEND_ADDR
+//!   браузер    ──HTTPS──▶ axum: открытый HTTP-реверс-прокси          │              (VPN-нода)
+//!               (proxy_http.rs, TLS до бэкенда ВНУТРИ NRXP-ноги) ──┘
 //! ```
+//!
+//! Обычная ссылка в браузере (GET без `Upgrade`) теперь тоже долетает до
+//! настоящего сайта/бэкенда за нодой, не только WS-клиенты — см.
+//! `proxy_http.rs`: осознанно "открытый прокси без контроля", кто угодно,
+//! кто откроет ссылку на эту VDS, попадает на реальный сайт, никакой
+//! проверки личности на этом входе нет.
 //!
 //! Зачем отдельный бинарь, а не просто "клиент-edge, но не wasm": протокольная
 //! логика (хендшейк, кадры, шифрование) уже платформо-независима —
@@ -22,8 +31,8 @@
 //!
 //! ## Два слоя маскировки (важно понимать по отдельности)
 //!
-//! 1. **Входящая нога (пользователь ⇄ эта VDS)** — обычный WSS (WebSocket
-//!    поверх настоящего TLS). Реального TLS-терминатора в этом бинаре нет
+//! 1. **Входящая нога (пользователь/браузер ⇄ эта VDS)** — обычный HTTPS/WSS
+//!    поверх настоящего TLS. Реального TLS-терминатора в этом бинаре нет
 //!    осознанно — см. `README.md` за тем, почему это должен делать Caddy
 //!    (или любой другой reverse-proxy) перед этим процессом: настоящий
 //!    ACME-сертификат убедительнее самоподписанного, а сам этот процесс
@@ -36,10 +45,17 @@
 //!    netflow/файрвол-логи без какой-либо расшифровки. Если конкретно
 //!    хостер — часть модели угроз, `DECOY_SNI` тут не панацея (см. README).
 //!
+//! Для HTTP-прокси есть ещё и ТРЕТИЙ, вложенный слой — настоящий TLS-клиент
+//! до реального `BACKEND_ADDR`, поднятый ПРЯМО НАД NRXP-нёй (см.
+//! `tunnel_stream.rs`/`proxy_http.rs`) — не путать с decoy-маскировкой слоя 2
+//! выше, это два независимых TLS-рукопожатия с разными целями.
+//!
 //! Конфигурация — только переменные окружения (см. `EdgeConfig::from_env`),
 //! секрет (`AUTH_TOKEN`) в их числе — ничего не зашито в бинарь.
 
 mod bridge;
+mod proxy_http;
+mod tunnel_stream;
 
 use axum::extract::ws::WebSocketUpgrade;
 use axum::extract::{FromRequestParts, Request, State};
@@ -93,17 +109,19 @@ Commercial support is available at
 /// разворачивал воркер-вариант.
 pub struct EdgeConfig {
     /// `host:port` вашей VPN-ноды (`netrunner-server`) — ClientHello-таргет.
-    vpn_node_addr: String,
-    /// `host:port`, который нода откроет по `Connect`-кадру (ваш бэкенд).
-    backend_addr: String,
+    pub(crate) vpn_node_addr: String,
+    /// `host:port`, который нода откроет по `Connect`-кадру (ваш бэкенд) —
+    /// используется и WS-мостом, и HTTP-прокси (там же ещё и как SNI/Host
+    /// для внутреннего TLS до реального бэкенда, см. `proxy_http.rs`).
+    pub(crate) backend_addr: String,
     /// Домен-декой для поддельного `ClientHello` — должен резолвиться и
     /// отвечать 200, чтобы отпечаток держался правдоподобно (см.
     /// `core::net::DEFAULT_DECOY_HOST` и ARCH.md в основном репозитории).
-    decoy_sni: String,
+    pub(crate) decoy_sni: String,
     /// Bearer-токен для auth-heartbeat — нужен только если нода поднята с
     /// `--require-auth`. Пустая строка, если не задан (нода без
     /// `--require-auth` его не проверяет).
-    auth_token: String,
+    pub(crate) auth_token: String,
 }
 
 impl EdgeConfig {
@@ -145,14 +163,21 @@ struct Args {
     port: u16,
 }
 
-/// Единственный маршрут — зеркало `fetch` в `client-edge/src/lib.rs`:
-/// WS-апгрейд уходит в мост, всё остальное (сканер DPI, healthcheck,
-/// случайный визит) получает decoy-страницу. `WebSocketUpgrade` извлекается
-/// вручную через `from_request_parts`, а не как параметр-экстрактор — иначе
-/// запрос без нужных заголовков падал бы 400-й ошибкой axum ДО того, как этот
-/// обработчик вообще получит управление, вместо тихого ухода в decoy-ветку
-/// (то же поведение, что и explicit-проверка `Upgrade`-заголовка в
-/// wasm-варианте, `client-edge/src/lib.rs::fetch`).
+/// Decoy-страница — общая для трёх мест: не-WS/не-HTTP-прокси-путь ниже уже
+/// не бывает (см. `handle`), но `proxy_http::proxy` тоже отдаёт её как
+/// graceful fallback, если сам бэкенд/нода недоступны (см. её doc comment).
+pub(crate) fn decoy_response() -> Response {
+    Html(DECOY_PAGE_HTML).into_response()
+}
+
+/// Единственный маршрут: WS-апгрейд уходит в мост (`bridge.rs`), любой
+/// другой HTTP-запрос — в открытый реверс-прокси (`proxy_http.rs`), который
+/// сам решит, что ответить (реальный сайт или decoy при сбое). `WebSocketUpgrade`
+/// извлекается вручную через `from_request_parts`, а не как параметр-
+/// экстрактор — иначе запрос без нужных заголовков падал бы 400-й ошибкой
+/// axum ДО того, как этот обработчик вообще получит управление, вместо
+/// тихого ухода в HTTP-прокси-ветку (то же поведение, что и explicit-проверка
+/// `Upgrade`-заголовка в wasm-варианте, `client-edge/src/lib.rs::fetch`).
 async fn handle(State(cfg): State<Arc<EdgeConfig>>, req: Request) -> Response {
     let is_upgrade = req
         .headers()
@@ -162,7 +187,7 @@ async fn handle(State(cfg): State<Arc<EdgeConfig>>, req: Request) -> Response {
         .unwrap_or(false);
 
     if !is_upgrade {
-        return Html(DECOY_PAGE_HTML).into_response();
+        return proxy_http::proxy(cfg, req).await;
     }
 
     let (mut parts, _body) = req.into_parts();
@@ -170,7 +195,7 @@ async fn handle(State(cfg): State<Arc<EdgeConfig>>, req: Request) -> Response {
         Ok(ws) => ws.on_upgrade(move |socket| bridge::run(socket, cfg)),
         // Заголовок Upgrade: websocket есть, но остальное (Sec-WebSocket-Key
         // и т.п.) не сходится — тот же decoy, не axum-дефолтная ошибка.
-        Err(_) => Html(DECOY_PAGE_HTML).into_response(),
+        Err(_) => decoy_response(),
     }
 }
 
@@ -201,6 +226,16 @@ async fn shutdown_signal(token: CancellationToken) {
 
 #[tokio::main]
 async fn main() {
+    // rustls 0.23+ больше не выбирает крипто-бэкенд неявно (даже когда в
+    // дереве зависимостей включена только ОДНА фича, "ring") — без этого
+    // явного вызова ПЕРВЫЙ же `rustls::ClientConfig::builder()` в
+    // `proxy_http.rs` паникует в отдельной tokio-задаче на каждый запрос
+    // (см. `rustls::crypto::CryptoProvider`). Ставить нужно РОВНО один раз
+    // за жизнь процесса, до первого TLS-хендшейка — то есть здесь, в start.
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("Не удалось установить крипто-провайдер rustls");
+
     // Та же причина, что и у netrunner-server: НЕ пишем JSON-лог на диск —
     // JSON уходит в stdout, виден через `docker logs`/journalctl.
     Logger::init(None, true);
