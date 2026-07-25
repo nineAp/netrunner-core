@@ -1,0 +1,20 @@
+[package]
+name = "netrunner-edge-native"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "netrunner-edge"
+path = "src/main.rs"
+
+[dependencies]
+netrunner-core = { path = "../core" }
+netrunner-logger = { path = "../tools/log" }
+tokio = { version = "1.49.0", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+axum = { version = "0.8", features = ["ws"] }
+bytes = "1.5"
+futures-util = "0.3"
+rand = "0.10.0"
+clap = { version = "4.4", features = ["derive"] }
+tracing = "0.1"

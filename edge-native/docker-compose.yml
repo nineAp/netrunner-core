@@ -1,0 +1,50 @@
+# Разворачивается прямо на новой VDS (см. README.md). Caddy держит 443/80 сам
+# (HTTP-01 ACME challenge — не нужен ни DNS-провайдер, ни его API-токен,
+# в отличие от Caddyfile.dev в netrunner-backend, где 80 занят и используется
+# DNS-01) и реверс-проксирует на edge по внутренней docker-сети, никогда не
+# выставляя порт самого netrunner-edge наружу напрямую.
+services:
+  caddy:
+    image: caddy:2
+    container_name: netrunner-edge-caddy
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      - EDGE_DOMAIN=${EDGE_DOMAIN}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - edge
+    networks:
+      - netrunner_edge
+
+  edge:
+    build:
+      context: ..
+      dockerfile: edge-native/Dockerfile
+    image: ${IMAGE:-netrunner-edge:latest}
+    container_name: netrunner-edge
+    restart: always
+    # Порт НЕ публикуется на хост — только Caddy достаёт его по имени
+    # сервиса внутри docker-сети (см. reverse_proxy в Caddyfile.example).
+    expose:
+      - "8082"
+    environment:
+      - VPN_NODE_ADDR=${VPN_NODE_ADDR}
+      - BACKEND_ADDR=${BACKEND_ADDR}
+      - DECOY_SNI=${DECOY_SNI:-www.debian.org}
+      - AUTH_TOKEN=${AUTH_TOKEN:-}
+    networks:
+      - netrunner_edge
+
+networks:
+  netrunner_edge:
+    driver: bridge
+
+volumes:
+  caddy_data:
+  caddy_config:

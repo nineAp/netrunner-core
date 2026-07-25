@@ -1,0 +1,11 @@
+# Реверс-прокси с настоящим TLS перед netrunner-edge — тот же приём, что и
+# Caddyfile.dev в netrunner-backend (см. его комментарий): порт 443 держит
+# Caddy, сам процесс netrunner-edge никогда не видит приватный ключ TLS и
+# слушает только локально (127.0.0.1:8082 внутри docker-сети compose).
+#
+# Замените домен на тот, что реально арендован под эту VDS — {$EDGE_DOMAIN}
+# подставляется из .env через docker-compose.yml (env_file), редактировать
+# сам этот файл при каждой смене VDS не нужно.
+{$EDGE_DOMAIN} {
+	reverse_proxy edge:8082
+}
