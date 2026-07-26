@@ -28,8 +28,15 @@ use hyper_util::rt::TokioIo;
 use netrunner_logger::{error, warn};
 use rustls_pki_types::ServerName;
 use std::sync::{Arc, LazyLock};
+use std::time::Duration;
 use tokio_rustls::rustls;
 use tokio_rustls::TlsConnector;
+
+/// Один keep-alive HTTP/1.1-отправитель поверх уже установленного
+/// NRXP-туннеля + внутреннего TLS до бэкенда — то, чем реально владеет пул в
+/// `EdgeConfig::conn_pool` (см. её doc-комментарий за тем, зачем пул вообще
+/// нужен).
+pub(crate) type PooledSender = hyper::client::conn::http1::SendRequest<Full<Bytes>>;
 
 /// Верхняя граница тела запроса/ответа, которое прокси готов буферизовать
 /// целиком в памяти — `hyper::client::conn::http1` в этой версии проще всего
@@ -97,62 +104,65 @@ async fn try_proxy(cfg: &EdgeConfig, req: axum::extract::Request) -> Result<Resp
         .rsplit_once(':')
         .ok_or_else(|| format!("BACKEND_ADDR must be host:port, got {:?}", cfg.backend_addr))?;
 
-    let tunnel_stream = TunnelStream::connect(cfg, &cfg.backend_addr).await?;
-
-    let connector = TlsConnector::from(TLS_CONFIG.clone());
-    let server_name = ServerName::try_from(backend_host.to_string())
-        .map_err(|e| format!("invalid backend hostname {backend_host:?}: {e}"))?;
-    let tls_stream = connector
-        .connect(server_name, tunnel_stream)
-        .await
-        .map_err(|e| format!("TLS handshake with backend failed: {e}"))?;
-
-    let (mut send_request, connection) =
-        hyper::client::conn::http1::handshake(TokioIo::new(tls_stream))
-            .await
-            .map_err(|e| format!("HTTP/1 handshake with backend failed: {e}"))?;
-
-    // Живёт ровно на один запрос-ответ — TunnelStream не пулится между
-    // запросами (см. doc в tunnel_stream.rs), так что и эта задача завершится
-    // сама, как только send_request выше закроет свою сторону.
-    tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            warn!("[netrunner-edge] backend connection closed: {e}");
-        }
-    });
-
     let (parts, body) = req.into_parts();
     let path_and_query = parts
         .uri
         .path_and_query()
         .map(|pq| pq.as_str())
-        .unwrap_or("/");
-
-    let mut out_req = hyper::Request::builder()
-        .method(parts.method)
-        .uri(path_and_query);
-    for (name, value) in parts.headers.iter() {
-        // Host переписываем на реальный бэкенд ниже — иначе бэкенд увидит
-        // домен ЭТОЙ VDS и не поймёт, какой виртуальный хост отдавать (то
-        // же самое сделал бы любой обычный reverse-proxy). Hop-by-hop —
-        // см. doc `is_hop_by_hop`.
-        if name != header::HOST && !is_hop_by_hop(name) {
-            out_req = out_req.header(name, value);
-        }
-    }
-    out_req = out_req.header(header::HOST, backend_host);
-
+        .unwrap_or("/")
+        .to_string();
     let body_bytes = axum::body::to_bytes(body, MAX_PROXIED_BODY_BYTES)
         .await
         .map_err(|e| format!("reading request body: {e}"))?;
-    let out_req = out_req
-        .body(Full::new(body_bytes))
-        .map_err(|e| format!("building proxied request: {e}"))?;
 
-    let resp = send_request
-        .send_request(out_req)
-        .await
-        .map_err(|e| format!("sending proxied request: {e}"))?;
+    // Собирается заново на каждую попытку (а не один раз) — `hyper::Request`
+    // не `Clone`, а попытки может быть две (пул + фоллбэк на свежее
+    // соединение ниже); сама сборка дешёвая (`body_bytes` — `Bytes`, клон по
+    // счётчику ссылок, не копия).
+    let build_request = || -> Result<hyper::Request<Full<Bytes>>, String> {
+        let mut builder = hyper::Request::builder()
+            .method(parts.method.clone())
+            .uri(&path_and_query);
+        for (name, value) in parts.headers.iter() {
+            // Host переписываем на реальный бэкенд ниже — иначе бэкенд увидит
+            // домен ЭТОЙ VDS и не поймёт, какой виртуальный хост отдавать (то
+            // же самое сделал бы любой обычный reverse-proxy). Hop-by-hop —
+            // см. doc `is_hop_by_hop`.
+            if name != header::HOST && !is_hop_by_hop(name) {
+                builder = builder.header(name, value);
+            }
+        }
+        builder = builder.header(header::HOST, backend_host);
+        builder
+            .body(Full::new(body_bytes.clone()))
+            .map_err(|e| format!("building proxied request: {e}"))
+    };
+
+    // Сначала пробуем уже поднятое keep-alive соединение из пула — см. doc
+    // на `EdgeConfig::conn_pool` за тем, почему это не просто оптимизация.
+    // Протухшее соединение (нода/бэкенд закрыли простаивавший канал) —
+    // не ошибка, просто открываем новое ниже, как и раньше.
+    let mut sender = pop_pooled(cfg).await;
+    let mut resp = None;
+    if let Some(sr) = sender.as_mut() {
+        match sr.send_request(build_request()?).await {
+            Ok(r) => resp = Some(r),
+            Err(_) => sender = None,
+        }
+    }
+
+    let resp = match resp {
+        Some(r) => r,
+        None => {
+            let mut sr = connect_backend(cfg, backend_host).await?;
+            let r = sr
+                .send_request(build_request()?)
+                .await
+                .map_err(|e| format!("sending proxied request: {e}"))?;
+            sender = Some(sr);
+            r
+        }
+    };
 
     let (parts, body) = resp.into_parts();
     let body_bytes: Bytes = body
@@ -160,6 +170,13 @@ async fn try_proxy(cfg: &EdgeConfig, req: axum::extract::Request) -> Result<Resp
         .await
         .map_err(|e| format!("reading backend response body: {e}"))?
         .to_bytes();
+
+    // Тело полностью вычитано — соединение снова простаивает и готово к
+    // следующему запросу, кладём обратно в пул вместо того, чтобы дать ему
+    // молча упасть вместе с этой функцией.
+    if let Some(sr) = sender {
+        push_pooled(cfg, sr).await;
+    }
 
     let mut builder = Response::builder().status(parts.status);
     if let Some(headers) = builder.headers_mut() {
@@ -180,4 +197,104 @@ async fn try_proxy(cfg: &EdgeConfig, req: axum::extract::Request) -> Result<Resp
         .body(Body::from(body_bytes))
         .map_err(|e| format!("building response: {e}"))
         .map(IntoResponse::into_response)
+}
+
+/// Верхняя граница `EdgeConfig::conn_pool` — держим её небольшой: пул не
+/// призван обслуживать неограниченный параллелизм, только сгладить типичную
+/// пачку суб-ресурсов одной страницы, не открывая для каждого из них свежий
+/// NRXP-хендшейк одновременно (см. doc на `EdgeConfig::conn_pool`).
+const MAX_POOLED_CONNS: usize = 8;
+
+/// Сколько НОВЫХ NRXP-хендшейков до ноды можно поднимать одновременно. Пул
+/// сам по себе не спасает первый холодный всплеск запросов (первая загрузка
+/// страницы бьёт по пустому пулу — все параллельные суб-ресурсы разом видят
+/// "пусто" и разом же пытаются открыть свежее соединение, то есть тот же
+/// самый затор, из-за которого пул вообще появился, просто один раз при
+/// каждом холодном старте вместо каждого запроса). Живая проверка показала,
+/// что нода спокойно поднимает 5 одновременных исходящих TCP до бэкенда, но
+/// уже на 15 часть из них не успевает уложиться и превращается в "tls
+/// handshake eof" — лимит ниже (с запасом) превращает всплеск в несколько
+/// последовательных мелких партий вместо одной большой.
+const MAX_CONCURRENT_BACKEND_CONNECTS: usize = 4;
+
+static CONNECT_LIMIT: LazyLock<tokio::sync::Semaphore> =
+    LazyLock::new(|| tokio::sync::Semaphore::new(MAX_CONCURRENT_BACKEND_CONNECTS));
+
+/// Верхняя граница на весь цикл "TCP до ноды + NRXP-хендшейк + TLS до
+/// бэкенда + HTTP/1-хендшейк" — без неё зависшая (не оборвавшаяся с ошибкой,
+/// а именно ЗАВИСШАЯ на каком-то `.await`) попытка держала бы один из
+/// `MAX_CONCURRENT_BACKEND_CONNECTS` пропусков семафора бесконечно, и уже
+/// СЛЕДУЮЩИЕ запросы вставали бы в очередь за него — на живой проверке
+/// именно так и произошло: несколько зависших попыток из-за одной пачки
+/// конкурентных запросов держали семафор потом ещё много минут, и с виду
+/// не связанные с ними одиночные запросы тоже начали тормозить на ~20-25с.
+const BACKEND_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Устанавливает НОВОЕ NRXP+TLS+HTTP/1-соединение до `backend_addr` — то же
+/// самое, что раньше делал `try_proxy` инлайном на каждый запрос. Теперь
+/// вызывается только когда пул пуст или отдал протухшее соединение.
+async fn connect_backend(cfg: &EdgeConfig, backend_host: &str) -> Result<PooledSender, String> {
+    let _permit = CONNECT_LIMIT
+        .acquire()
+        .await
+        .expect("CONNECT_LIMIT semaphore is never closed");
+
+    tokio::time::timeout(
+        BACKEND_CONNECT_TIMEOUT,
+        connect_backend_inner(cfg, backend_host),
+    )
+    .await
+    .map_err(|_| format!("connecting via {} timed out after {BACKEND_CONNECT_TIMEOUT:?}", cfg.vpn_node_addr))?
+}
+
+async fn connect_backend_inner(cfg: &EdgeConfig, backend_host: &str) -> Result<PooledSender, String> {
+    let tunnel_stream = TunnelStream::connect(cfg, &cfg.backend_addr).await?;
+
+    let connector = TlsConnector::from(TLS_CONFIG.clone());
+    let server_name = ServerName::try_from(backend_host.to_string())
+        .map_err(|e| format!("invalid backend hostname {backend_host:?}: {e}"))?;
+    let tls_stream = connector
+        .connect(server_name, tunnel_stream)
+        .await
+        .map_err(|e| format!("TLS handshake with backend failed: {e}"))?;
+
+    let (send_request, connection) =
+        hyper::client::conn::http1::handshake(TokioIo::new(tls_stream))
+            .await
+            .map_err(|e| format!("HTTP/1 handshake with backend failed: {e}"))?;
+
+    // Живёт, пока соединение не закроется (нода/бэкенд оборвали канал или
+    // сама `SendRequest` вышла из пула по возрасту) — не обязательно на один
+    // запрос, раз теперь есть переиспользование через пул.
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            warn!("[netrunner-edge] backend connection closed: {e}");
+        }
+    });
+
+    Ok(send_request)
+}
+
+/// Достаёт одно готовое к работе соединение из пула, если есть. `ready()`
+/// проверяется ВНЕ лока над пулом (сам лок держим только на время `pop()`) —
+/// иначе конкурентные запросы сериализовались бы друг за другом на этой
+/// проверке, что свело бы на нет весь смысл пулинга (ровно та проблема с
+/// живой VDS, из-за которой пул вообще появился).
+async fn pop_pooled(cfg: &EdgeConfig) -> Option<PooledSender> {
+    let mut sr = cfg.conn_pool.lock().await.pop()?;
+    if sr.ready().await.is_ok() {
+        Some(sr)
+    } else {
+        None
+    }
+}
+
+/// Возвращает соединение в пул после того, как ответ на текущий запрос
+/// полностью вычитан (см. вызов в `try_proxy`) — переполнение пула просто
+/// роняет соединение (закрывается само через `Drop`), не ошибка.
+async fn push_pooled(cfg: &EdgeConfig, sr: PooledSender) {
+    let mut pool = cfg.conn_pool.lock().await;
+    if pool.len() < MAX_POOLED_CONNS {
+        pool.push(sr);
+    }
 }

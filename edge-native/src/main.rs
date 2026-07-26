@@ -122,6 +122,22 @@ pub struct EdgeConfig {
     /// `--require-auth`. Пустая строка, если не задан (нода без
     /// `--require-auth` его не проверяет).
     pub(crate) auth_token: String,
+    /// Пул переиспользуемых keep-alive HTTP/1.1-соединений до `backend_addr`
+    /// поверх уже установленных NRXP-туннелей (см. `proxy_http.rs`). Не
+    /// "конфигурация" в строгом смысле остальных полей — рантайм-состояние,
+    /// но кладём его сюда же, а не заводим отдельную структуру состояния:
+    /// `Arc<EdgeConfig>` и так уже общий на все запросы, значит уже ровно то,
+    /// что нужно для пула. Появился не как заранее заложенная оптимизация,
+    /// а как фикс живого бага: без него каждый суб-ресурс страницы (десятки
+    /// параллельных запросов браузера — CSS/JS/картинки одного визита)
+    /// открывал СВОЙ отдельный TCP+NRXP-хендшейк до ноды одновременно, а нода
+    /// не поднимает исходящие TCP до бэкенда настолько параллельно — живая
+    /// проверка через `blue-pixel-studio.online` стабильно давала "TLS
+    /// handshake with backend failed: tls handshake eof" на части
+    /// одновременных запросов (страница "не догружалась"). Переиспользование
+    /// уже поднятых соединений между запросами убирает саму эту конкуренцию,
+    /// а не просто ускоряет — см. `proxy_http::pop_pooled`/`push_pooled`.
+    pub(crate) conn_pool: tokio::sync::Mutex<Vec<proxy_http::PooledSender>>,
 }
 
 impl EdgeConfig {
@@ -139,12 +155,42 @@ impl EdgeConfig {
             .expect("BACKEND_ADDR обязателен — host:port бэкенда за нодой");
         let decoy_sni = std::env::var("DECOY_SNI").unwrap_or_else(|_| "www.debian.org".to_string());
         let auth_token = std::env::var("AUTH_TOKEN").unwrap_or_default();
+        validate_host_port("VPN_NODE_ADDR", &vpn_node_addr);
+        validate_host_port("BACKEND_ADDR", &backend_addr);
         Self {
             vpn_node_addr,
             backend_addr,
             decoy_sni,
             auth_token,
+            conn_pool: tokio::sync::Mutex::new(Vec::new()),
         }
+    }
+}
+
+/// Проверяет, что переменная окружения реально `host:port`, а не URL со
+/// схемой — живой баг: `BACKEND_ADDR=https://netrunner-vpn.com` (вместо
+/// `netrunner-vpn.com:443`) не ловится наивной проверкой "есть хоть один
+/// ':'" (в URL со схемой он тоже есть, просто не там), и `rsplit_once(':')`
+/// в `proxy_http.rs` молча режет по ПОСЛЕДНЕМУ ':' — а он там ровно один,
+/// сразу после схемы (`"https://netrunner-vpn.com".rsplit_once(':')` даёт
+/// `("https", "//netrunner-vpn.com")`), так что "хостом" становится строка
+/// `"https"`, а нода получает по `Connect`-кадру мусорный адрес целиком —
+/// итог ровно то же самое "TLS handshake with backend failed: tls handshake
+/// eof", что и настоящий сетевой сбой, только тут причина — опечатка в
+/// конфиге, а не сеть. Падаем сразу при старте с понятной причиной вместо
+/// того, чтобы это всплывало на каждый запрос уже в `proxy_http.rs`.
+fn validate_host_port(var_name: &str, value: &str) {
+    if value.contains("://") {
+        panic!(
+            "{var_name} должен быть в формате host:port, БЕЗ схемы (http://, https://) — \
+             получено {value:?}, ожидалось что-то вроде \"example.com:443\""
+        );
+    }
+    let (_, port) = value.rsplit_once(':').unwrap_or_else(|| {
+        panic!("{var_name} должен быть в формате host:port — получено {value:?}")
+    });
+    if port.parse::<u16>().is_err() {
+        panic!("{var_name}: {value:?} — после последнего ':' должен быть числовой порт, получено {port:?}");
     }
 }
 
