@@ -129,20 +129,24 @@ cargo run -p netrunner-edge-native
 
 ## Деплой на VDS (Caddy + Docker)
 
-`docker-compose.yml` в этой же директории поднимает оба контейнера сразу —
-скопируйте его и `Caddyfile.example` (переименовав в `Caddyfile`) на новую
-VDS рядом с `.env`:
+`docker-compose.yml` в этой же директории поднимает оба контейнера сразу.
+**Важно:** его сервис `edge` собирается из исходников (`build: context: ..`,
+т.е. из корня `netrunner-proxy` — см. "Сборка для прода" ниже за тем, почему),
+поэтому на VDS должен быть весь репозиторий, не только `docker-compose.yml` и
+`Caddyfile.example` — голого `scp` этих двух файлов в отдельную папку (как
+могло бы показаться по названию `/root/netrunner-edge/`) недостаточно, `docker
+compose up -d` не найдёт чем собирать `edge` и упадёт на билде:
 
 ```bash
-scp docker-compose.yml Caddyfile.example root@your-new-vds:/root/netrunner-edge/
 ssh root@your-new-vds
-cd /root/netrunner-edge
-mv Caddyfile.example Caddyfile
+git clone <url-этого-репозитория> /root/netrunner-proxy
+cd /root/netrunner-proxy/edge-native
+cp Caddyfile.example Caddyfile
 # отредактировать домен в Caddyfile и создать .env (см. ниже)
 docker compose up -d
 ```
 
-`.env` рядом с `docker-compose.yml`:
+`.env` рядом с `docker-compose.yml` (в `edge-native/`):
 
 ```bash
 EDGE_DOMAIN=your-fresh-domain.example      # домен, на который смотрит Caddyfile
@@ -152,13 +156,26 @@ DECOY_SNI=www.debian.org
 AUTH_TOKEN=your-nrxp-bearer-token
 ```
 
-Обновление образа на уже развёрнутой VDS — `docker compose pull && docker
-compose up -d`, тот же принцип, что и в `.gitea/workflows/deploy.yml` для
-обычных нод (см. корень репозитория) — тут просто не автоматизировано через
-CI, потому что каждая edge-VDS — по определению одноразовая/недолгоживущая
-точка входа, а не часть постоянного `nodes.json`.
+Обновление на уже развёрнутой VDS — `git pull && docker compose build &&
+docker compose up -d` (см. "Сборка для прода" ниже за тем, почему не `docker
+compose pull`). Тот же принцип "пересобрать из исходников на месте", что и в
+`.gitea/workflows/deploy.yml` для обычных нод (см. корень репозитория) в
+смысле "код обновился → нужен новый образ", но без самого CI: тут это не
+автоматизировано, потому что каждая edge-VDS — по определению
+одноразовая/недолгоживущая точка входа, а не часть постоянного `nodes.json`.
 
-## Сборка образа вручную
+## Сборка для прода
+
+Два варианта — Docker-образ (штатный путь, см. "Деплой на VDS" выше) или
+голый release-бинарь без Docker, если на этой VDS reverse-proxy/автозапуском
+уже управляют иначе.
+
+### Docker-образ
+
+`docker-compose.yml` уже собирает образ сам при первом `docker compose up -d`
+(директива `build:` у сервиса `edge`, см. сам файл) — собирать вручную нужно
+только чтобы проверить сборку до деплоя или перезалить тег в свой приватный
+registry:
 
 ```bash
 docker build -f edge-native/Dockerfile -t netrunner-edge:latest .
@@ -167,6 +184,70 @@ docker build -f edge-native/Dockerfile -t netrunner-edge:latest .
 (контекст сборки — корень `netrunner-proxy`, не эта директория — тот же
 приём, что и у корневого `Dockerfile`, т.к. `cargo chef`/workspace видит все
 крейты только из корня).
+
+**Обновление образа на уже развёрнутой VDS.** Ни один `.gitea/workflows/*`
+не публикует этот образ ни в какой registry (в отличие от обычных нод —
+`deploy.yml` там тянет уже собранный образ через `GT_REGISTRY_TOKEN`, см.
+корень репозитория) — осознанно, та же причина, что и всегда: каждая
+edge-VDS одноразовая/недолгоживущая, не часть постоянного `nodes.json`, так
+что заводить под неё отдельный CI-пайплайн незачем. Отсюда следствие:
+`docker compose pull` здесь ничего не найдёт (нет такого тега в registry,
+только локально собранный). Обновляйте так — подтяните исходники и
+пересоберите на самой VDS:
+
+```bash
+cd /root/netrunner-proxy/edge-native
+git pull
+docker compose build && docker compose up -d
+```
+
+### Голый release-бинарь (без Docker)
+
+```bash
+cargo build --release -p netrunner-edge-native
+# бинарь: target/release/netrunner-edge
+```
+
+Собирайте либо прямо на целевой VDS, либо на машине с той же версией glibc,
+что и на ней (тот же повод, по которому `Dockerfile` собирает внутри
+контейнера на `bookworm`, а не переиспользует бинарь CI-раннера, см. его
+комментарий) — иначе перенесённый бинарь может не запуститься из-за
+несовпадения версий glibc.
+
+Перенесите бинарь на VDS и заведите systemd-юнит — TLS-терминацию всё равно
+должен делать Caddy/nginx перед этим процессом (см. "Конфигурация" выше),
+сам сервис слушает только локально:
+
+```bash
+scp target/release/netrunner-edge root@your-vds:/opt/netrunner-edge/netrunner-edge
+```
+
+```ini
+# /etc/systemd/system/netrunner-edge.service
+[Unit]
+Description=netrunner-edge-native
+After=network.target
+
+[Service]
+EnvironmentFile=/opt/netrunner-edge/.env
+ExecStart=/opt/netrunner-edge/netrunner-edge --host 127.0.0.1 --port 8082
+Restart=always
+User=netrunner-edge
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+systemctl daemon-reload
+systemctl enable --now netrunner-edge
+```
+
+`EnvironmentFile` — тот же набор переменных, что и в разделе "Конфигурация"
+выше (`VPN_NODE_ADDR`, `BACKEND_ADDR`, `DECOY_SNI`, `AUTH_TOKEN`), построчно
+`KEY=value` — systemd читает его сам и кладёт в окружение процесса,
+`EdgeConfig::from_env` ничего не знает о том, как именно процесс получил
+переменные.
 
 ## Ограничения
 
