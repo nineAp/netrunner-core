@@ -26,6 +26,7 @@
 use crate::tunnel_stream::TunnelStream;
 use crate::EdgeConfig;
 use axum::body::Body;
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
@@ -94,14 +95,60 @@ static TLS_CONFIG: LazyLock<Arc<rustls::ClientConfig>> = LazyLock::new(|| {
 /// а превращаются в ту же decoy-страницу, что и раньше отдавалась на любой
 /// не-WS запрос: недоступность бэкенда/ноды снаружи должна выглядеть как
 /// "тут просто дефолтная страница веб-сервера", а не как явная ошибка прокси.
+///
+/// ИСКЛЮЧЕНИЕ — статические ассеты (см. `looks_like_asset`): им на неудаче
+/// отдаём настоящий 502, а не decoy-200. Живой инцидент: `blue-pixel-studio.online`
+/// стоит за Cloudflare, а у неё дефолтное поведение — кэшировать ответы на
+/// `*.js`/`*.css` и т.п. по расширению пути НЕЗАВИСИМО от `Cache-Control`
+/// источника. Один-единственный неудачный (но временный — см. известную
+/// нестабильность свежих коннектов до ноды) запрос к иммутабельному
+/// хеш-именованному чанку, отданный как decoy-200, Cloudflare кэширует
+/// НАВСЕГДА (ну или до ручной чистки) — и уже ВСЕ посетители получают
+/// сломанный чанк вместо честной редкой осечки. 502 никакой CDN по
+/// умолчанию не кэширует, так что следующий реальный запрос получит новую,
+/// скорее всего удачную, попытку — вместо забетонированной в кэше старой.
 pub async fn proxy(cfg: Arc<EdgeConfig>, req: axum::extract::Request) -> Response {
+    let is_asset = looks_like_asset(req.uri().path());
     match try_proxy(&cfg, req).await {
         Ok(resp) => resp,
         Err(e) => {
             error!("[netrunner-edge] http proxy failed: {e}");
-            crate::decoy_response()
+            if is_asset {
+                (StatusCode::BAD_GATEWAY, "upstream unavailable").into_response()
+            } else {
+                crate::decoy_response()
+            }
         }
     }
+}
+
+/// Эвристика "это статический ассет странице, не сама страница/API" — по
+/// расширению в последнем сегменте пути. Не претендует на полноту (список
+/// расширений открытый), достаточно покрыть то, что реально генерирует Vite
+/// (`.js`/`.css`/шрифты/картинки/`.map`) — именно эти URL идут
+/// хеш-именованными и попадают под агрессивное CDN-кэширование, см. doc на
+/// `proxy`.
+fn looks_like_asset(path: &str) -> bool {
+    let Some(ext) = path.rsplit('/').next().and_then(|f| f.rsplit_once('.')) else {
+        return false;
+    };
+    matches!(
+        ext.1.to_ascii_lowercase().as_str(),
+        "js" | "mjs"
+            | "css"
+            | "map"
+            | "woff"
+            | "woff2"
+            | "ttf"
+            | "eot"
+            | "png"
+            | "jpg"
+            | "jpeg"
+            | "gif"
+            | "webp"
+            | "svg"
+            | "ico"
+    )
 }
 
 /// Разбирает путь запроса и решает, куда его вести. Два независимых сигнала,
@@ -210,7 +257,7 @@ async fn try_proxy(cfg: &EdgeConfig, req: axum::extract::Request) -> Result<Resp
     // нужно.
     if let Some(target) = account_redirect_target(&path_and_query) {
         return Response::builder()
-            .status(axum::http::StatusCode::FOUND)
+            .status(StatusCode::FOUND)
             .header(header::LOCATION, target)
             .body(Body::empty())
             .map_err(|e| format!("building account-redirect response: {e}"));
@@ -531,5 +578,20 @@ mod tests {
             account_redirect_target("/en/account/api/v1/auth/telegram/session"),
             None
         );
+    }
+
+    /// Живой инцидент: CDN перед нами (Cloudflare) кэширует `*.js`/`*.css`
+    /// по расширению независимо от `Cache-Control` источника — decoy-200 на
+    /// временную (не постоянную) неудачу застревал в её кэше навсегда,
+    /// пока кто-то не почистит руками. См. doc на `proxy`.
+    #[test]
+    fn recognizes_static_asset_extensions() {
+        assert!(looks_like_asset("/account/assets/index-BVs-cDup.js"));
+        assert!(looks_like_asset("/account/assets/index-CaA__h5d.css"));
+        assert!(looks_like_asset("/account/assets/lib-BbZj81bx.js.map"));
+        assert!(looks_like_asset("/fonts/inter.woff2"));
+        assert!(!looks_like_asset("/en/account/profile"));
+        assert!(!looks_like_asset("/en/account/api/v1/users/me"));
+        assert!(!looks_like_asset("/"));
     }
 }
