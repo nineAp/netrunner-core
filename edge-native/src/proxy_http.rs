@@ -4,18 +4,24 @@
 //! говорить WebSocket (см. `bridge.rs`) — обычный переход по ссылке в
 //! браузере получал только decoy-страницу. Здесь та же самая NRXP-нога до
 //! ноды используется для настоящего HTTP-запроса: браузер видит реальный
-//! ответ `BACKEND_ADDR`, а цепочка (эта VDS -> нода -> бэкенд) остаётся
-//! замаскированной под обычный TLS ровно так же, как и для WS-клиентов —
-//! осознанно "открытый прокси без контроля" (нет проверки, кто именно сюда
-//! пришёл), см. `main.rs` за подробным разбором обоих слоёв маскировки.
+//! ответ, а цепочка (эта VDS -> нода -> апстрим) остаётся замаскированной под
+//! обычный TLS ровно так же, как и для WS-клиентов — осознанно "открытый
+//! прокси без контроля" (нет проверки, кто именно сюда пришёл), см. `main.rs`
+//! за подробным разбором обоих слоёв маскировки.
+//!
+//! Апстрим — не один хост, а два: `LANDING_ADDR` (сама разметка сайта) и
+//! `BACKEND_ADDR` (его API) — см. `route_for` за тем, как путь запроса решает,
+//! куда его вести, и `EdgeConfig::landing_addr`/`backend_addr` за тем, почему
+//! разделять их вообще пришлось (зеркалируемый лендинг и его API живут на
+//! разных хостах, один `BACKEND_ADDR` на всё запросы к API 404-ил).
 //!
 //! Настоящий TLS здесь — ВНУТРЕННИЙ слой: `TunnelStream` (см.
 //! `tunnel_stream.rs`) — это просто ещё один поток байт (Connect-нога до
-//! `BACKEND_ADDR`), NRXP ничего не знает про TLS поверх себя. `tokio_rustls`
-//! поднимает настоящий TLS-клиент прямо на этом потоке до реального хоста
-//! бэкенда — тем же способом, каким обычный reverse-proxy подключился бы к
-//! апстриму напрямую по TCP, только вместо `TcpStream::connect` здесь
-//! `TunnelStream::connect`.
+//! выбранного апстрима), NRXP ничего не знает про TLS поверх себя.
+//! `tokio_rustls` поднимает настоящий TLS-клиент прямо на этом потоке до
+//! реального хоста — тем же способом, каким обычный reverse-proxy
+//! подключился бы к апстриму напрямую по TCP, только вместо
+//! `TcpStream::connect` здесь `TunnelStream::connect`.
 
 use crate::tunnel_stream::TunnelStream;
 use crate::EdgeConfig;
@@ -98,12 +104,29 @@ pub async fn proxy(cfg: Arc<EdgeConfig>, req: axum::extract::Request) -> Respons
     }
 }
 
-async fn try_proxy(cfg: &EdgeConfig, req: axum::extract::Request) -> Result<Response, String> {
-    let (backend_host, _) = cfg
-        .backend_addr
-        .rsplit_once(':')
-        .ok_or_else(|| format!("BACKEND_ADDR must be host:port, got {:?}", cfg.backend_addr))?;
+/// Разбирает путь запроса и решает, куда его вести: подстрока `/api/` —
+/// самый надёжный сигнал вызова API из того, что видно на этом слое (без
+/// разбора самой разметки/JS зеркалируемого сайта). Взято из живого примера:
+/// зеркалируемый лендинг рендерит SPA-путь вида `/en/account/...` (не
+/// начинается с `/api`), а сам SPA изнутри дёргает
+/// `/en/account/api/v1/auth/telegram/session` — с префиксом языка/раздела
+/// ПЕРЕД `api`, поэтому именно "содержит `/api/`", а не "начинается с
+/// `/api`". До этой проверки всё шло на один-единственный `BACKEND_ADDR`,
+/// и такие вызовы либо 404-лись (лендинг не знает такого пути), либо били по
+/// правильному хосту, но случайно, в зависимости от того, что реально стояло
+/// в `BACKEND_ADDR` на конкретной VDS.
+fn route_for<'a>(
+    cfg: &'a EdgeConfig,
+    path: &str,
+) -> (&'a str, &'a tokio::sync::Mutex<Vec<PooledSender>>) {
+    if path.contains("/api/") {
+        (&cfg.backend_addr, &cfg.backend_pool)
+    } else {
+        (&cfg.landing_addr, &cfg.landing_pool)
+    }
+}
 
+async fn try_proxy(cfg: &EdgeConfig, req: axum::extract::Request) -> Result<Response, String> {
     let (parts, body) = req.into_parts();
     let path_and_query = parts
         .uri
@@ -111,6 +134,12 @@ async fn try_proxy(cfg: &EdgeConfig, req: axum::extract::Request) -> Result<Resp
         .map(|pq| pq.as_str())
         .unwrap_or("/")
         .to_string();
+
+    let (target_addr, pool) = route_for(cfg, &path_and_query);
+    let (target_host, _) = target_addr
+        .rsplit_once(':')
+        .ok_or_else(|| format!("upstream addr must be host:port, got {target_addr:?}"))?;
+
     let body_bytes = axum::body::to_bytes(body, MAX_PROXIED_BODY_BYTES)
         .await
         .map_err(|e| format!("reading request body: {e}"))?;
@@ -132,17 +161,18 @@ async fn try_proxy(cfg: &EdgeConfig, req: axum::extract::Request) -> Result<Resp
                 builder = builder.header(name, value);
             }
         }
-        builder = builder.header(header::HOST, backend_host);
+        builder = builder.header(header::HOST, target_host);
         builder
             .body(Full::new(body_bytes.clone()))
             .map_err(|e| format!("building proxied request: {e}"))
     };
 
-    // Сначала пробуем уже поднятое keep-alive соединение из пула — см. doc
-    // на `EdgeConfig::conn_pool` за тем, почему это не просто оптимизация.
-    // Протухшее соединение (нода/бэкенд закрыли простаивавший канал) —
-    // не ошибка, просто открываем новое ниже, как и раньше.
-    let mut sender = pop_pooled(cfg).await;
+    // Сначала пробуем уже поднятое keep-alive соединение из пула, привязанного
+    // к ЭТОМУ конкретному апстриму (`route_for` выше) — см. doc на
+    // `EdgeConfig::landing_pool`/`backend_pool` за тем, почему это не просто
+    // оптимизация. Протухшее соединение (нода/бэкенд закрыли простаивавший
+    // канал) — не ошибка, просто открываем новое ниже, как и раньше.
+    let mut sender = pop_pooled(pool).await;
     let mut resp = None;
     if let Some(sr) = sender.as_mut() {
         match sr.send_request(build_request()?).await {
@@ -154,7 +184,7 @@ async fn try_proxy(cfg: &EdgeConfig, req: axum::extract::Request) -> Result<Resp
     let resp = match resp {
         Some(r) => r,
         None => {
-            let mut sr = connect_backend(cfg, backend_host).await?;
+            let mut sr = connect_backend(cfg, target_addr, target_host).await?;
             let r = sr
                 .send_request(build_request()?)
                 .await
@@ -175,7 +205,7 @@ async fn try_proxy(cfg: &EdgeConfig, req: axum::extract::Request) -> Result<Resp
     // следующему запросу, кладём обратно в пул вместо того, чтобы дать ему
     // молча упасть вместе с этой функцией.
     if let Some(sr) = sender {
-        push_pooled(cfg, sr).await;
+        push_pooled(pool, sr).await;
     }
 
     let mut builder = Response::builder().status(parts.status);
@@ -230,10 +260,18 @@ static CONNECT_LIMIT: LazyLock<tokio::sync::Semaphore> =
 /// не связанные с ними одиночные запросы тоже начали тормозить на ~20-25с.
 const BACKEND_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Устанавливает НОВОЕ NRXP+TLS+HTTP/1-соединение до `backend_addr` — то же
-/// самое, что раньше делал `try_proxy` инлайном на каждый запрос. Теперь
-/// вызывается только когда пул пуст или отдал протухшее соединение.
-async fn connect_backend(cfg: &EdgeConfig, backend_host: &str) -> Result<PooledSender, String> {
+/// Устанавливает НОВОЕ NRXP+TLS+HTTP/1-соединение до `target_addr`
+/// (`LANDING_ADDR` или `BACKEND_ADDR` — см. `route_for`) — то же самое, что
+/// раньше делал `try_proxy` инлайном на каждый запрос. Теперь вызывается
+/// только когда пул пуст или отдал протухшее соединение. `CONNECT_LIMIT`
+/// общий на оба апстрима намеренно — он защищает НОДУ (см. её doc) от
+/// слишком многих одновременных свежих хендшейков, а нода тут одна на оба
+/// направления, лендинг и бэкенд просто два разных `Connect`-кадра через неё.
+async fn connect_backend(
+    cfg: &EdgeConfig,
+    target_addr: &str,
+    target_host: &str,
+) -> Result<PooledSender, String> {
     let _permit = CONNECT_LIMIT
         .acquire()
         .await
@@ -241,18 +279,22 @@ async fn connect_backend(cfg: &EdgeConfig, backend_host: &str) -> Result<PooledS
 
     tokio::time::timeout(
         BACKEND_CONNECT_TIMEOUT,
-        connect_backend_inner(cfg, backend_host),
+        connect_backend_inner(cfg, target_addr, target_host),
     )
     .await
     .map_err(|_| format!("connecting via {} timed out after {BACKEND_CONNECT_TIMEOUT:?}", cfg.vpn_node_addr))?
 }
 
-async fn connect_backend_inner(cfg: &EdgeConfig, backend_host: &str) -> Result<PooledSender, String> {
-    let tunnel_stream = TunnelStream::connect(cfg, &cfg.backend_addr).await?;
+async fn connect_backend_inner(
+    cfg: &EdgeConfig,
+    target_addr: &str,
+    target_host: &str,
+) -> Result<PooledSender, String> {
+    let tunnel_stream = TunnelStream::connect(cfg, target_addr).await?;
 
     let connector = TlsConnector::from(TLS_CONFIG.clone());
-    let server_name = ServerName::try_from(backend_host.to_string())
-        .map_err(|e| format!("invalid backend hostname {backend_host:?}: {e}"))?;
+    let server_name = ServerName::try_from(target_host.to_string())
+        .map_err(|e| format!("invalid upstream hostname {target_host:?}: {e}"))?;
     let tls_stream = connector
         .connect(server_name, tunnel_stream)
         .await
@@ -279,9 +321,11 @@ async fn connect_backend_inner(cfg: &EdgeConfig, backend_host: &str) -> Result<P
 /// проверяется ВНЕ лока над пулом (сам лок держим только на время `pop()`) —
 /// иначе конкурентные запросы сериализовались бы друг за другом на этой
 /// проверке, что свело бы на нет весь смысл пулинга (ровно та проблема с
-/// живой VDS, из-за которой пул вообще появился).
-async fn pop_pooled(cfg: &EdgeConfig) -> Option<PooledSender> {
-    let mut sr = cfg.conn_pool.lock().await.pop()?;
+/// живой VDS, из-за которой пул вообще появился). Параметризовано пулом
+/// (`landing_pool` или `backend_pool`, см. `route_for`), а не завязано на
+/// `EdgeConfig` напрямую — один и тот же код обслуживает оба апстрима.
+async fn pop_pooled(pool: &tokio::sync::Mutex<Vec<PooledSender>>) -> Option<PooledSender> {
+    let mut sr = pool.lock().await.pop()?;
     if sr.ready().await.is_ok() {
         Some(sr)
     } else {
@@ -292,9 +336,45 @@ async fn pop_pooled(cfg: &EdgeConfig) -> Option<PooledSender> {
 /// Возвращает соединение в пул после того, как ответ на текущий запрос
 /// полностью вычитан (см. вызов в `try_proxy`) — переполнение пула просто
 /// роняет соединение (закрывается само через `Drop`), не ошибка.
-async fn push_pooled(cfg: &EdgeConfig, sr: PooledSender) {
-    let mut pool = cfg.conn_pool.lock().await;
+async fn push_pooled(pool: &tokio::sync::Mutex<Vec<PooledSender>>, sr: PooledSender) {
+    let mut pool = pool.lock().await;
     if pool.len() < MAX_POOLED_CONNS {
         pool.push(sr);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_cfg() -> EdgeConfig {
+        EdgeConfig {
+            vpn_node_addr: "1.2.3.4:443".to_string(),
+            landing_addr: "netrunner-vpn.com:443".to_string(),
+            backend_addr: "account.netrunner-vpn.com:443".to_string(),
+            decoy_sni: "cloudflare.com".to_string(),
+            auth_token: String::new(),
+            landing_pool: tokio::sync::Mutex::new(Vec::new()),
+            backend_pool: tokio::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Живой пример из бага: SPA-путь лендинга (`/en/account/...`) не должен
+    /// уйти на бэкенд, а вложенный вызов API того же SPA — обязан.
+    #[test]
+    fn routes_landing_pages_and_api_calls_to_different_upstreams() {
+        let cfg = test_cfg();
+
+        let (addr, _) = route_for(&cfg, "/");
+        assert_eq!(addr, "netrunner-vpn.com:443");
+
+        let (addr, _) = route_for(&cfg, "/en/account/dashboard");
+        assert_eq!(addr, "netrunner-vpn.com:443");
+
+        let (addr, _) = route_for(&cfg, "/en/account/api/v1/auth/telegram/session");
+        assert_eq!(addr, "account.netrunner-vpn.com:443");
+
+        let (addr, _) = route_for(&cfg, "/api/v1/health");
+        assert_eq!(addr, "account.netrunner-vpn.com:443");
     }
 }

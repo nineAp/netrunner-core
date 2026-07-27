@@ -35,6 +35,7 @@ services:
       - "8082"
     environment:
       - VPN_NODE_ADDR=${VPN_NODE_ADDR}
+      - LANDING_ADDR=${LANDING_ADDR}
       - BACKEND_ADDR=${BACKEND_ADDR}
       - DECOY_SNI=${DECOY_SNI:-www.debian.org}
       - AUTH_TOKEN=${AUTH_TOKEN:-}

@@ -8,9 +8,16 @@
 //! ```text
 //!   WS-клиент  ──WSS──▶  axum: WS ⇄ NRXP-мост (bridge.rs)          ──┐
 //!                                                                     ├──NRXP/TCP──▶  netrunner-server  ──▶  BACKEND_ADDR
-//!   браузер    ──HTTPS──▶ axum: открытый HTTP-реверс-прокси          │              (VPN-нода)
+//!   браузер    ──HTTPS──▶ axum: открытый HTTP-реверс-прокси          │              (VPN-нода)         └──▶  LANDING_ADDR
 //!               (proxy_http.rs, TLS до бэкенда ВНУТРИ NRXP-ноги) ──┘
 //! ```
+//!
+//! HTTP-прокси (`proxy_http.rs`) ведёт на ДВА разных реальных хоста, не на
+//! один: пути, похожие на вызов API (содержат `/api/`), — на `BACKEND_ADDR`,
+//! всё остальное (сама разметка страницы, статика) — на `LANDING_ADDR`. WS-
+//! мост (`bridge.rs`) продолжает вести только на `BACKEND_ADDR` — это цель
+//! настоящего VPN-туннеля, лендинг тут ни при чём. См. `proxy_http::route_for`
+//! за самой логикой разбора пути.
 //!
 //! Обычная ссылка в браузере (GET без `Upgrade`) теперь тоже долетает до
 //! настоящего сайта/бэкенда за нодой, не только WS-клиенты — см.
@@ -110,9 +117,18 @@ Commercial support is available at
 pub struct EdgeConfig {
     /// `host:port` вашей VPN-ноды (`netrunner-server`) — ClientHello-таргет.
     pub(crate) vpn_node_addr: String,
-    /// `host:port`, который нода откроет по `Connect`-кадру (ваш бэкенд) —
-    /// используется и WS-мостом, и HTTP-прокси (там же ещё и как SNI/Host
-    /// для внутреннего TLS до реального бэкенда, см. `proxy_http.rs`).
+    /// `host:port` витрины/лендинга (реальный сайт, который видит браузер по
+    /// умолчанию) — HTTP-прокси шлёт сюда любой путь, НЕ похожий на вызов API
+    /// (см. `proxy_http::route_for`). WS-мост (`bridge.rs`) эту переменную не
+    /// использует вообще — у него единственная цель `backend_addr`.
+    pub(crate) landing_addr: String,
+    /// `host:port` бэкенда — WS-мост всегда ведёт сюда (это и есть цель
+    /// реального VPN-туннеля), а HTTP-прокси — только для путей, похожих на
+    /// вызов API (см. `proxy_http::route_for`). До появления `landing_addr`
+    /// сюда шло вообще всё, из-за чего вызовы API зеркалируемого сайта, не
+    /// совпадающие по хосту с лендингом (`.../api/v1/...` на самом деле живёт
+    /// на ДРУГОМ хосте, чем сам лендинг), тихо ловили 404 — сайт зеркалировал
+    /// лендинг, но не мог дотянуться до его же API.
     pub(crate) backend_addr: String,
     /// Домен-декой для поддельного `ClientHello` — должен резолвиться и
     /// отвечать 200, чтобы отпечаток держался правдоподобно (см.
@@ -122,7 +138,7 @@ pub struct EdgeConfig {
     /// `--require-auth`. Пустая строка, если не задан (нода без
     /// `--require-auth` его не проверяет).
     pub(crate) auth_token: String,
-    /// Пул переиспользуемых keep-alive HTTP/1.1-соединений до `backend_addr`
+    /// Пул переиспользуемых keep-alive HTTP/1.1-соединений до `landing_addr`
     /// поверх уже установленных NRXP-туннелей (см. `proxy_http.rs`). Не
     /// "конфигурация" в строгом смысле остальных полей — рантайм-состояние,
     /// но кладём его сюда же, а не заводим отдельную структуру состояния:
@@ -137,7 +153,13 @@ pub struct EdgeConfig {
     /// одновременных запросов (страница "не догружалась"). Переиспользование
     /// уже поднятых соединений между запросами убирает саму эту конкуренцию,
     /// а не просто ускоряет — см. `proxy_http::pop_pooled`/`push_pooled`.
-    pub(crate) conn_pool: tokio::sync::Mutex<Vec<proxy_http::PooledSender>>,
+    pub(crate) landing_pool: tokio::sync::Mutex<Vec<proxy_http::PooledSender>>,
+    /// То же самое, но для `backend_addr` — отдельный пул, а не общий с
+    /// `landing_pool`: keep-alive HTTP/1.1-соединение привязано к конкретному
+    /// TCP-хосту на другом конце (свой `Host`-заголовок, свой сертификат),
+    /// переиспользовать соединение к лендингу для запроса к бэкенду (или
+    /// наоборот) — не переиспользование, а поломанный запрос не туда.
+    pub(crate) backend_pool: tokio::sync::Mutex<Vec<proxy_http::PooledSender>>,
 }
 
 impl EdgeConfig {
@@ -151,18 +173,23 @@ impl EdgeConfig {
     fn from_env() -> Self {
         let vpn_node_addr = std::env::var("VPN_NODE_ADDR")
             .expect("VPN_NODE_ADDR обязателен — host:port вашей VPN-ноды");
+        let landing_addr = std::env::var("LANDING_ADDR")
+            .expect("LANDING_ADDR обязателен — host:port витрины/лендинга за нодой");
         let backend_addr = std::env::var("BACKEND_ADDR")
-            .expect("BACKEND_ADDR обязателен — host:port бэкенда за нодой");
+            .expect("BACKEND_ADDR обязателен — host:port бэкенда (API) за нодой");
         let decoy_sni = std::env::var("DECOY_SNI").unwrap_or_else(|_| "www.debian.org".to_string());
         let auth_token = std::env::var("AUTH_TOKEN").unwrap_or_default();
         validate_host_port("VPN_NODE_ADDR", &vpn_node_addr);
+        validate_host_port("LANDING_ADDR", &landing_addr);
         validate_host_port("BACKEND_ADDR", &backend_addr);
         Self {
             vpn_node_addr,
+            landing_addr,
             backend_addr,
             decoy_sni,
             auth_token,
-            conn_pool: tokio::sync::Mutex::new(Vec::new()),
+            landing_pool: tokio::sync::Mutex::new(Vec::new()),
+            backend_pool: tokio::sync::Mutex::new(Vec::new()),
         }
     }
 }
@@ -291,8 +318,8 @@ async fn main() {
     let cfg = Arc::new(EdgeConfig::from_env());
 
     info!(
-        "🛰️  netrunner-edge слушает {}:{} → нода {} → бэкенд {}",
-        args.host, args.port, cfg.vpn_node_addr, cfg.backend_addr
+        "🛰️  netrunner-edge слушает {}:{} → нода {} → лендинг {} / бэкенд {}",
+        args.host, args.port, cfg.vpn_node_addr, cfg.landing_addr, cfg.backend_addr
     );
 
     let app = Router::new()
