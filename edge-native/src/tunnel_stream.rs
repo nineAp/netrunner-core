@@ -6,14 +6,34 @@
 //! открытым HTTP-реверс-прокси (`proxy_http.rs`); WS-мост (`bridge.rs`)
 //! работает с той же нодой напрямую через `EdgeTunnel`, без этой обёртки —
 //! ему не нужен `AsyncRead`/`AsyncWrite`, только явный цикл кадров.
+//!
+//! Чтение и запись сокета разнесены по разным задачам (`into_split` +
+//! отдельный writer-таск) НЕ ради производительности, а из-за живого бага:
+//! нода шлёт health-check PING на произвольном probe stream_id и ждёт PONG,
+//! иначе через HEALTH_CHECK_TIMEOUT (20с) эвиктит ногу (см.
+//! `Muxer::perform_health_check` в core/src/net/connection/muxer.rs). Раньше
+//! `poll_read` складывал PONG в буфер, который сливался только когда hyper
+//! САМ вызывал `poll_write` — а простаивающему в пуле keep-alive-соединению
+//! `proxy_http.rs::landing_pool`/`backend_pool` писать НЕЧЕГО, так что hyper
+//! запись не дёргал, PONG не уходил, и нода рвала полностью исправные
+//! пуловые соединения сама (живая проверка: пуловое соединение умирало
+//! ровно ~20с спустя после последнего использования — событие "backend
+//! connection closed" в логе точно совпадало с HEALTH_CHECK_TIMEOUT).
+//! Теперь `poll_read`, увидев PING, кидает PONG в канал к writer-таску
+//! НЕМЕДЛЕННО и синхронно (`try_send`, не требует `.await`/`Poll`) — вообще
+//! не завися от того, вызывает ли hyper `poll_write` в этот момент.
 
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::{Bytes, BytesMut};
 use netrunner_core::edge::{EdgeFrameKind, EdgeHandshake, EdgeTunnel, HandshakeOutcome};
+use netrunner_logger::warn;
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::net::tcp::OwnedReadHalf;
 use tokio::net::TcpStream;
+use tokio::sync::mpsc;
+use tokio_util::sync::PollSender;
 
 use crate::EdgeConfig;
 
@@ -24,33 +44,31 @@ use crate::EdgeConfig;
 const TUNNEL_STREAM_ID: u32 = 1;
 const SOCKET_READ_CHUNK: usize = 16 * 1024;
 
+/// Ёмкость канала до writer-таска — исходящих кадров одновременно в полёте
+/// немного (обычно один `Data`-кадр на `poll_write` + изредка один PONG),
+/// с большим запасом на случай короткого всплеска.
+const WRITE_CHANNEL_CAPACITY: usize = 32;
+
 pub struct TunnelStream {
-    socket: TcpStream,
+    read_half: OwnedReadHalf,
     tunnel: EdgeTunnel,
+    /// Для `poll_write` (нужен poll-совместимый reserve+send, см.
+    /// `tokio_util::sync::PollSender`) — единственный владелец права
+    /// "зарезервировать слот", поэтому не клонируется.
+    write_tx: PollSender<Bytes>,
+    /// Для PONG из `poll_read` — обычный клон `Sender` того же канала:
+    /// `try_send` не требует `Poll`/резервирования и не конфликтует с
+    /// `write_tx` (mpsc допускает много `Sender` на один канал).
+    control_tx: mpsc::Sender<Bytes>,
     /// Декодированные, но ещё не отданные вызывающему коду байты Data-кадров
     /// нашего stream_id — один вызов `tunnel.feed()` может вернуть сразу
     /// несколько кадров, а `poll_read` отдаёт их по частям, по мере того,
     /// сколько попросил вызывающий буфер.
     read_buf: BytesMut,
-    /// Переиспользуемый буфер одного `socket.read()` — заведён в структуре,
-    /// а не создаётся заново на каждый `poll_read`, чтобы не платить
-    /// zero-init 16 КБ на каждый вызов.
+    /// Переиспользуемый буфер одного `read_half.read()` — заведён в
+    /// структуре, а не создаётся заново на каждый `poll_read`, чтобы не
+    /// платить zero-init 16 КБ на каждый вызов.
     read_raw: Box<[u8; SOCKET_READ_CHUNK]>,
-    /// Закодированный, но ещё не полностью дописанный в сокет исходящий
-    /// кадр — `poll_write` может столкнуться с частичной записью на уровне
-    /// TCP (сам кадр крупнее одного успешного `socket.write()`), а по
-    /// контракту `AsyncWrite` повторный вызов может прийти с ДРУГИМ
-    /// буфером — реальный источник данных для дозаписи после `Pending`
-    /// должен жить здесь, а не в аргументе `buf`.
-    pending_write: BytesMut,
-    /// Закодированные служебные кадры (сейчас — только health-check PONG, см.
-    /// `poll_read`), ожидающие отправки. Отдельно от `pending_write`
-    /// намеренно: тот хранит РОВНО ОДИН исходный `Data`-кадр на случай
-    /// частичной записи и повторного вызова `poll_write` с тем же `buf`
-    /// (см. её doc) — подмешивать туда что-то ещё сломало бы этот инвариант.
-    /// Всегда сливается в сокет ПЕРВЫМ, до `pending_write`, в `poll_write`
-    /// и `poll_shutdown` (см. `flush_control_write`).
-    control_write: BytesMut,
     eof: bool,
 }
 
@@ -95,13 +113,35 @@ impl TunnelStream {
             .await
             .map_err(|e| format!("write Connect frame: {e}"))?;
 
+        // Дальше чтение и запись идут раздельно — см. doc на модуль за тем,
+        // почему: writer-таск владеет своей половиной единолично и пишет
+        // всё, что придёт по каналу (обычные Data-кадры из poll_write И
+        // health-check PONG из poll_read), независимо от того, что в этот
+        // момент делает вызывающий код (hyper) с нашим `AsyncWrite`.
+        let (read_half, write_half) = socket.into_split();
+        let (tx, mut rx) = mpsc::channel::<Bytes>(WRITE_CHANNEL_CAPACITY);
+        let control_tx = tx.clone();
+
+        tokio::spawn(async move {
+            let mut write_half = write_half;
+            while let Some(chunk) = rx.recv().await {
+                if let Err(e) = write_half.write_all(&chunk).await {
+                    warn!("[netrunner-edge] tunnel writer failed: {e}");
+                    return;
+                }
+            }
+            // Все Sender/PollSender сброшены (TunnelStream уничтожен) —
+            // канал закрылся сам, это штатное завершение, не ошибка.
+            let _ = write_half.shutdown().await;
+        });
+
         Ok(Self {
-            socket,
+            read_half,
             tunnel,
+            write_tx: PollSender::new(tx),
+            control_tx,
             read_buf: BytesMut::new(),
             read_raw: Box::new([0u8; SOCKET_READ_CHUNK]),
-            pending_write: BytesMut::new(),
-            control_write: BytesMut::new(),
             eof: false,
         })
     }
@@ -155,7 +195,7 @@ impl AsyncRead for TunnelStream {
             }
 
             let mut raw_buf = ReadBuf::new(this.read_raw.as_mut_slice());
-            match Pin::new(&mut this.socket).poll_read(cx, &mut raw_buf) {
+            match Pin::new(&mut this.read_half).poll_read(cx, &mut raw_buf) {
                 Poll::Ready(Ok(())) => {
                     let n = raw_buf.filled().len();
                     if n == 0 {
@@ -172,26 +212,17 @@ impl AsyncRead for TunnelStream {
                         if frame.kind == EdgeFrameKind::Heartbeat {
                             // Нода периодически шлёт health-check PING на
                             // произвольном probe stream_id (не 0, не
-                            // TUNNEL_STREAM_ID — см. `Muxer::perform_health_check`
-                            // в core/src/net/connection/muxer.rs) и ждёт PONG на
-                            // том же stream_id, иначе через HEALTH_CHECK_TIMEOUT
-                            // (20с) считает ногу мёртвой и эвиктит — живой баг,
-                            // симметричный тому же в `bridge.rs` (см. её doc за
-                            // подробностями): пул держит соединения ЖИВЫМИ
-                            // между запросами именно чтобы их переиспользовать,
-                            // так что не отвечать на этот пинг means нода рвёт
-                            // ровно те долгоживущие соединения, что пул и создан
-                            // хранить. Кладём PONG в `control_write`, а не сразу
-                            // в сокет — `poll_read` синхронный, писать в него
-                            // напрямую здесь нельзя, ближайший `poll_write`/
-                            // `poll_shutdown` сольёт первым (см. их doc).
+                            // TUNNEL_STREAM_ID) и ждёт PONG на том же
+                            // stream_id — см. doc на модуль за тем, почему
+                            // это `try_send` в канал, а не буфер на слив
+                            // потом.
                             if &frame.payload[..] == b"PING" {
                                 if let Ok(pong) = this.tunnel.encode_frame(
                                     frame.stream_id,
                                     EdgeFrameKind::Heartbeat,
                                     Bytes::from_static(b"PONG"),
                                 ) {
-                                    this.control_write.extend_from_slice(&pong);
+                                    let _ = this.control_tx.try_send(pong);
                                 }
                             }
                         } else if frame.stream_id == 0 && frame.kind == EdgeFrameKind::Close {
@@ -221,29 +252,6 @@ impl AsyncRead for TunnelStream {
     }
 }
 
-impl TunnelStream {
-    /// Сливает `control_write` (health-check PONG, см. `poll_read`) в сокет
-    /// ПЕРЕД любой другой записью — вызывается из `poll_write`/`poll_shutdown`.
-    /// Отдельно от `pending_write`, чтобы не ломать её инвариант "ровно один
-    /// исходный `Data`-кадр на случай повторного вызова с тем же `buf`".
-    fn poll_flush_control(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        while !self.control_write.is_empty() {
-            match Pin::new(&mut self.socket).poll_write(cx, &self.control_write) {
-                Poll::Ready(Ok(0)) => {
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::WriteZero,
-                        "tunnel socket write returned 0 (control)",
-                    )))
-                }
-                Poll::Ready(Ok(n)) => self.control_write.advance(n),
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
-            }
-        }
-        Poll::Ready(Ok(()))
-    }
-}
-
 impl AsyncWrite for TunnelStream {
     fn poll_write(
         self: Pin<&mut Self>,
@@ -251,66 +259,58 @@ impl AsyncWrite for TunnelStream {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
-        match this.poll_flush_control(cx) {
+        match this.write_tx.poll_reserve(cx) {
             Poll::Ready(Ok(())) => {}
-            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            Poll::Ready(Err(_)) => {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "tunnel writer task gone",
+                )))
+            }
             Poll::Pending => return Poll::Pending,
         }
-        if this.pending_write.is_empty() {
-            let frame = match this.tunnel.encode_frame(
-                TUNNEL_STREAM_ID,
-                EdgeFrameKind::Data,
-                Bytes::copy_from_slice(buf),
-            ) {
-                Ok(f) => f,
-                Err(e) => return Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidData, e))),
-            };
-            this.pending_write.extend_from_slice(&frame);
+        let frame = match this.tunnel.encode_frame(
+            TUNNEL_STREAM_ID,
+            EdgeFrameKind::Data,
+            Bytes::copy_from_slice(buf),
+        ) {
+            Ok(f) => f,
+            Err(e) => return Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidData, e))),
+        };
+        match this.write_tx.send_item(frame) {
+            Ok(()) => Poll::Ready(Ok(buf.len())),
+            Err(_) => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "tunnel writer task gone",
+            ))),
         }
-        while !this.pending_write.is_empty() {
-            match Pin::new(&mut this.socket).poll_write(cx, &this.pending_write) {
-                Poll::Ready(Ok(0)) => {
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::WriteZero,
-                        "tunnel socket write returned 0",
-                    )))
-                }
-                Poll::Ready(Ok(n)) => this.pending_write.advance(n),
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
-            }
-        }
-        Poll::Ready(Ok(buf.len()))
     }
 
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let this = self.get_mut();
-        Pin::new(&mut this.socket).poll_flush(cx)
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        // Реальная запись идёт асинхронно в writer-таске (см. doc на
+        // модуль) — раздельного сигнала "уже точно ушло в сокет" отсюда нет,
+        // а сам writer-таск пишет их last-in-first-out по мере поступления
+        // в канал, так что "передано в канал" — практический эквивалент
+        // "flushed" для этого транспорта (тот же принцип, что раньше был у
+        // TcpStream::poll_flush — для сырого TCP это всегда no-op).
+        Poll::Ready(Ok(()))
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
-        match this.poll_flush_control(cx) {
-            Poll::Ready(Ok(())) => {}
-            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-            Poll::Pending => return Poll::Pending,
-        }
-        if this.pending_write.is_empty() {
-            if let Ok(frame) =
-                this.tunnel
-                    .encode_frame(TUNNEL_STREAM_ID, EdgeFrameKind::Close, Bytes::new())
-            {
-                this.pending_write.extend_from_slice(&frame);
+        // Лучшее усилие: сообщаем ноде о закрытии Close-кадром, если канал
+        // до writer-таска ещё жив и не занят резервированием из poll_write
+        // прямо сейчас. Реальный TCP FIN уйдёт от writer-таска сам, как
+        // только этот `TunnelStream` (и все его Sender/PollSender) будут
+        // уничтожены — ждать этого здесь синхронно не нужно.
+        if let Ok(frame) =
+            this.tunnel
+                .encode_frame(TUNNEL_STREAM_ID, EdgeFrameKind::Close, Bytes::new())
+        {
+            if let Some(sender) = this.write_tx.get_ref() {
+                let _ = sender.try_send(frame);
             }
         }
-        while !this.pending_write.is_empty() {
-            match Pin::new(&mut this.socket).poll_write(cx, &this.pending_write) {
-                Poll::Ready(Ok(0)) => break,
-                Poll::Ready(Ok(n)) => this.pending_write.advance(n),
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
-            }
-        }
-        Pin::new(&mut this.socket).poll_shutdown(cx)
+        Poll::Ready(Ok(()))
     }
 }
