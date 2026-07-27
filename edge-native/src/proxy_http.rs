@@ -130,6 +130,31 @@ fn route_for<'a>(
     }
 }
 
+/// Бэкенд ничего не знает про префикс "/account" — он смонтирован на
+/// "/api/v1" и раздаёт SPA/`/assets` без него (см. `netrunner-backend/src/api.rs`),
+/// тот же приём, что и в `netrunner-mirror/src/index.js`
+/// (`pathname.slice("/account".length)`). Браузер же шлёт запросы именно с
+/// этим префиксом — его добавляет `resolveAccountBase()` в
+/// `netrunner-landing/app/[lang]/auth/auth-client.tsx`, когда страница
+/// открыта не с канонического домена (ровно наш случай: любой заход через
+/// эту VDS). Без отрезания префикса первая страница ЛК (`/account/profile`)
+/// ещё попадает в SPA-fallback бэкенда и рендерится, но все её чанки
+/// (`/account/assets/*.js`, путь берётся из рантайм `<base href="/account/">`,
+/// см. `frontend/index.html`/`frontend/src/base.ts`) для бэкенда — тоже
+/// незнакомый путь, что снова ловит тот же SPA-fallback и отдаёт им
+/// `index.html` вместо JS: браузер видит "Failed to load module script...
+/// MIME type text/html" ровно на этих чанках.
+fn strip_account_prefix(path_and_query: &str) -> std::borrow::Cow<'_, str> {
+    match path_and_query.strip_prefix("/account") {
+        Some("") => std::borrow::Cow::Borrowed("/"),
+        Some(rest) if rest.starts_with('/') => std::borrow::Cow::Borrowed(rest),
+        // "/account?foo=bar" (no trailing slash before the query string) —
+        // rest is "?foo=bar", which isn't a valid path on its own.
+        Some(rest) if rest.starts_with('?') => std::borrow::Cow::Owned(format!("/{rest}")),
+        _ => std::borrow::Cow::Borrowed(path_and_query),
+    }
+}
+
 async fn try_proxy(cfg: &EdgeConfig, req: axum::extract::Request) -> Result<Response, String> {
     let (parts, body) = req.into_parts();
     let path_and_query = parts
@@ -144,6 +169,15 @@ async fn try_proxy(cfg: &EdgeConfig, req: axum::extract::Request) -> Result<Resp
         .rsplit_once(':')
         .ok_or_else(|| format!("upstream addr must be host:port, got {target_addr:?}"))?;
 
+    // Только у BACKEND_ADDR путь может нести префикс "/account", который
+    // сам бэкенд не понимает (см. doc на `strip_account_prefix`) — у
+    // LANDING_ADDR путь пересылается как есть, ничего резать не нужно.
+    let forwarded_path = if target_addr == cfg.backend_addr {
+        strip_account_prefix(&path_and_query)
+    } else {
+        std::borrow::Cow::Borrowed(path_and_query.as_str())
+    };
+
     let body_bytes = axum::body::to_bytes(body, MAX_PROXIED_BODY_BYTES)
         .await
         .map_err(|e| format!("reading request body: {e}"))?;
@@ -155,7 +189,7 @@ async fn try_proxy(cfg: &EdgeConfig, req: axum::extract::Request) -> Result<Resp
     let build_request = || -> Result<hyper::Request<Full<Bytes>>, String> {
         let mut builder = hyper::Request::builder()
             .method(parts.method.clone())
-            .uri(&path_and_query);
+            .uri(forwarded_path.as_ref());
         for (name, value) in parts.headers.iter() {
             // Host переписываем на реальный бэкенд ниже — иначе бэкенд увидит
             // домен ЭТОЙ VDS и не поймёт, какой виртуальный хост отдавать (то
@@ -386,5 +420,35 @@ mod tests {
 
         let (addr, _) = route_for(&cfg, "/api/v1/health");
         assert_eq!(addr, "account.netrunner-vpn.com:443");
+    }
+
+    /// Живой баг: ЛК открыт через эту VDS (не с канонического домена), браузер
+    /// получает `<base href="/account/">` (см. `frontend/index.html`) и после
+    /// него шлёт все чанки с этим префиксом — бэкенд его не понимает и без
+    /// отрезания отвечал на `/account/assets/*.js` тем же `index.html`
+    /// (SPA-fallback), что и на саму страницу — "Failed to load module
+    /// script... MIME type text/html" в консоли браузера.
+    #[test]
+    fn strips_account_prefix_only_for_backend_bound_paths() {
+        assert_eq!(strip_account_prefix("/account"), "/");
+        assert_eq!(strip_account_prefix("/account/profile"), "/profile");
+        assert_eq!(
+            strip_account_prefix("/account/assets/jsx-runtime-BIe8Z300.js"),
+            "/assets/jsx-runtime-BIe8Z300.js"
+        );
+        assert_eq!(
+            strip_account_prefix("/account/api/v1/users/me"),
+            "/api/v1/users/me"
+        );
+        // Не трогаем пути, где "/account" — не префикс, а совпадение где-то
+        // внутри (тот самый `/en/account/profile` из route_for — сюда
+        // `strip_account_prefix` не применяется вовсе, см. `try_proxy`).
+        assert_eq!(
+            strip_account_prefix("/en/account/profile"),
+            "/en/account/profile"
+        );
+        // Путь, который лишь НАЧИНАЕТСЯ так же, но это другой сегмент —
+        // "/accounting", не "/account".
+        assert_eq!(strip_account_prefix("/accounting"), "/accounting");
     }
 }
