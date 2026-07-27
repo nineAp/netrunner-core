@@ -111,6 +111,32 @@ async fn run_bridge(mut ws: WebSocket, cfg: &EdgeConfig) -> Result<(), String> {
                     return Err("vpn node closed the tunnel leg".to_string());
                 }
                 for frame in tunnel.feed(&sock_buf[..n])? {
+                    if frame.kind == EdgeFrameKind::Heartbeat {
+                        // Нода периодически шлёт health-check PING на СВОЁМ
+                        // произвольном probe stream_id (не 0, не EDGE_STREAM_ID
+                        // — см. `Muxer::perform_health_check` в
+                        // core/src/net/connection/muxer.rs) и ждёт PONG на том
+                        // же stream_id в пределах HEALTH_CHECK_TIMEOUT (20с).
+                        // Без ответа нода считает ногу мёртвой и эвиктит её —
+                        // ЖИВОЙ БАГ: соединение обрывалось само по себе даже
+                        // когда всё было исправно, просто потому что этот цикл
+                        // никогда не отвечал на пинг (см. `StreamHandler::handle`
+                        // в handler.rs за тем, как отвечает "толстый" клиент —
+                        // ровно то же самое здесь, вручную, раз этот бридж не
+                        // использует общий `StreamHandler`).
+                        if &frame.payload[..] == b"PING" {
+                            let pong = tunnel.encode_frame(
+                                frame.stream_id,
+                                EdgeFrameKind::Heartbeat,
+                                Bytes::from_static(b"PONG"),
+                            )?;
+                            socket
+                                .write_all(&pong)
+                                .await
+                                .map_err(|e| format!("write heartbeat pong: {e}"))?;
+                        }
+                        continue;
+                    }
                     if frame.stream_id == 0 && frame.kind == EdgeFrameKind::Close {
                         // Явный отказ ноды (--require-auth и т.п.), не голый
                         // TCP EOF — stream_id=0 никогда не используется
@@ -119,7 +145,7 @@ async fn run_bridge(mut ws: WebSocket, cfg: &EdgeConfig) -> Result<(), String> {
                         return Err(format!("vpn node rejected connection: {reason}"));
                     }
                     if frame.stream_id != EDGE_STREAM_ID {
-                        continue; // heartbeat/диагностика ноды — не наш поток
+                        continue; // диагностика ноды — не наш поток
                     }
                     match frame.kind {
                         EdgeFrameKind::Data => {
