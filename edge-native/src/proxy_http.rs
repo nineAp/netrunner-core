@@ -155,6 +155,23 @@ fn strip_account_prefix(path_and_query: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
+/// `Some(target)` — редиректнуть на `target` перед проксированием, см. doc
+/// в `try_proxy` за полным обоснованием (лендинг строит переход в аккаунт с
+/// языковым префиксом ПЕРЕД "/account", из-за чего собственный бутстрап
+/// аккаунта неверно вычисляет `<base href>`). Срабатывает только когда
+/// "/account" реально встречается НЕ в позиции 0 — путь, уже начинающийся с
+/// "/account", и путь без "/account" вообще не трогаем. Вызовы API
+/// намеренно исключены (`strip_account_prefix` их не режет и они уже
+/// работают как есть, лишний редирект тут не нужен и рискует сломать
+/// fetch/XHR с ручной обработкой `Location`).
+fn account_redirect_target(path_and_query: &str) -> Option<&str> {
+    let idx = path_and_query.find("/account")?;
+    if idx == 0 || path_and_query.contains("/api/") {
+        return None;
+    }
+    Some(&path_and_query[idx..])
+}
+
 async fn try_proxy(cfg: &EdgeConfig, req: axum::extract::Request) -> Result<Response, String> {
     let (parts, body) = req.into_parts();
     let path_and_query = parts
@@ -163,6 +180,41 @@ async fn try_proxy(cfg: &EdgeConfig, req: axum::extract::Request) -> Result<Resp
         .map(|pq| pq.as_str())
         .unwrap_or("/")
         .to_string();
+
+    // Оригинал при переходе в раздел "аккаунт" делает полный переход на
+    // ОТДЕЛЬНЫЙ домен (account.netrunner-vpn.com/profile — БЕЗ языкового
+    // префикса, "account" там сам домен, не сегмент пути). У нас один и тот
+    // же origin, а ссылку на переход строит лендинг с языковым префиксом
+    // ПЕРЕД "/account" (`/en/account/profile`, см. resolveAccountBase() в
+    // netrunner-landing). Собственный бутстрап-скрипт index.html аккаунта
+    // (см. doc на `strip_account_prefix`) выбирает `<base href>` ТОЛЬКО по
+    // тому, начинается ли `location.pathname` РОВНО с "/account" (позиция
+    // 0) — из-за "/en/" перед этим он всегда выбирает "/" вместо
+    // "/account/", и все относительные чанки (`./assets/*.js`) начинают
+    // резолвиться от корня: либо мимо `BACKEND_ADDR` в `LANDING_ADDR` (404,
+    // если в пути вообще нет "/account"), либо на `BACKEND_ADDR`, но НЕ
+    // срезанными (`strip_account_prefix` режет только путь, начинающийся с
+    // "/account", а тут спереди ещё "/en") — оба случая живая проверка
+    // подтвердила: браузер видит "MIME type text/html" вместо JS.
+    //
+    // Поправить сам JS аккаунта нельзя (другой репозиторий/сборка), поэтому
+    // нормализуем то, что видит браузер: редиректим, роняя всё ДО
+    // "/account", когда это НЕ вызов API (тот и так работает с префиксом
+    // как есть — бэкенд его сам матчит по суффиксу, см. doc на
+    // `strip_account_prefix`, лишний редирект ему не нужен и рискует
+    // сломать fetch/XHR с ручной обработкой `Location`). После редиректа
+    // `location.pathname` у браузера уже начинается с "/account", и
+    // собственный скрипт аккаунта сам выбирает правильный `<base href>` —
+    // дальше все относительные чанки одной страницы резолвятся уже
+    // корректно, точечно чинить каждый `/assets/*.js` по отдельности не
+    // нужно.
+    if let Some(target) = account_redirect_target(&path_and_query) {
+        return Response::builder()
+            .status(axum::http::StatusCode::FOUND)
+            .header(header::LOCATION, target)
+            .body(Body::empty())
+            .map_err(|e| format!("building account-redirect response: {e}"));
+    }
 
     let (target_addr, pool) = route_for(cfg, &path_and_query);
     let (target_host, _) = target_addr
@@ -450,5 +502,34 @@ mod tests {
         // Путь, который лишь НАЧИНАЕТСЯ так же, но это другой сегмент —
         // "/accounting", не "/account".
         assert_eq!(strip_account_prefix("/accounting"), "/accounting");
+    }
+
+    /// Живой баг: браузер видит "Failed to load module script... MIME type
+    /// text/html" на чанках ЛК даже ПОСЛЕ фикса `strip_account_prefix` —
+    /// потому что бутстрап аккаунта сам вычисляет `<base href>` по
+    /// `location.pathname.indexOf("/account") === 0`, а лендинг ведёт на
+    /// `/en/account/profile` (языковой префикс ПЕРЕД "/account", проверка
+    /// не проходит). Редирект нормализует путь до того, как этот скрипт
+    /// вообще выполнится.
+    #[test]
+    fn redirects_account_pages_but_not_api_calls_or_already_normalized_paths() {
+        assert_eq!(
+            account_redirect_target("/en/account/profile"),
+            Some("/account/profile")
+        );
+        assert_eq!(
+            account_redirect_target("/ru/account/settings?tab=billing"),
+            Some("/account/settings?tab=billing")
+        );
+        // Уже нормализован — незачем редиректить самого себя в бесконечный цикл.
+        assert_eq!(account_redirect_target("/account/profile"), None);
+        // Не про аккаунт вообще.
+        assert_eq!(account_redirect_target("/en/pricing"), None);
+        // Вызов API — уже работает с префиксом как есть, редирект не нужен
+        // (см. doc на `account_redirect_target`).
+        assert_eq!(
+            account_redirect_target("/en/account/api/v1/auth/telegram/session"),
+            None
+        );
     }
 }
