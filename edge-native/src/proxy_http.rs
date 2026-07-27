@@ -104,22 +104,26 @@ pub async fn proxy(cfg: Arc<EdgeConfig>, req: axum::extract::Request) -> Respons
     }
 }
 
-/// Разбирает путь запроса и решает, куда его вести: подстрока `/api/` —
-/// самый надёжный сигнал вызова API из того, что видно на этом слое (без
-/// разбора самой разметки/JS зеркалируемого сайта). Взято из живого примера:
-/// зеркалируемый лендинг рендерит SPA-путь вида `/en/account/...` (не
-/// начинается с `/api`), а сам SPA изнутри дёргает
-/// `/en/account/api/v1/auth/telegram/session` — с префиксом языка/раздела
-/// ПЕРЕД `api`, поэтому именно "содержит `/api/`", а не "начинается с
-/// `/api`". До этой проверки всё шло на один-единственный `BACKEND_ADDR`,
-/// и такие вызовы либо 404-лись (лендинг не знает такого пути), либо били по
-/// правильному хосту, но случайно, в зависимости от того, что реально стояло
-/// в `BACKEND_ADDR` на конкретной VDS.
+/// Разбирает путь запроса и решает, куда его вести. Два независимых сигнала,
+/// оба ведут на `BACKEND_ADDR`:
+/// - подстрока `/api/` — вызов API (`/en/account/api/v1/auth/telegram/session`);
+/// - подстрока `/account` — весь раздел "аккаунт" целиком, а не только его
+///   API: в оригинале сам сайт уводит браузер на другой хост
+///   (`account.netrunner-vpn.com/profile`) для ЭТИХ страниц, т.е. фронт
+///   раздела "аккаунт" (не только его API) физически живёт на бэкенде, а не
+///   на лендинге — `/en/account/profile` СНАЧАЛА казался обычной страницей
+///   лендинга (не содержит `/api/`), но лендинг о таком пути не знает и
+///   отдаёт 404, потому что этот путь никогда там и не жил.
+///
+/// До появления этой развилки всё шло на один-единственный `BACKEND_ADDR`, и
+/// такие вызовы либо 404-лись (не тот апстрим не знает такого пути), либо
+/// били по правильному хосту, но случайно, в зависимости от того, что
+/// реально стояло в `BACKEND_ADDR` на конкретной VDS.
 fn route_for<'a>(
     cfg: &'a EdgeConfig,
     path: &str,
 ) -> (&'a str, &'a tokio::sync::Mutex<Vec<PooledSender>>) {
-    if path.contains("/api/") {
+    if path.contains("/api/") || path.contains("/account") {
         (&cfg.backend_addr, &cfg.backend_pool)
     } else {
         (&cfg.landing_addr, &cfg.landing_pool)
@@ -359,8 +363,11 @@ mod tests {
         }
     }
 
-    /// Живой пример из бага: SPA-путь лендинга (`/en/account/...`) не должен
-    /// уйти на бэкенд, а вложенный вызов API того же SPA — обязан.
+    /// Живые примеры из двух последовательных багов: обычная страница
+    /// лендинга уходит на лендинг, а весь раздел "аккаунт" — целиком на
+    /// бэкенд, не только его API-вызовы (см. doc на `route_for` за тем,
+    /// почему `/en/account/profile` — не страница лендинга, хоть и не
+    /// содержит `/api/`).
     #[test]
     fn routes_landing_pages_and_api_calls_to_different_upstreams() {
         let cfg = test_cfg();
@@ -368,8 +375,11 @@ mod tests {
         let (addr, _) = route_for(&cfg, "/");
         assert_eq!(addr, "netrunner-vpn.com:443");
 
-        let (addr, _) = route_for(&cfg, "/en/account/dashboard");
+        let (addr, _) = route_for(&cfg, "/en/pricing");
         assert_eq!(addr, "netrunner-vpn.com:443");
+
+        let (addr, _) = route_for(&cfg, "/en/account/profile");
+        assert_eq!(addr, "account.netrunner-vpn.com:443");
 
         let (addr, _) = route_for(&cfg, "/en/account/api/v1/auth/telegram/session");
         assert_eq!(addr, "account.netrunner-vpn.com:443");
