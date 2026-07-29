@@ -281,6 +281,16 @@ async fn try_proxy(cfg: &EdgeConfig, req: axum::extract::Request) -> Result<Resp
         .await
         .map_err(|e| format!("reading request body: {e}"))?;
 
+    // Настоящий Host, который видел браузер (blue-pixel-studio.online и
+    // т.п.) — нужен ниже как `X-Forwarded-Host`, ДО того как мы его
+    // перепишем на `target_host` для самого запроса. См. doc на
+    // `build_request` за тем, зачем бэкенду вообще знать оригинал.
+    let original_host = parts
+        .headers
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+
     // Собирается заново на каждую попытку (а не один раз) — `hyper::Request`
     // не `Clone`, а попытки может быть две (пул + фоллбэк на свежее
     // соединение ниже); сама сборка дешёвая (`body_bytes` — `Bytes`, клон по
@@ -299,6 +309,24 @@ async fn try_proxy(cfg: &EdgeConfig, req: axum::extract::Request) -> Result<Resp
             }
         }
         builder = builder.header(header::HOST, target_host);
+        // Живой баг: бэкенд определяет по Host, безопасно ли ставить
+        // `Set-Cookie: ...; Domain=.netrunner-vpn.com` (см.
+        // cookie_domain_attr в netrunner-backend/src/modules/auth/controller.rs)
+        // — но раз мы САМИ переписали Host на `target_host` строкой выше
+        // (обязательно, иначе бэкенд не поймёт, какой вирт.хост отдавать),
+        // бэкенд видит "account.netrunner-vpn.com" и честно ставит
+        // Domain=.netrunner-vpn.com — а браузер при этом реально стоит на
+        // blue-pixel-studio.online и молча дропает такую cookie целиком
+        // (RFC 6265 domain-match). Итог живьём: Telegram-логин "успешен"
+        // (токен приходит в теле ответа), но /users/me и /auth/refresh
+        // сразу после — 401 навсегда, ЛК зацикливается обратно на /en/auth.
+        // X-Forwarded-Host — единственный правдивый сигнал о том, что
+        // реально видел браузер; без него у бэкенда просто нет способа
+        // отличить "настоящий account.netrunner-vpn.com" от "зеркало,
+        // прикидывающееся им ради маршрутизации".
+        if let Some(ref host) = original_host {
+            builder = builder.header("x-forwarded-host", host.as_str());
+        }
         builder
             .body(Full::new(body_bytes.clone()))
             .map_err(|e| format!("building proxied request: {e}"))
