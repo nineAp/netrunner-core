@@ -930,6 +930,14 @@ impl ServerHandler {
         decoy_host: &str,
         requested_sni: Option<&str>,
     ) {
+        // Единая точка для всех трёх причин fallback (невалидный ClientHello,
+        // TLS_HELLO_TIMEOUT, парсинг не удался) — та, кто сюда попал, ПО
+        // ОПРЕДЕЛЕНИЮ не наш клиент (не собрал корректный Netrunner-хендшейк),
+        // отсюда и метрика: любой TCP-коннект на 443, не ставший
+        // `netrunner_vpn_established_total`, либо сюда, либо в
+        // `netrunner_auth_failed_total` (см. ниже в `run`) — граница между
+        // "реальный VPN-трафик" и "сканеры/DPI-пробы, долбящиеся на порт".
+        metrics::counter!("netrunner_scanner_fallback_total").increment(1);
         let sni_target = requested_sni.filter(|h| is_plausible_hostname(h));
 
         // Приватность: не логируем ни запрошенный SNI, ни разрешённый адрес —
@@ -1126,6 +1134,15 @@ impl TunnelHandler for ServerHandler {
                             break (sid, lid, token);
                         }
                     }
+                    // Собрал корректный Netrunner-хендшейк (не сканер — тот
+                    // отсеялся бы ещё в handle_stealth_fallback), но не смог
+                    // пройти auth-фрейм — тот же счётчик, что уже копится в
+                    // backend_client.rs::validate() при отказе бэкенда (тот же
+                    // Grafana-панель "Auth failures/sec", см.
+                    // netrunner-data/observability/grafana-dashboards/proxy-nodes.json) —
+                    // просто ещё один источник событий "auth провалился", на
+                    // фрейм-уровне, ДО похода к бэкенду.
+                    metrics::counter!("netrunner_auth_failures_total").increment(1);
                     return Err(AppError::new(
                         ERR_AUTH_FAILED,
                         "Ошибка авторизации",
@@ -1149,6 +1166,7 @@ impl TunnelHandler for ServerHandler {
                         AppError::new(ERR_INFRA_TIMEOUT, "Ошибка сокета", e.to_string())
                     })?;
                     if n == 0 {
+                        metrics::counter!("netrunner_auth_failures_total").increment(1);
                         return Err(AppError::new(
                             ERR_AUTH_FAILED,
                             "Отказ",
@@ -1158,6 +1176,7 @@ impl TunnelHandler for ServerHandler {
                 }
                 Err(e) => {
                     error!("❌ Secure Auth Failed: {:?}", e.stage);
+                    metrics::counter!("netrunner_auth_failures_total").increment(1);
                     return Err(AppError::new(
                         ERR_AUTH_FAILED,
                         "Доступ запрещен",
@@ -1177,6 +1196,10 @@ impl TunnelHandler for ServerHandler {
             match validator.validate(&auth_token).await {
                 Ok(quota) => muxer.set_quota_user(quota.user_id),
                 Err(e) => {
+                    // Не дублируем счётчик — `BackendClient::validate` (см.
+                    // server/src/backend_client.rs) уже инкрементит тот же
+                    // `netrunner_auth_failures_total` сам, на обеих своих
+                    // ветках отказа (пустой токен / бэкенд отклонил).
                     warn!("❌ Backend rejected client token: {}", e.internal_msg);
                     // Раньше клиент видел только голый TCP EOF на отказ — неотличимо
                     // от сбоя сети/недоступной цели (см. client-edge: "vpn node
@@ -1209,6 +1232,12 @@ impl TunnelHandler for ServerHandler {
 
         let control_tx_clone = control_tx.clone();
         muxer.add_leg(leg_id, control_tx, data_tx);
+        // Прошли все три фазы (валидный хендшейк → auth-фрейм → токен принят
+        // бэкендом, если --require-auth включён) — вот теперь это реальное
+        // "подключение к моему VPN", не просто TCP-коннект на 443. См.
+        // netrunner_scanner_fallback_total/netrunner_auth_failed_total выше за
+        // тем, как выглядят остальные две категории.
+        metrics::counter!("netrunner_vpn_established_total").increment(1);
 
         let opener = Arc::new(RemoteOpener {
             muxer: muxer.clone(),

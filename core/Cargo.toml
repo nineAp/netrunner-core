@@ -48,6 +48,13 @@ tokio = { version = "1.49.0", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 socket2 = { version = "0.5", features = ["all"] }
 libc = "0.2"
+# Только для `ServerHandler::run` (см. net/connection/connection.rs) — считает
+# scanner-fallback/auth-failed/vpn-established отдельно от голого TCP-accept
+# (тот считается в server/src/network.rs). Клиентский код этот путь никогда не
+# исполняет (ServerHandler конструируется только в server/), поэтому здесь
+# просто неиспользуемая зависимость на клиентских сборках — тот же порядок
+# цены, что и уже используемый в этом крейте `tracing`.
+metrics = "0.24.3"
 
 # `std::time::SystemTime::now()` panics on wasm32-unknown-unknown ("time not
 # implemented on this platform" — no OS clock syscall there). web-time is an
