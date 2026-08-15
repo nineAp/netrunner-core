@@ -37,6 +37,7 @@ use x25519_dalek::{PublicKey, StaticSecret};
 use crate::crypto::ecdh::ECDH;
 
 /// Разбирает 32-байтовое значение из hex-строки конфига.
+#[allow(clippy::result_large_err)]
 fn parse_key_hex(what: &str, value: &str) -> Result<[u8; 32], AppError> {
     let raw = hex::decode(value.trim()).map_err(|e| {
         AppError::new(
@@ -65,6 +66,7 @@ pub struct PeerIdentity {
 
 impl PeerIdentity {
     /// `secret_hex` — `nrxp_secret` ноды, `public_hex` — её `nrxp_static_public`.
+    #[allow(clippy::result_large_err)]
     pub fn from_hex(secret_hex: &str, public_hex: &str) -> Result<Self, AppError> {
         Ok(Self {
             secret: parse_key_hex("nrxp_secret", secret_hex)?,
@@ -93,6 +95,7 @@ impl LocalIdentity {
     /// `true` — отвергать. Пока `strict` выключен, активный MITM может просто
     /// переписать заявленную версию в `ClientHello` и увести соединение на
     /// старую схему, поэтому переходный режим обязан быть временным.
+    #[allow(clippy::result_large_err)]
     pub fn from_hex(secret_hex: &str, private_hex: &str, strict: bool) -> Result<Self, AppError> {
         Ok(Self {
             secret: parse_key_hex("nrxp_secret", secret_hex)?,

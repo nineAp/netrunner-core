@@ -130,6 +130,12 @@ fn main() {
     // Обе переменные либо заданы вместе, либо не заданы вовсе: нода с одной
     // половиной конфигурации — это тихо сломанная нода, поэтому падаем на
     // старте, а не на каждом хендшейке.
+    //
+    // Флаги для метрик: сам `Identity` их наружу не отдаёт, а видеть, с чем
+    // РЕАЛЬНО поднята нода, нужно — строка в БД бэкенда может от неё отстать
+    // (например, `.env` уехал не тот). Расхождение видно сравнением
+    // `netrunner_nrxp_*` с ноды и `node_nrxp_*` с бэкенда.
+    let mut nrxp_strict_flag = false;
     let identity = match (
         std::env::var("PROXY_NRXP_SECRET").ok(),
         std::env::var("PROXY_NRXP_PRIVATE_KEY").ok(),
@@ -157,6 +163,7 @@ fn main() {
                 strict,
                 "NRXP identity loaded"
             );
+            nrxp_strict_flag = strict;
             Some(Identity::Local(local))
         }
         (None, None) => {
@@ -174,9 +181,16 @@ fn main() {
     // Регистрируется один раз, до первого metrics::counter!/gauge!/histogram! —
     // если --metrics-port не задан, вызовы макросов молча уходят в
     // no-op recorder по умолчанию (штатное поведение крейта metrics).
+    let nrxp_configured_flag = identity.is_some();
+
     let metrics_handle = args
         .metrics_port
         .map(|_| metrics_server::install_recorder());
+
+    // Только после install_recorder: до него макросы metrics! уходят в
+    // no-op-рекордер по умолчанию и значение бы потерялось.
+    metrics::gauge!("netrunner_nrxp_identity_configured").set(nrxp_configured_flag as u8 as f64);
+    metrics::gauge!("netrunner_nrxp_strict").set(nrxp_strict_flag as u8 as f64);
 
     let net = Network::new(
         args.host.clone(),

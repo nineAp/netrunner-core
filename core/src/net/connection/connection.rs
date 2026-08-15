@@ -1087,6 +1087,17 @@ impl TunnelHandler for ServerHandler {
                     ) {
                         Ok((sh, peer_version)) => {
                             debug!(peer_version, "✅ Valid Netrunner ClientHello detected");
+                            // Разрез хендшейков по заявленной версии протокола.
+                            // Это единственный способ увидеть, сколько на ноде
+                            // осталось клиентов старой анонимной схемы, — а без
+                            // этого числа нельзя ответить на вопрос «пора ли
+                            // включать строгий режим»: включённый слишком рано,
+                            // он отрубит их разом (см. `MIN_VERSION_FOR_STATIC_DH`).
+                            metrics::counter!(
+                                "netrunner_handshake_total",
+                                "version" => peer_version.to_string()
+                            )
+                            .increment(1);
                             break (sh, peer_version);
                         }
                         Err(e) => {
