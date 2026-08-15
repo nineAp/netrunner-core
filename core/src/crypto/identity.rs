@@ -50,7 +50,10 @@ fn parse_key_hex(what: &str, value: &str) -> Result<[u8; 32], AppError> {
         AppError::new(
             ERR_AUTH_FAILED,
             "Ошибка конфигурации",
-            format!("{what}: ожидалось 32 байта (64 hex-символа), получено {}", raw.len()),
+            format!(
+                "{what}: ожидалось 32 байта (64 hex-символа), получено {}",
+                raw.len()
+            ),
         )
     })
 }
