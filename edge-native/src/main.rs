@@ -142,6 +142,15 @@ pub struct EdgeConfig {
     /// `--require-auth`. Пустая строка, если не задан (нода без
     /// `--require-auth` его не проверяет).
     pub(crate) auth_token: String,
+    /// Учётные данные ноды из админки бэкенда (`NRXP_SECRET` +
+    /// `NRXP_PUBLIC_KEY`, hex по 64 символа) — включают аутентифицированный
+    /// хендшейк. `None`, если не заданы: тогда edge ходит на ноду по старой
+    /// анонимной схеме и активного посредника не заметит.
+    ///
+    /// Это НЕ `PROXY_INTERNAL_SECRET` ноды и не её приватный статический ключ:
+    /// сюда кладутся ровно те же публичные половины, что бэкенд раздаёт
+    /// обычным клиентам.
+    pub(crate) identity: Option<netrunner_core::Identity>,
     /// Пул переиспользуемых keep-alive HTTP/1.1-соединений до `landing_addr`
     /// поверх уже установленных NRXP-туннелей (см. `proxy_http.rs`). Не
     /// "конфигурация" в строгом смысле остальных полей — рантайм-состояние,
@@ -186,12 +195,28 @@ impl EdgeConfig {
         validate_host_port("VPN_NODE_ADDR", &vpn_node_addr);
         validate_host_port("LANDING_ADDR", &landing_addr);
         validate_host_port("BACKEND_ADDR", &backend_addr);
+
+        // Обе переменные задаются вместе: половина учётных данных — это тихо
+        // сломанная конфигурация, падаем на старте, а не на каждом туннеле.
+        let identity = match (
+            std::env::var("NRXP_SECRET").ok(),
+            std::env::var("NRXP_PUBLIC_KEY").ok(),
+        ) {
+            (Some(secret), Some(public)) => Some(netrunner_core::Identity::Peer(
+                netrunner_core::PeerIdentity::from_hex(&secret, &public)
+                    .expect("NRXP_SECRET/NRXP_PUBLIC_KEY: 32 байта hex каждый"),
+            )),
+            (None, None) => None,
+            _ => panic!("NRXP_SECRET и NRXP_PUBLIC_KEY задаются только вместе"),
+        };
+
         Self {
             vpn_node_addr,
             landing_addr,
             backend_addr,
             decoy_sni,
             auth_token,
+            identity,
             landing_pool: tokio::sync::Mutex::new(Vec::new()),
             backend_pool: tokio::sync::Mutex::new(Vec::new()),
         }

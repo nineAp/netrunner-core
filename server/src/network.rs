@@ -10,6 +10,7 @@ use netrunner_core::net::{
     AuthValidator, Connection, NetworkConfig, NodeHealthReport, ServerHandler, SessionManager,
     TunnelHandler, TOPOLOGY_PRINT_INTERVAL,
 };
+use netrunner_core::Identity;
 use netrunner_logger::{debug, error, info, warn};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -78,6 +79,10 @@ pub struct Network {
     /// `None` — health-эндпоинт выключен (по умолчанию для обратной
     /// совместимости с уже развёрнутыми нодами без этого флага).
     health_port: Option<u16>,
+    /// Долговременные учётные данные ноды (`PROXY_NRXP_SECRET` +
+    /// `PROXY_NRXP_PRIVATE_KEY`), заведённые в админке бэкенда. `None` — не
+    /// настроены, нода принимает только старый анонимный хендшейк.
+    identity: Option<Identity>,
 }
 
 impl Network {
@@ -87,6 +92,7 @@ impl Network {
         decoy_host: impl Into<Arc<str>>,
         auth: Option<Arc<dyn AuthValidator>>,
         health_port: Option<u16>,
+        identity: Option<Identity>,
     ) -> Self {
         Self {
             host,
@@ -94,6 +100,7 @@ impl Network {
             decoy_host: decoy_host.into(),
             auth,
             health_port,
+            identity,
         }
     }
 
@@ -266,6 +273,7 @@ impl Network {
                             session_manager.clone(),
                             self.decoy_host.clone(),
                             self.auth.clone(),
+                            self.identity.clone(),
                         );
 
                         let active_now = active_connections.fetch_add(1, Ordering::Relaxed) + 1;

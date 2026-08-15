@@ -130,8 +130,27 @@ impl EdgeHandshake {
     /// что-то, что меняется от попытки к попытке (см. doc на `for_session`
     /// про то, почему смена отпечатка между реконнектами — плохая идея).
     pub fn new(decoy_sni: impl Into<String>, session_seed: &str) -> Self {
+        Self::with_identity(decoy_sni, session_seed, None)
+    }
+
+    /// То же самое, но с учётными данными ноды (`nrxp_secret` +
+    /// `nrxp_public_key` из админки бэкенда): включает аутентифицированный
+    /// хендшейк v3.
+    ///
+    /// Edge ходит на ту же ноду тем же протоколом, что и приложение, и без
+    /// учётных данных он остаётся ровно так же уязвим к активному посреднику —
+    /// с той разницей, что его токен долгоживущий (`edge_...`, выпускается
+    /// один раз), поэтому цена перехвата здесь выше, а не ниже.
+    pub fn with_identity(
+        decoy_sni: impl Into<String>,
+        session_seed: &str,
+        identity: Option<crate::Identity>,
+    ) -> Self {
         Self {
-            session_keys: SessionKeys::new(true),
+            session_keys: match identity {
+                Some(id) => SessionKeys::with_identity(true, id),
+                None => SessionKeys::new(true),
+            },
             decoy_host: decoy_sni.into(),
             profile: BrowserProfile::for_session(session_seed),
             hello_parsed: false,

@@ -25,10 +25,17 @@ use netrunner_logger::{AppError, ERR_NET_TLS_TAMPER};
 use x25519_dalek::PublicKey;
 
 use crate::{
-    crypto::{ecdh::ECDH, hkdf::HKDF},
+    crypto::{ecdh::ECDH, hkdf::HKDF, identity::Identity},
     net::{AUTH_TIME_STEP, AUTH_WINDOW_SIZE},
     tlseng::ExtensionStack,
 };
+
+/// Доменный ярлык, который уходит в `ikm` вместе с результатами DH.
+///
+/// Гарантирует, что PRK схемы v3 (два DH) не может совпасть с PRK старой схемы
+/// v2 (один DH) даже теоретически: у них разный входной материал по построению,
+/// а не «просто разной длины».
+const IKM_DOMAIN_V3: &[u8] = b"nrxp-v3-static-dh";
 
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -106,21 +113,115 @@ type DirectionalAeadKeys = ([u8; 32], [u8; 12], [u8; 32], [u8; 12]);
 pub struct SessionKeys {
     /// Пара солей (локальная + удалённая) для HKDF.
     salt: SaltPair,
-    /// Эфемерный ключ X25519; расходуется при выводе общего секрета.
+    /// Эфемерный ключ X25519; уничтожается сразу после вывода ключей сессии.
     ecdh: ECDH,
     /// Ключ для time-based аутентификации кадров (HMAC). Заполняется в HKDF-фазе.
     auth_key: [u8; 32],
     /// Выведенные AEAD-параметры `(tx_key, tx_iv, rx_key, rx_iv)`; `None` до хендшейка.
     current_aead: Option<DirectionalAeadKeys>,
+    /// Долговременные учётные данные ноды (см. [`Identity`]). `None` — старая
+    /// анонимная схема v2: нода без настроенных ключей или клиент, которому
+    /// бэкенд их ещё не выдал.
+    identity: Option<Identity>,
+    /// Версия протокола, заявленная противоположной стороной. У клиента это
+    /// его собственная заявленная версия (он и решает, по какой схеме идти), у
+    /// сервера проставляется из `session_id[0]` разобранного `ClientHello`
+    /// до вывода ключей — см. [`SessionKeys::set_peer_version`].
+    peer_version: u8,
 }
 
 impl SessionKeys {
+    /// Старая анонимная схема (протокол v2): без учётных данных ноды.
     pub(crate) fn new(is_initiator: bool) -> Self {
         Self {
             salt: SaltPair::new(is_initiator),
             ecdh: ECDH::new(),
             auth_key: [0u8; 32],
             current_aead: None,
+            identity: None,
+            peer_version: crate::PROTOCOL_VERSION_ANONYMOUS,
+        }
+    }
+
+    /// Аутентифицированная схема (протокол v3): в хендшейк входят секрет ноды
+    /// (тег `ClientHello`) и её статический ключ (второй DH).
+    pub(crate) fn with_identity(is_initiator: bool, identity: Identity) -> Self {
+        Self {
+            identity: Some(identity),
+            peer_version: crate::PROTOCOL_VERSION,
+            ..Self::new(is_initiator)
+        }
+    }
+
+    /// Версия протокола, которую эта сторона заявляет в `session_id[0]`.
+    ///
+    /// Клиент **без** учётных данных обязан заявлять v2: иначе нода станет
+    /// проверять у него ключевой тег, которого он посчитать не может.
+    pub(crate) fn claimed_version(&self) -> u8 {
+        if self.identity.is_some() {
+            crate::PROTOCOL_VERSION
+        } else {
+            crate::PROTOCOL_VERSION_ANONYMOUS
+        }
+    }
+
+    /// Сервер: зафиксировать версию, заявленную клиентом, до вывода ключей.
+    pub(crate) fn set_peer_version(&mut self, version: u8) {
+        self.peer_version = version;
+    }
+
+    /// Идти ли по схеме v3 (второй DH + ключевой тег хендшейка).
+    ///
+    /// Обе стороны должны ответить на это одинаково, иначе они выведут разные
+    /// ключи и сессия умрёт на первом же кадре. Условие поэтому симметричное:
+    /// учётные данные есть **и** пир заявил версию не ниже
+    /// [`MIN_VERSION_FOR_STATIC_DH`](crate::MIN_VERSION_FOR_STATIC_DH).
+    pub(crate) fn uses_static_dh(&self) -> bool {
+        self.identity.is_some() && self.peer_version >= crate::MIN_VERSION_FOR_STATIC_DH
+    }
+
+    /// Отвергать ли пира, пришедшего по старой анонимной схеме.
+    ///
+    /// Пока нода не в strict-режиме, downgrade остаётся возможен: активный
+    /// посредник переписывает `session_id[0]` на 2, и хендшейк идёт по схеме
+    /// без аутентификации. Строгий режим — обязательный финальный шаг
+    /// раскатки, а не опция.
+    pub(crate) fn rejects_anonymous(&self) -> bool {
+        self.identity.as_ref().is_some_and(Identity::strict)
+    }
+
+    /// Тег для `session_id` своего `ClientHello` (только клиент).
+    ///
+    /// В схеме v3 считается на ключе ноды и привязан к этому конкретному
+    /// соединению; в v2 — старый безключевой тег от времени.
+    pub(crate) fn handshake_tag(&self, random: &[u8; 32]) -> [u8; 16] {
+        match &self.identity {
+            Some(id) => SessionAuth::new(*id.secret())
+                .generate_handshake_tag(random, &self.public_key_bytes()),
+            None => SessionAuth::new(self.auth_key).generate_current_tag(),
+        }
+    }
+
+    /// Проверка тега из `ClientHello` (только сервер), до вывода ключей.
+    ///
+    /// Криптографии тяжелее HMAC здесь нет намеренно: тег проверяется на каждом
+    /// входящем `ClientHello`, в том числе на пробах сканеров, и X25519 в этой
+    /// точке был бы бесплатным DoS-усилителем.
+    pub(crate) fn verify_handshake_tag(
+        &self,
+        received_tag: &[u8; 16],
+        random: &[u8; 32],
+        peer_public: &[u8; 32],
+    ) -> bool {
+        if self.uses_static_dh() {
+            let Some(id) = &self.identity else {
+                return false;
+            };
+            SessionAuth::new(*id.secret()).verify_handshake_tag(received_tag, random, peer_public)
+        } else if self.rejects_anonymous() {
+            false
+        } else {
+            SessionAuth::new(self.auth_key).verify_tag(received_tag)
         }
     }
 
@@ -158,64 +259,84 @@ impl SessionKeys {
             "Updating keys with new salt"
         );
 
+        let public_key = PublicKey::from(Self::extract_peer_public(extensions, is_server)?);
+        self.generate_keys(&public_key, is_server)
+    }
+
+    /// Достаёт публичный ключ X25519 пира из расширения KeyShare (`0x0033`).
+    ///
+    /// Вынесено из [`update_keys`](SessionKeys::update_keys) отдельно, потому
+    /// что серверу этот ключ нужен **раньше** вывода ключей: в схеме v3 он
+    /// входит в тег `ClientHello`, а тег проверяется до любых DH. Операция
+    /// чисто разборная — скан уже распарсенного [`ExtensionStack`], никакой
+    /// криптографии, поэтому её безопасно делать на неаутентифицированном
+    /// вводе.
+    ///
+    /// Парсинг асимметричен: у сервера `ClientHello` содержит список именованных
+    /// групп, поэтому ключ ищется по маркеру `00 1d 00 20` (X25519, 32 байта);
+    /// у клиента `ServerHello` отдаёт ровно один ключ по фиксированному смещению.
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn extract_peer_public(
+        extensions: &ExtensionStack,
+        is_server: bool,
+    ) -> Result<[u8; 32], AppError> {
         const EXT_KEY_SHARE: u16 = 0x0033;
 
-        if let Some(dh_data) = extensions.find_by_type(EXT_KEY_SHARE) {
-            let mut key_bytes = [0u8; 32];
-
-            if is_server {
-                if dh_data.len() < 38 {
-                    return Err(AppError::new(
-                        ERR_NET_TLS_TAMPER,
-                        "Ошибка маскировки",
-                        format!("Client KeyShare too short: {}", dh_data.len()),
-                    ));
-                }
-
-                let mut found = false;
-                for i in 2..=(dh_data.len() - 34) {
-                    if dh_data[i..i + 4] == [0x00, 0x1d, 0x00, 0x20] {
-                        key_bytes.copy_from_slice(&dh_data[i + 4..i + 36]);
-                        found = true;
-                        break;
-                    }
-                }
-
-                if !found {
-                    return Err(AppError::new(
-                        ERR_NET_TLS_TAMPER,
-                        "Ошибка маскировки",
-                        "Could not find x25519 key in ClientHello",
-                    ));
-                }
-            } else {
-                if dh_data.len() < 36 {
-                    return Err(AppError::new(
-                        ERR_NET_TLS_TAMPER,
-                        "Ошибка маскировки",
-                        "Server KeyShare too short",
-                    ));
-                }
-                key_bytes.copy_from_slice(&dh_data[4..36]);
-            }
-
-            if key_bytes.iter().all(|&x| x == 0) {
-                return Err(AppError::new(
-                    ERR_NET_TLS_TAMPER,
-                    "Ошибка шифрования",
-                    "Extracted remote public key is all ZEROS!",
-                ));
-            }
-
-            let public_key = PublicKey::from(key_bytes);
-            self.generate_keys(&public_key, is_server)
-        } else {
-            Err(AppError::new(
+        let Some(dh_data) = extensions.find_by_type(EXT_KEY_SHARE) else {
+            return Err(AppError::new(
                 ERR_NET_TLS_TAMPER,
                 "Ошибка маскировки",
                 "No KeyShare extension found in handshake",
-            ))
+            ));
+        };
+
+        let mut key_bytes = [0u8; 32];
+
+        if is_server {
+            if dh_data.len() < 38 {
+                return Err(AppError::new(
+                    ERR_NET_TLS_TAMPER,
+                    "Ошибка маскировки",
+                    format!("Client KeyShare too short: {}", dh_data.len()),
+                ));
+            }
+
+            let mut found = false;
+            for i in 2..=(dh_data.len() - 34) {
+                if dh_data[i..i + 4] == [0x00, 0x1d, 0x00, 0x20] {
+                    key_bytes.copy_from_slice(&dh_data[i + 4..i + 36]);
+                    found = true;
+                    break;
+                }
+            }
+
+            if !found {
+                return Err(AppError::new(
+                    ERR_NET_TLS_TAMPER,
+                    "Ошибка маскировки",
+                    "Could not find x25519 key in ClientHello",
+                ));
+            }
+        } else {
+            if dh_data.len() < 36 {
+                return Err(AppError::new(
+                    ERR_NET_TLS_TAMPER,
+                    "Ошибка маскировки",
+                    "Server KeyShare too short",
+                ));
+            }
+            key_bytes.copy_from_slice(&dh_data[4..36]);
         }
+
+        if key_bytes.iter().all(|&x| x == 0) {
+            return Err(AppError::new(
+                ERR_NET_TLS_TAMPER,
+                "Ошибка шифрования",
+                "Extracted remote public key is all ZEROS!",
+            ));
+        }
+
+        Ok(key_bytes)
     }
 
     /// Низкоуровневый вывод ключей: ECDH → HKDF-Extract → пять HKDF-Expand.
@@ -225,18 +346,54 @@ impl SessionKeys {
     /// Затем `is_server` назначает направления: для сервера tx=`server_*`,
     /// rx=`client_*`, для клиента — наоборот. Так одна и та же пара ключей
     /// у клиента служит на запись, а у сервера — на чтение, и наоборот.
+    ///
+    /// ## Что именно уходит в `ikm` (v2 против v3)
+    ///
+    /// ```text
+    /// v2:  ikm = DH(своя эфемерная, чужая эфемерная)
+    /// v3:  ikm = DH(своя эфемерная, чужая эфемерная) ‖ static_dh ‖ "nrxp-v3-static-dh"
+    /// ```
+    ///
+    /// Первый DH даёт forward secrecy, второй — аутентификацию: посчитать его
+    /// может только владелец приватного статического ключа ноды. Посредник,
+    /// подсунувший клиенту свою эфемерную пару, выведет другой `ikm` и другие
+    /// ключи, поэтому первый же кадр у него не расшифруется. Именно этот второй
+    /// DH и есть вся разница между «анонимным обменом ключами» и
+    /// «аутентифицированным».
+    ///
+    /// Ни один из двух результатов не идёт в HKDF в одиночку: конкатенация
+    /// обязательна, иначе выпадение любого из них осталось бы незамеченным.
     #[allow(clippy::result_large_err)]
     fn generate_keys(
         &mut self,
         public_key: &PublicKey,
         is_server: bool,
     ) -> Result<DirectionalAeadKeys, AppError> {
-        let shared_key = self
+        let ephemeral_dh = self
             .ecdh
-            .get_shared(public_key)
+            .dh(public_key)
             .ok_or_else(|| AppError::new(ERR_NET_TLS_TAMPER, "Сбой", "No shared secret"))?;
 
-        let hkdf = HKDF::extract_key(&self.salt.get_total(), &shared_key);
+        let mut ikm = Vec::with_capacity(64 + IKM_DOMAIN_V3.len());
+        ikm.extend_from_slice(&ephemeral_dh);
+
+        if self.uses_static_dh() {
+            let identity = self
+                .identity
+                .as_ref()
+                .expect("uses_static_dh() implies identity is present");
+            let static_dh = identity
+                .static_dh(&self.ecdh, public_key)
+                .ok_or_else(|| AppError::new(ERR_NET_TLS_TAMPER, "Сбой", "No static secret"))?;
+            ikm.extend_from_slice(&static_dh);
+            ikm.extend_from_slice(IKM_DOMAIN_V3);
+        }
+
+        // Forward secrecy: приватный эфемерный ключ больше не нужен ни одной
+        // ветке — уничтожаем его здесь, а не «когда-нибудь на Drop».
+        self.ecdh.burn();
+
+        let hkdf = HKDF::extract_key(&self.salt.get_total(), &ikm);
 
         let c_key = HKDF::expand_key::<32>(&hkdf, b"client_aead")
             .map_err(|e| AppError::new(ERR_NET_TLS_TAMPER, "Ошибка ключей", e))?;
@@ -338,6 +495,83 @@ impl SessionAuth {
         let now = now_unix_secs();
 
         Self::compute_tag(&self.auth_key, now / AUTH_TIME_STEP)
+    }
+
+    /// Чистая функция: тег `ClientHello` для шага `step`, соли `random` и
+    /// эфемерного публичного ключа клиента `peer_public`.
+    ///
+    /// Два отличия от пер-кадрового [`compute_tag`](SessionAuth::compute_tag),
+    /// и оба существенные:
+    ///
+    /// 1. **Ключ — секрет ноды, а не `auth_key`.** На момент отправки
+    ///    `ClientHello` ключей сессии ещё не существует: обмен ими только
+    ///    начинается. Раньше в этой точке брался `auth_key`, который до
+    ///    `update_keys` равен нулям, — тег получался чистой функцией времени,
+    ///    одинаковой для всех развёртываний в мире, и вычислялся кем угодно без
+    ///    единого секрета. Барьер на входе был нулевой.
+    /// 2. **Привязка к соединению.** Под HMAC уходят соль и KeyShare клиента,
+    ///    поэтому перехваченный тег нельзя вставить в чужой `ClientHello`: с
+    ///    другим эфемерным ключом он не сойдётся. Тег «только от времени» был
+    ///    валиден для любого отправителя все 300 секунд окна.
+    ///
+    /// Домен разделён префиксом: значение, посчитанное здесь, не может совпасть
+    /// с пер-кадровым тегом на том же ключе и шаге.
+    pub fn compute_handshake_tag(
+        secret: &[u8],
+        step: u64,
+        random: &[u8; 32],
+        peer_public: &[u8; 32],
+    ) -> [u8; 16] {
+        let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC error");
+        mac.update(b"nrxp-handshake-v3");
+        mac.update(&step.to_be_bytes());
+        mac.update(random);
+        mac.update(peer_public);
+        let result = mac.finalize().into_bytes();
+        let mut tag = [0u8; 16];
+        tag.copy_from_slice(&result[..16]);
+        tag
+    }
+
+    /// Тег `ClientHello` на текущий момент — кладётся в `session_id[16..32]`.
+    pub fn generate_handshake_tag(&self, random: &[u8; 32], peer_public: &[u8; 32]) -> [u8; 16] {
+        let now = now_unix_secs();
+
+        Self::compute_handshake_tag(&self.auth_key, now / AUTH_TIME_STEP, random, peer_public)
+    }
+
+    /// Проверяет тег `ClientHello` против того же окна `[step-W .. step+W]`.
+    ///
+    /// # Инвариант безопасности (НЕ ЛОМАТЬ)
+    ///
+    /// Тот же, что у [`verify_tag`](SessionAuth::verify_tag): цикл всегда
+    /// прогоняет все `2*AUTH_WINDOW_SIZE + 1` кандидатов, сравнение побайтовое
+    /// через накопление `diff |= a ^ b`, без раннего `break`. Здесь это важнее,
+    /// чем в data-фазе: метод стоит на неаутентифицированном вводе и вызывается
+    /// на каждой пробе сканера.
+    pub fn verify_handshake_tag(
+        &self,
+        received_tag: &[u8; 16],
+        random: &[u8; 32],
+        peer_public: &[u8; 32],
+    ) -> bool {
+        let current_step = now_unix_secs() / AUTH_TIME_STEP;
+
+        let mut matched = 0u8;
+        for step in (current_step.saturating_sub(AUTH_WINDOW_SIZE))
+            ..=(current_step.saturating_add(AUTH_WINDOW_SIZE))
+        {
+            let candidate =
+                Self::compute_handshake_tag(&self.auth_key, step, random, peer_public);
+            let mut diff = 0u8;
+            for (a, b) in candidate.iter().zip(received_tag.iter()) {
+                diff |= a ^ b;
+            }
+            // Никакого раннего выхода: накапливаем результат по всем шагам.
+            matched |= (diff == 0) as u8;
+        }
+
+        matched != 0
     }
 
     /// Проверяет тег входящего кадра против окна `[step-W .. step+W]`.

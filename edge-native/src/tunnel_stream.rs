@@ -89,7 +89,8 @@ impl TunnelStream {
             rand::random::<u32>()
         );
 
-        let hello = EdgeHandshake::new(cfg.decoy_sni.clone(), &session_id);
+        let hello =
+            EdgeHandshake::with_identity(cfg.decoy_sni.clone(), &session_id, cfg.identity.clone());
         socket
             .write_all(&hello.client_hello_bytes())
             .await

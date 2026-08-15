@@ -18,7 +18,12 @@ interface SessionManager {
         boolean killswitch_enabled,
         sequence<string> excluded_apps,
         sequence<string> excluded_domains,
-        string? auth_token
+        string? auth_token,
+        // Учётные данные ноды из списка серверов бэкенда (hex по 64 символа):
+        // включают аутентифицированный хендшейк. Оба null — старая анонимная
+        // схема, сервер клиенту ничем себя не подтверждает.
+        string? node_secret,
+        string? node_public_key
     );
     VpnTrafficStats get_traffic_stats();
 };

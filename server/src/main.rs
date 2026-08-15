@@ -17,6 +17,7 @@ mod metrics_server;
 mod network;
 use clap::Parser;
 use netrunner_core::net::AuthValidator;
+use netrunner_core::{Identity, LocalIdentity};
 use netrunner_logger::{error, info, Logger};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -119,6 +120,57 @@ fn main() {
         None
     };
 
+    // Долговременные учётные данные ноды: секрет входа и приватная половина
+    // статической пары X25519. Заводятся в админке бэкенда, сюда приезжают
+    // провижинингом рядом с PROXY_INTERNAL_SECRET — но это РАЗНЫЕ секреты с
+    // разным уровнем доступа: internal_secret пускает в control-plane и
+    // клиентам не отдаётся никогда, а публичная половина статической пары,
+    // наоборот, раздаётся каждому клиенту (см. crypto::identity).
+    //
+    // Обе переменные либо заданы вместе, либо не заданы вовсе: нода с одной
+    // половиной конфигурации — это тихо сломанная нода, поэтому падаем на
+    // старте, а не на каждом хендшейке.
+    let identity = match (
+        std::env::var("PROXY_NRXP_SECRET").ok(),
+        std::env::var("PROXY_NRXP_PRIVATE_KEY").ok(),
+    ) {
+        (Some(secret), Some(private_key)) => {
+            // Пока false, нода принимает и клиентов старой анонимной схемы —
+            // это нужно ровно на время раскатки, пока бэкенд не раздал ключи
+            // всем приложениям. Оставлять так навсегда нельзя: активному
+            // посреднику достаточно переписать заявленную версию в
+            // ClientHello, чтобы увести соединение на неаутентифицированную
+            // схему. Финальный шаг раскатки — PROXY_NRXP_STRICT=true.
+            let strict = std::env::var("PROXY_NRXP_STRICT")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+
+            let local = LocalIdentity::from_hex(&secret, &private_key, strict)
+                .expect("PROXY_NRXP_SECRET/PROXY_NRXP_PRIVATE_KEY: 32 байта hex каждый");
+
+            // Публичную половину печатаем при старте: оператор сверяет её с
+            // тем, что показывает админка для этой ноды. Разошлись — клиенты
+            // не подключатся, и увидеть это в логе старта дешевле, чем в
+            // графике неудачных хендшейков через сутки.
+            netrunner_logger::info!(
+                nrxp_public_key = %local.public_key_hex(),
+                strict,
+                "NRXP identity loaded"
+            );
+            Some(Identity::Local(local))
+        }
+        (None, None) => {
+            netrunner_logger::warn!(
+                "NRXP identity not configured: анонимный хендшейк, аутентификации сервера нет"
+            );
+            None
+        }
+        _ => panic!(
+            "PROXY_NRXP_SECRET и PROXY_NRXP_PRIVATE_KEY задаются только вместе: \
+             нода с половиной учётных данных не сможет аутентифицировать себя клиентам"
+        ),
+    };
+
     // Регистрируется один раз, до первого metrics::counter!/gauge!/histogram! —
     // если --metrics-port не задан, вызовы макросов молча уходят в
     // no-op recorder по умолчанию (штатное поведение крейта metrics).
@@ -132,6 +184,7 @@ fn main() {
         args.decoy_host,
         auth,
         args.health_port,
+        identity,
     );
 
     let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");

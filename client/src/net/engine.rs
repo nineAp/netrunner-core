@@ -794,6 +794,19 @@ pub struct EngineConfig {
     /// `--require-auth` или приложение ещё не залогинено (Ghost Protocol seed
     /// генерируется/логинится в фоне почти сразу, см. `netrunner-app/src/lib/api.ts`).
     pub auth_token: Option<String>,
+    /// Учётные данные ноды из списка серверов, полученного от бэкенда:
+    /// `nrxp_secret` и `nrxp_public_key`, оба hex по 64 символа.
+    ///
+    /// Заданы — хендшейк идёт по аутентифицированной схеме: клиент проверяемо
+    /// отличает свою ноду от чужой, и активный посредник, подсунувший свой
+    /// ключ, не выведет ключей сессии. Не заданы — старый анонимный хендшейк
+    /// (нода, которой в админке ещё не завели ключи).
+    ///
+    /// Приходят по HTTPS от бэкенда, которому приложение уже доверяет по
+    /// обычному PKI, — это и есть корень доверия, из которого растёт
+    /// аутентификация туннеля.
+    pub node_secret: Option<String>,
+    pub node_public_key: Option<String>,
 }
 
 impl EngineConfig {
@@ -811,11 +824,25 @@ impl EngineConfig {
             excluded_domains: Vec::new(),
             decoy_sni: netrunner_core::net::DEFAULT_DECOY_HOST.to_string(),
             auth_token: None,
+            node_secret: None,
+            node_public_key: None,
         }
     }
 
     pub fn with_decoy_sni(mut self, decoy_sni: impl Into<String>) -> Self {
         self.decoy_sni = decoy_sni.into();
+        self
+    }
+
+    /// Учётные данные ноды из списка серверов бэкенда. Оба значения — hex по
+    /// 64 символа; любое отсутствует ⇒ работаем по старой анонимной схеме.
+    pub fn with_node_credentials(
+        mut self,
+        node_secret: Option<String>,
+        node_public_key: Option<String>,
+    ) -> Self {
+        self.node_secret = node_secret;
+        self.node_public_key = node_public_key;
         self
     }
 
@@ -922,11 +949,30 @@ impl EngineBuilder {
         let (tx_to_tunnel, rx_for_client_handler) = mpsc::channel::<RawCastFrame>(cap);
         let (tx_for_client_handler, rx_from_tunnel) = mpsc::channel::<RawCastFrame>(cap);
 
+        // Учётные данные ноды собираются только если бэкенд прислал ОБА
+        // значения. Невалидный hex — не повод молча откатиться на анонимный
+        // хендшейк: это тихо снимало бы аутентификацию сервера ровно тогда,
+        // когда конфиг испорчен, поэтому подключение прерывается.
+        let identity = match (
+            self.config.node_secret.as_deref(),
+            self.config.node_public_key.as_deref(),
+        ) {
+            (Some(secret), Some(public)) => Some(netrunner_core::Identity::Peer(
+                netrunner_core::PeerIdentity::from_hex(secret, public)
+                    .map_err(|e| format!("Bad node credentials: {}", e))?,
+            )),
+            _ => {
+                warn!("Node credentials absent: анонимный хендшейк, сервер не аутентифицируется");
+                None
+            }
+        };
+
         info!("Establishing secure tunnel to proxy server...");
         let muxer = ClientHandler::connect(
             &self.config.remote_address,
             self.config.decoy_sni.clone(),
             self.config.auth_token.clone(),
+            identity,
             rx_for_client_handler,
             tx_for_client_handler,
         )

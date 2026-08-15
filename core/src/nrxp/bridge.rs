@@ -14,7 +14,7 @@
 //! Внутренний трейт [`TlsInterceptor`] задаёт общий каркас «распарсить TLS-запись
 //! → проверить её тип → достать полезное содержимое» для хендшейка и AppData.
 
-use crate::crypto::{SessionAuth, SessionKeys};
+use crate::crypto::SessionKeys;
 use crate::nrxp::errors::{ErrorAction, ErrorStage, TlsError};
 use crate::parser::Parser;
 use crate::tlseng::ExtensionStack;
@@ -225,14 +225,33 @@ impl TlsBridge {
             }
 
             let peer_version = base.session_id[0];
+            keys.set_peer_version(peer_version);
 
             let mut received_tag = [0u8; 16];
             received_tag.copy_from_slice(&base.session_id[16..32]);
 
-            // ВАЖНО: Используем SessionAuth для проверки начального тега хендшейка
-            let auth = SessionAuth::new(keys.get_auth_key());
-            if !auth.verify_tag(&received_tag) {
-                netrunner_logger::warn!("Unauthorized ClientHello: Auth Tag mismatch");
+            // Эфемерный ключ клиента нужен ДО проверки тега: в схеме v3 он
+            // входит в сам тег. Это только разбор уже распарсенных расширений,
+            // без криптографии, — на неаутентифицированном вводе тяжелее HMAC
+            // здесь ничего быть не должно.
+            let peer_public = SessionKeys::extract_peer_public(extensions, true).map_err(|e| {
+                netrunner_logger::warn!(error = %e, "Malformed KeyShare in ClientHello");
+                TlsError::new(
+                    ErrorStage::Handshake("Bad KeyShare"),
+                    ErrorAction::Drop,
+                    Bytes::new(),
+                )
+            })?;
+
+            // Порядок сохранён: тег проверяется до вывода ключей. Какой именно
+            // тег ожидается — ключевой (v3) или старый безключевой (v2) —
+            // решает `SessionKeys` по учётным данным ноды и заявленной версии
+            // клиента; нода в строгом режиме отвергает анонимную схему целиком.
+            if !keys.verify_handshake_tag(&received_tag, &base.random, &peer_public) {
+                netrunner_logger::warn!(
+                    peer_version,
+                    "Unauthorized ClientHello: Auth Tag mismatch"
+                );
                 return Err(TlsError::new(
                     ErrorStage::Handshake("Auth Failed"),
                     ErrorAction::Drop,

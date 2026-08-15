@@ -89,6 +89,12 @@ pub(crate) struct TunnelEngine {
     /// Bearer-токен клиента (пусто — авторизация выключена/не залогинен),
     /// нужен для того же внутреннего реконнекта, что и `decoy_sni` выше.
     pub auth_token: Arc<str>,
+    /// Учётные данные ноды (см. [`crate::crypto::identity`]) — по той же
+    /// причине, что и два поля выше: реконнект проводит хендшейк заново и
+    /// обязан пройти его по той же схеме, что и первичное подключение.
+    /// Молчаливый откат на анонимную схему при реконнекте означал бы, что
+    /// достаточно оборвать ноге TCP, чтобы снять с неё аутентификацию.
+    pub identity: Option<crate::Identity>,
 }
 
 impl TunnelEngine {
@@ -137,6 +143,7 @@ impl TunnelEngine {
             profile,
             &self.decoy_sni,
             &self.auth_token,
+            self.identity.as_ref(),
         )
         .await
     }

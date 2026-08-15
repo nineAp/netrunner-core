@@ -21,7 +21,7 @@
 use std::{net::Ipv4Addr, sync::Arc, time::Instant};
 
 use crate::{
-    crypto::{ChaChaCipher, SessionKeys},
+    crypto::{ChaChaCipher, Identity, SessionKeys},
     net::{
         connection::{
             engine::TunnelEngine,
@@ -271,6 +271,12 @@ impl ClientHandler {
     /// уехал бы относительно передающей, и первая же настоящая запись не
     /// расшифровалась бы. Раньше буфер действительно отбрасывался, и это не
     /// стреляло только потому, что сервер до первого слова клиента молчал.
+    ///
+    /// `identity` — учётные данные ноды, полученные приложением от бэкенда.
+    /// `Some` включает аутентифицированную схему v3 (ключевой тег + второй DH,
+    /// см. [`crate::crypto::identity`]); `None` оставляет старый анонимный
+    /// хендшейк — так подключается клиент к ноде, для которой бэкенд ещё не
+    /// выдал ключей.
     pub(crate) async fn perform_handshake(
         stream: tokio::net::TcpStream,
         session_id: &str,
@@ -278,6 +284,7 @@ impl ClientHandler {
         profile: &BrowserProfile,
         decoy_sni: &str,
         auth_token: &str,
+        identity: Option<&Identity>,
     ) -> Result<
         (
             OwnedReadHalf,
@@ -290,7 +297,10 @@ impl ClientHandler {
     > {
         stream.set_nodelay(true).unwrap_or_default();
         let mut conn = Connection::new(stream);
-        let mut session_keys = SessionKeys::new(true);
+        let mut session_keys = match identity {
+            Some(id) => SessionKeys::with_identity(true, id.clone()),
+            None => SessionKeys::new(true),
+        };
         let ch = TlsBridge::wrap_client_hello(profile, decoy_sni, &session_keys);
 
         conn.outbound
@@ -411,6 +421,7 @@ impl ClientHandler {
         session_id: &str,
         decoy_sni: &Arc<str>,
         auth_token: &Arc<str>,
+        identity: &Option<Identity>,
     ) -> Result<(), AppError> {
         let leg_name = format!("TCP-Leg-{}", leg_id);
 
@@ -453,9 +464,16 @@ impl ClientHandler {
             .map_err(|e| AppError::new(ERR_INFRA_TIMEOUT, "Сбой сокета", e.to_string()))?;
 
         let profile = BrowserProfile::for_session(session_id);
-        let (inbound, outbound, rx_codec, tx_codec, handshake_tail) =
-            Self::perform_handshake(stream, session_id, leg_id, profile, decoy_sni, auth_token)
-                .await?;
+        let (inbound, outbound, rx_codec, tx_codec, handshake_tail) = Self::perform_handshake(
+            stream,
+            session_id,
+            leg_id,
+            profile,
+            decoy_sni,
+            auth_token,
+            identity.as_ref(),
+        )
+        .await?;
 
         let cap = NetworkConfig::global().channel_capacity;
         let (control_tx, control_rx) = mpsc::channel::<MuxMessage>(cap);
@@ -483,6 +501,7 @@ impl ClientHandler {
             leg_status: crate::net::connection::engine::LegStatus::Active,
             decoy_sni: decoy_sni.clone(),
             auth_token: auth_token.clone(),
+            identity: identity.clone(),
         };
 
         let run_result = engine.run().await;
@@ -516,10 +535,16 @@ impl ClientHandler {
     /// стороны (см. `EngineConfig::decoy_sni` в `client`); в перспективе будет
     /// приходить динамически со списком серверов, чтобы не расходиться с тем,
     /// на какой decoy-хост настроен конкретный сервер (`--decoy-host`).
+    ///
+    /// `identity` — учётные данные этой ноды из конфига, который приложение
+    /// получило от бэкенда (`nrxp_secret` + `nrxp_public_key`). `Some` включает
+    /// аутентифицированный хендшейк v3 на **всех** ногах сессии; `None` —
+    /// старая анонимная схема для нод, которым учётные данные ещё не заведены.
     pub async fn connect(
         remote_proxy_addr: &str,
         decoy_sni: impl Into<Arc<str>>,
         auth_token: Option<String>,
+        identity: Option<Identity>,
         mut rx_from_engine: mpsc::Receiver<RawCastFrame>,
         tx_to_engine: mpsc::Sender<RawCastFrame>,
     ) -> Result<Arc<Muxer>, AppError> {
@@ -559,6 +584,7 @@ impl ClientHandler {
             let sid = session_id.clone();
             let decoy_sni = decoy_sni.clone();
             let auth_token = auth_token.clone();
+            let identity = identity.clone();
             tokio::spawn(async move {
                 // Разброс старта ног. Ровный шаг `LEG_STAGGER_DELAY * id` открывал
                 // четыре соединения строго по метроному — арифметическая прогрессия
@@ -577,8 +603,15 @@ impl ClientHandler {
                         info!("Leg {} stopping: session marked fatal", id);
                         return;
                     }
-                    if let Err(e) =
-                        Self::establish_leg(&addr, id, m.clone(), &sid, &decoy_sni, &auth_token)
+                    if let Err(e) = Self::establish_leg(
+                        &addr,
+                        id,
+                        m.clone(),
+                        &sid,
+                        &decoy_sni,
+                        &auth_token,
+                        &identity,
+                    )
                             .await
                     {
                         if e.code == ERR_AUTH_FAILED {
@@ -912,6 +945,11 @@ pub struct ServerHandler {
     /// передан), поведение как до этой фичи. `Some` — токен клиента
     /// обязателен и проверяется бэкендом при установке первой ноги сессии.
     pub(crate) auth: Option<Arc<dyn crate::net::AuthValidator>>,
+    /// Долговременные учётные данные этой ноды (см. [`crate::crypto::identity`]),
+    /// заведённые в админке бэкенда и приехавшие сюда провижинингом. `None` —
+    /// нода их не настроила и работает по старой анонимной схеме: хендшейк без
+    /// аутентификации сервера, как до v3.
+    pub(crate) identity: Option<Identity>,
 }
 
 impl ServerHandler {
@@ -920,12 +958,14 @@ impl ServerHandler {
         session_manager: Arc<SessionManager>,
         decoy_host: Arc<str>,
         auth: Option<Arc<dyn crate::net::AuthValidator>>,
+        identity: Option<Identity>,
     ) -> Self {
         Self {
             conn: connection,
             session_manager,
             decoy_host,
             auth,
+            identity,
         }
     }
 
@@ -1030,7 +1070,10 @@ impl TunnelHandler for ServerHandler {
             mut outbound,
             mut read_buf,
         } = self.conn;
-        let mut session_keys = SessionKeys::new(false);
+        let mut session_keys = match self.identity {
+            Some(id) => SessionKeys::with_identity(false, id),
+            None => SessionKeys::new(false),
+        };
 
         let (hello, peer_version) = loop {
             let buf_snapshot = read_buf.clone().freeze();
@@ -1317,9 +1360,11 @@ impl TunnelHandler for ServerHandler {
             session_id,
             leg_status: crate::net::connection::engine::LegStatus::Active,
             // Сервер никогда не реконнектит (см. `attempt_reconnect`'s early
-            // return on empty `remote_addr`), поэтому SNI/токен здесь не используются.
+            // return on empty `remote_addr`), поэтому SNI/токен/учётные данные
+            // здесь не используются.
             decoy_sni: Arc::from(""),
             auth_token: Arc::from(""),
+            identity: None,
         };
 
         let res = engine.run().await;
@@ -1480,9 +1525,39 @@ mod tests {
     /// синхронизируются через настоящий сокет, а не только в идеальном
     /// одноразовом буфере.
     ///
+    /// Гоняется в двух режимах: анонимном (v2, нода без учётных данных) и
+    /// аутентифицированном (v3, у ноды и клиента согласованные ключи). Второй
+    /// случай — сквозная проверка того, что двойной DH сходится не только в
+    /// юнит-тестах на голых `SessionKeys`, но и через настоящий сокет со всеми
+    /// CCS и cover-записями.
     #[tokio::test]
     async fn legitimate_handshake_succeeds_over_real_tcp() {
+        for authenticated in [false, true] {
+            legitimate_handshake_case(authenticated).await;
+        }
+    }
+
+    async fn legitimate_handshake_case(authenticated: bool) {
         NetworkConfig::init_global(1500);
+
+        let (client_identity, node_identity) = if authenticated {
+            let local = crate::LocalIdentity::from_hex(
+                &hex::encode([3u8; 32]),
+                &hex::encode([5u8; 32]),
+                true,
+            )
+            .unwrap();
+            let peer =
+                crate::PeerIdentity::from_hex(&hex::encode([3u8; 32]), &local.public_key_hex())
+                    .unwrap();
+            (
+                Some(Identity::Peer(peer)),
+                Some(Identity::Local(local)),
+            )
+        } else {
+            (None, None)
+        };
+
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -1494,6 +1569,7 @@ mod tests {
                 Arc::new(SessionManager::new()),
                 Arc::from("example.com"),
                 None,
+                node_identity,
             );
             // run() продолжает в muxer/engine после хендшейка и вернётся сам,
             // как только клиент закроет сокет (наш тест-клиент не шлёт
@@ -1512,6 +1588,7 @@ mod tests {
                 BrowserProfile::for_session(&session_id),
                 &Arc::<str>::from("example.com"),
                 "",
+                client_identity.as_ref(),
             ),
         )
         .await
@@ -1572,6 +1649,7 @@ mod tests {
                 conn,
                 Arc::new(SessionManager::new()),
                 Arc::from("this-host-does-not-resolve.invalid"),
+                None,
                 None,
             );
             handler.run().await

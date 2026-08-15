@@ -151,6 +151,13 @@ impl SessionManager {
     /// `sni` — домен-декой для `ClientHello` этого сервера; приложение берёт
     /// его из [`known_servers`] по выбранному `remote_address` (в будущем —
     /// из бэкенда вместе с остальными полями узла).
+    ///
+    /// `node_secret` и `node_public_key` — учётные данные выбранной ноды из
+    /// списка серверов, который приложение получило от бэкенда (поля
+    /// `nrxp_secret` и `nrxp_public_key`, hex по 64 символа). Переданы оба —
+    /// хендшейк аутентифицированный: клиент проверяемо отличает свою ноду от
+    /// чужой. Не переданы — старый анонимный хендшейк, для нод, которым в
+    /// админке ещё не завели ключи.
     #[allow(clippy::too_many_arguments)]
     pub fn spawn_session(
         &self,
@@ -162,6 +169,8 @@ impl SessionManager {
         excluded_apps: Vec<String>,
         excluded_domains: Vec<String>,
         auth_token: Option<String>,
+        node_secret: Option<String>,
+        node_public_key: Option<String>,
     ) -> Arc<Session> {
         // На мобильных Logger::init здесь — первый и единственный вызов (нет
         // отдельного main.rs), поэтому production-флаг должен зависеть от
@@ -198,7 +207,8 @@ impl SessionManager {
             .with_excluded_apps(excluded_apps)
             .with_excluded_domains(excluded_domains)
             .with_decoy_sni(sni)
-            .with_auth_token(auth_token);
+            .with_auth_token(auth_token)
+            .with_node_credentials(node_secret, node_public_key);
 
         #[cfg(any(target_os = "android", target_os = "ios"))]
         {

@@ -17,7 +17,7 @@ use aead::{rand_core::RngCore, OsRng};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 use crate::{
-    crypto::{SessionAuth, SessionKeys},
+    crypto::SessionKeys,
     nrxp::{ErrorAction, ErrorStage, TlsError},
     parser::Parser,
     tlseng::{
@@ -134,13 +134,15 @@ impl ClientHello {
         // не влияет на JA3/JA4 (значение session_id в отпечаток не входит, только
         // его длина), позволяет серверу узнать, какое "протокольное" поведение
         // клиент способен понять, до того как что-либо ему отправить.
-        session_id_bytes[0] = crate::PROTOCOL_VERSION;
+        session_id_bytes[0] = keys.claimed_version();
         OsRng.fill_bytes(&mut session_id_bytes[1..16]);
 
-        // session_id[16..32] = текущий time-based auth-тег: сервер проверит его
-        // первым делом и отвергнет ClientHello без валидного тега.
-        let auth = SessionAuth::new(keys.get_auth_key());
-        session_id_bytes[16..].copy_from_slice(&auth.generate_current_tag());
+        // session_id[16..32] = auth-тег: сервер проверит его первым делом и
+        // отвергнет ClientHello без валидного тега. В схеме v3 тег считается на
+        // секрете ноды и привязан к этому соединению (соль + KeyShare); в v2 —
+        // старый тег от одного лишь времени. Выбор делает сам `SessionKeys` по
+        // наличию учётных данных, см. `SessionKeys::handshake_tag`.
+        session_id_bytes[16..].copy_from_slice(&keys.handshake_tag(&tls_random));
 
         // Цель паддинга (`profile.target_padding_len`) меряется в байтах
         // **payload TLS-записи**, а не всей записи вместе с её 5-байтовым
@@ -478,6 +480,7 @@ mod tests {
     use super::*;
     use crate::crypto::SessionKeys;
     use crate::tlseng::ExtensionStack;
+    use crate::{Identity, LocalIdentity, PeerIdentity};
 
     fn parse_client_hello_record(wire: &Bytes) -> (ClientHello, ExtensionStack) {
         let mut record_buf = BytesMut::from(&wire[..]);
@@ -570,7 +573,12 @@ mod tests {
             let (client_hello, client_ext) = parse_client_hello_record(&ch_wire);
 
             assert_eq!(client_hello.session_id.len(), 32);
-            assert_eq!(client_hello.session_id[0], crate::PROTOCOL_VERSION);
+            // Клиент без учётных данных ноды обязан заявлять анонимную схему:
+            // иначе нода потребует ключевой тег, посчитать который ему нечем.
+            assert_eq!(
+                client_hello.session_id[0],
+                crate::PROTOCOL_VERSION_ANONYMOUS
+            );
             assert_eq!(client_hello.cipher_suites, profile.cipher_suites);
 
             let mut server_keys = SessionKeys::new(false);
@@ -630,5 +638,222 @@ mod tests {
             !auth.verify_tag(&received_tag),
             "a tampered auth tag must not verify"
         );
+    }
+
+    // ==================================================================
+    // Протокол v3: аутентифицированный хендшейк
+    // ==================================================================
+
+    /// Пара учётных данных одной ноды: то, что лежит на ней самой, и то, что
+    /// бэкенд отдаёт её клиентам.
+    fn identity_pair(node_secret: [u8; 32], node_private: [u8; 32], strict: bool) -> (Identity, Identity) {
+        let local = LocalIdentity::from_hex(
+            &hex::encode(node_secret),
+            &hex::encode(node_private),
+            strict,
+        )
+        .expect("valid hex credentials");
+        let peer = PeerIdentity::from_hex(&hex::encode(node_secret), &local.public_key_hex())
+            .expect("valid hex credentials");
+        (Identity::Peer(peer), Identity::Local(local))
+    }
+
+    /// Прогоняет полный обмен ClientHello/ServerHello и возвращает выведенные
+    /// обеими сторонами AEAD-ключи. `server_identity` — то, чем отвечающая
+    /// сторона представляется: в тесте на MITM сюда подставляется чужая.
+    fn run_handshake(
+        client_identity: Option<Identity>,
+        server_identity: Option<Identity>,
+    ) -> (SessionKeys, SessionKeys) {
+        let client_keys = match client_identity {
+            Some(id) => SessionKeys::with_identity(true, id),
+            None => SessionKeys::new(true),
+        };
+        let ch_wire =
+            ClientHello::make_client_hello(&BrowserProfile::CHROME_131, "example.com", &client_keys);
+        let (client_hello, client_ext) = parse_client_hello_record(&ch_wire);
+
+        let mut server_keys = match server_identity {
+            Some(id) => SessionKeys::with_identity(false, id),
+            None => SessionKeys::new(false),
+        };
+        server_keys.set_peer_version(client_hello.session_id[0]);
+        server_keys
+            .update_keys(client_hello.random, &client_ext, true)
+            .expect("server key derivation must succeed");
+
+        let server_pub = server_keys.public_key_bytes();
+        let sh_wire = ServerHello::make_server_hello(
+            &client_hello,
+            &server_pub,
+            server_keys.local_salt(),
+            &ServerProfile::MODERN,
+        );
+        let (server_hello, server_ext) = parse_server_hello_record(&sh_wire);
+
+        let mut client_keys = client_keys;
+        client_keys
+            .update_keys(server_hello.random, &server_ext, false)
+            .expect("client key derivation must succeed");
+
+        (client_keys, server_keys)
+    }
+
+    #[test]
+    fn v3_handshake_derives_matching_keys_and_claims_version_3() {
+        let (peer, local) = identity_pair([7u8; 32], [9u8; 32], true);
+
+        let client_keys = SessionKeys::with_identity(true, peer.clone());
+        let ch_wire =
+            ClientHello::make_client_hello(&BrowserProfile::CHROME_131, "example.com", &client_keys);
+        let (client_hello, _) = parse_client_hello_record(&ch_wire);
+        assert_eq!(
+            client_hello.session_id[0],
+            crate::PROTOCOL_VERSION,
+            "клиент с учётными данными обязан заявлять v3"
+        );
+        // Раскладка `session_id` не изменилась: те же 32 байта, тег на том же
+        // месте. Схема v3 не стоит на проводе ни одного лишнего байта.
+        assert_eq!(client_hello.session_id.len(), 32);
+
+        let (client_keys, server_keys) = run_handshake(Some(peer), Some(local));
+        let (c_tx_k, _, c_rx_k, _) = client_keys.get_aead_parameters();
+        let (s_tx_k, _, s_rx_k, _) = server_keys.get_aead_parameters();
+
+        assert_eq!(c_tx_k, s_rx_k);
+        assert_eq!(c_rx_k, s_tx_k);
+        assert_eq!(client_keys.get_auth_key(), server_keys.get_auth_key());
+    }
+
+    /// Главный тест на активного посредника.
+    ///
+    /// Атакующий знает секрет ноды — предполагаем худшее, он разобрал
+    /// клиентский конфиг, — поэтому валидный тег `ClientHello` он построить
+    /// может и до обмена ключами его ничто не останавливает. Чего у него нет,
+    /// так это приватного статического ключа ноды. Без него второй DH у сторон
+    /// расходится, а с ним и все ключи сессии: клиент шифрует тем, что
+    /// посредник расшифровать не в состоянии.
+    ///
+    /// До v3 этот тест был бы зелёным в обратную сторону — ключи совпадали бы,
+    /// потому что сходиться им было не с чем.
+    #[test]
+    fn mitm_without_the_node_private_key_derives_different_keys() {
+        let node_secret = [7u8; 32];
+        let (peer_of_real_node, _real_node) = identity_pair(node_secret, [9u8; 32], true);
+        // Тот же секрет входа, другой статический ключ — ровно то, чем
+        // располагает посредник.
+        let (_, impostor) = identity_pair(node_secret, [42u8; 32], true);
+
+        let (client_keys, impostor_keys) = run_handshake(Some(peer_of_real_node), Some(impostor));
+
+        let (c_tx_k, _, c_rx_k, _) = client_keys.get_aead_parameters();
+        let (i_tx_k, _, i_rx_k, _) = impostor_keys.get_aead_parameters();
+
+        assert_ne!(
+            c_tx_k, i_rx_k,
+            "посредник без статического ключа ноды не должен вывести ключ чтения клиента"
+        );
+        assert_ne!(
+            c_rx_k, i_tx_k,
+            "и ключ, которым клиент читает, тоже не должен сойтись"
+        );
+        assert_ne!(client_keys.get_auth_key(), impostor_keys.get_auth_key());
+    }
+
+    /// Клиент, у которого есть учётные данные, не должен сходиться с нодой,
+    /// которая их не настроила: это несовпадение конфигурации, и падать оно
+    /// обязано в сторону отказа, а не молчаливого отката на анонимную схему.
+    #[test]
+    fn v3_client_does_not_match_an_anonymous_node() {
+        let (peer, _) = identity_pair([7u8; 32], [9u8; 32], true);
+        let (client_keys, server_keys) = run_handshake(Some(peer), None);
+
+        let (c_tx_k, _, _, _) = client_keys.get_aead_parameters();
+        let (_, _, s_rx_k, _) = server_keys.get_aead_parameters();
+        assert_ne!(c_tx_k, s_rx_k);
+    }
+
+    #[test]
+    fn handshake_tag_requires_the_node_secret() {
+        let (peer, local) = identity_pair([7u8; 32], [9u8; 32], true);
+        // Нода с другим секретом входа — например, тег посчитан для соседней
+        // ноды или клиент не обновил конфиг после ротации.
+        let (_, other_node) = identity_pair([8u8; 32], [9u8; 32], true);
+
+        let client_keys = SessionKeys::with_identity(true, peer);
+        let ch_wire =
+            ClientHello::make_client_hello(&BrowserProfile::CHROME_131, "example.com", &client_keys);
+        let (client_hello, client_ext) = parse_client_hello_record(&ch_wire);
+
+        let mut tag = [0u8; 16];
+        tag.copy_from_slice(&client_hello.session_id[16..32]);
+        let peer_public = SessionKeys::extract_peer_public(&client_ext, true).unwrap();
+
+        let mut right = SessionKeys::with_identity(false, local);
+        right.set_peer_version(client_hello.session_id[0]);
+        assert!(
+            right.verify_handshake_tag(&tag, &client_hello.random, &peer_public),
+            "своя нода обязана принять тег"
+        );
+
+        let mut wrong = SessionKeys::with_identity(false, other_node);
+        wrong.set_peer_version(client_hello.session_id[0]);
+        assert!(
+            !wrong.verify_handshake_tag(&tag, &client_hello.random, &peer_public),
+            "нода с другим секретом обязана отвергнуть тег"
+        );
+    }
+
+    /// Тег привязан к соединению: перехваченный `ClientHello` нельзя переиграть,
+    /// подставив свой KeyShare, хотя окно валидности по времени ещё открыто.
+    #[test]
+    fn handshake_tag_is_bound_to_the_client_keyshare() {
+        let (peer, local) = identity_pair([7u8; 32], [9u8; 32], true);
+
+        let client_keys = SessionKeys::with_identity(true, peer);
+        let ch_wire =
+            ClientHello::make_client_hello(&BrowserProfile::CHROME_131, "example.com", &client_keys);
+        let (client_hello, client_ext) = parse_client_hello_record(&ch_wire);
+
+        let mut tag = [0u8; 16];
+        tag.copy_from_slice(&client_hello.session_id[16..32]);
+        let mut replayed_public = SessionKeys::extract_peer_public(&client_ext, true).unwrap();
+        replayed_public[0] ^= 0xFF;
+
+        let mut node = SessionKeys::with_identity(false, local);
+        node.set_peer_version(client_hello.session_id[0]);
+        assert!(
+            !node.verify_handshake_tag(&tag, &client_hello.random, &replayed_public),
+            "тег с чужим KeyShare не должен проходить"
+        );
+    }
+
+    /// Переходный режим раскатки и его финал: пока `strict` выключен, нода
+    /// принимает клиентов старой схемы (иначе апгрейд парка невозможен), после
+    /// включения — перестаёт, и downgrade по заявленной версии закрывается.
+    #[test]
+    fn strict_mode_decides_the_fate_of_anonymous_clients() {
+        let anonymous_client = SessionKeys::new(true);
+        let ch_wire = ClientHello::make_client_hello(
+            &BrowserProfile::CHROME_131,
+            "example.com",
+            &anonymous_client,
+        );
+        let (client_hello, client_ext) = parse_client_hello_record(&ch_wire);
+        let mut tag = [0u8; 16];
+        tag.copy_from_slice(&client_hello.session_id[16..32]);
+        let peer_public = SessionKeys::extract_peer_public(&client_ext, true).unwrap();
+
+        for (strict, expected) in [(false, true), (true, false)] {
+            let (_, local) = identity_pair([7u8; 32], [9u8; 32], strict);
+            let mut node = SessionKeys::with_identity(false, local);
+            node.set_peer_version(client_hello.session_id[0]);
+            assert_eq!(
+                node.verify_handshake_tag(&tag, &client_hello.random, &peer_public),
+                expected,
+                "strict={strict}: анонимный клиент должен быть {}",
+                if expected { "принят" } else { "отвергнут" }
+            );
+        }
     }
 }

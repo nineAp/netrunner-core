@@ -114,6 +114,12 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         .secret("AUTH_TOKEN")
         .map(|v| v.to_string())
         .unwrap_or_default();
+    // Учётные данные ноды из админки бэкенда: включают аутентифицированный
+    // хендшейк. `NRXP_SECRET` — секрет (кладётся как secret), `NRXP_PUBLIC_KEY`
+    // — публичная половина статического ключа (обычная переменная, она и так
+    // раздаётся всем клиентам). Не заданы — старая анонимная схема.
+    let nrxp_secret = env.secret("NRXP_SECRET").map(|v| v.to_string()).ok();
+    let nrxp_public_key = env.var("NRXP_PUBLIC_KEY").map(|v| v.to_string()).ok();
 
     let pair = WebSocketPair::new()?;
     let server = pair.server;
@@ -123,7 +129,16 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
     // клиенту с апгрейдом — тот уходит сразу вместе с pair.client ниже.
     let bridge_ws = server.clone();
     ctx.wait_until(async move {
-        if let Err(e) = run_bridge(&bridge_ws, vpn_node, decoy_sni, backend_addr, auth_token).await
+        if let Err(e) = run_bridge(
+            &bridge_ws,
+            vpn_node,
+            decoy_sni,
+            backend_addr,
+            auth_token,
+            nrxp_secret,
+            nrxp_public_key,
+        )
+        .await
         {
             console_error!("[netrunner-edge] bridge failed: {e}");
         }
@@ -142,7 +157,16 @@ async fn run_bridge(
     decoy_sni: String,
     backend_addr: String,
     auth_token: String,
+    nrxp_secret: Option<String>,
+    nrxp_public_key: Option<String>,
 ) -> std::result::Result<(), String> {
+    let identity = match (nrxp_secret.as_deref(), nrxp_public_key.as_deref()) {
+        (Some(secret), Some(public)) => Some(netrunner_core::Identity::Peer(
+            netrunner_core::PeerIdentity::from_hex(secret, public)
+                .map_err(|e| format!("bad NRXP credentials: {e}"))?,
+        )),
+        _ => None,
+    };
     let (host, port) = split_host_port(&vpn_node)?;
 
     let mut socket = Socket::builder()
@@ -163,7 +187,7 @@ async fn run_bridge(
         (js_sys::Math::random() * u32::MAX as f64) as u32
     );
 
-    let hello = EdgeHandshake::new(decoy_sni, &session_id);
+    let hello = EdgeHandshake::with_identity(decoy_sni, &session_id, identity);
     socket
         .write_all(&hello.client_hello_bytes())
         .await

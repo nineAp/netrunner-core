@@ -519,6 +519,9 @@ mod tests {
             backend_addr: "account.netrunner-vpn.com:443".to_string(),
             decoy_sni: "cloudflare.com".to_string(),
             auth_token: String::new(),
+            // Маршрутизация HTTP не зависит от учётных данных ноды — они нужны
+            // только на хендшейке туннеля.
+            identity: None,
             landing_pool: tokio::sync::Mutex::new(Vec::new()),
             backend_pool: tokio::sync::Mutex::new(Vec::new()),
         }
