@@ -261,7 +261,16 @@ impl ClientHandler {
     /// SNI=`decoy_sni`) → дождаться `ServerHello` и вывести ключи → зарядить
     /// шифр и кодек → отправить первый зашифрованный auth-кадр `Heartbeat` с
     /// `"session_id:leg_id:auth_token"` (третий сегмент может быть пустым).
-    /// Возвращает половинки сокета и готовые кодеки.
+    ///
+    /// Возвращает половинки сокета, готовые кодеки **и остаток буфера чтения**.
+    /// Последнее обязательно: сервер отправляет cover-flight
+    /// ([`crate::MIN_VERSION_FOR_COVER`]) сразу вслед за `ServerHello` и CCS, и
+    /// эти записи почти всегда приезжают тем же TCP-сегментом, то есть оседают
+    /// в `read_buf` ещё до того, как хендшейк завершится. Выбросить буфер здесь
+    /// означало бы потерять целые TLS-записи: счётчик nonce приёмной стороны
+    /// уехал бы относительно передающей, и первая же настоящая запись не
+    /// расшифровалась бы. Раньше буфер действительно отбрасывался, и это не
+    /// стреляло только потому, что сервер до первого слова клиента молчал.
     pub(crate) async fn perform_handshake(
         stream: tokio::net::TcpStream,
         session_id: &str,
@@ -275,6 +284,7 @@ impl ClientHandler {
             OwnedWriteHalf,
             crate::nrxp::RxCodec,
             crate::nrxp::TxCodec,
+            BytesMut,
         ),
         AppError,
     > {
@@ -373,7 +383,13 @@ impl ClientHandler {
             .await
             .map_err(|e| AppError::new(ERR_INFRA_TIMEOUT, "Сбой отправки", e.to_string()))?;
 
-        Ok((conn.inbound, conn.outbound, rx_codec, tx_codec))
+        Ok((
+            conn.inbound,
+            conn.outbound,
+            rx_codec,
+            tx_codec,
+            conn.read_buf,
+        ))
     }
 
     /// Устанавливает одну ногу и крутит её движок до остановки.
@@ -437,7 +453,7 @@ impl ClientHandler {
             .map_err(|e| AppError::new(ERR_INFRA_TIMEOUT, "Сбой сокета", e.to_string()))?;
 
         let profile = BrowserProfile::for_session(session_id);
-        let (inbound, outbound, rx_codec, tx_codec) =
+        let (inbound, outbound, rx_codec, tx_codec, handshake_tail) =
             Self::perform_handshake(stream, session_id, leg_id, profile, decoy_sni, auth_token)
                 .await?;
 
@@ -455,7 +471,9 @@ impl ClientHandler {
             // 💡 ИЗМЕНЕНО: Передаем кодеки без Arc<Mutex>
             rx_codec: Some(rx_codec),
             tx_codec: Some(tx_codec),
-            read_buf: BytesMut::with_capacity(NetworkConfig::global().connection_buf_size),
+            // Не пустой буфер, а именно остаток хендшейка: в нём уже могут
+            // лежать cover-записи сервера, пришедшие тем же сегментом.
+            read_buf: handshake_tail,
             control_rx: Some(control_rx),
             data_rx: Some(data_rx),
             handler,
@@ -542,7 +560,15 @@ impl ClientHandler {
             let decoy_sni = decoy_sni.clone();
             let auth_token = auth_token.clone();
             tokio::spawn(async move {
-                tokio::time::sleep(LEG_STAGGER_DELAY * id).await;
+                // Разброс старта ног. Ровный шаг `LEG_STAGGER_DELAY * id` открывал
+                // четыре соединения строго по метроному — арифметическая прогрессия
+                // по времени, самостоятельный признак, не зависящий от содержимого
+                // пакетов. Браузер тоже открывает несколько соединений к одному
+                // origin, но с разбросом, а не с точностью до миллисекунды.
+                if id > 0 {
+                    let spread = rand::rng().random_range(0.6..1.4);
+                    tokio::time::sleep(LEG_STAGGER_DELAY.mul_f64(id as f64 * spread)).await;
+                }
                 let mut attempt: u32 = 0;
                 loop {
                     if m.is_fatal() {
@@ -1120,6 +1146,35 @@ impl TunnelHandler for ServerHandler {
         let codec = Codec::new(cipher, session_keys.get_auth_key());
         let (mut rx_codec, mut tx_codec) = codec.split();
 
+        // Cover-flight: имитация того, что настоящий TLS 1.3-сервер отправляет
+        // сразу после ServerHello (EncryptedExtensions + Certificate +
+        // CertificateVerify + Finished — всё это уже под шифром, то есть едет
+        // записями ApplicationData).
+        //
+        // Без него наблюдаемая картина была однозначной: сервер отвечал
+        // 127-байтовым ServerHello, 6-байтовым CCS и замолкал, а первую запись
+        // ApplicationData отправлял КЛИЕНТ. В настоящем TLS так не бывает
+        // никогда — там первым говорит сервер, и его первый flight весит
+        // 1–5 КБ, а не 133 байта. Признак булев, ложных срабатываний ноль, и
+        // он обесценивал точность мимикрии ClientHello целиком.
+        //
+        // Только клиентам, объявившим версию ≥ 2: старый клиент не знает типа
+        // кадра Cover и уронил бы ногу на неизвестном байте.
+        if peer_version >= crate::MIN_VERSION_FOR_COVER {
+            for record_len in crate::tlseng::sample_server_flight() {
+                let cover = tx_codec.encode_cover(record_len).map_err(|e| {
+                    AppError::new(
+                        ERR_NET_TLS_TAMPER,
+                        "Сбой шифрования",
+                        format!("Cover frame encryption failed: {:?}", e.stage),
+                    )
+                })?;
+                outbound.write_all(&cover).await.map_err(|e| {
+                    AppError::new(ERR_INFRA_TIMEOUT, "Ошибка отправки", e.to_string())
+                })?;
+            }
+        }
+
         let (session_id, leg_id, auth_token) = loop {
             match rx_codec.decode_inbound(&mut read_buf) {
                 Ok(Some(frame)) => {
@@ -1424,6 +1479,7 @@ mod tests {
     /// байтовые юнит-тесты: что CCS/версия/хендшейк действительно
     /// синхронизируются через настоящий сокет, а не только в идеальном
     /// одноразовом буфере.
+    ///
     #[tokio::test]
     async fn legitimate_handshake_succeeds_over_real_tcp() {
         NetworkConfig::init_global(1500);
@@ -1462,7 +1518,34 @@ mod tests {
         .expect("handshake must not hang")
         .expect("legitimate handshake must succeed");
 
-        let (_inbound, _outbound, _rx_codec, _tx_codec) = handshake;
+        let (_inbound, _outbound, mut rx_codec, _tx_codec, mut tail) = handshake;
+
+        // Регрессия на потерю хвоста хендшейка. Сервер шлёт cover-flight сразу
+        // за ServerHello/CCS, и эти записи приезжают тем же TCP-сегментом, то
+        // есть оседают в буфере ДО конца хендшейка. Раньше `perform_handshake`
+        // буфер не возвращал, а вызывающий заводил движку пустой — записи
+        // молча терялись, счётчик nonce приёмника уезжал относительно
+        // передатчика, и первая же настоящая запись не расшифровывалась.
+        // Здесь проверяем ровно это: хвост непустой, целиком разбирается и
+        // состоит только из Cover-кадров.
+        assert!(
+            !tail.is_empty(),
+            "сервер обязан прислать cover-flight сразу после ServerHello"
+        );
+
+        let mut cover_frames = 0;
+        while let Some(frame) = rx_codec
+            .decode_inbound(&mut tail)
+            .expect("хвост хендшейка обязан расшифровываться — иначе nonce разъехался")
+        {
+            assert_eq!(
+                frame.header.frame_type,
+                crate::nrxp::FrameType::Cover,
+                "в первом flight'е сервера не может быть ничего, кроме cover"
+            );
+            cover_frames += 1;
+        }
+        assert!(cover_frames >= 1, "cover-flight не должен быть пустым");
         drop(_inbound);
         drop(_outbound);
 

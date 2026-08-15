@@ -85,6 +85,11 @@ impl From<FrameType> for EdgeFrameKind {
             FrameType::UdpData => EdgeFrameKind::UdpData,
             FrameType::Diag => EdgeFrameKind::Diag,
             FrameType::Credit => EdgeFrameKind::Credit,
+            // Cover до сюда не доходит: `EdgeTunnel::feed` отбрасывает такие
+            // кадры раньше, чем дело дойдёт до конверсии. Отображаем в
+            // Heartbeat как безопасный no-op, чтобы не заводить публичный
+            // вариант перечисления под чисто внутреннюю механику маскировки.
+            FrameType::Cover => EdgeFrameKind::Heartbeat,
         }
     }
 }
@@ -227,6 +232,12 @@ impl EdgeTunnel {
         let mut out = Vec::new();
         loop {
             match self.rx.decode_inbound(&mut self.inbuf) {
+                // Cover-кадры (см. `FrameType::Cover`) — набивка ради формы
+                // трафика, данных в них нет. Отбрасываем прямо здесь, а не
+                // заводим вариант в `EdgeFrameKind`: иначе каждый потребитель
+                // edge-API (Worker, edge-native) обязан был бы знать про
+                // маскировочную механику ядра и молча её игнорировать.
+                Ok(Some(frame)) if frame.header.frame_type == FrameType::Cover => continue,
                 Ok(Some(frame)) => out.push(EdgeFrame {
                     stream_id: frame.header.stream_id,
                     kind: frame.header.frame_type.into(),

@@ -78,6 +78,9 @@ impl RawCastAdapter {
             FrameType::Credit => {
                 return Err("Credit frame is handled by muxer, not the bridge".into())
             }
+            FrameType::Cover => {
+                return Err("Cover frame is discarded by the handler, not the bridge".into())
+            }
         };
 
         Ok(RawCastFrame {

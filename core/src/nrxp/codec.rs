@@ -13,50 +13,273 @@
 //!
 //! ## Буфер `staging` в [`RxCodec`]
 //!
-//! Опирается на инвариант «1 TLS-запись = 1 кадр NRXP». TLS-записи
-//! расшифровываются по одной в общий буфер `staging`, и сразу делается попытка
-//! распарсить кадр. `staging` переживает вызовы `decode_inbound`: если в одном
-//! TCP-чтении пришло несколько записей, лишние остаются в нём до следующего
-//! вызова. Любой провал AEAD или парсинга после успешной расшифровки трактуется
+//! Инвариант — «кадр целиком лежит внутри одной TLS-записи»: кадр никогда не
+//! режется границей записи, но записей на кадр может приходиться меньше одной,
+//! то есть одна запись несёт **один или несколько** кадров (см.
+//! [`TxCodec::encode_batch`]). TLS-записи расшифровываются по одной в общий
+//! буфер `staging`, после чего делается попытка распарсить кадр; всё, что не
+//! разобрано в текущем вызове, переживает `decode_inbound` в `staging` и
+//! разбирается на следующем. Вызывающий reader крутит `decode_inbound` в цикле
+//! до `Ok(None)`, поэтому пачка кадров из одной записи выгребается целиком.
+//!
+//! Именно из-за этого свойства батчинг на передающей стороне **не потребовал ни
+//! изменений приёмника, ни бампа версии протокола**: уже задеплоенные узлы
+//! разбирают многокадровые записи корректно.
+//!
+//! Любой провал AEAD или парсинга после успешной расшифровки трактуется
 //! как рассинхрон/tampering → [`ErrorAction::Drop`] (пересоздать ногу с нуля).
 
 use crate::crypto::{AeadPacker, ChaChaCipher, ChaChaStream, SessionAuth};
 use crate::nrxp::bridge::TlsBridge;
 use crate::nrxp::errors::{ErrorAction, ErrorStage, TlsError};
-use crate::nrxp::frame::{Frame, FrameType};
+use crate::nrxp::frame::{Frame, FrameType, FRAME_HEADER_SIZE, MAX_RECORD_PLAINTEXT};
 use crate::parser::Parser;
-use bytes::{Bytes, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
+use rand::RngExt;
+
+/// Длина AEAD-тега ChaCha20-Poly1305: на столько шифртекст длиннее открытого
+/// текста, и ровно на столько поле длины TLS-записи больше плейнтекста.
+const AEAD_TAG_LEN: usize = 16;
+
+/// Максимальная длина TLS-записи на проводе (поле длины) — 16401.
+const MAX_RECORD_LEN: usize = MAX_RECORD_PLAINTEXT + AEAD_TAG_LEN;
+
+/// Выравниватель длин TLS-записей, параметры которого **свои у каждого соединения**.
+///
+/// Зачем набивка вообще: длина TLS-записи едет в открытом виде (2 байта
+/// заголовка записи не шифруются), поэтому без выравнивания наблюдатель читает
+/// точный размер каждого сообщения и строит по нему website-fingerprinting
+/// поверх сколь угодно хорошей маскировки хендшейка.
+///
+/// ## Что здесь было раньше и почему это чинилось
+///
+/// Набивка считалась в самом кадре по фиксированному набору бакетов
+/// {256, 512, 1024, 2048, 4096, 8192}, и, поскольку одна TLS-запись несла ровно
+/// один кадр, длина записи всегда равнялась `бакет + 41`. Отсюда арифметическая
+/// инварианта `длина − 41 = 2^k`, одинаковая **для всех соединений и всех
+/// развёртываний сразу**: множество наблюдаемых длин сводилось к шести
+/// значениям, а проверка стоила одно вычитание и один тест на степень двойки.
+///
+/// ## Что здесь теперь
+///
+/// Сетка с шагом: цель — ближайшая сверху точка `offset + k·step`, но не ниже
+/// `floor`. Все три параметра выбираются один раз на соединение. Свойства:
+///
+/// - набивка ограничена сверху `step − 1` (максимум 511 байт), то есть дешевле
+///   бакетов — там кадр 1400 байт добивался до 2048;
+/// - длин в соединении получается много (кратные шагу), а не шесть, что ближе
+///   к поведению настоящего TLS, чем любая короткая сетка;
+/// - общего для всех узлов маркера не остаётся: `step`/`offset`/`floor` у
+///   каждого соединения свои.
+///
+/// ## Что осталось незакрытым (честно)
+///
+/// Внутри одного соединения длины padded-записей сравнимы по модулю `step`, и
+/// наблюдатель, собравший достаточно записей, этот шаг восстановит. Это
+/// заметно слабее прежнего глобального признака, но не ноль. Полное решение —
+/// шейпинг под измеренное распределение длин настоящего сайта, а не сетка;
+/// это отдельная работа, а не правка кодека.
+struct PadShaper {
+    /// Шаг сетки, 64..=512 байт. Ограничивает набивку сверху.
+    step: usize,
+    /// Сдвиг сетки, чтобы длины не были кратны шагу «от нуля».
+    offset: usize,
+    /// Нижняя граница длины записи: без неё короткий payload оставался бы
+    /// коротким и выдавал бы себя размером.
+    floor: usize,
+}
+
+impl PadShaper {
+    fn new() -> Self {
+        let mut rng = rand::rng();
+        let step = rng.random_range(64..=512);
+        Self {
+            step,
+            offset: rng.random_range(0..step),
+            floor: rng.random_range(128..=512),
+        }
+    }
+
+    /// Целевая длина TLS-записи (то самое открытое поле длины) для записи,
+    /// открытый текст которой занимает `plaintext_len` байт.
+    ///
+    /// Записи, которые уже упёрлись в потолок, не трогаются: их длина и так
+    /// определяется размером батча writer'а, а не содержимым одного сообщения.
+    fn target_record_len(&self, plaintext_len: usize) -> usize {
+        let record_len = plaintext_len + AEAD_TAG_LEN;
+        if record_len >= MAX_RECORD_LEN {
+            return record_len;
+        }
+
+        let rel = record_len.saturating_sub(self.offset);
+        let aligned = self.offset + rel.div_ceil(self.step) * self.step;
+        let target = aligned.max(self.floor).max(record_len);
+
+        // Выходить за потолок настоящего TLS 1.3 нельзя ни при каких параметрах
+        // сетки — лучше оставить запись как есть.
+        if target > MAX_RECORD_LEN {
+            record_len
+        } else {
+            target
+        }
+    }
+}
 
 /// Исходящее направление: шифрует кадры для отправки в туннель.
 pub struct TxCodec {
     crypto: ChaChaStream,
     auth: SessionAuth,
+    shaper: PadShaper,
 }
 
 impl TxCodec {
     pub fn new(crypto: ChaChaStream, auth: SessionAuth) -> Self {
-        Self { crypto, auth }
+        Self {
+            crypto,
+            auth,
+            shaper: PadShaper::new(),
+        }
     }
 
     /// Кодирует один кадр в готовую к отправке TLS-запись `ApplicationData`.
-    ///
-    /// Шаги: сгенерировать time-based тег → собрать байты кадра → зашифровать
-    /// in-place (буфер вырастает на 16 байт AEAD-тега) → обернуть в TLS-запись.
-    /// Любая ошибка шифрования критична → [`ErrorAction::Drop`].
     pub(crate) fn encode_frame(
         &mut self,
         stream_id: u32,
         frame_type: FrameType,
         payload: Bytes,
     ) -> Result<Bytes, TlsError> {
+        self.encode_batch(vec![(stream_id, frame_type, payload)])
+    }
+
+    /// Кодирует пачку кадров, укладывая их в минимальное число TLS-записей.
+    ///
+    /// Кадры набиваются в запись жадно, пока помещаются в
+    /// [`MAX_RECORD_PLAINTEXT`]; на каждую запись приходится одно AEAD-шифрование
+    /// (один nonce) и один заголовок записи. Хвост последней записи добивается
+    /// набивкой до целевой длины из [`PadShaper`].
+    ///
+    /// ## Совместимость
+    ///
+    /// Приёмная сторона к этому готова **без изменений и без бампа версии**:
+    /// [`RxCodec::decode_inbound`] расшифровывает запись в буфер `staging`,
+    /// отдаёт первый разобранный кадр, а остаток оставляет в `staging` до
+    /// следующего вызова; вызывающий reader крутит `decode_inbound` в цикле до
+    /// `Ok(None)`. То есть запись с N кадрами корректно разбирает и уже
+    /// задеплоенная старая нода, и старый клиент.
+    pub(crate) fn encode_batch(
+        &mut self,
+        items: Vec<(u32, FrameType, Bytes)>,
+    ) -> Result<Bytes, TlsError> {
+        if items.is_empty() {
+            return Ok(Bytes::new());
+        }
+
         let tag = self.auth.generate_current_tag();
-        let frame = Frame::new(stream_id, frame_type, payload);
+        let mut out = BytesMut::new();
+        let mut batch: Vec<(u32, FrameType, Bytes)> = Vec::new();
+        let mut batch_len = 0usize;
 
-        // frame_bytes — это BytesMut. Выделяем и формируем заголовок.
-        let mut frame_bytes = frame.into_bytes(&tag);
+        for item in items {
+            let need = Frame::wire_len(item.2.len(), 0);
 
-        // Шифруем In-Place. Массив frame_bytes мутирует и вырастает на 16 байт тега AEAD.
-        self.crypto.encrypt(&mut frame_bytes).map_err(|e| {
+            // Кадр, который сам по себе не влезает в запись (крупный
+            // control-payload вроде Diag-снапшота), уезжает отдельной записью
+            // без набивки — как и до появления батчинга.
+            if need > MAX_RECORD_PLAINTEXT {
+                if !batch.is_empty() {
+                    self.flush_shaped(&tag, std::mem::take(&mut batch), batch_len, &mut out)?;
+                    batch_len = 0;
+                }
+                self.flush_record(&tag, vec![item], 0, &mut out)?;
+                continue;
+            }
+
+            if batch_len + need > MAX_RECORD_PLAINTEXT {
+                self.flush_shaped(&tag, std::mem::take(&mut batch), batch_len, &mut out)?;
+                batch_len = 0;
+            }
+
+            batch_len += need;
+            batch.push(item);
+        }
+
+        if !batch.is_empty() {
+            self.flush_shaped(&tag, batch, batch_len, &mut out)?;
+        }
+
+        Ok(out.freeze())
+    }
+
+    /// Кодирует один [`FrameType::Cover`]-кадр так, чтобы длина TLS-записи
+    /// вышла **ровно** `target_record_len`.
+    ///
+    /// Cover-кадры имитируют flight настоящего TLS-сервера, поэтому их размер
+    /// задаётся снаружи профилем ([`crate::tlseng::sample_server_flight`]) и
+    /// не проходит через [`PadShaper`]: тот выравнивает наш собственный
+    /// трафик, а здесь надо попасть в заранее посчитанную длину.
+    pub(crate) fn encode_cover(&mut self, target_record_len: usize) -> Result<Bytes, TlsError> {
+        // Запись из одного пустого кадра — это 25 байт заголовка + 16 байт
+        // AEAD-тега, всё остальное добирается набивкой.
+        const EMPTY_COVER_RECORD: usize = FRAME_HEADER_SIZE as usize + AEAD_TAG_LEN;
+
+        let target = target_record_len.clamp(EMPTY_COVER_RECORD, MAX_RECORD_LEN);
+        let pad = target - EMPTY_COVER_RECORD;
+
+        let tag = self.auth.generate_current_tag();
+        let mut out = BytesMut::new();
+        self.flush_record(
+            &tag,
+            vec![(0, FrameType::Cover, Bytes::new())],
+            pad,
+            &mut out,
+        )?;
+        Ok(out.freeze())
+    }
+
+    /// [`flush_record`](Self::flush_record) с набивкой, посчитанной шейпером.
+    fn flush_shaped(
+        &mut self,
+        tag: &[u8; 16],
+        frames: Vec<(u32, FrameType, Bytes)>,
+        plain_len: usize,
+        out: &mut BytesMut,
+    ) -> Result<(), TlsError> {
+        let pad = self
+            .shaper
+            .target_record_len(plain_len)
+            .saturating_sub(plain_len + AEAD_TAG_LEN)
+            .min(MAX_RECORD_PLAINTEXT - plain_len);
+        self.flush_record(tag, frames, pad, out)
+    }
+
+    /// Собирает кадры в один открытый текст, дописывает `pad` байт набивки,
+    /// шифрует одним вызовом AEAD и кладёт готовую TLS-запись в `out`.
+    ///
+    /// Набивка идёт в ХВОСТ последнего кадра записи: `padding_len` — поле
+    /// самого кадра, и приёмник пропускает его штатно, ничего не зная о том,
+    /// что решение принималось на уровне записи.
+    fn flush_record(
+        &mut self,
+        tag: &[u8; 16],
+        frames: Vec<(u32, FrameType, Bytes)>,
+        pad: usize,
+        out: &mut BytesMut,
+    ) -> Result<(), TlsError> {
+        debug_assert!(!frames.is_empty());
+
+        let plain_len: usize = frames
+            .iter()
+            .map(|(_, _, payload)| Frame::wire_len(payload.len(), 0))
+            .sum();
+
+        let mut buf = BytesMut::with_capacity(plain_len + pad);
+        let last = frames.len() - 1;
+        for (idx, (stream_id, frame_type, payload)) in frames.into_iter().enumerate() {
+            let pad_here = if idx == last { pad as u16 } else { 0 };
+            buf.put_slice(&Frame::new(stream_id, frame_type, payload).into_bytes(tag, pad_here));
+        }
+
+        self.crypto.encrypt(&mut buf).map_err(|e| {
             netrunner_logger::error!("Encryption failed: {:?}", e);
             TlsError::new(
                 ErrorStage::Tls("Encryption failed"),
@@ -65,8 +288,8 @@ impl TxCodec {
             )
         })?;
 
-        // Только в самом конце замораживаем буфер (Zero-Copy операция) для отправки
-        Ok(TlsBridge::pack_app_data(frame_bytes.freeze()))
+        out.put_slice(&TlsBridge::pack_app_data(buf.freeze()));
+        Ok(())
     }
 }
 
@@ -106,11 +329,13 @@ impl RxCodec {
             }
         }
 
-        // Encoding invariant: one TLS ApplicationData record = one encrypted NRXP
-        // frame.  We decrypt each record independently into the staging buffer and
-        // immediately attempt to parse.  split_off + decrypt_in_place + unsplit is
-        // used to keep the decrypted bytes in staging's existing allocation (zero
-        // extra allocation on the fast path).
+        // Encoding invariant: an NRXP frame never straddles a TLS record boundary,
+        // but one record may carry SEVERAL frames (see TxCodec::encode_batch).  We
+        // decrypt each record independently into the staging buffer and immediately
+        // attempt to parse; whatever is left over stays in staging for the next
+        // call.  split_off + decrypt_in_place + unsplit is used to keep the
+        // decrypted bytes in staging's existing allocation (zero extra allocation
+        // on the fast path).
         while let Some(app_data) = TlsBridge::unpack_app_data(buffer)? {
             let start_idx = self.staging.len();
             self.staging.extend_from_slice(&app_data.payload);
@@ -142,11 +367,11 @@ impl RxCodec {
                 return Ok(Some(frame));
             }
 
-            // try_parse_frame returned Ok(None) — this should never happen with the
-            // 1:1 TLS-record→NRXP-frame invariant, but if it does (e.g. an empty
-            // padding-only frame), we continue to the next TLS record rather than
-            // looping indefinitely.  The staging bytes will be parsed on the next
-            // decode_inbound call.
+            // try_parse_frame returned Ok(None) — this should never happen, since a
+            // frame is never split across records, so a fully decrypted record
+            // always yields at least one complete frame.  If it does happen anyway,
+            // we continue to the next TLS record rather than looping indefinitely.
+            // The staging bytes will be parsed on the next decode_inbound call.
         }
 
         Ok(None)
@@ -232,6 +457,50 @@ mod tests {
     }
 
     #[test]
+    fn cover_record_hits_the_requested_length_exactly() {
+        let ((_c, mut tx), (_s, _t)) = client_server_pair();
+        for target in [41usize, 60, 130, 1500, 4200, 16401] {
+            let wire = tx.encode_cover(target).unwrap();
+            let lens = record_lengths(&wire);
+            assert_eq!(lens.len(), 1, "cover — это ровно одна TLS-запись");
+            assert_eq!(
+                lens[0], target,
+                "профиль flight'а задаёт длину точно, шейпер к cover не применяется"
+            );
+        }
+    }
+
+    #[test]
+    fn cover_record_is_clamped_to_the_real_tls_maximum() {
+        let ((_c, mut tx), (_s, _t)) = client_server_pair();
+        // Меньше пустой записи и больше потолка TLS 1.3 — оба края зажимаются,
+        // а не приводят к панике на вычитании или к невалидной записи.
+        for target in [0usize, 1, 40, 100_000] {
+            let wire = tx.encode_cover(target).unwrap();
+            let len = record_lengths(&wire)[0];
+            assert!(
+                (41..=16401).contains(&len),
+                "длина cover-записи {len} вне допустимого диапазона"
+            );
+        }
+    }
+
+    #[test]
+    fn cover_frames_decode_as_cover_and_carry_no_payload() {
+        let ((_c, mut c_tx), (mut s_rx, _s_tx)) = client_server_pair();
+        let wire = c_tx.encode_cover(2000).unwrap();
+
+        let mut buf = BytesMut::from(&wire[..]);
+        let frame = s_rx.decode_inbound(&mut buf).unwrap().unwrap();
+        assert_eq!(frame.header.frame_type, FrameType::Cover);
+        assert!(frame.payload.is_empty(), "cover не несёт данных");
+        assert!(
+            s_rx.decode_inbound(&mut buf).unwrap().is_none(),
+            "в записи был ровно один кадр"
+        );
+    }
+
+    #[test]
     fn client_to_server_round_trip() {
         let ((_client_rx, mut client_tx), (mut server_rx, _server_tx)) = client_server_pair();
 
@@ -293,6 +562,161 @@ mod tests {
 
         let result = server_rx.decode_inbound(&mut tampered);
         assert!(result.is_err(), "tampered ciphertext must not decrypt");
+    }
+
+    /// Разбирает буфер на длины TLS-записей (то, что видит DPI в открытую).
+    fn record_lengths(wire: &[u8]) -> Vec<usize> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i + 5 <= wire.len() {
+            let len = u16::from_be_bytes([wire[i + 3], wire[i + 4]]) as usize;
+            out.push(len);
+            i += 5 + len;
+        }
+        assert_eq!(i, wire.len(), "буфер должен разбираться на целые записи");
+        out
+    }
+
+    #[test]
+    fn batch_of_frames_round_trips_through_an_unchanged_receiver() {
+        // Главная гарантия совместимости: приёмник не менялся вообще, а пачку
+        // кадров в одной записи обязан выгрести целиком и по порядку.
+        let ((_c_rx, mut c_tx), (mut s_rx, _s_tx)) = client_server_pair();
+
+        let sent: Vec<(u32, FrameType, Bytes)> = vec![
+            (1, FrameType::Connect, Bytes::from_static(b"1.2.3.4:443")),
+            (1, FrameType::Data, Bytes::from_static(b"GET / HTTP/1.1")),
+            (3, FrameType::Data, Bytes::from_static(b"second stream")),
+            (0, FrameType::Heartbeat, Bytes::new()),
+        ];
+        let wire = c_tx.encode_batch(sent.clone()).unwrap();
+
+        let mut buf = BytesMut::from(&wire[..]);
+        let mut got = Vec::new();
+        while let Some(frame) = s_rx.decode_inbound(&mut buf).unwrap() {
+            got.push((
+                frame.header.stream_id,
+                frame.header.frame_type,
+                frame.payload,
+            ));
+        }
+
+        assert_eq!(got, sent, "кадры должны прийти все и в исходном порядке");
+    }
+
+    #[test]
+    fn small_frames_share_a_single_tls_record() {
+        let ((_c_rx, mut c_tx), (_s_rx, _s_tx)) = client_server_pair();
+        let items = (0..8)
+            .map(|i| (i, FrameType::Data, Bytes::from_static(b"tiny")))
+            .collect();
+        let wire = c_tx.encode_batch(items).unwrap();
+        assert_eq!(
+            record_lengths(&wire).len(),
+            1,
+            "восемь мелких кадров обязаны уехать одной записью, а не восемью"
+        );
+    }
+
+    #[test]
+    fn record_length_never_exceeds_real_tls13_maximum() {
+        // 16401 = 2^14 плейнтекста + байт content_type + 16 байт AEAD-тега —
+        // потолок, который выдаёт настоящий TLS 1.3. Раньше кадр максимального
+        // размера давал 16425, то есть значение, недостижимое для браузера:
+        // константный маркер прямо в открытом поле длины.
+        let ((_c_rx, mut c_tx), (_s_rx, _s_tx)) = client_server_pair();
+
+        for total in [1usize, 8192, 16360, 16361, 40000, 100_000] {
+            let items = vec![(1, FrameType::Data, Bytes::from(vec![0u8; total]))]
+                .into_iter()
+                .flat_map(|(sid, ty, data)| {
+                    data.chunks(crate::nrxp::MAX_FRAME_PAYLOAD)
+                        .map(|c| (sid, ty, Bytes::copy_from_slice(c)))
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            let wire = c_tx.encode_batch(items).unwrap();
+            for len in record_lengths(&wire) {
+                assert!(
+                    len <= 16401,
+                    "длина записи {len} превышает максимум настоящего TLS 1.3 (16401)"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn max_payload_frame_produces_exactly_the_real_tls_maximum() {
+        let ((_c_rx, mut c_tx), (_s_rx, _s_tx)) = client_server_pair();
+        let wire = c_tx
+            .encode_frame(
+                1,
+                FrameType::Data,
+                Bytes::from(vec![0u8; crate::nrxp::MAX_FRAME_PAYLOAD]),
+            )
+            .unwrap();
+        assert_eq!(record_lengths(&wire), vec![16401]);
+    }
+
+    #[test]
+    fn shaper_never_exceeds_the_real_tls_maximum_and_bounds_the_padding() {
+        for _ in 0..2000 {
+            let shaper = PadShaper::new();
+            for plain in [1usize, 42, 300, 1441, 8233, MAX_RECORD_PLAINTEXT - 1, MAX_RECORD_PLAINTEXT]
+            {
+                let target = shaper.target_record_len(plain);
+                let record_len = plain + AEAD_TAG_LEN;
+                assert!(
+                    target >= record_len,
+                    "цель не может быть короче самой записи"
+                );
+                assert!(
+                    target <= MAX_RECORD_LEN.max(record_len),
+                    "цель {target} превышает потолок настоящего TLS 1.3"
+                );
+                // Набивка ограничена шагом либо подъёмом до пола — и то и другое
+                // не больше 512 байт.
+                assert!(
+                    target - record_len <= 512,
+                    "набивка {} превышает 512 байт", target - record_len
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn record_lengths_carry_no_global_power_of_two_invariant() {
+        // Регрессия на детектор `длина − 41 = 2^k`: до этой правки одна запись
+        // несла один кадр с бакетным паддингом, и множество длин сводилось к
+        // шести значениям, ОДИНАКОВЫМ для всех соединений сразу. Проверяем,
+        // что разные соединения дают разные сетки и инварианта больше нет.
+        let is_pow2 = |n: usize| n.is_power_of_two();
+
+        let mut seen = std::collections::HashSet::new();
+        let mut invariant_holds_everywhere = true;
+
+        for _ in 0..64 {
+            let ((_c_rx, mut c_tx), (_s_rx, _s_tx)) = client_server_pair();
+            let wire = c_tx
+                .encode_frame(1, FrameType::Data, Bytes::from_static(b"x"))
+                .unwrap();
+            let len = record_lengths(&wire)[0];
+            seen.insert(len);
+            if !is_pow2(len.saturating_sub(41)) {
+                invariant_holds_everywhere = false;
+            }
+        }
+
+        assert!(
+            seen.len() > 1,
+            "длина записи для одного и того же payload обязана отличаться между \
+             соединениями, иначе это по-прежнему глобальная константа: {seen:?}"
+        );
+        assert!(
+            !invariant_holds_everywhere,
+            "инварианта `длина − 41 = степень двойки` не должна выполняться для \
+             всех соединений подряд"
+        );
     }
 
     #[test]

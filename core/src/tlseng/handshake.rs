@@ -142,11 +142,24 @@ impl ClientHello {
         let auth = SessionAuth::new(keys.get_auth_key());
         session_id_bytes[16..].copy_from_slice(&auth.generate_current_tag());
 
-        let record_header = 5;
+        // Цель паддинга (`profile.target_padding_len`) меряется в байтах
+        // **payload TLS-записи**, а не всей записи вместе с её 5-байтовым
+        // заголовком. RFC 7685 (и реализующий его BoringSSL) добивает
+        // ClientHello так, чтобы payload записи был НЕ МЕНЬШЕ 512 байт —
+        // именно затем, чтобы выскочить из диапазона 256..511, который часть
+        // старых серверов принимает за SSLv2. На проводе это даёт запись 517.
+        //
+        // Раньше в `total_overhead` входили и эти 5 байт заголовка записи,
+        // поэтому цель 512 достигалась целиком вместе с ним: Chrome-профиль
+        // давал payload 507, Edge-профиль 511 — оба ВНУТРИ того самого
+        // запрещённого диапазона, из которого паддинг обязан выводить.
+        // Настоящий Chromium туда попасть не может по построению, так что
+        // проверка «отпечаток Chromium И payload записи в 256..511» отделяла
+        // нас от браузера одним пакетом и без единого ложного срабатывания.
         let handshake_header = 4;
         let client_hello_fixed = 2 + 32 + 1 + 32 + 2 + (profile.cipher_suites.len() * 2) + 2 + 2;
 
-        let total_overhead = record_header + handshake_header + client_hello_fixed;
+        let total_overhead = handshake_header + client_hello_fixed;
 
         let mut ext_builder = ExtensionBuilder::new();
 
@@ -494,6 +507,61 @@ mod tests {
     /// разбирает и строит ServerHello → клиент разбирает ServerHello. Обе
     /// стороны должны вывести идентичные AEAD-параметры (крест-накрест: tx
     /// одной стороны == rx другой) и общий auth_key.
+    #[test]
+    fn chromium_client_hello_escapes_the_rfc7685_forbidden_range() {
+        // RFC 7685 существует ровно затем, чтобы ClientHello не оставался в
+        // диапазоне 256..511 байт payload записи; BoringSSL добивает его до 512,
+        // что на проводе даёт запись 517. Раньше Chrome-профиль давал 507, а
+        // Edge-профиль 511 — оба ВНУТРИ запрещённого диапазона, куда настоящий
+        // Chromium попасть не может. Проверка «отпечаток Chromium И payload в
+        // 256..511» отделяла нас от браузера одним пакетом без ложных
+        // срабатываний.
+        for (name, profile) in [
+            ("Chrome 131", &BrowserProfile::CHROME_131),
+            ("Edge 130", &BrowserProfile::EDGE_130),
+        ] {
+            for host in [
+                "a.co",
+                "example.com",
+                "www.debian.org",
+                "very-long-subdomain.example.organization.test",
+            ] {
+                let keys = SessionKeys::new(true);
+                let wire = ClientHello::make_client_hello(profile, host, &keys);
+                let record_payload = u16::from_be_bytes([wire[3], wire[4]]) as usize;
+
+                assert_eq!(
+                    record_payload, 512,
+                    "{name} / SNI {host}: payload записи обязан быть ровно 512"
+                );
+                assert_eq!(
+                    wire.len(),
+                    517,
+                    "{name} / SNI {host}: запись на проводе обязана быть 517 байт"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn padding_is_the_last_extension_in_every_profile_that_uses_it() {
+        // Длина паддинга вычисляется под целевой размер всего ClientHello,
+        // поэтому любое расширение после него промахивает цель ровно на свою
+        // длину. Именно так Edge-профиль давал 511 вместо 512: за PADDING стоял
+        // завершающий GREASE на 4 байта. BoringSSL по той же причине всегда
+        // добавляет padding последним.
+        for profile in BrowserProfile::ALL {
+            let order = profile.extension_order.0;
+            if let Some(pos) = order.iter().position(|&e| e == crate::tlseng::types::TlsExtensions::PADDING) {
+                assert_eq!(
+                    pos,
+                    order.len() - 1,
+                    "PADDING обязан быть последним в порядке расширений"
+                );
+            }
+        }
+    }
+
     #[test]
     fn full_handshake_round_trip_derives_matching_keys() {
         for profile in BrowserProfile::ALL {

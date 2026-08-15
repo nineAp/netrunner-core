@@ -27,8 +27,26 @@ pub const TCP_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
 pub const UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
 /// Глобальный простой соединения до его закрытия.
 pub const GLOBAL_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
-/// Период health-check'ов ног туннеля (heartbeat/проверка живости).
+/// Базовый период heartbeat'а ноги (writer туннеля). Реальная задержка — это
+/// значение с джиттером ±30 % и множителем 1…8 по длительности простоя, см.
+/// `TunnelEngine::next_heartbeat_delay`.
 pub const HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(3);
+/// Насколько недавним должен быть PONG, чтобы `Muxer::perform_health_check`
+/// счёл ногу заведомо живой и **не слал ей отдельный PING**.
+///
+/// Heartbeat writer'а и health-check делают ровно одно и то же (PING → PONG →
+/// замер RTT), но исторически работали независимо: на пустом туннеле это
+/// давало на каждую ногу и heartbeat'ы, и пробы health-check'а — основной
+/// объём холостого трафика. Окно взято с запасом над самым медленным
+/// heartbeat'ом (3 с × 8 × 1,3 ≈ 31 с), чтобы на простое проба не срабатывала
+/// вообще.
+///
+/// **Цена:** на полностью idle-ноге обнаружение обрыва растягивается до
+/// `LEG_PONG_FRESHNESS + HEALTH_CHECK_TIMEOUT` (~65 с) вместо ~30 с. Это
+/// сознательно: пока по ноге нет трафика, её смерть ничего не стоит, а первая
+/// же попытка записи упрётся в ошибку сокета и уведёт поток на соседнюю ногу
+/// немедленно, не дожидаясь health-check'а.
+pub const LEG_PONG_FRESHNESS: Duration = Duration::from_secs(45);
 /// Сколько ждать ответа на health-check, прежде чем счесть ногу мёртвой.
 pub const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(20);
 /// Пауза перед переподключением упавшей ноги.
@@ -171,13 +189,25 @@ pub const TUNNEL_READ_RESERVE: usize = 16 * 1024;
 /// Maximum bytes written per stream in a single interleaved write pass.
 /// Base value; adaptive_batch_chunk multiplies this by (1 + RTT_ms / 250) up to 4×.
 /// At 300+ ms RTT, expect ~64 KB per pass (4× base), batching more frames per syscall.
-pub const TUNNEL_INTERLEAVE_CHUNK: usize = 16 * 1024;
+///
+/// Deliberately **exactly one frame payload**, not a round 16 KiB. `handle_outbound`
+/// slices a message into `MAX_FRAME_PAYLOAD` frames, so a chunk that is not a
+/// multiple of it leaves a tiny remainder frame on every single pass — with
+/// 16384 against a 16360 payload cap that was a 24-byte frame after every full
+/// one, i.e. a steady "big record, tiny record" alternation visible from the
+/// outside as a pattern of its own. Every adaptive multiple of this value stays
+/// an exact multiple of the frame payload.
+pub const TUNNEL_INTERLEAVE_CHUNK: usize = crate::nrxp::MAX_FRAME_PAYLOAD;
 /// Max bytes a stream bridge reads per pass before producing a data message.
 /// At high RTT (>300 ms), bigger chunks reduce context switches and improve
-/// coalescing in the writer. Increased to 64 KB: still fits in wire frames
-/// (multiple 16 KB NRXP frames per message) while batching better.
+/// coalescing in the writer. ~64 KB: still fits in wire frames (several NRXP
+/// frames per message) while batching better.
 /// Per-leg queue size = CHANNEL_PACKETS × this ≈ 64 × 64 KB = 4 MB baseline.
-pub const BRIDGE_READ_CHUNK: usize = 64 * 1024;
+///
+/// Expressed as a whole number of frame payloads for the same reason as
+/// [`TUNNEL_INTERLEAVE_CHUNK`]: a full read then slices into exactly four
+/// maximum-size frames with no systematic remainder.
+pub const BRIDGE_READ_CHUNK: usize = 4 * crate::nrxp::MAX_FRAME_PAYLOAD;
 
 // ── Tunnel leg TCP socket tuning ─────────────────────────────────────────────
 /// OS-level TCP send buffer for each tunnel leg.  At high RTT (>300 ms),

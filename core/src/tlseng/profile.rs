@@ -221,9 +221,90 @@ impl ServerProfile {
     };
 }
 
+/// Длины TLS-записей, которыми настоящий сервер TLS 1.3 отвечает сразу после
+/// `ServerHello` — то, что имитирует cover-flight (см. `nrxp::FrameType::Cover`).
+///
+/// ## Что имитируется
+///
+/// После `ServerHello` (и фиктивного CCS) сервер шлёт `EncryptedExtensions`,
+/// `Certificate`, `CertificateVerify` и `Finished`. Все они уже зашифрованы,
+/// поэтому на проводе едут записями с content-type `ApplicationData`. Отсюда
+/// два свойства, которые и надо воспроизвести:
+///
+/// 1. **первую запись `ApplicationData` в сессии всегда отправляет сервер**;
+/// 2. его первый flight весит порядка 1–5 КБ, а не 133 байта.
+///
+/// ## Откуда числа
+///
+/// Размер определяется цепочкой сертификатов: ECDSA P-256 (лист +
+/// промежуточный) — примерно 1,5–2,5 КБ, RSA-2048 — 3–4,5 КБ; сверху
+/// `CertificateVerify` (порядка 80–270 Б) и `Finished` (около 40–55 Б), плюс
+/// SCT/OCSP-stapling, если сервер их отдаёт. Часть стеков укладывает весь
+/// flight в одну запись, часть отделяет `Finished` в свою.
+///
+/// **Границы здесь эвристические.** Они выбраны так, чтобы накрыть обе
+/// типовые конфигурации, но не сняты с живого захвата конкретного decoy'я.
+/// Правильный следующий шаг — калибровать их по реальному ответу
+/// `decoy_host`: наблюдать длины записей его flight'а (заголовок записи не
+/// шифруется, читать содержимое не нужно) и воспроизводить именно их.
+pub(crate) fn sample_server_flight() -> Vec<usize> {
+    use rand::RngExt;
+    let mut rng = rand::rng();
+
+    // Разделять ли Finished в отдельную запись — примерно поровну, как и
+    // распределены сами стеки.
+    if rng.random_range(0..100) < 55 {
+        vec![rng.random_range(1500..=4200)]
+    } else {
+        vec![rng.random_range(1400..=3900), rng.random_range(50..=130)]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn server_flight_looks_like_a_real_certificate_flight() {
+        let mut seen_split = false;
+        let mut seen_single = false;
+
+        for _ in 0..2000 {
+            let flight = sample_server_flight();
+            assert!(
+                (1..=2).contains(&flight.len()),
+                "настоящий flight — одна или две записи, а не {}",
+                flight.len()
+            );
+
+            let total: usize = flight.iter().sum();
+            assert!(
+                (1400..=4400).contains(&total),
+                "суммарный flight {total} B вне правдоподобного диапазона для \
+                 цепочки сертификатов (ECDSA ~1,5–2,5 КБ, RSA-2048 ~3–4,5 КБ)"
+            );
+            assert!(
+                total > 1000,
+                "flight обязан быть на порядок больше прежних 133 B — иначе он \
+                 не решает задачу, ради которой введён"
+            );
+
+            for &len in &flight {
+                assert!(len <= 16401, "запись {len} длиннее максимума TLS 1.3");
+            }
+
+            match flight.len() {
+                1 => seen_single = true,
+                _ => seen_split = true,
+            }
+        }
+
+        assert!(
+            seen_single && seen_split,
+            "обе формы flight'а (одной записью и с отдельным Finished) должны \
+             встречаться — иначе это не распределение, а константа"
+        );
+    }
 
     #[test]
     fn for_session_is_deterministic_for_the_same_session_id() {

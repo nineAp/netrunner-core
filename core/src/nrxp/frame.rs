@@ -39,6 +39,22 @@ pub(crate) enum FrameType {
     /// прислать ещё N байт"). Отправляется приёмной стороной по мере
     /// освобождения локального буфера — см. `Muxer::grant_credit`/`consume_credit`.
     Credit = 0x07,
+    /// Кадр-пустышка: несёт только набивку и существует ради формы трафика,
+    /// а не ради данных. Получатель молча его отбрасывает.
+    ///
+    /// Зачем: в настоящем TLS 1.3 сервер сразу после `ServerHello` отправляет
+    /// `EncryptedExtensions` + `Certificate` + `CertificateVerify` + `Finished`,
+    /// и всё это едет записями с content-type `ApplicationData` — то есть
+    /// **первую запись ApplicationData в сессии всегда шлёт сервер**, и весит
+    /// его первый flight порядка 1–5 КБ. Без этих кадров наш сервер отвечал
+    /// 127-байтовым `ServerHello`, 6-байтовым CCS и замолкал до первого слова
+    /// клиента: булев признак с нулевой ошибкой, обесценивающий сколь угодно
+    /// точную мимикрию `ClientHello`.
+    ///
+    /// Тип введён в версии протокола 2 (см. [`crate::MIN_VERSION_FOR_COVER`]):
+    /// клиенту, объявившему версию 1, такие кадры не отправляются — он бы не
+    /// разобрал неизвестный тип и уронил ногу.
+    Cover = 0x08,
 }
 
 /// Разобранный заголовок кадра (25 байт). Поля идут в том же порядке, что и в wire.
@@ -75,9 +91,25 @@ const PADDING_LEN_SIZE: u16 = 2;
 /// Суммарный размер заголовка кадра — 25 байт.
 pub const FRAME_HEADER_SIZE: u16 =
     AUTH_TAG_SIZE + STREAM_ID_SIZE + FRAME_TYPE_SIZE + PAYLOAD_LEN_SIZE + PADDING_LEN_SIZE; // 25 bytes
-/// Потолок payload одного кадра (16 КБ). Совпадает с размером interleave-чанка
-/// writer'а: большие сообщения режутся на куски не больше этого значения.
-pub const MAX_FRAME_PAYLOAD: usize = 16 * 1024;
+
+/// Потолок открытого текста одной TLS-записи — 2^14 + 1 байт.
+///
+/// Ровно столько выдаёт конформный TLS 1.3: `content` до 2^14 плюс байт
+/// `content_type` в `TLSInnerPlaintext` (RFC 8446 §5.2). С 16-байтовым
+/// AEAD-тегом это даёт поле длины записи 16401 — верхнюю границу, которую
+/// реально видно в дампах браузерного HTTPS.
+///
+/// Раньше кадр мог занять 16384 байта payload, что после заголовка и тега
+/// давало поле длины **16425** — значение, недостижимое ни для одного
+/// браузера (record-padding TLS 1.3 они не применяют), то есть константный
+/// маркер в открытом виде. Ограничение введено, чтобы максимальная запись
+/// совпадала с настоящей байт-в-байт.
+pub const MAX_RECORD_PLAINTEXT: usize = (1 << 14) + 1;
+
+/// Потолок payload одного кадра: столько остаётся от [`MAX_RECORD_PLAINTEXT`]
+/// после 25-байтового заголовка. Кадр максимального размера занимает запись
+/// целиком, поле длины при этом равно 16401.
+pub const MAX_FRAME_PAYLOAD: usize = MAX_RECORD_PLAINTEXT - FRAME_HEADER_SIZE as usize; // 16360
 
 impl Frame {
     /// Конструирует кадр с нулевым `auth_tag` и `padding_len` — оба заполняются
@@ -96,26 +128,36 @@ impl Frame {
         }
     }
 
+    /// Размер кадра на проводе (до шифрования) при заданном паддинге.
+    #[inline(always)]
+    pub(crate) fn wire_len(payload_len: usize, padding_len: u16) -> usize {
+        FRAME_HEADER_SIZE as usize + payload_len + padding_len as usize
+    }
+
     /// Сериализует кадр в [`BytesMut`], готовый к шифрованию на месте.
     ///
     /// `auth_key` здесь — это уже готовый 16-байтовый тег (имя историческое),
-    /// который кладётся в начало заголовка. Для `Data`/`UdpData` — выравнивание
-    /// до ближайшего бакета из [`bucket_padding`] (throughput всё ещё важнее,
-    /// поэтому кадры, уже близкие к максимальному размеру, не паддятся вовсе),
-    /// для остальных типов — 0..255 случайных байт. Буфер выделяется один раз
-    /// точно под итоговый размер; заголовок собирается на стеке и пишется
-    /// одним `copy_from_slice`.
+    /// который кладётся в начало заголовка. `padding_len` задаётся **снаружи**:
+    /// решение о набивке принимает кодек, и принимает его на уровне целой
+    /// TLS-записи, а не отдельного кадра — см. `nrxp::codec::PadGrid`. Кадр
+    /// знает только, сколько случайных байт дописать в хвост.
+    ///
+    /// Раньше набивка считалась здесь же: `Data`/`UdpData` выравнивались до
+    /// ближайшего бакета из фиксированного набора {256…8192}, остальные типы
+    /// получали 0..255 случайных байт. Поскольку одна запись несла ровно один
+    /// кадр, длина записи получалась равной `бакет + 41` — то есть в открытом
+    /// поле длины TLS-записи наблюдалась арифметическая инварианта
+    /// «длина − 41 равна степени двойки». Набор возможных длин был при этом
+    /// одинаков для всех соединений и всех развёртываний. Именно поэтому
+    /// решение перенесено на уровень записи и рандомизировано на соединение.
+    ///
+    /// Буфер выделяется один раз точно под итоговый размер; заголовок
+    /// собирается на стеке и пишется одним `copy_from_slice`.
     #[inline]
-    pub(crate) fn into_bytes(mut self, auth_key: &[u8; 16]) -> BytesMut {
-        // 🔥 ОПТИМИЗАЦИЯ: Быстрая побитовая маска (& 0xFF) вместо дорогого деления с остатком (%)
-        let padding_len = match self.header.frame_type {
-            FrameType::Data | FrameType::UdpData => Self::bucket_padding(self.payload.len()),
-            _ => (rand::rng().next_u32() & 0xFF) as u16,
-        };
-
+    pub(crate) fn into_bytes(mut self, auth_key: &[u8; 16], padding_len: u16) -> BytesMut {
         self.header.padding_len = padding_len;
 
-        let total_size = FRAME_HEADER_SIZE as usize + self.payload.len() + padding_len as usize;
+        let total_size = Self::wire_len(self.payload.len(), padding_len);
         let mut buf = BytesMut::with_capacity(total_size);
 
         // 🔥 ОПТИМИЗАЦИЯ (Zero-Cost Abstraction): Собираем заголовок в стеке (в регистрах)
@@ -140,29 +182,6 @@ impl Frame {
         }
 
         buf
-    }
-
-    /// Длина паддинга для выравнивания `Data`/`UdpData` кадра до ближайшего
-    /// "круглого" бакета вместо точной длины полезной нагрузки.
-    ///
-    /// Не паддит кадры, уже близкие к [`MAX_FRAME_PAYLOAD`] (крупные бакеты
-    /// закачек) — это почти весь трафик объёмных передач, где паддинг только
-    /// снижал бы throughput без выигрыша в приватности (снаружи и так виден
-    /// кадр максимального размера, угадывать в нём нечего). Именно маленькие
-    /// кадры (запросы, интерактив, начало HTTP-ответа) — то место, где по
-    /// точной длине конкретного пакета легче всего строить атаки
-    /// website/traffic fingerprinting поверх уже неотличимого от HTTPS
-    /// хендшейка, поэтому их выравнивание даёт больше всего эффекта за
-    /// наименьшие накладные расходы.
-    #[inline]
-    fn bucket_padding(payload_len: usize) -> u16 {
-        const BUCKETS: [usize; 6] = [256, 512, 1024, 2048, 4096, 8192];
-        for &bucket in &BUCKETS {
-            if payload_len <= bucket {
-                return (bucket - payload_len) as u16;
-            }
-        }
-        0
     }
 }
 
@@ -200,6 +219,7 @@ impl Parser for FrameHeader {
             0x05 => FrameType::UdpData,
             0x06 => FrameType::Diag,
             0x07 => FrameType::Credit,
+            0x08 => FrameType::Cover,
             unknown => {
                 // After successful AEAD decryption an unknown frame type means a
                 // protocol version mismatch or data corruption that the cipher
@@ -275,15 +295,15 @@ mod tests {
 
     const AUTH_KEY: [u8; 16] = [0x42; 16];
 
-    fn round_trip(frame_type: FrameType, payload: &[u8]) -> Frame {
+    fn round_trip(frame_type: FrameType, payload: &[u8], pad: u16) -> Frame {
         let frame = Frame::new(7, frame_type, Bytes::copy_from_slice(payload));
-        let mut wire = frame.into_bytes(&AUTH_KEY);
+        let mut wire = frame.into_bytes(&AUTH_KEY, pad);
         Frame::parse(&mut wire).unwrap().unwrap()
     }
 
     #[test]
     fn round_trip_preserves_payload_and_metadata() {
-        let parsed = round_trip(FrameType::Data, b"some tunnel payload");
+        let parsed = round_trip(FrameType::Data, b"some tunnel payload", 0);
         assert_eq!(parsed.header.stream_id, 7);
         assert_eq!(parsed.header.frame_type, FrameType::Data);
         assert_eq!(&parsed.payload[..], b"some tunnel payload");
@@ -291,87 +311,71 @@ mod tests {
     }
 
     #[test]
-    fn control_frames_get_random_padding_0_to_255() {
-        for frame_type in [
-            FrameType::Connect,
-            FrameType::Close,
-            FrameType::Heartbeat,
-            FrameType::UdpConnect,
-            FrameType::Diag,
-            FrameType::Credit,
+    fn padding_is_whatever_the_caller_asked_for() {
+        // Кадр больше не решает сам, сколько набивки положить: решение принимает
+        // кодек на уровне TLS-записи (см. `nrxp::codec::PadGrid`). Здесь
+        // фиксируем ровно это — сколько попросили, столько и записано.
+        for (frame_type, pad) in [
+            (FrameType::Data, 0u16),
+            (FrameType::Data, 137),
+            (FrameType::UdpData, 4096),
+            (FrameType::Heartbeat, 255),
+            (FrameType::Connect, 1),
+            (FrameType::Credit, 0),
         ] {
             let frame = Frame::new(1, frame_type, Bytes::from_static(b"x"));
-            let wire = frame.into_bytes(&AUTH_KEY);
+            let wire = frame.into_bytes(&AUTH_KEY, pad);
             // padding_len живёт в байтах 23..25 заголовка.
-            let padding_len = u16::from_be_bytes([wire[23], wire[24]]);
-            assert!(
-                padding_len <= 255,
-                "{:?} padding {} exceeds the 0..=255 range",
-                frame_type,
-                padding_len
-            );
-            assert_eq!(
-                wire.len(),
-                FRAME_HEADER_SIZE as usize + 1 + padding_len as usize
-            );
+            assert_eq!(u16::from_be_bytes([wire[23], wire[24]]), pad);
+            assert_eq!(wire.len(), Frame::wire_len(1, pad));
         }
     }
 
     #[test]
-    fn data_frames_never_get_legacy_unbounded_padding() {
-        // Регрессия: раньше Data/UdpData вообще не паддились (padding_len == 0
-        // всегда). Теперь бакетное выравнивание — здесь просто фиксируем, что
-        // поведение осознанно изменилось, а не просто "иногда 0".
-        let frame = Frame::new(1, FrameType::Data, Bytes::copy_from_slice(&[0u8; 100]));
-        let wire = frame.into_bytes(&AUTH_KEY);
-        let padding_len = u16::from_be_bytes([wire[23], wire[24]]);
-        assert_eq!(padding_len, (256 - 100) as u16);
+    fn max_frame_payload_fills_exactly_one_tls_record() {
+        // Кадр максимального размера должен занимать открытый текст записи
+        // ЦЕЛИКОМ и ни байтом больше: после AEAD-тега это даёт поле длины
+        // 16401 — ровно столько, сколько выдаёт настоящий TLS 1.3.
+        assert_eq!(
+            Frame::wire_len(MAX_FRAME_PAYLOAD, 0),
+            MAX_RECORD_PLAINTEXT,
+            "максимальный кадр обязан ровно заполнять открытый текст записи"
+        );
+        assert_eq!(MAX_RECORD_PLAINTEXT + 16, 16401);
+
+        let frame = Frame::new(
+            1,
+            FrameType::Data,
+            Bytes::from(vec![0u8; MAX_FRAME_PAYLOAD]),
+        );
+        let wire = frame.into_bytes(&AUTH_KEY, 0);
+        assert_eq!(wire.len(), MAX_RECORD_PLAINTEXT);
     }
 
     #[test]
-    fn bucket_padding_boundaries() {
-        // На границе бакета — паддинг 0 (уже ровно на бакете).
-        assert_eq!(Frame::bucket_padding(256), 0);
-        assert_eq!(Frame::bucket_padding(512), 0);
-        assert_eq!(Frame::bucket_padding(8192), 0);
-        // На единицу больше границы — едет в следующий бакет.
-        assert_eq!(Frame::bucket_padding(257), 512 - 257);
-        assert_eq!(Frame::bucket_padding(2049), 4096 - 2049);
-        // Пустой payload — паддится до первого бакета.
-        assert_eq!(Frame::bucket_padding(0), 256);
-        // Крупные кадры (около MAX_FRAME_PAYLOAD) — без паддинга вовсе,
-        // throughput объёмных закачек не должен страдать.
-        assert_eq!(Frame::bucket_padding(8193), 0);
-        assert_eq!(Frame::bucket_padding(MAX_FRAME_PAYLOAD), 0);
-    }
-
-    #[test]
-    fn data_and_udpdata_frames_are_bucketed_identically() {
-        for frame_type in [FrameType::Data, FrameType::UdpData] {
-            let frame = Frame::new(1, frame_type, Bytes::copy_from_slice(&[0u8; 300]));
-            let wire = frame.into_bytes(&AUTH_KEY);
-            let padding_len = u16::from_be_bytes([wire[23], wire[24]]);
-            assert_eq!(padding_len, (512 - 300) as u16);
-        }
+    fn payload_len_field_still_fits_u16() {
+        // payload_len — 2 байта; потолок payload обязан в них помещаться,
+        // иначе `Frame::new` молча обрежет длину при касте.
+        assert!(MAX_FRAME_PAYLOAD <= u16::MAX as usize);
     }
 
     #[test]
     fn parse_skips_padding_without_exposing_it() {
         let frame = Frame::new(3, FrameType::Heartbeat, Bytes::from_static(b"auth-payload"));
-        let mut wire = frame.into_bytes(&AUTH_KEY);
+        let mut wire = frame.into_bytes(&AUTH_KEY, 200);
 
         let parsed = Frame::parse(&mut wire).unwrap().unwrap();
         assert_eq!(&parsed.payload[..], b"auth-payload");
         assert!(
             wire.is_empty(),
-            "parse must advance past payload AND padding (random 0..=255 for control frames), leaving nothing behind"
+            "parse must advance past payload AND padding, leaving nothing behind"
         );
     }
 
     #[test]
     fn incomplete_frame_is_none() {
         let frame = Frame::new(1, FrameType::Data, Bytes::copy_from_slice(&[0u8; 50]));
-        let mut wire = frame.into_bytes(&AUTH_KEY);
+        let mut wire = frame.into_bytes(&AUTH_KEY, 16);
         wire.truncate(wire.len() - 1);
         assert!(Frame::parse(&mut wire).unwrap().is_none());
     }
@@ -379,7 +383,7 @@ mod tests {
     #[test]
     fn unknown_frame_type_byte_is_an_error() {
         let frame = Frame::new(1, FrameType::Data, Bytes::copy_from_slice(&[0u8; 10]));
-        let mut wire = frame.into_bytes(&AUTH_KEY);
+        let mut wire = frame.into_bytes(&AUTH_KEY, 0);
         wire[20] = 0xEE; // frame_type byte — не входит ни в один известный вариант
         assert!(Frame::parse(&mut wire).is_err());
     }

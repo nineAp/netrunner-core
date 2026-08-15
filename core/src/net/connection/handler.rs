@@ -201,6 +201,37 @@ impl StreamHandler {
             }
 
             FrameType::Close => {
+                // stream_id=0 зарезервирован под heartbeat/diag (см. doc-
+                // комментарий модуля и `connection.rs`, откуда сервер шлёт
+                // "auth_rejected: <причина>" именно на этот id при
+                // безоговорочном отказе токена) — ни один реальный
+                // Connect-поток туда никогда не попадает, так что здесь можно
+                // безопасно читать payload как текстовый сигнал, не путая его
+                // с закрытием прикладного потока.
+                //
+                // РАНЬШЕ этот кадр обрабатывался наравне со всеми остальными
+                // Close — payload не читался вообще, поэтому сервер честно
+                // слал "auth_rejected", а клиент это никогда не видел:
+                // `establish_leg` (connection.rs) в итоге всегда получал
+                // общую ошибку "Движок остановлен" вместо ERR_AUTH_FAILED, и
+                // `Muxer::mark_fatal` (единственное, что останавливает
+                // бесконечный реконнект с тем же мёртвым токеном) не
+                // вызывался НИКОГДА. На практике это годами держало клиента
+                // с просроченным токеном в цикле "переподключение через 2с"
+                // навечно — 4 ноги (MAX_TUNNEL_LEGS) × раз в LEG_RECONNECT_DELAY
+                // дают устойчивые ~2 запроса/сек на internal/validate без
+                // единого шанса самостоятельно остановиться.
+                if stream_id == 0 {
+                    if let Ok(reason) = std::str::from_utf8(frame.payload.as_ref()) {
+                        if reason.starts_with("auth_rejected") {
+                            warn!(
+                                reason,
+                                "🚫 [Tunnel] Server rejected auth token, marking session fatal"
+                            );
+                            self.muxer.mark_fatal();
+                        }
+                    }
+                }
                 debug!(stream_id, "🏁 [Tunnel] Peer closed stream");
                 self.muxer.remove_stream(stream_id);
             }
@@ -236,6 +267,18 @@ impl StreamHandler {
                         json_line,
                     },
                 );
+            }
+
+            FrameType::Cover => {
+                // Набивка ради формы трафика (см. cover-flight в
+                // `ServerHandler::run`): данных в таком кадре нет, у него нет
+                // ни потока, ни адресата. Молча отбрасываем.
+                //
+                // Отдельная ветка нужна не только ради полноты `match`:
+                // reader ноги отдаёт сюда КАЖДЫЙ разобранный кадр (см.
+                // `TunnelEngine::run`), фильтра перед `handle` нет, так что
+                // cover-кадры сюда доходят штатно на каждом хендшейке.
+                trace!(stream_id, "🎭 [Tunnel] Cover frame discarded");
             }
         }
     }
@@ -277,5 +320,67 @@ impl StreamHandler {
                     .await;
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn client_handler() -> (StreamHandler, Arc<Muxer>) {
+        let muxer = Arc::new(Muxer::new(true, "test-session".into()));
+        (StreamHandler::new(muxer.clone(), None), muxer)
+    }
+
+    /// Регрессия на сам баг: сервер шлёт "auth_rejected: ..." Close-кадром на
+    /// stream_id=0 при безоговорочном отказе токена (см. `connection.rs`), но
+    /// раньше payload здесь вообще не читался — `mark_fatal()` не вызывался
+    /// НИКОГДА, и клиент с мёртвым токеном реконнектился раз в
+    /// LEG_RECONNECT_DELAY вечно (наблюдалось на проде: 4 ноги (MAX_TUNNEL_LEGS)
+    /// держали ~2 запроса/сек на /internal/validate часами).
+    #[tokio::test]
+    async fn close_frame_with_auth_rejected_reason_marks_session_fatal() {
+        let (handler, muxer) = client_handler();
+        assert!(!muxer.is_fatal());
+
+        let frame = Frame::new(
+            0,
+            FrameType::Close,
+            Bytes::from_static(b"auth_rejected: account banned"),
+        );
+        handler.handle(frame).await;
+
+        assert!(
+            muxer.is_fatal(),
+            "Close(stream_id=0, \"auth_rejected: ...\") обязан пометить сессию как фатальную"
+        );
+    }
+
+    /// Обычное закрытие прикладного потока (stream_id != 0) не имеет отношения
+    /// к авторизации — не должно гасить всю сессию.
+    #[tokio::test]
+    async fn close_frame_on_application_stream_does_not_mark_fatal() {
+        let (handler, muxer) = client_handler();
+
+        let frame = Frame::new(
+            42,
+            FrameType::Close,
+            Bytes::from_static(b"auth_rejected: this text on the wrong stream_id doesn't count"),
+        );
+        handler.handle(frame).await;
+
+        assert!(!muxer.is_fatal());
+    }
+
+    /// Пустой/обычный Close на служебном stream_id=0 (например, эвикт при
+    /// закрытии сокета) — тоже не должен ложно триггерить фатальное состояние.
+    #[tokio::test]
+    async fn close_frame_on_control_stream_without_auth_rejected_text_does_not_mark_fatal() {
+        let (handler, muxer) = client_handler();
+
+        let frame = Frame::new(0, FrameType::Close, Bytes::new());
+        handler.handle(frame).await;
+
+        assert!(!muxer.is_fatal());
     }
 }

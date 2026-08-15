@@ -251,6 +251,14 @@ impl ExtensionOrder {
 
     /// Edge — тот же Chromium-движок, порядок идентичен Chrome с поправкой на
     /// собственные GREASE-значения (`0x1a1a`/`0x3a3a` вместо `0xaaaa`).
+    ///
+    /// `PADDING` обязан быть **последним**. Его длина вычисляется так, чтобы
+    /// добить весь ClientHello до целевого размера, поэтому всё, что стоит
+    /// после него, промахивает цель ровно на свою длину. Раньше завершающий
+    /// GREASE `0x3a3a` шёл после паддинга и добавлял 4 байта: payload записи
+    /// получался 511 вместо 512, то есть ClientHello оставался внутри
+    /// диапазона 256..511, из которого паддинг по RFC 7685 обязан выводить.
+    /// BoringSSL по той же причине всегда добавляет padding последним.
     pub const EDGE_130: Self = Self(&[
         0x1a1a,
         TlsExtensions::SNI,
@@ -268,8 +276,8 @@ impl ExtensionOrder {
         TlsExtensions::COMPRESS_CERT,
         TlsExtensions::SCT,
         TlsExtensions::DELEGATED_CREDENTIAL,
-        TlsExtensions::PADDING,
         0x3a3a,
+        TlsExtensions::PADDING,
     ]);
 
     /// Firefox: своя собственная последовательность (не Chromium-семейство) —

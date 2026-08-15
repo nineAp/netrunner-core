@@ -43,5 +43,9 @@ mod types;
 pub(crate) use extension::ExtensionStack;
 pub(crate) use handshake::{ClientHello, HelloHeader, ServerHello};
 pub(crate) use profile::{BrowserProfile, ServerProfile};
+// Нужен только серверной стороне (`net::connection`), которой на
+// wasm32-unknown-unknown нет вовсе — там этот реэкспорт был бы unused.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) use profile::sample_server_flight;
 pub(crate) use tls_record::{ApplicationData, TlsRecord};
 pub(crate) use types::{ContentType, HelloType};

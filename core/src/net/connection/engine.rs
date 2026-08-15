@@ -23,6 +23,7 @@ use bytes::{Bytes, BytesMut};
 use netrunner_logger::{
     error, info, AppError, ERR_INFRA_TIMEOUT, ERR_NET_TLS_TAMPER, ERR_SYS_PANIC,
 };
+use rand::RngExt;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::tcp::{OwnedReadHalf, OwnedWriteHalf},
@@ -102,7 +103,7 @@ impl TunnelEngine {
     /// а не новый на каждую попытку реконнекта (см. doc на `for_session`).
     pub async fn attempt_reconnect(
         &mut self,
-    ) -> Result<(OwnedReadHalf, OwnedWriteHalf, RxCodec, TxCodec), AppError> {
+    ) -> Result<(OwnedReadHalf, OwnedWriteHalf, RxCodec, TxCodec, BytesMut), AppError> {
         info!("🔄 Attempting reconnect to {}", self.remote_addr);
 
         // Re-resolve the hostname each time so a server IP change or DNS
@@ -174,7 +175,7 @@ impl TunnelEngine {
 
                 self.leg_status = LegStatus::Reconnecting;
                 match self.attempt_reconnect().await {
-                    Ok((new_in, new_out, new_rx, new_tx)) => {
+                    Ok((new_in, new_out, new_rx, new_tx, new_tail)) => {
                         internal_attempt = 0; // successful reconnect — reset counter
 
                         let cap = crate::net::NetworkConfig::global().channel_capacity;
@@ -189,6 +190,10 @@ impl TunnelEngine {
                         self.outbound = Some(new_out);
                         self.rx_codec = Some(new_rx);
                         self.tx_codec = Some(new_tx);
+                        // Остаток буфера хендшейка: сервер шлёт cover-flight
+                        // сразу за ServerHello, и эти записи обычно уже лежат
+                        // здесь. Потерять их — рассинхронизировать nonce.
+                        self.read_buf = new_tail;
                         self.leg_status = LegStatus::Active;
                         info!("✅ Leg {} reconnected successfully", self.leg_id);
                     }
@@ -315,7 +320,15 @@ impl TunnelEngine {
             // ПИШУЩАЯ ЗАДАЧА
             let mut writer_handle = tokio::spawn(async move {
                 let mut outbound = outbound;
-                let mut heartbeat = tokio::time::interval(HEALTH_CHECK_INTERVAL);
+
+                // Heartbeat: интервал с джиттером и отступом на простое —
+                // см. `next_heartbeat_delay`. Раньше здесь был
+                // `tokio::time::interval(HEALTH_CHECK_INTERVAL)`, то есть
+                // ровно 3,000 с без разброса, вечно и на каждой из ног.
+                let mut hb_idle_streak: u32 = 0;
+                let mut wrote_since_hb = false;
+                let mut hb_deadline =
+                    tokio::time::Instant::now() + Self::next_heartbeat_delay(0);
 
                 let mut pending_data: Option<MuxMessage> = None;
 
@@ -325,7 +338,16 @@ impl TunnelEngine {
 
                         _ = token_writer.cancelled() => break,
 
-                        _ = heartbeat.tick() => {
+                        _ = tokio::time::sleep_until(hb_deadline) => {
+                            hb_idle_streak = if wrote_since_hb {
+                                0
+                            } else {
+                                hb_idle_streak.saturating_add(1)
+                            };
+                            wrote_since_hb = false;
+                            hb_deadline = tokio::time::Instant::now()
+                                + Self::next_heartbeat_delay(hb_idle_streak);
+
                             muxer_pong.record_ping_sent(leg_id);
                             let msg = MuxMessage { stream_id: 0, frame_type: FrameType::Heartbeat, data: Bytes::new() };
                             if let Err(e) = Self::handle_outbound(&mut outbound, &mut tx_codec, msg).await {
@@ -341,6 +363,7 @@ impl TunnelEngine {
                         msg_opt = control_rx.recv() => {
                             if let Some(msg) = msg_opt {
                                 let sid = msg.stream_id;
+                                wrote_since_hb = true;
                                 if let Err(e) = Self::handle_outbound(&mut outbound, &mut tx_codec, msg).await {
                                     crate::net::diagnostics::send_diag_event(
                                         crate::net::diagnostics::DiagnosticsEvent::TunnelWriteStuck {
@@ -355,6 +378,7 @@ impl TunnelEngine {
                         // 💡 ИСПРАВЛЕНИЕ 1: Мгновенно заходим в эту ветку, если есть данные
                         _ = std::future::ready(()), if pending_data.is_some() => {
                             let mut msg = pending_data.take().unwrap();
+                            wrote_since_hb = true;
 
                             // #4 Adaptive batch: under high RTT take a bigger interleave
                             // chunk so more frames coalesce into one write in
@@ -473,14 +497,53 @@ impl TunnelEngine {
         }
     }
 
+    /// Задержка до следующего heartbeat'а: база с джиттером плюс отступ на простое.
+    ///
+    /// Раньше heartbeat висел на `tokio::time::interval(HEALTH_CHECK_INTERVAL)` —
+    /// ровно 3,000 с, бесконечно, на каждой из ног. Два следствия:
+    ///
+    /// 1. Автокорреляция межпакетных интервалов на лаге 3 с давала узкий пик,
+    ///    которого не бывает у браузера: HTTP/2 PING он шлёт по необходимости,
+    ///    а на простое молчит.
+    /// 2. Пустая сессия стоила порядка мегабайта в час в каждую сторону
+    ///    (4 ноги × 1200 записей в час), а на мобильном клиенте — ещё и 1200
+    ///    пробуждений радио на ногу.
+    ///
+    /// `idle_streak` — сколько интервалов подряд по ноге не проехало ни одного
+    /// полезного кадра. Множитель ограничен восемью (до ~24 с при базе 3 с);
+    /// вместе с [`LEG_PONG_FRESHNESS`](crate::net::LEG_PONG_FRESHNESS) это и
+    /// даёт основное сокращение холостого трафика: health-check видит свежий
+    /// PONG от heartbeat'а и свою пробу не отправляет вовсе.
+    ///
+    /// Верхняя граница выбрана так, чтобы самый медленный heartbeat с джиттером
+    /// (3 с × 8 × 1,3 ≈ 31 с) оставался внутри окна свежести (45 с) — иначе
+    /// health-check начал бы добивать пробами ровно то, что здесь экономится.
+    fn next_heartbeat_delay(idle_streak: u32) -> std::time::Duration {
+        const MAX_IDLE_MULTIPLIER: u32 = 8;
+        /// Разброс вокруг базы, в процентах.
+        const JITTER_PCT: u64 = 30;
+
+        let multiplier = (1 + idle_streak).min(MAX_IDLE_MULTIPLIER) as u64;
+        let base_ms = HEALTH_CHECK_INTERVAL.as_millis() as u64 * multiplier;
+        let jitter_ms = base_ms * JITTER_PCT / 100;
+
+        std::time::Duration::from_millis(
+            base_ms - jitter_ms + rand::rng().random_range(0..=jitter_ms * 2),
+        )
+    }
+
     /// Шифрует сообщение в один или несколько кадров и пишет их в сокет.
     ///
     /// `Data` режется на кадры по [`MAX_FRAME_PAYLOAD`]; управляющие/UDP идут одним
-    /// кадром. Срабатывает адаптивный по RTT дедлайн записи
+    /// кадром. Вся пачка уходит в [`TxCodec::encode_batch`] одним вызовом: кадры
+    /// укладываются в минимальное число TLS-записей (несколько кадров на запись,
+    /// если помещаются), и на выходе получается один непрерывный буфер — то есть
+    /// один `write_all` вместо N (аналог sendmmsg для байт-потока: меньше
+    /// syscalls) и меньше заголовков записей на проводе.
+    ///
+    /// Срабатывает адаптивный по RTT дедлайн записи
     /// ([`adaptive_write_timeout`](super::muxer::adaptive_write_timeout)) — чтобы
-    /// медленная, но живая нога не убивалась по жёсткому тайм-ауту. Несколько
-    /// кадров коалесятся в один `write_all` (аналог sendmmsg для байт-потока:
-    /// меньше syscalls); одиночный кадр пишется напрямую без лишней копии.
+    /// медленная, но живая нога не убивалась по жёсткому тайм-ауту.
     async fn handle_outbound(
         outbound: &mut OwnedWriteHalf,
         tx_codec: &mut TxCodec,
@@ -489,38 +552,25 @@ impl TunnelEngine {
         let mut data = msg.data;
         let stream_id = msg.stream_id;
         let frame_type = msg.frame_type;
-        let mut packets = Vec::new();
+        let mut frames = Vec::new();
 
         if frame_type == FrameType::Data {
             while !data.is_empty() {
                 let chunk_size = std::cmp::min(data.len(), MAX_FRAME_PAYLOAD);
-                let chunk = data.split_to(chunk_size);
-
-                match tx_codec.encode_frame(stream_id, frame_type, chunk) {
-                    Ok(pkt) => packets.push(pkt),
-                    Err(e) => {
-                        error!(stream_id, error = ?e, "Encryption failed for TCP chunk");
-                        return Err(AppError::new(
-                            ERR_NET_TLS_TAMPER,
-                            "Ошибка шифрования пакета",
-                            format!("Encryption error: {:?}", e),
-                        ));
-                    }
-                }
+                frames.push((stream_id, frame_type, data.split_to(chunk_size)));
             }
         } else {
-            match tx_codec.encode_frame(stream_id, frame_type, data) {
-                Ok(pkt) => packets.push(pkt),
-                Err(e) => {
-                    error!(stream_id, error = ?e, "Encryption failed for control/udp frame");
-                    return Err(AppError::new(
-                        ERR_NET_TLS_TAMPER,
-                        "Ошибка шифрования пакета",
-                        format!("Encryption error: {:?}", e),
-                    ));
-                }
-            }
+            frames.push((stream_id, frame_type, data));
         }
+
+        let wire = tx_codec.encode_batch(frames).map_err(|e| {
+            error!(stream_id, error = ?e, "Encryption failed for outbound batch");
+            AppError::new(
+                ERR_NET_TLS_TAMPER,
+                "Ошибка шифрования пакета",
+                format!("Encryption error: {:?}", e),
+            )
+        })?;
 
         // Adaptive write deadline: floor of 20 s (BBR-friendly), but scales with
         // the live RTT so a high-latency path (RTT > 2.5 s) doesn't trip a flat
@@ -529,12 +579,6 @@ impl TunnelEngine {
         let write_timeout = crate::net::connection::muxer::adaptive_write_timeout(
             std::time::Duration::from_secs(20),
         );
-        // #3 Syscall batching (sendmmsg-analog for a TCP byte stream): when a Data
-        // message produced several MAX_FRAME_PAYLOAD frames, coalesce them into ONE
-        // contiguous buffer and issue a single write_all instead of N — fewer
-        // User→Kernel transitions under exactly the high-throughput conditions that
-        // were producing tunnel_write_stuck. The single-frame case (control/UDP and
-        // ≤16 KB payloads) keeps the zero-copy direct write with no extra copy.
         let stuck = || -> AppError {
             error!(stream_id, "🔥 Physical leg STUCK on write. Killing leg.");
             // Increment counter; the call site in run() emits the full event
@@ -549,21 +593,8 @@ impl TunnelEngine {
             )
         };
 
-        if packets.len() == 1 {
-            let write_future = outbound.write_all(&packets[0]);
-            if tokio::time::timeout(write_timeout, write_future)
-                .await
-                .is_err()
-            {
-                return Err(stuck());
-            }
-        } else if !packets.is_empty() {
-            let total: usize = packets.iter().map(|p| p.len()).sum();
-            let mut batch = BytesMut::with_capacity(total);
-            for pkt in &packets {
-                batch.extend_from_slice(pkt);
-            }
-            let write_future = outbound.write_all(&batch);
+        if !wire.is_empty() {
+            let write_future = outbound.write_all(&wire);
             if tokio::time::timeout(write_timeout, write_future)
                 .await
                 .is_err()

@@ -73,6 +73,23 @@ pub struct LegStats {
     pub tx_bytes: AtomicU64,
     pub rx_bytes: AtomicU64,
     pub rtt_ms: AtomicU32,
+    /// Момент последнего PONG по ноге, в миллисекундах от [`process_uptime_ms`].
+    ///
+    /// Нужен, чтобы [`Muxer::perform_health_check`] не слал PING ноге, которая
+    /// только что и так ответила: heartbeat writer'а и health-check —
+    /// две независимые механики, делающие ровно одно и то же (PING → PONG →
+    /// замер RTT), и на живой ноге вторая была чистым дублированием трафика.
+    /// `0` означает «PONG ещё не приходил».
+    pub last_pong_ms: AtomicU64,
+}
+
+/// Монотонные миллисекунды от старта процесса.
+///
+/// `Instant` нельзя положить в атомик, а для проверки свежести PONG'а нужен
+/// именно неблокирующий доступ из горячего пути — отсюда общая точка отсчёта.
+fn process_uptime_ms() -> u64 {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis() as u64
 }
 
 /// Атомарная статистика одного потока: переданные/принятые байты.
@@ -650,6 +667,15 @@ impl Muxer {
     /// Обрабатывает PONG: считает RTT и обновляет сглаженную оценку (EWMA, α=0.25),
     /// затем пересчитывает глобальный минимум [`GLOBAL_MIN_RTT`] по всем ногам.
     pub async fn record_pong(&self, leg_id: u32) {
+        // Отмечаем свежесть ноги ДО разбора RTT: PONG мог прийти на heartbeat
+        // writer'а, для которого `pending_pings` не заполняется, и такой ответ
+        // всё равно доказывает, что нога жива (см. `perform_health_check`).
+        if let Some(leg) = self.legs.get(&leg_id) {
+            leg.stats
+                .last_pong_ms
+                .store(process_uptime_ms().max(1), Ordering::Relaxed);
+        }
+
         if let Some((_, start_time)) = self.pending_pings.remove(&leg_id) {
             let measured = start_time.elapsed().as_millis() as u32;
             if let Some(leg) = self.legs.get(&leg_id) {
@@ -1131,6 +1157,22 @@ impl Muxer {
                 let Some(leg) = self.legs.get(&leg_id) else {
                     continue;
                 };
+
+                // Нога, которая ответила PONG'ом недавно, уже доказала, что
+                // жива — слать ей ещё один PING незачем. Heartbeat writer'а и
+                // этот health-check исторически работали независимо и на живой
+                // ноге дублировали друг друга: на пустом туннеле это давало
+                // четыре записи на ногу за цикл вместо одной, то есть основной
+                // объём холостого трафика.
+                let last_pong = leg.stats.last_pong_ms.load(Ordering::Relaxed);
+                if last_pong != 0
+                    && process_uptime_ms().saturating_sub(last_pong)
+                        < crate::net::LEG_PONG_FRESHNESS.as_millis() as u64
+                {
+                    trace!(leg_id, "Health check skipped: fresh PONG already seen");
+                    continue;
+                }
+
                 leg.control_tx.clone()
             };
 
