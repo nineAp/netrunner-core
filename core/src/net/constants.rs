@@ -220,6 +220,15 @@ pub const TUNNEL_SOCKET_SNDBUF: u32 = 1024 * 1024;
 /// bounded to keep stale in-flight download data (for already-closed streams)
 /// small so the tunnel recovers in ~1 s after a heavy download.
 pub const TUNNEL_SOCKET_RCVBUF: u32 = 256 * 1024;
+/// Threshold above which Linux withholds socket write-readiness until the
+/// amount of not-yet-sent data falls again.  Keeping this close to two NRXP
+/// records limits how far a bulk stream can run ahead of the fair writer before
+/// a newly-arrived interactive stream gets its turn.
+///
+/// This is a local socket policy only: it neither changes TCP options on the
+/// wire nor the NRXP/TLS record format.  Linux and Android apply it; other
+/// targets simply ignore it.
+pub const TUNNEL_TCP_NOTSENT_LOWAT: u32 = (2 * crate::nrxp::MAX_FRAME_PAYLOAD) as u32;
 
 // ── Smoltcp socket defaults ──────────────────────────────────────────────────
 /// Packet slots for the ICMP socket's RX and TX packet buffers.

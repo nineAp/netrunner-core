@@ -17,11 +17,14 @@
 //! переподключение с экспоненциальным backoff+jitter. Сервер (`remote_addr`
 //! пуст) при обрыве просто завершает задачу: реконнект инициирует клиент.
 
-use std::sync::Arc;
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::Arc,
+};
 
 use bytes::{Bytes, BytesMut};
 use netrunner_logger::{
-    error, info, AppError, ERR_INFRA_TIMEOUT, ERR_NET_TLS_TAMPER, ERR_SYS_PANIC,
+    AppError, ERR_INFRA_TIMEOUT, ERR_NET_TLS_TAMPER, ERR_SYS_PANIC, error, info,
 };
 use rand::RngExt;
 use tokio::{
@@ -34,13 +37,161 @@ use tracing::instrument;
 
 use crate::{
     net::{
-        connection::{handler::StreamHandler, muxer::MuxMessage},
         FALLBACK_CONNECT_TIMEOUT, HEALTH_CHECK_INTERVAL, MAX_INTERNAL_RECONNECT_ATTEMPTS,
         MAX_RECONNECT_BACKOFF_MS, RECONNECT_BACKOFF_BASE, RECONNECT_BACKOFF_JITTER_MS,
         TUNNEL_INTERLEAVE_CHUNK, TUNNEL_MAX_BUFFER_SIZE, TUNNEL_READ_RESERVE,
+        connection::{
+            handler::StreamHandler,
+            muxer::{MuxMessage, TcpSocketStats},
+        },
     },
-    nrxp::{ErrorAction, FrameType, RxCodec, TxCodec, MAX_FRAME_PAYLOAD},
+    nrxp::{ErrorAction, FrameType, MAX_FRAME_PAYLOAD, RxCodec, TxCodec},
 };
+
+/// Per-leg userspace flow queue.  The mpsc channel remains the bounded ingress
+/// and backpressure mechanism; once messages reach the writer they are split by
+/// `stream_id` so a bulk stream cannot monopolise every dequeue opportunity.
+///
+/// Streams that have just become active live in `new_streams`; a stream that
+/// still has data after one quantum moves to `old_streams`.  This is the useful
+/// latency property of FQ-CoDel/DRR without packet dropping: sparse interactive
+/// flows get one prompt turn, while continuously-backlogged flows round-robin.
+#[derive(Default)]
+struct FairDataQueue {
+    streams: HashMap<u32, VecDeque<MuxMessage>>,
+    new_streams: VecDeque<u32>,
+    old_streams: VecDeque<u32>,
+    queued_messages: usize,
+}
+
+impl FairDataQueue {
+    fn push(&mut self, message: MuxMessage) {
+        let stream_id = message.stream_id;
+        if let Some(queue) = self.streams.get_mut(&stream_id) {
+            queue.push_back(message);
+        } else {
+            let mut queue = VecDeque::new();
+            queue.push_back(message);
+            self.streams.insert(stream_id, queue);
+            self.new_streams.push_back(stream_id);
+        }
+        self.queued_messages += 1;
+    }
+
+    fn is_empty(&self) -> bool {
+        self.queued_messages == 0
+    }
+
+    fn queued_messages(&self) -> usize {
+        self.queued_messages
+    }
+
+    fn active_streams(&self) -> usize {
+        self.streams.len()
+    }
+
+    /// Returns at most `quantum` bytes for stream-oriented Data.  UDP datagrams
+    /// are never split because their message boundary is semantic.
+    fn pop_chunk(&mut self, quantum: usize) -> Option<MuxMessage> {
+        let stream_id = self
+            .new_streams
+            .pop_front()
+            .or_else(|| self.old_streams.pop_front())?;
+        let quantum = quantum.max(1);
+
+        let (chunk, stream_empty) = {
+            let queue = self.streams.get_mut(&stream_id)?;
+            let front = queue.front_mut()?;
+            let chunk = if front.frame_type == FrameType::Data && front.data.len() > quantum {
+                MuxMessage {
+                    stream_id,
+                    frame_type: front.frame_type,
+                    data: front.data.split_to(quantum),
+                }
+            } else {
+                self.queued_messages = self.queued_messages.saturating_sub(1);
+                queue.pop_front().expect("fair queue front disappeared")
+            };
+            (chunk, queue.is_empty())
+        };
+
+        if stream_empty {
+            self.streams.remove(&stream_id);
+        } else {
+            self.old_streams.push_back(stream_id);
+        }
+        Some(chunk)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn read_tcp_socket_stats(outbound: &OwnedWriteHalf) -> Option<TcpSocketStats> {
+    use std::os::fd::AsRawFd;
+
+    let fd = outbound.as_ref().as_raw_fd();
+    let mut info = std::mem::MaybeUninit::<libc::tcp_info>::zeroed();
+    let mut len = std::mem::size_of::<libc::tcp_info>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_INFO,
+            info.as_mut_ptr().cast(),
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    let info = unsafe { info.assume_init() };
+
+    // Linux exposes bytes accepted by the socket but not yet handed to TCP via
+    // SIOCOUTQNSD.  This is the queue that channel capacity alone cannot see.
+    let mut notsent_bytes: libc::c_int = 0;
+    let notsent_rc =
+        unsafe { libc::ioctl(fd, libc::SIOCOUTQNSD as libc::Ioctl, &mut notsent_bytes) };
+    if notsent_rc != 0 {
+        notsent_bytes = 0;
+    }
+
+    // Older libc releases stop `tcp_info` at `tcpi_total_retrans`, so estimate
+    // the current delivery ceiling from cwnd / RTT instead of depending on the
+    // newer `tcpi_delivery_rate` tail field.  RTT is expressed in microseconds.
+    let delivery_rate = if info.tcpi_rtt == 0 {
+        0
+    } else {
+        (info.tcpi_snd_cwnd as u64)
+            .saturating_mul(info.tcpi_snd_mss.max(1) as u64)
+            .saturating_mul(1_000_000)
+            / info.tcpi_rtt as u64
+    };
+    Some(TcpSocketStats {
+        notsent_bytes: notsent_bytes.max(0) as u64,
+        unacked_bytes: info.tcpi_unacked as u64 * info.tcpi_snd_mss.max(1) as u64,
+        delivery_rate,
+        total_retrans: info.tcpi_total_retrans,
+    })
+}
+
+#[cfg(target_os = "android")]
+fn read_tcp_socket_stats(outbound: &OwnedWriteHalf) -> Option<TcpSocketStats> {
+    use std::os::fd::AsRawFd;
+
+    // Android's libc bindings omit `tcp_info`, but the kernel still exposes the
+    // not-yet-sent byte count that matters most for avoiding a queued leg.
+    let fd = outbound.as_ref().as_raw_fd();
+    let mut notsent_bytes: libc::c_int = 0;
+    let rc = unsafe { libc::ioctl(fd, libc::SIOCOUTQNSD as libc::Ioctl, &mut notsent_bytes) };
+    (rc == 0).then_some(TcpSocketStats {
+        notsent_bytes: notsent_bytes.max(0) as u64,
+        ..TcpSocketStats::default()
+    })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn read_tcp_socket_stats(_outbound: &OwnedWriteHalf) -> Option<TcpSocketStats> {
+    None
+}
 
 /// Состояние ноги: работает или в процессе переподключения.
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -268,7 +419,9 @@ impl TunnelEngine {
                 let mut inbound = inbound;
                 loop {
                     if read_buf.len() > TUNNEL_MAX_BUFFER_SIZE {
-                        error!("CRITICAL: Read buffer exceeded 1MB (OOM Protection). Dropping connection!");
+                        error!(
+                            "CRITICAL: Read buffer exceeded 1MB (OOM Protection). Dropping connection!"
+                        );
                         return Err(AppError::new(
                             ERR_INFRA_TIMEOUT,
                             "Переполнение буфера",
@@ -334,12 +487,32 @@ impl TunnelEngine {
                 // ровно 3,000 с без разброса, вечно и на каждой из ног.
                 let mut hb_idle_streak: u32 = 0;
                 let mut wrote_since_hb = false;
-                let mut hb_deadline =
-                    tokio::time::Instant::now() + Self::next_heartbeat_delay(0);
+                let mut hb_deadline = tokio::time::Instant::now() + Self::next_heartbeat_delay(0);
 
-                let mut pending_data: Option<MuxMessage> = None;
+                let mut fair_data = FairDataQueue::default();
+                // Do not turn the writer-local fair queues into an unbounded
+                // second buffer.  At most one channel's worth is classified at
+                // a time; the original mpsc channel keeps applying backpressure.
+                let fair_queue_cap = data_rx.max_capacity().max(1);
+                let mut data_closed = false;
+                let mut tcp_info_tick =
+                    tokio::time::interval(std::time::Duration::from_millis(250));
+                tcp_info_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
                 loop {
+                    // Pull a bounded snapshot of currently waiting streams before
+                    // choosing the next one.  Without this drain, a continuously
+                    // ready bulk stream would keep the `biased` select branch hot
+                    // and newly-arrived sparse streams would remain invisible.
+                    while fair_data.queued_messages() < fair_queue_cap && !data_closed {
+                        match data_rx.try_recv() {
+                            Ok(msg) => fair_data.push(msg),
+                            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                                data_closed = true;
+                            }
+                        }
+                    }
                     tokio::select! {
                         biased;
 
@@ -367,6 +540,12 @@ impl TunnelEngine {
                             }
                         }
 
+                        _ = tcp_info_tick.tick() => {
+                            if let Some(sample) = read_tcp_socket_stats(&outbound) {
+                                muxer_pong.record_tcp_socket_stats(leg_id, sample);
+                            }
+                        }
+
                         msg_opt = control_rx.recv() => {
                             if let Some(msg) = msg_opt {
                                 let sid = msg.stream_id;
@@ -382,26 +561,24 @@ impl TunnelEngine {
                             } else { break; }
                         }
 
-                        // 💡 ИСПРАВЛЕНИЕ 1: Мгновенно заходим в эту ветку, если есть данные
-                        _ = std::future::ready(()), if pending_data.is_some() => {
-                            let mut msg = pending_data.take().unwrap();
+                        _ = std::future::ready(()), if !fair_data.is_empty() => {
                             wrote_since_hb = true;
 
-                            // #4 Adaptive batch: under high RTT take a bigger interleave
-                            // chunk so more frames coalesce into one write in
-                            // handle_outbound (#3); at low RTT stay small for fairness.
-                            let interleave_chunk = crate::net::connection::muxer::adaptive_batch_chunk(
-                                TUNNEL_INTERLEAVE_CHUNK,
-                            );
-                            let chunk_size = std::cmp::min(msg.data.len(), interleave_chunk);
-                            let chunk_data = msg.data.split_to(chunk_size);
-
-                            let chunk_msg = MuxMessage {
-                                stream_id: msg.stream_id,
-                                frame_type: msg.frame_type,
-                                data: chunk_data,
+                            // With competing streams, one turn is exactly one full
+                            // TLS/NRXP record.  A lone bulk stream retains the old
+                            // RTT-adaptive batching and therefore its throughput.
+                            let quantum = if fair_data.active_streams() > 1 {
+                                TUNNEL_INTERLEAVE_CHUNK
+                            } else {
+                                crate::net::connection::muxer::adaptive_batch_chunk(
+                                    TUNNEL_INTERLEAVE_CHUNK,
+                                )
                             };
+                            let chunk_msg = fair_data
+                                .pop_chunk(quantum)
+                                .expect("fair data queue became empty during dequeue");
                             let chunk_sid = chunk_msg.stream_id;
+                            let chunk_len = chunk_msg.data.len() as u64;
 
                             if let Err(e) = Self::handle_outbound(&mut outbound, &mut tx_codec, chunk_msg).await {
                                 crate::net::diagnostics::send_diag_event(
@@ -411,20 +588,19 @@ impl TunnelEngine {
                                 );
                                 return Err((e, control_rx, data_rx, tx_codec));
                             }
+                            muxer_pong.record_leg_data_drained(leg_id, chunk_len);
 
-                            if !msg.data.is_empty() {
-                                pending_data = Some(msg);
-                            }
-
-                            // 💡 ИСПРАВЛЕНИЕ 1.2: Вызываем yield ЗДЕСЬ. Это заставит планировщик
-                            // проверить пинги и контрольные пакеты перед отправкой следующего куска.
+                            // Give heartbeat/control and newly-arrived sparse data
+                            // a chance before the next flow-queue quantum.
                             tokio::task::yield_now().await;
                         }
 
-                        msg_opt = data_rx.recv(), if pending_data.is_none() => {
+                        msg_opt = data_rx.recv(), if !data_closed && fair_data.queued_messages() < fair_queue_cap => {
                             if let Some(msg) = msg_opt {
-                                pending_data = Some(msg);
-                            } else { break; }
+                                fair_data.push(msg);
+                            } else {
+                                data_closed = true;
+                            }
                         }
                     }
                 }
@@ -610,5 +786,74 @@ impl TunnelEngine {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod fair_data_queue_tests {
+    use super::*;
+
+    fn message(stream_id: u32, frame_type: FrameType, data: &'static [u8]) -> MuxMessage {
+        MuxMessage {
+            stream_id,
+            frame_type,
+            data: Bytes::from_static(data),
+        }
+    }
+
+    #[test]
+    fn sparse_stream_preempts_an_already_backlogged_stream() {
+        let mut queue = FairDataQueue::default();
+        queue.push(message(1, FrameType::Data, b"abcdefgh"));
+
+        let first = queue.pop_chunk(4).unwrap();
+        assert_eq!(first.stream_id, 1);
+        assert_eq!(&first.data[..], b"abcd");
+
+        queue.push(message(3, FrameType::Data, b"x"));
+        let sparse = queue.pop_chunk(4).unwrap();
+        assert_eq!(sparse.stream_id, 3);
+        assert_eq!(&sparse.data[..], b"x");
+
+        let bulk = queue.pop_chunk(4).unwrap();
+        assert_eq!(bulk.stream_id, 1);
+        assert_eq!(&bulk.data[..], b"efgh");
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn competing_streams_rotate_by_one_quantum() {
+        let mut queue = FairDataQueue::default();
+        queue.push(message(1, FrameType::Data, b"abcdefgh"));
+        queue.push(message(3, FrameType::Data, b"ABCDEFGH"));
+
+        let turns: Vec<u32> = (0..4)
+            .map(|_| queue.pop_chunk(4).unwrap().stream_id)
+            .collect();
+
+        assert_eq!(turns, vec![1, 3, 1, 3]);
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn messages_keep_fifo_order_within_one_stream() {
+        let mut queue = FairDataQueue::default();
+        queue.push(message(7, FrameType::Data, b"first"));
+        queue.push(message(7, FrameType::Data, b"second"));
+
+        assert_eq!(&queue.pop_chunk(64).unwrap().data[..], b"first");
+        assert_eq!(&queue.pop_chunk(64).unwrap().data[..], b"second");
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn udp_datagram_is_never_split_by_the_fair_quantum() {
+        let mut queue = FairDataQueue::default();
+        queue.push(message(9, FrameType::UdpData, b"one-datagram"));
+
+        let datagram = queue.pop_chunk(2).unwrap();
+        assert_eq!(datagram.frame_type, FrameType::UdpData);
+        assert_eq!(&datagram.data[..], b"one-datagram");
+        assert!(queue.is_empty());
     }
 }

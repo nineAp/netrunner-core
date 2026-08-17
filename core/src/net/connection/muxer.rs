@@ -50,20 +50,20 @@
 use arc_swap::ArcSwap;
 use bytes::Bytes;
 use dashmap::DashMap;
-use netrunner_logger::{info, instrument, trace, warn, AppError, ERR_INFRA_TIMEOUT};
+use netrunner_logger::{AppError, ERR_INFRA_TIMEOUT, info, instrument, trace, warn};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc::{error::TrySendError, Sender};
 use tokio::sync::Notify;
+use tokio::sync::mpsc::{Sender, error::TrySendError};
 use tokio_util::sync::CancellationToken;
 
-use crate::net::diagnostics::{self, DiagnosticsEvent, LegMetrics, TunnelMetrics, DIAG_COUNTERS};
 use crate::net::INITIAL_RTT_MS;
+use crate::net::diagnostics::{self, DIAG_COUNTERS, DiagnosticsEvent, LegMetrics, TunnelMetrics};
 use crate::net::{
-    BACKLOG_REAPER_IDLE_TIMEOUT, BACKLOG_REAPER_INTERVAL, BACKLOG_STUCK_GRACE, MAX_TUNNEL_LEGS,
-    STREAM_BACKLOG_MAX_BYTES,
+    BACKLOG_REAPER_IDLE_TIMEOUT, BACKLOG_REAPER_INTERVAL, BACKLOG_STUCK_GRACE, BRIDGE_READ_CHUNK,
+    MAX_TUNNEL_LEGS, STREAM_BACKLOG_MAX_BYTES,
 };
 use crate::nrxp::FrameType;
 
@@ -73,6 +73,22 @@ pub struct LegStats {
     pub tx_bytes: AtomicU64,
     pub rx_bytes: AtomicU64,
     pub rtt_ms: AtomicU32,
+    /// Payload bytes accepted by the per-leg data channel but not yet written
+    /// by its socket writer.  Unlike `Sender::capacity`, this remains accurate
+    /// when messages have different sizes and while the fair writer holds them
+    /// in its local per-stream queues.
+    pub queued_data_bytes: AtomicU64,
+    /// Monotonic timestamp at which the currently non-empty data queue became
+    /// non-empty.  Zero means no application data is waiting.
+    pub queued_since_ms: AtomicU64,
+    /// Linux TCP_INFO snapshot.  These stay zero on unsupported platforms.
+    pub tcp_notsent_bytes: AtomicU64,
+    pub tcp_unacked_bytes: AtomicU64,
+    pub tcp_delivery_rate: AtomicU64,
+    pub tcp_total_retrans: AtomicU32,
+    /// Last time `tcp_total_retrans` increased.  Used as a short-lived penalty
+    /// when assigning new streams; historical losses do not poison a leg forever.
+    pub last_retrans_ms: AtomicU64,
     /// Момент последнего PONG по ноге, в миллисекундах от [`process_uptime_ms`].
     ///
     /// Нужен, чтобы [`Muxer::perform_health_check`] не слал PING ноге, которая
@@ -198,14 +214,74 @@ struct MuxLeg {
 }
 
 impl MuxLeg {
-    /// Степень загруженности `data`-канала: 0.0 — пусто, 1.0 — канал полностью
-    /// забит. Используется в скоринге ног при выборе (`select_leg`).
+    /// Observable queue pressure in the application channel, fair-writer queue
+    /// and Linux TCP write queue.  The public/diagnostic form is clamped to 1.0.
     fn congestion_factor(&self) -> f64 {
         let max = self.data_tx.max_capacity();
         let current_capacity = self.data_tx.capacity();
         let filled = max.saturating_sub(current_capacity);
-        (filled as f64) / (max as f64)
+        let channel_pressure = if max == 0 {
+            0.0
+        } else {
+            filled as f64 / max as f64
+        };
+
+        let byte_capacity = max.saturating_mul(BRIDGE_READ_CHUNK).max(1) as f64;
+        let queued = self.stats.queued_data_bytes.load(Ordering::Relaxed) as f64;
+        let byte_pressure = queued / byte_capacity;
+
+        let notsent = self.stats.tcp_notsent_bytes.load(Ordering::Relaxed) as f64;
+        let kernel_pressure = notsent / (crate::net::TUNNEL_TCP_NOTSENT_LOWAT.max(1) as f64);
+
+        channel_pressure
+            .max(byte_pressure)
+            .max(kernel_pressure)
+            .clamp(0.0, 1.0)
     }
+
+    /// Wider score used only for new-flow placement.  It deliberately exceeds
+    /// 1.0 for a queue that has waited multiple RTTs or for a leg that has just
+    /// retransmitted, so a superficially-low RTT cannot hide a stalled path.
+    fn selection_load_factor(&self) -> f64 {
+        let base = self.congestion_factor();
+        let now = process_uptime_ms();
+        let queued_since = self.stats.queued_since_ms.load(Ordering::Relaxed);
+        let rtt = self.stats.rtt_ms.load(Ordering::Relaxed).max(1) as f64;
+        let queue_delay = if queued_since == 0 {
+            0.0
+        } else {
+            now.saturating_sub(queued_since) as f64 / rtt
+        };
+
+        let delivery_rate = self.stats.tcp_delivery_rate.load(Ordering::Relaxed);
+        let queued = self
+            .stats
+            .queued_data_bytes
+            .load(Ordering::Relaxed)
+            .saturating_add(self.stats.tcp_notsent_bytes.load(Ordering::Relaxed));
+        let drain_delay = if delivery_rate == 0 {
+            0.0
+        } else {
+            (queued as f64 * 1000.0 / delivery_rate as f64) / rtt
+        };
+
+        let last_retrans = self.stats.last_retrans_ms.load(Ordering::Relaxed);
+        let retrans_penalty = if last_retrans > 0
+            && now.saturating_sub(last_retrans) <= (rtt as u64).saturating_mul(4).max(1_000)
+        {
+            1.0
+        } else {
+            0.0
+        };
+
+        base.max(queue_delay).max(drain_delay).min(3.0) + retrans_penalty
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct UdpFlowletState {
+    leg_id: u32,
+    last_send_ms: u64,
 }
 
 /// Генератор `stream_id`, разводящий клиента и сервер по чётности.
@@ -234,6 +310,17 @@ pub struct MuxMessage {
     pub(crate) stream_id: u32,
     pub(crate) frame_type: FrameType,
     pub(crate) data: Bytes,
+}
+
+/// Portable subset of Linux TCP_INFO consumed by leg scoring.  The engine
+/// fills it where the platform exposes the fields; other targets simply leave
+/// the corresponding atomics at zero.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct TcpSocketStats {
+    pub notsent_bytes: u64,
+    pub unacked_bytes: u64,
+    pub delivery_rate: u64,
+    pub total_retrans: u32,
 }
 
 pub static GLOBAL_MIN_RTT: AtomicU32 = AtomicU32::new(INITIAL_RTT_MS);
@@ -306,6 +393,10 @@ pub struct Muxer {
     credits: Arc<DashMap<u32, Arc<CreditState>>>,
     /// Sticky-привязка потока к ноге (`stream_id` → `leg_id`).
     stream_bindings: Arc<DashMap<u32, u32>>,
+    /// UDP has no in-order delivery contract, so it uses short flowlets instead
+    /// of a lifetime sticky binding.  A quiet gap or a congested leg permits the
+    /// next datagram to move without changing the NRXP frame format.
+    udp_flowlets: Arc<DashMap<u32, UdpFlowletState>>,
     /// Время отправки PING по каждой ноге — для измерения RTT по PONG.
     pending_pings: Arc<DashMap<u32, Instant>>,
     /// Генератор `stream_id` (чётность по роли).
@@ -347,6 +438,7 @@ impl Muxer {
             streams: Arc::new(DashMap::new()),
             credits: Arc::new(DashMap::new()),
             stream_bindings: Arc::new(DashMap::new()),
+            udp_flowlets: Arc::new(DashMap::new()),
             id_gen: Arc::new(IdGenerator::new(is_client)),
             pending_pings: Arc::new(DashMap::new()),
             session_id: Arc::new(session_id),
@@ -542,6 +634,8 @@ impl Muxer {
     fn clear_bindings_for_leg(&self, leg_id: u32) {
         self.stream_bindings
             .retain(|_, bound_leg| *bound_leg != leg_id);
+        self.udp_flowlets
+            .retain(|_, flowlet| flowlet.leg_id != leg_id);
     }
 
     /// Безопасно эвиктит ногу, но только если её текущий `control_tx` совпадает с
@@ -585,6 +679,7 @@ impl Muxer {
         }
         self.legs.clear();
         self.stream_bindings.clear();
+        self.udp_flowlets.clear();
         self.update_legs_cache();
     }
 
@@ -593,47 +688,33 @@ impl Muxer {
         self.legs.len()
     }
 
-    /// Выбирает ногу для отправки кадра потока `stream_id`.
-    ///
-    /// Двухуровнево: (1) горячий путь — привязанный поток резолвит ногу по id
-    /// прямо из `legs` (без скана и клонирования кэша); (2) новый/осиротевший
-    /// поток скорится по всем ногам (RTT доминирует, congestion лишь модулирует),
-    /// из ног в пределах 2× от лучшего скора выбирается round-robin, и привязка
-    /// фиксируется. Подробности скоринга — в inline-комментариях ниже.
-    fn select_leg(&self, stream_id: u32) -> Option<MuxLeg> {
-        // 1. FAST PATH (hot, per data frame): a bound stream resolves its leg by
-        //    id straight from the legs map — no full-cache Arc clone and no vector
-        //    scan. Reading `legs` (source of truth, not the cached snapshot) also
-        //    transparently picks up a leg that reconnected under the same id.
-        if let Some(leg_id_ref) = self.stream_bindings.get(&stream_id) {
-            let leg_id = *leg_id_ref;
-            if let Some(leg) = self.legs.get(&leg_id) {
-                return Some(leg.clone());
-            }
-            // Bound leg disappeared — fall through and re-pick a fresh one below.
-        }
-
-        // 2. New (or re-homed) stream: load the leg set and choose.
+    /// Picks a new leg using latency plus application/kernel queue state.
+    /// `exclude` is best-effort: if it would remove the only live leg, that leg
+    /// remains eligible.
+    fn pick_leg(&self, exclude: Option<u32>) -> Option<MuxLeg> {
         let legs = self.active_legs_cache.load_full();
         if legs.is_empty() {
             return None;
         }
 
-        // 3. O(N) поиск лучшей леги без сортировки всего вектора.
-        // Consider all available legs so the 4th leg is not permanently starved.
-        // MUXER_POOL_SIZE is kept for topology printing but no longer limits
-        // leg selection: sticky bindings already prevent hot-leg thrashing.
-        // RTT-DOMINANT score: a leg's latency sets the scale, congestion only
-        // modulates within legs of similar RTT. A drastically slower leg is never
-        // preferred over a fast one, even when the fast leg is congested. (The old
-        // additive `rtt + congestion*2000` could score a busy 160 ms leg WORSE
-        // than an idle 1300 ms one, routing new streams onto the laggy leg.)
+        let mut eligible: Vec<&MuxLeg> =
+            legs.iter().filter(|leg| exclude != Some(leg.id)).collect();
+        if eligible.is_empty() {
+            eligible = legs.iter().collect();
+        }
+
+        // RTT remains the base, but queue residence, bytes already accepted by
+        // the writer, Linux `notsent` bytes and a recent retransmission can now
+        // quarantine an apparently-fast leg before its mpsc channel fills.
         let score = |leg: &MuxLeg| -> f64 {
             let rtt = (leg.stats.rtt_ms.load(Ordering::Relaxed) as f64).max(1.0);
-            rtt * (1.0 + leg.congestion_factor())
+            rtt * (1.0 + leg.selection_load_factor())
         };
 
-        let best = legs.iter().map(&score).fold(f64::MAX, f64::min);
+        let best = eligible
+            .iter()
+            .map(|leg| score(leg))
+            .fold(f64::MAX, f64::min);
 
         // Candidate set = every leg within 2× of the best score. Drastically
         // worse (slow / bufferbloated) legs are excluded; near-equal legs are all
@@ -642,21 +723,75 @@ impl Muxer {
         // once, before congestion registers) spreads across legs instead of all
         // binding to the single current-best leg — which previously left one leg
         // saturated and the others idle (low aggregate upload + stop-start stalls).
-        let candidates: Vec<&MuxLeg> = legs.iter().filter(|&l| score(l) <= best * 2.0).collect();
+        let candidates: Vec<&MuxLeg> = eligible
+            .into_iter()
+            .filter(|leg| score(leg) <= best * 2.0)
+            .collect();
 
-        let selected_leg = if candidates.is_empty() {
+        if candidates.is_empty() {
             None
         } else {
             let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) as usize % candidates.len();
             Some(candidates[idx].clone())
-        };
+        }
+    }
 
-        if let Some(leg) = selected_leg {
-            self.stream_bindings.insert(stream_id, leg.id);
-            return Some(leg);
+    /// Выбирает lifetime-sticky ногу для TCP/control потока.
+    fn select_leg(&self, stream_id: u32) -> Option<MuxLeg> {
+        // Hot path: preserving one outer leg also preserves TCP stream ordering
+        // without adding sequence numbers to NRXP.
+        if let Some(leg_id_ref) = self.stream_bindings.get(&stream_id) {
+            let leg_id = *leg_id_ref;
+            if let Some(leg) = self.legs.get(&leg_id) {
+                return Some(leg.clone());
+            }
         }
 
-        None
+        let leg = self.pick_leg(None)?;
+        self.stream_bindings.insert(stream_id, leg.id);
+        Some(leg)
+    }
+
+    /// Chooses a leg for one UDP datagram.  During a short burst the flowlet
+    /// stays on one leg to limit reordering; after a quiet gap, or immediately
+    /// when that leg builds a standing queue, the next datagram may move.
+    fn select_udp_leg(&self, stream_id: u32) -> Option<MuxLeg> {
+        let now = process_uptime_ms().max(1);
+        let gap_ms = (GLOBAL_MIN_RTT.load(Ordering::Relaxed) as u64 / 2).clamp(10, 100);
+        let previous = self.udp_flowlets.get(&stream_id).map(|state| *state);
+
+        if let Some(previous) = previous {
+            if let Some(leg) = self.legs.get(&previous.leg_id) {
+                let within_flowlet = now.saturating_sub(previous.last_send_ms) < gap_ms;
+                if within_flowlet && leg.selection_load_factor() < 1.0 {
+                    let selected = leg.clone();
+                    drop(leg);
+                    self.udp_flowlets.insert(
+                        stream_id,
+                        UdpFlowletState {
+                            leg_id: selected.id,
+                            last_send_ms: now,
+                        },
+                    );
+                    return Some(selected);
+                }
+            }
+        }
+
+        let exclude = previous.and_then(|old| {
+            self.legs
+                .get(&old.leg_id)
+                .and_then(|leg| (leg.selection_load_factor() >= 1.0).then_some(old.leg_id))
+        });
+        let selected = self.pick_leg(exclude)?;
+        self.udp_flowlets.insert(
+            stream_id,
+            UdpFlowletState {
+                leg_id: selected.id,
+                last_send_ms: now,
+            },
+        );
+        Some(selected)
     }
 
     /// Запоминает момент отправки PING по ноге (для замера RTT по PONG).
@@ -702,6 +837,69 @@ impl Muxer {
         }
     }
 
+    /// Records that payload has crossed the bounded mpsc channel boundary but
+    /// has not yet completed a socket write.  This count intentionally includes
+    /// bytes moved into the writer's local fair queues.
+    fn record_leg_data_queued(&self, leg: &MuxLeg, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        let previous = leg
+            .stats
+            .queued_data_bytes
+            .fetch_add(bytes, Ordering::AcqRel);
+        if previous == 0 {
+            leg.stats
+                .queued_since_ms
+                .store(process_uptime_ms().max(1), Ordering::Release);
+        }
+    }
+
+    /// Called by the writer after a fair-scheduled chunk has completed its
+    /// `write_all`.  Saturating CAS avoids underflow if a dying leg races cleanup.
+    pub(crate) fn record_leg_data_drained(&self, leg_id: u32, bytes: u64) {
+        let Some(leg) = self.legs.get(&leg_id) else {
+            return;
+        };
+        let stats = &leg.stats;
+        let new_value = stats
+            .queued_data_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                Some(current.saturating_sub(bytes))
+            })
+            .map(|previous| previous.saturating_sub(bytes))
+            .unwrap_or(0);
+        if new_value == 0 {
+            stats.queued_since_ms.store(0, Ordering::Release);
+        }
+    }
+
+    /// Publishes a sampled TCP_INFO subset without putting a syscall on the
+    /// stream-selection hot path.
+    pub(crate) fn record_tcp_socket_stats(&self, leg_id: u32, sample: TcpSocketStats) {
+        let Some(leg) = self.legs.get(&leg_id) else {
+            return;
+        };
+        let stats = &leg.stats;
+        stats
+            .tcp_notsent_bytes
+            .store(sample.notsent_bytes, Ordering::Relaxed);
+        stats
+            .tcp_unacked_bytes
+            .store(sample.unacked_bytes, Ordering::Relaxed);
+        stats
+            .tcp_delivery_rate
+            .store(sample.delivery_rate, Ordering::Relaxed);
+        let previous = stats
+            .tcp_total_retrans
+            .swap(sample.total_retrans, Ordering::Relaxed);
+        if sample.total_retrans > previous {
+            stats
+                .last_retrans_ms
+                .store(process_uptime_ms().max(1), Ordering::Relaxed);
+        }
+    }
+
     /// Отправляет кадр в сеть, выбирая ногу и применяя стратегию по типу кадра.
     ///
     /// - **Данные** (`Data`/`UdpData`): `send().await` (backpressure) с
@@ -712,7 +910,7 @@ impl Muxer {
     /// - **Прочий контроль**: `try_send`; при переполнении кадр дропается с
     ///   сигналом `ControlChannelFull`, не блокируя.
     #[instrument(skip(self, message), fields(session_id = %self.session_id, stream_id = message.stream_id, frame = ?message.frame_type))]
-    pub async fn send_to_network(&self, mut message: MuxMessage) -> Result<(), AppError> {
+    pub async fn send_to_network(&self, message: MuxMessage) -> Result<(), AppError> {
         let is_data = matches!(message.frame_type, FrameType::Data | FrameType::UdpData);
 
         if is_data {
@@ -724,23 +922,31 @@ impl Muxer {
             // bounded: remove_leg drops the leg from the cache, so select_leg can
             // never hand back the same dead leg, and it terminates at None.
             loop {
-                let leg = match self.select_leg(message.stream_id) {
+                let leg = match if message.frame_type == FrameType::UdpData {
+                    self.select_udp_leg(message.stream_id)
+                } else {
+                    self.select_leg(message.stream_id)
+                } {
                     Some(l) => l,
                     None => {
                         return Err(AppError::new(
                             ERR_INFRA_TIMEOUT,
                             "Нет связи",
                             "No active legs",
-                        ))
+                        ));
                     }
                 };
 
                 let stream_id = message.stream_id;
                 let size = message.data.len() as u64;
 
-                // 💡 ДАННЫЕ: Используем .send().await для создания Backpressure
-                match leg.data_tx.send(message).await {
-                    Ok(_) => {
+                // Reserve first so queue accounting becomes visible before the
+                // receiver can dequeue the message.  The bounded channel still
+                // supplies the original local, sub-RTT backpressure.
+                match leg.data_tx.clone().reserve_owned().await {
+                    Ok(permit) => {
+                        self.record_leg_data_queued(&leg, size);
+                        permit.send(message);
                         leg.stats.tx_bytes.fetch_add(size, Ordering::Relaxed);
                         if let Some(stream_ref) = self.streams.get(&stream_id) {
                             stream_ref
@@ -751,10 +957,9 @@ impl Muxer {
                         }
                         return Ok(());
                     }
-                    Err(send_err) => {
-                        // Recover the payload from the failed send so the retry
-                        // on another leg does not lose the chunk.
-                        message = send_err.0;
+                    Err(_) => {
+                        // `reserve` failed before taking ownership, so `message`
+                        // is still available for retry on another live leg.
                         DIAG_COUNTERS.upload_fails.fetch_add(1, Ordering::Relaxed);
                         diagnostics::send_diag_event(DiagnosticsEvent::UploadFailed {
                             stream_id,
@@ -775,7 +980,7 @@ impl Muxer {
                         ERR_INFRA_TIMEOUT,
                         "Нет связи",
                         "No active legs",
-                    ))
+                    ));
                 }
             };
 
@@ -988,6 +1193,7 @@ impl Muxer {
             slot.token.cancel();
         }
         self.stream_bindings.remove(&stream_id);
+        self.udp_flowlets.remove(&stream_id);
     }
 
     // ORDERING CONTRACT: preserved by construction — each stream has exactly one
@@ -1363,18 +1569,12 @@ impl Muxer {
             .map(|leg| {
                 let cap = leg.data_tx.max_capacity();
                 let free = leg.data_tx.capacity();
-                let filled = cap.saturating_sub(free);
-                let congestion_factor = if cap > 0 {
-                    filled as f64 / cap as f64
-                } else {
-                    0.0
-                };
                 LegMetrics {
                     leg_id: leg.id,
                     rtt_ms: leg.stats.rtt_ms.load(Ordering::Relaxed),
                     tx_mb: leg.stats.tx_bytes.load(Ordering::Relaxed) as f64 / 1_048_576.0,
                     rx_mb: leg.stats.rx_bytes.load(Ordering::Relaxed) as f64 / 1_048_576.0,
-                    congestion_factor,
+                    congestion_factor: leg.congestion_factor(),
                     data_channel_free: free,
                     data_channel_capacity: cap,
                     session_id: self.session_id.to_string(),
@@ -1388,5 +1588,68 @@ impl Muxer {
             total_streams: self.streams.len(),
             session_count: 1,
         }
+    }
+}
+
+#[cfg(test)]
+mod scheduling_tests {
+    use super::*;
+
+    fn muxer_with_two_legs() -> Muxer {
+        let muxer = Muxer::new(true, "scheduling-test".into());
+        for leg_id in 0..2 {
+            let (control_tx, _control_rx) = tokio::sync::mpsc::channel(8);
+            let (data_tx, _data_rx) = tokio::sync::mpsc::channel(8);
+            muxer.add_leg(leg_id, control_tx, data_tx);
+            muxer
+                .legs
+                .get(&leg_id)
+                .unwrap()
+                .stats
+                .rtt_ms
+                .store(50, Ordering::Relaxed);
+        }
+        muxer.update_legs_cache();
+        muxer
+    }
+
+    #[tokio::test]
+    async fn healthy_udp_burst_stays_in_one_flowlet() {
+        let muxer = muxer_with_two_legs();
+        let first = muxer.select_udp_leg(11).unwrap().id;
+        let second = muxer.select_udp_leg(11).unwrap().id;
+
+        assert_eq!(first, second);
+    }
+
+    #[tokio::test]
+    async fn congested_udp_flowlet_moves_to_another_leg() {
+        let muxer = muxer_with_two_legs();
+        let first = muxer.select_udp_leg(13).unwrap().id;
+        let leg = muxer.legs.get(&first).unwrap();
+        leg.stats.queued_data_bytes.store(
+            (leg.data_tx.max_capacity() * BRIDGE_READ_CHUNK) as u64,
+            Ordering::Relaxed,
+        );
+        drop(leg);
+
+        let second = muxer.select_udp_leg(13).unwrap().id;
+        assert_ne!(first, second);
+    }
+
+    #[tokio::test]
+    async fn byte_accounting_includes_writer_local_queue() {
+        let muxer = muxer_with_two_legs();
+        let leg = muxer.legs.get(&0).unwrap().clone();
+
+        muxer.record_leg_data_queued(&leg, 10_000);
+        assert_eq!(leg.stats.queued_data_bytes.load(Ordering::Relaxed), 10_000);
+        assert_ne!(leg.stats.queued_since_ms.load(Ordering::Relaxed), 0);
+
+        muxer.record_leg_data_drained(0, 4_000);
+        assert_eq!(leg.stats.queued_data_bytes.load(Ordering::Relaxed), 6_000);
+        muxer.record_leg_data_drained(0, 6_000);
+        assert_eq!(leg.stats.queued_data_bytes.load(Ordering::Relaxed), 0);
+        assert_eq!(leg.stats.queued_since_ms.load(Ordering::Relaxed), 0);
     }
 }

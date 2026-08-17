@@ -23,15 +23,15 @@ use std::{net::Ipv4Addr, sync::Arc, time::Instant};
 use crate::{
     crypto::{ChaChaCipher, Identity, SessionKeys},
     net::{
+        DNS_LOOKUP_TIMEOUT, FALLBACK_CONNECT_TIMEOUT, HTTPS_PORT, LEG_RECONNECT_DELAY,
+        LEG_STAGGER_DELAY, MAX_TUNNEL_LEGS, NETWORK_WATCHER_INTERVAL, NetworkConfig,
+        SECURE_HANDSHAKE_TIMEOUT, SESSION_CLEANUP_DELAY, STREAM_PAUSE_BUDGET, STREAM_PAUSE_RETRY,
+        TLS_HELLO_TIMEOUT, TOPOLOGY_PRINT_INTERVAL,
         connection::{
             engine::TunnelEngine,
             handler::{RemoteOpener, StreamHandler},
             muxer::{MuxMessage, Muxer},
         },
-        NetworkConfig, DNS_LOOKUP_TIMEOUT, FALLBACK_CONNECT_TIMEOUT, HTTPS_PORT,
-        LEG_RECONNECT_DELAY, LEG_STAGGER_DELAY, MAX_TUNNEL_LEGS, NETWORK_WATCHER_INTERVAL,
-        SECURE_HANDSHAKE_TIMEOUT, SESSION_CLEANUP_DELAY, STREAM_PAUSE_BUDGET, STREAM_PAUSE_RETRY,
-        TLS_HELLO_TIMEOUT, TOPOLOGY_PRINT_INTERVAL,
     },
     nrxp::{Codec, Frame, FrameType, TlsBridge},
     rawcast::{LocalProtocol, RawCastAdapter, RawCastFrame},
@@ -40,14 +40,14 @@ use crate::{
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use netrunner_logger::{
-    debug, error, info, warn, AppError, ERR_AUTH_FAILED, ERR_INFRA_TIMEOUT, ERR_NET_TLS_TAMPER,
+    AppError, ERR_AUTH_FAILED, ERR_INFRA_TIMEOUT, ERR_NET_TLS_TAMPER, debug, error, info, warn,
 };
 use rand::{Rng, RngExt};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{
-        tcp::{OwnedReadHalf, OwnedWriteHalf},
         TcpStream,
+        tcp::{OwnedReadHalf, OwnedWriteHalf},
     },
     sync::mpsc,
 };
@@ -122,8 +122,51 @@ pub struct Connection {
     pub(crate) read_buf: BytesMut,
 }
 
+/// Applies a low write-readiness threshold to bytes accepted from userspace but
+/// not yet handed to the Linux TCP stack.  This keeps the kernel-side queue
+/// close enough to the NRXP fair scheduler that bulk writes cannot run far
+/// ahead of interactive streams.
+///
+/// `TCP_NOTSENT_LOWAT` is local socket state; unlike MPTCP/TCP Fast Open it does
+/// not add a visible TCP option and therefore does not alter the camouflage.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn tune_tcp_notsent_lowat(stream: &TcpStream) {
+    use std::os::fd::AsRawFd;
+
+    // Bionic does not currently export this Linux UAPI constant through the
+    // Rust libc crate, even though the Android kernel implements option 25.
+    #[cfg(target_os = "linux")]
+    let option_name = libc::TCP_NOTSENT_LOWAT;
+    #[cfg(target_os = "android")]
+    let option_name: libc::c_int = 25;
+
+    let value = crate::net::TUNNEL_TCP_NOTSENT_LOWAT as libc::c_uint;
+    let rc = unsafe {
+        libc::setsockopt(
+            stream.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            option_name,
+            (&value as *const libc::c_uint).cast(),
+            std::mem::size_of_val(&value) as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        debug!(
+            error = %std::io::Error::last_os_error(),
+            "TCP_NOTSENT_LOWAT is unavailable; continuing with OS defaults"
+        );
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn tune_tcp_notsent_lowat(_stream: &TcpStream) {}
+
 impl Connection {
     pub fn new(stream: TcpStream) -> Self {
+        // Both are local scheduling controls.  Neither changes the NRXP wire
+        // format or advertises a non-standard TCP option to the peer.
+        let _ = stream.set_nodelay(true);
+        tune_tcp_notsent_lowat(&stream);
         let (inbound, outbound) = stream.into_split();
         Self {
             inbound,
@@ -213,7 +256,7 @@ async fn consume_middlebox_ccs(
                             ERR_INFRA_TIMEOUT,
                             "Разрыв соединения",
                             "EOF while waiting for ChangeCipherSpec",
-                        ))
+                        ));
                     }
                     Ok(Ok(_)) => continue,
                     Ok(Err(e)) => {
@@ -221,14 +264,14 @@ async fn consume_middlebox_ccs(
                             ERR_INFRA_TIMEOUT,
                             "Ошибка чтения",
                             e.to_string(),
-                        ))
+                        ));
                     }
                     Err(_) => {
                         return Err(AppError::new(
                             ERR_INFRA_TIMEOUT,
                             "Таймаут handshake",
                             "Timeout waiting for ChangeCipherSpec",
-                        ))
+                        ));
                     }
                 }
             }
@@ -237,7 +280,7 @@ async fn consume_middlebox_ccs(
                     ERR_NET_TLS_TAMPER,
                     "Ошибка TLS",
                     format!("TLS error while reading ChangeCipherSpec: {:?}", e.stage),
-                ))
+                ));
             }
         }
     }
@@ -335,7 +378,7 @@ impl ClientHandler {
                                 ERR_INFRA_TIMEOUT,
                                 "Разрыв соединения",
                                 "EOF on handshake".to_string(),
-                            ))
+                            ));
                         }
                         Ok(Ok(_)) => continue,
                         Ok(Err(e)) => {
@@ -343,14 +386,14 @@ impl ClientHandler {
                                 ERR_INFRA_TIMEOUT,
                                 "Ошибка чтения",
                                 e.to_string(),
-                            ))
+                            ));
                         }
                         Err(_) => {
                             return Err(AppError::new(
                                 ERR_INFRA_TIMEOUT,
                                 "Таймаут handshake",
                                 "Handshake read timeout",
-                            ))
+                            ));
                         }
                     }
                 }
@@ -359,7 +402,7 @@ impl ClientHandler {
                         ERR_NET_TLS_TAMPER,
                         "Ошибка TLS",
                         format!("TLS error: {:?}", e.stage),
-                    ))
+                    ));
                 }
             }
         }
@@ -612,7 +655,7 @@ impl ClientHandler {
                         &auth_token,
                         &identity,
                     )
-                            .await
+                    .await
                     {
                         if e.code == ERR_AUTH_FAILED {
                             // Сервер безоговорочно отверг токен (см. `validate`
@@ -1101,7 +1144,10 @@ impl TunnelHandler for ServerHandler {
                             break (sh, peer_version);
                         }
                         Err(e) => {
-                            warn!("❌ Unauthorized/Invalid ClientHello. Triggering Stealth Fallback. Reason: {:?}", e.stage);
+                            warn!(
+                                "❌ Unauthorized/Invalid ClientHello. Triggering Stealth Fallback. Reason: {:?}",
+                                e.stage
+                            );
                             // Невалидный (например, чужой) ClientHello всё равно разобрался
                             // синтаксически — достаём его SNI, чтобы fallback проксировал
                             // именно на запрошенный хост, а не всегда на один и тот же decoy.
@@ -1128,7 +1174,7 @@ impl TunnelHandler for ServerHandler {
                                 ERR_INFRA_TIMEOUT,
                                 "Клиент отключился",
                                 "Client closed connection",
-                            ))
+                            ));
                         }
                         Ok(Ok(_)) => continue,
                         _ => {
@@ -1146,7 +1192,9 @@ impl TunnelHandler for ServerHandler {
                     }
                 }
                 Err(_) => {
-                    warn!("❌ Handshake parse failed (Not a valid TLS probe). Triggering Stealth Fallback.");
+                    warn!(
+                        "❌ Handshake parse failed (Not a valid TLS probe). Triggering Stealth Fallback."
+                    );
                     Self::handle_stealth_fallback(
                         inbound,
                         outbound,
@@ -1561,10 +1609,7 @@ mod tests {
             let peer =
                 crate::PeerIdentity::from_hex(&hex::encode([3u8; 32]), &local.public_key_hex())
                     .unwrap();
-            (
-                Some(Identity::Peer(peer)),
-                Some(Identity::Local(local)),
-            )
+            (Some(Identity::Peer(peer)), Some(Identity::Local(local)))
         } else {
             (None, None)
         };
