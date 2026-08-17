@@ -32,7 +32,7 @@ use crate::{
     net::engine::{EngineBuilder, EngineConfig},
     tun::{
         device::{GLOBAL_RX_BYTES, GLOBAL_RX_PACKETS, GLOBAL_TX_BYTES, GLOBAL_TX_PACKETS},
-        routing::reset_platform_routing,
+        routing::{TunnelMode, reset_platform_routing},
     },
 };
 use netrunner_logger::{error, info};
@@ -107,6 +107,45 @@ pub struct VpnTrafficStats {
 ///
 /// Хранит токен отмены и данные для отката маршрутизации. Останавливается явно
 /// ([`stop`](Session::stop)) или автоматически при `Drop`.
+/// Строка политики организации → [`TunnelMode`].
+///
+/// Неизвестное и отсутствующее значение — [`TunnelMode::All`], то есть прежнее
+/// поведение. Это не «на всякий случай»: приложение старее бэкенда увидит
+/// режим, которого не знает, и должно повести себя как обычный VPN, а не
+/// оставить сотрудника без сети, отказавшись подключаться.
+fn parse_tunnel_mode(raw: Option<&str>) -> TunnelMode {
+    match raw {
+        Some("resources") => TunnelMode::Resources,
+        Some("bypass_lan") => TunnelMode::BypassLan,
+        Some("all") | None => TunnelMode::All,
+        Some(other) => {
+            netrunner_logger::warn!("Неизвестный режим туннеля {:?} — работаем как all", other);
+            TunnelMode::All
+        }
+    }
+}
+
+#[cfg(test)]
+mod tunnel_mode_tests {
+    use super::*;
+
+    #[test]
+    fn known_modes_map_directly() {
+        assert_eq!(parse_tunnel_mode(Some("resources")), TunnelMode::Resources);
+        assert_eq!(parse_tunnel_mode(Some("bypass_lan")), TunnelMode::BypassLan);
+        assert_eq!(parse_tunnel_mode(Some("all")), TunnelMode::All);
+    }
+
+    /// Главное свойство: клиент старее бэкенда не должен ломаться о режим,
+    /// про который он ещё не знает.
+    #[test]
+    fn unknown_and_missing_fall_back_to_full_tunnel() {
+        assert_eq!(parse_tunnel_mode(None), TunnelMode::All);
+        assert_eq!(parse_tunnel_mode(Some("")), TunnelMode::All);
+        assert_eq!(parse_tunnel_mode(Some("site_to_site")), TunnelMode::All);
+    }
+}
+
 #[derive(uniffi::Object)]
 pub struct Session {
     pub(crate) cancel_token: CancellationToken,
@@ -171,6 +210,8 @@ impl SessionManager {
         auth_token: Option<String>,
         node_secret: Option<String>,
         node_public_key: Option<String>,
+        tunnel_mode: Option<String>,
+        routed_cidrs: Vec<String>,
     ) -> Arc<Session> {
         // На мобильных Logger::init здесь — первый и единственный вызов (нет
         // отдельного main.rs), поэтому production-флаг должен зависеть от
@@ -208,7 +249,8 @@ impl SessionManager {
             .with_excluded_domains(excluded_domains)
             .with_decoy_sni(sni)
             .with_auth_token(auth_token)
-            .with_node_credentials(node_secret, node_public_key);
+            .with_node_credentials(node_secret, node_public_key)
+            .with_tunnel_mode(parse_tunnel_mode(tunnel_mode.as_deref()), routed_cidrs);
 
         #[cfg(any(target_os = "android", target_os = "ios"))]
         {

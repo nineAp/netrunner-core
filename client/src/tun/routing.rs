@@ -115,13 +115,106 @@ pub fn allow_excluded_ip_linux(ip: &str) {
     }
 }
 
-/// Ставит платформенные правила маршрутизации: весь трафic → TUN, доступ к
-/// прокси сохраняется, при `killswitch` всё прочее блокируется. `excluded_apps`
-/// (на Linux — UID) проходят мимо туннеля (split-tunneling).
+/// Что именно заворачивается в туннель.
+///
+/// Появилось вместе с корпоративным (managed) режимом: организация может
+/// выдать сотруднику доступ К РЕСУРСАМ, а не «всю сеть через нас». Для
+/// частного пользователя режим всегда [`TunnelMode::All`] — ровно прежнее
+/// поведение, ничего не меняется.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum TunnelMode {
+    /// Весь трафик в туннель (классический VPN).
+    #[default]
+    All,
+    /// Только объявленные подсети (ZTNA): личный трафик сотрудника через нас
+    /// не идёт вообще. Это не оптимизация, а обещание, которое даётся клиенту
+    /// при продаже, — и именно поэтому режим реализован маршрутизацией, а не
+    /// фильтрацией «уже внутри туннеля».
+    Resources,
+    /// Весь трафик, кроме локальной сети (домашний принтер, NAS, роутер).
+    BypassLan,
+}
+
+/// Диапазоны RFC 1918 + loopback — то, что считается «локальной сетью».
+/// Один список на оба места, где он нужен ([`TunnelMode::BypassLan`] и
+/// kill-switch), чтобы они не разъехались.
+const LAN_RANGES: &str = "127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16";
+
+/// Пропускает только то, что заведомо безопасно подставить в команду.
+///
+/// Значения приходят с бэкенда (`org_resources.value`, уже нормализованные
+/// там), но здесь они попадают в строку, которая исполняется шеллом, — а
+/// доверять валидации на другой стороне сети для такого нельзя. Форма
+/// проверяется буквально: только цифры, точки и одна косая с длиной префикса.
+fn is_safe_cidr(value: &str) -> bool {
+    let Some((addr, prefix)) = value.split_once('/') else {
+        return false;
+    };
+    let Ok(len) = prefix.parse::<u8>() else {
+        return false;
+    };
+    if len > 32 {
+        return false;
+    }
+    let octets: Vec<&str> = addr.split('.').collect();
+    octets.len() == 4
+        && octets
+            .iter()
+            .all(|o| !o.is_empty() && o.len() <= 3 && o.parse::<u8>().is_ok())
+}
+
+/// Отбрасывает всё, что не прошло [`is_safe_cidr`], с записью в лог.
+///
+/// Молча пропустить негодное значение нельзя: в режиме [`TunnelMode::Resources`]
+/// пустой список означает «в туннель не идёт ничего», и сотрудник получил бы
+/// молча неработающий доступ вместо внятной строки в логе.
+fn sanitize_cidrs(cidrs: &[String]) -> Vec<String> {
+    cidrs
+        .iter()
+        .filter_map(|c| {
+            if is_safe_cidr(c) {
+                Some(c.clone())
+            } else {
+                netrunner_logger::warn!("Отброшена некорректная подсеть ресурса: {:?}", c);
+                None
+            }
+        })
+        .collect()
+}
+
+/// `10.0.0.0/8` → `255.0.0.0`. Нужна Windows-ветке: `route add` принимает
+/// маску, а не длину префикса.
+///
+/// Без `cfg(windows)` намеренно: функция чистая и покрыта тестами, которые
+/// гоняются на Linux в CI, — под `cfg` они бы там просто не компилировались.
+fn cidr_to_mask(cidr: &str) -> Option<String> {
+    let (_, prefix) = cidr.split_once('/')?;
+    let len: u32 = prefix.parse().ok()?;
+    if len > 32 {
+        return None;
+    }
+    // Сдвиг на 32 — UB для u32 в Rust (паника в debug), поэтому /0 отдельно.
+    let bits: u32 = if len == 0 { 0 } else { u32::MAX << (32 - len) };
+    Some(format!(
+        "{}.{}.{}.{}",
+        bits >> 24,
+        (bits >> 16) & 0xFF,
+        (bits >> 8) & 0xFF,
+        bits & 0xFF
+    ))
+}
+
+/// Ставит платформенные правила маршрутизации: трафик → TUN (какой именно —
+/// решает `mode`), доступ к прокси сохраняется, при `killswitch` всё прочее
+/// блокируется. `excluded_apps` (на Linux — UID) проходят мимо туннеля
+/// (split-tunneling). `routed_cidrs` используется только в
+/// [`TunnelMode::Resources`] — это подсети ресурсов организации.
 pub fn setup_platform_routing(
     remote_address: &str,
     killswitch: bool,
     excluded_apps: &[String],
+    mode: TunnelMode,
+    routed_cidrs: &[String],
 ) -> io::Result<()> {
     let proxy_ip = remote_address.split(':').next().unwrap_or(remote_address);
 
@@ -183,19 +276,76 @@ pub fn setup_platform_routing(
             false,
         )?;
 
-        // 3. Базовая маркировка трафика для отправки в TUN
-        let mark_rule = format!(
-            "nft add rule ip netrunner output ip daddr != {} oifname != \"netr0\" mark set 0x1",
-            proxy_ip
-        );
-        run_cmd_ext(&mark_rule, false)?;
+        // 3. Локальная сеть мимо туннеля — до маркировки, потому что
+        // `accept` терминален: домашний принтер и NAS остаются доступны.
+        if mode == TunnelMode::BypassLan {
+            run_cmd_ext(
+                &format!("nft add rule ip netrunner output ip daddr {{ {LAN_RANGES} }} accept"),
+                false,
+            )?;
+        }
 
-        // 4. KILLSWITCH
-        if killswitch {
+        // 4. Маркировка трафика для отправки в TUN — здесь и проходит
+        // разница между обычным VPN и корпоративным ZTNA.
+        match mode {
+            TunnelMode::All | TunnelMode::BypassLan => {
+                let mark_rule = format!(
+                    "nft add rule ip netrunner output ip daddr != {} oifname != \"netr0\" mark set 0x1",
+                    proxy_ip
+                );
+                run_cmd_ext(&mark_rule, false)?;
+            }
+            TunnelMode::Resources => {
+                // `flags interval` обязателен: без него set хранит только
+                // одиночные адреса и не принимает подсети вообще.
+                run_cmd_ext(
+                    "nft add set ip netrunner tunneled_nets { type ipv4_addr; flags interval; }",
+                    true,
+                )?;
+
+                let safe = sanitize_cidrs(routed_cidrs);
+                if safe.is_empty() {
+                    // Пустой список — не ошибка конфигурации, а законное
+                    // состояние (админ ещё не выдал ни одного ресурса).
+                    // Туннель поднимается, но в него ничего не маршрутизируется.
+                    netrunner_logger::warn!(
+                        "Режим resources без единой подсети — в туннель не пойдёт ничего"
+                    );
+                } else {
+                    run_cmd_ext(
+                        &format!(
+                            "nft add element ip netrunner tunneled_nets {{ {} }}",
+                            safe.join(", ")
+                        ),
+                        false,
+                    )?;
+                    run_cmd_ext(
+                        "nft add rule ip netrunner output ip daddr @tunneled_nets oifname != \"netr0\" mark set 0x1",
+                        false,
+                    )?;
+                    netrunner_logger::info!(
+                        "🎯 Режим resources: в туннель маршрутизировано подсетей: {}",
+                        safe.len()
+                    );
+                }
+            }
+        }
+
+        // 5. KILLSWITCH
+        //
+        // В режиме resources его НЕ ставим, и это не упущение: «резать всё
+        // мимо туннеля» там означало бы отрубить сотруднику весь личный
+        // интернет, хотя через нас он и не должен идти. Утечки ресурсного
+        // трафика при этом всё равно нет — он маркируется в таблицу 100 с
+        // единственным маршрутом через netr0, и если интерфейс исчез, пакет
+        // просто не находит маршрута. То есть режим fail-closed по построению,
+        // а не по отдельному правилу.
+        if killswitch && mode != TunnelMode::Resources {
             netrunner_logger::info!("🔒 Killswitch ENABLED (Linux)");
             // Исключения для локальной сети (крайне важно для сохранения доступа к роутеру)
-            let lan_bypass = "nft add rule ip netrunner output ip daddr { 127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 } accept";
-            run_cmd_ext(lan_bypass, false)?;
+            let lan_bypass =
+                format!("nft add rule ip netrunner output ip daddr {{ {LAN_RANGES} }} accept");
+            run_cmd_ext(&lan_bypass, false)?;
 
             // Разрешаем трафик до самого прокси-сервера
             run_cmd_ext(
@@ -260,24 +410,72 @@ pub fn setup_platform_routing(
             true,
         )?;
 
-        // Направляем весь трафик в TUN
-        run_cmd_ext(
-            &format!(
-                "route add 0.0.0.0 mask 128.0.0.0 10.0.0.2 if {} metric 5",
-                tun_idx
-            ),
-            true,
-        )?;
-        run_cmd_ext(
-            &format!(
-                "route add 128.0.0.0 mask 128.0.0.0 10.0.0.2 if {} metric 5",
-                tun_idx
-            ),
-            true,
-        )?;
+        match mode {
+            TunnelMode::All | TunnelMode::BypassLan => {
+                // Весь трафик в TUN. Двумя половинками /1, а не заменой
+                // дефолта: так исходный маршрут остаётся в таблице и его не
+                // надо восстанавливать вручную при отключении.
+                run_cmd_ext(
+                    &format!(
+                        "route add 0.0.0.0 mask 128.0.0.0 10.0.0.2 if {} metric 5",
+                        tun_idx
+                    ),
+                    true,
+                )?;
+                run_cmd_ext(
+                    &format!(
+                        "route add 128.0.0.0 mask 128.0.0.0 10.0.0.2 if {} metric 5",
+                        tun_idx
+                    ),
+                    true,
+                )?;
 
-        // KILLSWITCH: Удаляем дефолтный физический маршрут
-        if killswitch {
+                // Локальная сеть мимо туннеля — явными маршрутами через
+                // физический шлюз с меньшей метрикой, чем у половинок выше.
+                if mode == TunnelMode::BypassLan {
+                    for (net, mask) in [
+                        ("10.0.0.0", "255.0.0.0"),
+                        ("172.16.0.0", "255.240.0.0"),
+                        ("192.168.0.0", "255.255.0.0"),
+                    ] {
+                        run_cmd_ext(
+                            &format!("route add {net} mask {mask} {gateway} metric 1"),
+                            true,
+                        )?;
+                    }
+                }
+            }
+            TunnelMode::Resources => {
+                // Маршрут на каждую подсеть ресурса вместо перехвата дефолта.
+                // Всё остальное продолжает ходить как ходило — сотрудник даже
+                // не замечает, что туннель поднят.
+                let safe = sanitize_cidrs(routed_cidrs);
+                if safe.is_empty() {
+                    netrunner_logger::warn!(
+                        "Режим resources без единой подсети — в туннель не пойдёт ничего"
+                    );
+                }
+                for cidr in &safe {
+                    let Some(mask) = cidr_to_mask(cidr) else {
+                        continue;
+                    };
+                    let net = cidr.split('/').next().unwrap_or(cidr);
+                    run_cmd_ext(
+                        &format!("route add {net} mask {mask} 10.0.0.2 if {tun_idx} metric 5"),
+                        true,
+                    )?;
+                }
+                netrunner_logger::info!(
+                    "🎯 Режим resources: маршрутов в туннель добавлено: {}",
+                    safe.len()
+                );
+            }
+        }
+
+        // KILLSWITCH: Удаляем дефолтный физический маршрут.
+        // В режиме resources — не трогаем: дефолт там и должен остаться, через
+        // него идёт весь личный трафик (см. тот же разбор в Linux-ветке).
+        if killswitch && mode != TunnelMode::Resources {
             netrunner_logger::info!(
                 "🔒 Killswitch ENABLED (Windows). Deleting default physical route."
             );
@@ -340,4 +538,69 @@ pub fn reset_platform_routing(_proxy_ip: Option<&str>, _was_killswitch: bool) ->
         eprintln!("Android/Mobile routing on native side");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Значения подсетей приходят по сети и попадают в строку, которую
+    /// исполняет шелл. Проверяем именно отсев, а не «формат красивый».
+    #[test]
+    fn only_well_formed_cidrs_pass() {
+        for good in ["10.0.0.0/8", "192.168.1.0/24", "0.0.0.0/0", "10.1.2.3/32"] {
+            assert!(is_safe_cidr(good), "отверг корректное {good}");
+        }
+        for bad in [
+            "10.0.0.0",             // без префикса
+            "10.0.0.0/33",          // префикс вне диапазона
+            "10.0.0.0/8; rm -rf /", // инъекция команды
+            "10.0.0.0/8 accept",    // инъекция правила nft
+            "gitlab.corp/24",       // не адрес
+            "999.0.0.0/8",          // октет вне диапазона
+            "10.0.0/8",             // мало октетов
+            "10.0.0.0.0/8",         // много октетов
+            "",
+            "/8",
+        ] {
+            assert!(!is_safe_cidr(bad), "принял негодное {bad:?}");
+        }
+    }
+
+    #[test]
+    fn sanitize_drops_bad_and_keeps_good() {
+        let input = vec![
+            "10.0.0.0/8".to_string(),
+            "не подсеть".to_string(),
+            "192.168.0.0/16".to_string(),
+        ];
+        assert_eq!(
+            sanitize_cidrs(&input),
+            vec!["10.0.0.0/8".to_string(), "192.168.0.0/16".to_string()]
+        );
+    }
+
+    #[test]
+    fn prefix_length_converts_to_mask() {
+        assert_eq!(cidr_to_mask("10.0.0.0/8").as_deref(), Some("255.0.0.0"));
+        assert_eq!(
+            cidr_to_mask("192.168.1.0/24").as_deref(),
+            Some("255.255.255.0")
+        );
+        assert_eq!(
+            cidr_to_mask("10.1.2.3/32").as_deref(),
+            Some("255.255.255.255")
+        );
+        // /0 — отдельная ветка: сдвиг u32 на 32 в Rust это паника в debug.
+        assert_eq!(cidr_to_mask("0.0.0.0/0").as_deref(), Some("0.0.0.0"));
+        assert_eq!(cidr_to_mask("10.0.0.0/33"), None);
+        assert_eq!(cidr_to_mask("10.0.0.0"), None);
+    }
+
+    /// Режим по умолчанию обязан остаться прежним поведением: частный
+    /// пользователь ничего не должен заметить от появления корпоративного.
+    #[test]
+    fn default_mode_is_full_tunnel() {
+        assert_eq!(TunnelMode::default(), TunnelMode::All);
+    }
 }

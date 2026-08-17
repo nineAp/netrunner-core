@@ -50,7 +50,7 @@ use crate::net::connection_manager::ConnectionManager;
 use crate::net::dns::DnsHandler;
 use crate::net::socket_factory::{SmolSocketFactory, SocketProvider};
 use crate::tun::device::TrafficCounter;
-use crate::tun::routing::setup_platform_routing;
+use crate::tun::routing::{TunnelMode, setup_platform_routing};
 use crate::tun::tun::Tun;
 
 pub static START_TIME: LazyLock<StdInstant> = LazyLock::new(StdInstant::now);
@@ -783,6 +783,13 @@ pub struct EngineConfig {
     pub excluded_apps: Vec<String>,
     /// Домены в обход туннеля.
     pub excluded_domains: Vec<String>,
+    /// Что заворачивать в туннель (см. [`TunnelMode`]). Для частного
+    /// пользователя всегда `All` — прежнее поведение. `Resources` приходит
+    /// только из политики организации (managed-режим).
+    pub tunnel_mode: TunnelMode,
+    /// Подсети ресурсов организации. Используются исключительно в
+    /// [`TunnelMode::Resources`]; в остальных режимах игнорируются.
+    pub routed_cidrs: Vec<String>,
     /// SNI поддельного `ClientHello` (домен-декой, под который маскируется
     /// хендшейк). Пока статический атрибут конфигурации — раньше был
     /// захардкожен константой глубоко в TLS-слое ядра. В перспективе будет
@@ -822,6 +829,8 @@ impl EngineConfig {
             killswitch_enabled: true,
             excluded_apps: Vec::new(),
             excluded_domains: Vec::new(),
+            tunnel_mode: TunnelMode::All,
+            routed_cidrs: Vec::new(),
             decoy_sni: netrunner_core::net::DEFAULT_DECOY_HOST.to_string(),
             auth_token: None,
             node_secret: None,
@@ -880,6 +889,16 @@ impl EngineConfig {
         self.excluded_domains = domains;
         self
     }
+
+    /// Режим туннелирования и подсети ресурсов задаются одним вызовом:
+    /// по отдельности их выставить нельзя, потому что `Resources` без списка
+    /// подсетей означает «в туннель не идёт ничего» — состояние, в которое
+    /// попасть по невнимательности не должно быть возможно.
+    pub fn with_tunnel_mode(mut self, mode: TunnelMode, routed_cidrs: Vec<String>) -> Self {
+        self.tunnel_mode = mode;
+        self.routed_cidrs = routed_cidrs;
+        self
+    }
 }
 
 /// Сборщик [`Engine`]: подготавливает DNS, маршрутизацию, туннель и интерфейс.
@@ -925,13 +944,15 @@ impl EngineBuilder {
 
         if self.config.setup_routing {
             info!(
-                "Applying platform routing rules (Killswitch: {})...",
-                self.config.killswitch_enabled
+                "Applying platform routing rules (Killswitch: {}, mode: {:?})...",
+                self.config.killswitch_enabled, self.config.tunnel_mode
             );
             setup_platform_routing(
                 &self.config.remote_address,
                 self.config.killswitch_enabled,
                 &self.config.excluded_apps,
+                self.config.tunnel_mode,
+                &self.config.routed_cidrs,
             )
             .map_err(|e| format!("Routing setup failed: {}", e))?;
         }

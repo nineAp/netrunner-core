@@ -23,7 +23,16 @@ interface SessionManager {
         // включают аутентифицированный хендшейк. Оба null — старая анонимная
         // схема, сервер клиенту ничем себя не подтверждает.
         string? node_secret,
-        string? node_public_key
+        string? node_public_key,
+        // Корпоративный (managed) режим: "all" | "resources" | "bypass_lan".
+        // Строка, а не enum, сознательно — значение приезжает с бэкенда как
+        // строка политики и здесь только пробрасывается; лишний тип в UDL
+        // означал бы конвертацию в каждом из трёх мостов (Kotlin/Swift/Rust)
+        // без единой выгоды. Неизвестное значение трактуется как "all".
+        string? tunnel_mode,
+        // Подсети ресурсов организации (CIDR). Нужны только в режиме
+        // "resources"; в остальных игнорируются.
+        sequence<string> routed_cidrs
     );
     VpnTrafficStats get_traffic_stats();
 };
