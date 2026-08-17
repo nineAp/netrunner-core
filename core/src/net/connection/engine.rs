@@ -32,7 +32,6 @@ use tokio::{
     net::tcp::{OwnedReadHalf, OwnedWriteHalf},
     sync::mpsc::Receiver,
 };
-use tokio_util::sync::CancellationToken;
 use tracing::instrument;
 
 use crate::{
@@ -409,7 +408,11 @@ impl TunnelEngine {
             let muxer = self.muxer.clone();
             let muxer_pong = self.muxer.clone();
 
-            let token = CancellationToken::new();
+            // Дочерний от эпохи сети: при смене сети муксер отменяет эпоху, и
+            // reader/writer этой ноги обрываются мгновенно, не дожидаясь
+            // таймаута мёртвого сокета (см. `Muxer::network_epoch_token`).
+            // Собственная отмена ноги при этом продолжает работать как раньше.
+            let token = self.muxer.network_epoch_token().child_token();
             let token_reader = token.clone();
             let token_writer = token.clone();
 

@@ -207,6 +207,12 @@ impl Engine {
             (mpsc::Sender<Bytes>, Arc<std::sync::atomic::AtomicBool>),
         > = std::collections::HashMap::new();
 
+        // Момент, после которого туннель считается мёртвым, если к нему так и
+        // не поднялось ни одной ноги. Сдвигается вперёд каждый раз, когда
+        // живая нога есть, поэтому штатный реконнект его не задевает.
+        let mut alive_deadline =
+            tokio::time::Instant::now() + netrunner_core::net::TUNNEL_DEAD_AFTER;
+
         loop {
             // Сервер безоговорочно отверг наш токен (см. `Muxer::mark_fatal`,
             // выставляется per-leg циклом в `ClientHandler::connect`, когда
@@ -220,6 +226,34 @@ impl Engine {
             if self.muxer.as_ref().is_some_and(|m| m.is_fatal()) {
                 error!("Session marked fatal (server rejected auth token) — shutting down engine");
                 return;
+            }
+
+            // Туннель без единой живой ноги. Ноги переподключаются сами и
+            // бесконечно, поэтому «нет ног» — не повод паниковать сразу: пауза
+            // между попытками штатно занимает секунды. Но если это тянется
+            // дольше TUNNEL_DEAD_AFTER, туннель мёртв по-настоящему, и
+            // держать сессию — значит врать пользователю: он видит
+            // «подключено», а трафик в лучшем случае никуда не идёт, в худшем
+            // (Android, где закрытый TUN возвращает маршрутизацию системе)
+            // уходит мимо VPN открытым текстом.
+            //
+            // Выходим сами: `spawn_session` увидит завершение `run()`,
+            // переведёт статус в failed и уронит Session, а её Drop откатит
+            // маршрутизацию и kill-switch.
+            match self.muxer.as_ref().map(|m| m.active_legs_count()) {
+                Some(0) => {
+                    if tokio::time::Instant::now() >= alive_deadline {
+                        error!(
+                            "Туннель без живых ног дольше {:?} — сессия признана мёртвой",
+                            netrunner_core::net::TUNNEL_DEAD_AFTER
+                        );
+                        return;
+                    }
+                }
+                _ => {
+                    alive_deadline =
+                        tokio::time::Instant::now() + netrunner_core::net::TUNNEL_DEAD_AFTER;
+                }
             }
 
             let now = Self::current_time();

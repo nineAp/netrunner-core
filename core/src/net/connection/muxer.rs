@@ -428,6 +428,17 @@ pub struct Muxer {
     /// сессию сам — без этого приложение молча висело в статусе "connected"
     /// с мёртвым туннелем, пока пользователь вручную не выключит VPN.
     fatal: Arc<AtomicBool>,
+    /// Токен текущей «эпохи» сети. Отменяется при [`remove_all_legs`](Self::remove_all_legs)
+    /// и тут же заменяется свежим.
+    ///
+    /// Нужен, потому что убрать ногу из карты — не то же самое, что её убить:
+    /// задача `TunnelEngine::run` продолжает висеть на своём сокете. При смене
+    /// сети (Wi-Fi ↔ LTE) TCP не получает RST, пакеты просто перестают
+    /// доходить, и сокет живёт до таймаута ОС — это минуты, в течение которых
+    /// муксер пуст и отправлять некуда. Токен каждой ноги — потомок этого,
+    /// поэтому отмена мгновенно рвёт reader/writer и отправляет ногу на
+    /// переподключение по новому маршруту.
+    network_epoch: Arc<ArcSwap<CancellationToken>>,
 }
 
 impl Muxer {
@@ -448,6 +459,7 @@ impl Muxer {
             quota_user_id: Arc::new(ArcSwap::from_pointee(None)),
             quota_reported_bytes: Arc::new(AtomicU64::new(0)),
             fatal: Arc::new(AtomicBool::new(false)),
+            network_epoch: Arc::new(ArcSwap::from_pointee(CancellationToken::new())),
         };
         muxer.spawn_backlog_reaper();
         muxer
@@ -462,6 +474,12 @@ impl Muxer {
     /// `true`, если сессию нужно завершать, а не реконнектить (см. [`mark_fatal`](Self::mark_fatal)).
     pub fn is_fatal(&self) -> bool {
         self.fatal.load(Ordering::Relaxed)
+    }
+
+    /// Токен текущей эпохи сети — от него нога порождает свой дочерний
+    /// (см. [`network_epoch`](Self::network_epoch)).
+    pub fn network_epoch_token(&self) -> CancellationToken {
+        CancellationToken::clone(&self.network_epoch.load())
     }
 
     /// Складывает байты ноги, которая уходит из `legs` (эвикт/реконнект), в
@@ -681,6 +699,14 @@ impl Muxer {
         self.stream_bindings.clear();
         self.udp_flowlets.clear();
         self.update_legs_cache();
+
+        // И действительно убить задачи ног, а не только вычистить карту:
+        // старый сокет после смены сети не отдаёт ошибку, он просто молчит.
+        // Сначала ставим новую эпоху, потом отменяем старую — нога, которая
+        // проснётся от отмены и сразу пойдёт переподключаться, должна взять
+        // уже свежий токен, а не тот, который отменяется прямо сейчас.
+        let previous = self.network_epoch.swap(Arc::new(CancellationToken::new()));
+        previous.cancel();
     }
 
     /// Число активных ног.
@@ -1651,5 +1677,31 @@ mod scheduling_tests {
         muxer.record_leg_data_drained(0, 6_000);
         assert_eq!(leg.stats.queued_data_bytes.load(Ordering::Relaxed), 0);
         assert_eq!(leg.stats.queued_since_ms.load(Ordering::Relaxed), 0);
+    }
+
+    /// Смена сети обязана именно УБИВАТЬ ноги, а не только вычищать карту.
+    ///
+    /// Проверяется и порядок: нога, которую разбудила отмена, тут же идёт
+    /// переподключаться и берёт токен заново — он должен быть уже новым,
+    /// иначе она мгновенно отменится сама об себя и уйдёт в цикл.
+    #[tokio::test]
+    async fn remove_all_legs_cancels_the_epoch_and_hands_out_a_fresh_one() {
+        let muxer = Muxer::new(true, "test-session".into());
+
+        let before = muxer.network_epoch_token();
+        let leg_token = before.child_token();
+        assert!(!leg_token.is_cancelled());
+
+        muxer.remove_all_legs();
+
+        assert!(
+            leg_token.is_cancelled(),
+            "токен ноги обязан отмениться вместе с эпохой"
+        );
+        let after = muxer.network_epoch_token();
+        assert!(
+            !after.is_cancelled(),
+            "новая эпоха не должна быть отменённой — иначе следующая нога умрёт на старте"
+        );
     }
 }

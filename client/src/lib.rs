@@ -329,16 +329,24 @@ impl SessionManager {
                     info!("Engine built successfully, starting loop...");
                     CONNECTION_STATE.store(CONN_CONNECTED, Ordering::Relaxed);
 
+                    // Исход цикла различается по причине, и это важно: движок,
+                    // завершившийся САМ, — это отказ (мёртвый туннель, отвергнутый
+                    // токен), а не штатная остановка. Раньше оба случая давали
+                    // CONN_IDLE, и Android-сервис, который глушит VPN только на
+                    // "failed", в первом случае продолжал держать интерфейс и
+                    // показывать «подключено» (см. startStatsLoop в VpnPlugin.kt).
+                    let mut engine_failed = false;
                     tokio::select! {
                         _ = engine.run(tun) => {
-                            info!("Engine loop finished normally.");
+                            error!("Engine loop finished on its own — tunnel is dead");
+                            engine_failed = true;
                         },
                         _ = engine_token.cancelled() => {
                             info!("Engine task shutting down via token");
                         }
                     }
-                    // Цикл завершился (штатно или по отмене) — больше не connected.
-                    CONNECTION_STATE.store(CONN_IDLE, Ordering::Relaxed);
+                    let outcome = if engine_failed { CONN_FAILED } else { CONN_IDLE };
+                    CONNECTION_STATE.store(outcome, Ordering::Relaxed);
                 }
                 Err(e) => {
                     error!("Failed to build VPN Engine: {}", e);
