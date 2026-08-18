@@ -97,11 +97,35 @@ cargo run --release -p netrunner-loadtest -- --concurrency 50 --duration-secs 30
 
 ```bash
 make setup-server     # apt install build-essential libssl-dev pkg-config rsync на VPS
-make build-server      # cargo build --release --bin netrunner-server
-make deploy-server      # rsync бинарника + systemd unit, restart сервиса
-make deploy-dev          # то же, но на DEV_IP / *.dev.service
-make logs / make ssh      # journalctl -f / быстрый ssh на прод-ноду
+make build-server      # собирает netrunner-server + netrunner-masque-edge
+make deploy-server     # rsync обоих бинарников + двух systemd unit
+make deploy-dev        # то же, но на DEV_IP / *.dev.service
+make logs              # основной TCP-сервер
+make logs-masque       # HTTP/3 relay на UDP/443
+make ssh               # быстрый ssh на прод-ноду
 ```
+
+Основной сервер и MASQUE могут жить на одном IP и одном номере порта без
+конфликта: `netrunner-server` занимает `0.0.0.0:443/tcp`, а
+`netrunner-masque-edge` — `0.0.0.0:443/udp`. Ручной systemd-деплой всегда
+кладёт оба бинарника и оба юнита, но MASQUE-юнит имеет
+`ConditionPathExists=/etc/netrunner/masque-edge.env`: без конфигурации он
+пропускается и не влияет на работающий NRXP. Шаблон —
+`server/masque-edge.env.example`; файл на ноде должен иметь права `0600`.
+
+Корневой Docker-образ устроен так же: содержит оба бинарника, а entrypoint
+запускает MASQUE только при `MASQUE_ENABLED=true` или автоматически, когда
+одновременно заданы `MASQUE_TOKEN`, `MASQUE_CERT_FILE` и `MASQUE_KEY_FILE`.
+Старый вызов бэкенда `IMAGE ./netrunner-proxy ...` поддерживается. Для
+включения на Docker-ноде сертификат и ключ нужно смонтировать в контейнер, а
+в firewall открыть именно `443/udp`; существующее правило `443/tcp` этого не
+делает. Сертификат должен быть публично доверенным и совпадать с relay hostname
+из iOS-профиля.
+
+`MASQUE_TOKEN` — отдельный секрет, который попадёт в профиль устройства.
+Переиспользовать `PROXY_INTERNAL_SECRET` нельзя: тот даёт ноде доступ к
+control-plane и никогда не должен оказываться у клиента.
+
 Продовый путь деплоя нод — **не этот репозиторий**. Ноды разворачивает и
 пересобирает `netrunner-backend` (`NodeService`, админка), а новый образ
 приезжает на них сам: watchtower на каждой ноде опрашивает реестр раз в
@@ -250,7 +274,8 @@ TUN/L3-перехвата, только релей уже собранного �
 (репозиторий зеркалится на GitHub, но CI там не гоняется).
 
 - **`build.yml`** (push в `main`, теги `v*`, `workflow_dispatch`):
-  - `build` — собирает `netrunner-server` **внутри** Docker (multi-stage,
+  - `build` — собирает `netrunner-server` и `netrunner-masque-edge`
+    **внутри** одного Docker-образа (multi-stage,
     `cargo-chef`, единая база `rust:1-bookworm` → `debian:bookworm-slim` —
     решает рассинхрон glibc раннера vs рантайма, см. комментарий в
     `Dockerfile`), пушит образ в Container Registry самой Gitea.

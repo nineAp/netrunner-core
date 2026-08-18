@@ -1,4 +1,5 @@
-# Собирает netrunner-server (release-бинарник) и пушит Docker-образ во
+# Собирает netrunner-server и netrunner-masque-edge (release-бинарники) в
+# одном runtime-образе и пушит его во
 # встроенный Container Registry самой Gitea (gitea.netrunner-vpn.com), не
 # ghcr.io. Dockerfile теперь компилирует Rust ВНУТРИ себя (multi-stage,
 # см. Dockerfile) — раньше бинарник собирался отдельным шагом прямо на
@@ -10,7 +11,7 @@
 # тот же, что и в netrunner-backend/netrunner-landing (пакеты в Gitea
 # принадлежат аккаунту, не репозиторию, но значение нужно продублировать в
 # Settings каждого из репозиториев).
-name: Build & Push Proxy Image
+name: Build & Push Server Image
 
 on:
   push:

@@ -4,6 +4,7 @@ members = [
     "client",
     "client-edge",
     "edge-native",
+    "masque-edge",
     "server",
     "tools/bindgen",
     "tools/log",

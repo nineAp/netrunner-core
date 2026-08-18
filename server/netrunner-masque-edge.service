@@ -1,0 +1,22 @@
+[Unit]
+Description=Netrunner MASQUE Edge (HTTP/3 relay)
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/etc/netrunner/masque-edge.env
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/netr-core
+Environment=MASQUE_BIND=0.0.0.0:443
+EnvironmentFile=/etc/netrunner/masque-edge.env
+ExecStartPre=/usr/bin/test -r ${MASQUE_CERT_FILE}
+ExecStartPre=/usr/bin/test -r ${MASQUE_KEY_FILE}
+ExecStart=/root/netr-core/netrunner-masque-edge serve --bind ${MASQUE_BIND} --cert ${MASQUE_CERT_FILE} --key ${MASQUE_KEY_FILE}
+Restart=always
+RestartSec=3
+LimitNOFILE=1048576
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target

@@ -18,21 +18,31 @@ RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS builder
 COPY --from=planner /app/recipe.json recipe.json
-RUN cargo chef cook --release --recipe-path recipe.json -p netrunner-server
+RUN cargo chef cook --release --recipe-path recipe.json \
+    -p netrunner-server \
+    -p netrunner-masque-edge
 COPY . .
-RUN cargo build --release -p netrunner-server
+RUN cargo build --release \
+    -p netrunner-server \
+    -p netrunner-masque-edge
 
 FROM debian:bookworm-slim
 WORKDIR /app
 
-# ca-certificates — сетевые HTTPS-запросы прокси. wget — единственная цель:
-# HEALTHCHECK ниже дёргает локальный /health (см. server/src/health.rs) —
-# без него в образе нечем сделать HTTP-запрос для докеровской проверки.
-RUN apt-get update && apt-get install -y ca-certificates libssl3 wget && rm -rf /var/lib/apt/lists/*
+# ca-certificates — сетевые HTTPS-запросы прокси. wget нужен внешней
+# `--health-cmd`, которую задаёт netrunner-backend при `docker run`: она
+# дёргает локальный /health (см. server/src/health.rs).
+RUN apt-get update && apt-get install -y ca-certificates libssl3 tini wget && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/target/release/netrunner-server /app/netrunner-proxy
+COPY --from=builder /app/target/release/netrunner-masque-edge /app/netrunner-masque-edge
+COPY --chmod=0755 server/container-entrypoint.sh /app/container-entrypoint.sh
 
 EXPOSE 443/udp
 EXPOSE 443/tcp
 
+# Бэкенд исторически передаёт после имени образа явную команду
+# `./netrunner-proxy ...`. Entrypoint сохраняет эту форму совместимой и при
+# наличии MASQUE_* запускает рядом HTTP/3 relay на UDP того же номера порта.
+ENTRYPOINT ["/usr/bin/tini", "--", "/app/container-entrypoint.sh"]
 CMD ["./netrunner-proxy"]

@@ -5,6 +5,8 @@ DEV_IP :=$(strip $(DEV_IP))
 REMOTE_USER := $(strip $(REMOTE_USER))
 REMOTE_PATH := $(strip $(REMOTE_PATH))
 SERVICE_NAME := $(strip $(SERVICE_NAME))
+MASQUE_SERVICE_NAME ?= netrunner-masque-edge
+MASQUE_SERVICE_NAME := $(strip $(MASQUE_SERVICE_NAME))
 
 # Безопасное олучение путей из ENV или дефолтов
 ANDROID_ADB_HOST := $(strip $(ANDROID_ADB_HOST))
@@ -21,7 +23,7 @@ SSH_OPTS = -o IPQoS=throughput -o ServerAliveInterval=30
 RSYNC_OPTS = -avz --inplace --progress -e "ssh $(SSH_OPTS)"
 
 
-.PHONY: debug-client debug-server build-android build-server build-edge deploy-server logs ssh setup-server release-all
+.PHONY: debug-client debug-server build-android build-server build-edge deploy-server deploy-dev logs logs-masque ssh setup-server release-all
 
 # --- Релизный цикл ---
 # --- Релизный цикл ---
@@ -90,8 +92,8 @@ build-android:
 	rsync -av "$(ANDROID_BUILD_SRC)/" "$(ANDROID_PROJECT_LIBS)/"
 
 build-server:
-	@echo "--- Сборка сервера (Release) ---"
-	cargo build --bin netrunner-server --release
+	@echo "--- Сборка серверных бинарников (Release) ---"
+	cargo build --release -p netrunner-server -p netrunner-masque-edge
 
 # Сборка wasm-клиента для Cloudflare Workers (client-edge/) — тот же
 # worker-build, что и wrangler.toml::[build].command запускает сам при
@@ -115,39 +117,46 @@ setup-server:
 	ssh $(SSH_OPTS) $(REMOTE_USER)@$(SERVER_IP) "\
 		apt-get update && \
 		apt-get install -y build-essential libssl-dev pkg-config rsync && \
-		mkdir -p $(REMOTE_PATH)"
+		mkdir -p $(REMOTE_PATH) /etc/netrunner"
+	@echo "MASQUE включится после создания /etc/netrunner/masque-edge.env (пример: server/masque-edge.env.example)."
 
 # Деплой с использованием rsync и принудительной очисткой
 deploy-server: build-server
 	@echo "--- [1/4] Остановка сервиса и очистка зависших процессов ---"
 	ssh $(SSH_OPTS) $(REMOTE_USER)@$(SERVER_IP) "\
+		systemctl stop $(MASQUE_SERVICE_NAME) || true; \
 		systemctl stop $(SERVICE_NAME) || true; \
 		pkill -9 $(SERVICE_NAME) || true; \
-		rm -f $(REMOTE_PATH)/$(SERVICE_NAME).tmp"
+		rm -f $(REMOTE_PATH)/$(SERVICE_NAME).tmp $(REMOTE_PATH)/$(MASQUE_SERVICE_NAME).tmp"
 	
-	@echo "--- [2/4] Копирование бинарника (rsync) ---"
-	rsync $(RSYNC_OPTS) target/release/netrunner-server $(REMOTE_USER)@$(SERVER_IP):$(REMOTE_PATH)/
+	@echo "--- [2/4] Копирование серверных бинарников (rsync) ---"
+	rsync $(RSYNC_OPTS) target/release/netrunner-server target/release/netrunner-masque-edge $(REMOTE_USER)@$(SERVER_IP):$(REMOTE_PATH)/
 	
 	@echo "--- [3/4] Обновление конфигурации systemd ---"
-	rsync $(RSYNC_OPTS) server/netrunner-server.service $(REMOTE_USER)@$(SERVER_IP):/etc/systemd/system/
+	rsync $(RSYNC_OPTS) server/netrunner-server.service server/netrunner-masque-edge.service $(REMOTE_USER)@$(SERVER_IP):/etc/systemd/system/
 	
-	@echo "--- [4/4] Перезапуск сервиса ---"
+	@echo "--- [4/4] Перезапуск сервисов ---"
 	ssh $(SSH_OPTS) $(REMOTE_USER)@$(SERVER_IP) "\
 		systemctl daemon-reload && \
 		systemctl enable $(SERVICE_NAME) && \
-		systemctl start $(SERVICE_NAME)"
+		systemctl enable $(MASQUE_SERVICE_NAME) && \
+		systemctl start $(SERVICE_NAME) && \
+		systemctl start $(MASQUE_SERVICE_NAME) && \
+		systemctl is-active --quiet $(SERVICE_NAME) && \
+		(systemctl is-active --quiet $(MASQUE_SERVICE_NAME) || test ! -f /etc/netrunner/masque-edge.env)"
 	@echo "--- Деплой завершен успешно! ---"
 
 
 deploy-dev: build-server
 	@echo "--- [1/4] Остановка сервиса и очистка зависших процессов DEV ---"
 	ssh $(SSH_OPTS) $(REMOTE_USER)@$(DEV_IP) "\
+		systemctl stop $(MASQUE_SERVICE_NAME) || true; \
 		systemctl stop $(SERVICE_NAME) || true; \
 		pkill -9 $(SERVICE_NAME) || true; \
-		rm -f $(REMOTE_PATH)/$(SERVICE_NAME).tmp"
+		rm -f $(REMOTE_PATH)/$(SERVICE_NAME).tmp $(REMOTE_PATH)/$(MASQUE_SERVICE_NAME).tmp"
 	
-	@echo "--- [2/4] Копирование бинарника (rsync) ---"
-	rsync $(RSYNC_OPTS) target/release/netrunner-server $(REMOTE_USER)@$(DEV_IP):$(REMOTE_PATH)/
+	@echo "--- [2/4] Копирование серверных бинарников (rsync) ---"
+	rsync $(RSYNC_OPTS) target/release/netrunner-server target/release/netrunner-masque-edge $(REMOTE_USER)@$(DEV_IP):$(REMOTE_PATH)/
 	
 	@echo "--- [3/4] Обновление конфигурации systemd ---"
 	# Локальный файл называется *.dev.service (чтобы не путать с прод-юнитом в
@@ -156,16 +165,24 @@ deploy-dev: build-server
 	# под своим исходным именем, и юнит с новым портом/конфигом никогда не
 	# подхватывался (systemctl тихо продолжал использовать старый файл).
 	rsync $(RSYNC_OPTS) server/netrunner-server.dev.service $(REMOTE_USER)@$(DEV_IP):/etc/systemd/system/$(SERVICE_NAME).service
+	rsync $(RSYNC_OPTS) server/netrunner-masque-edge.service $(REMOTE_USER)@$(DEV_IP):/etc/systemd/system/
 	
-	@echo "--- [4/4] Перезапуск сервиса ---"
+	@echo "--- [4/4] Перезапуск сервисов ---"
 	ssh $(SSH_OPTS) $(REMOTE_USER)@$(DEV_IP) "\
 		systemctl daemon-reload && \
 		systemctl enable $(SERVICE_NAME) && \
-		systemctl start $(SERVICE_NAME)"
+		systemctl enable $(MASQUE_SERVICE_NAME) && \
+		systemctl start $(SERVICE_NAME) && \
+		systemctl start $(MASQUE_SERVICE_NAME) && \
+		systemctl is-active --quiet $(SERVICE_NAME) && \
+		(systemctl is-active --quiet $(MASQUE_SERVICE_NAME) || test ! -f /etc/netrunner/masque-edge.env)"
 	@echo "--- Деплой завершен успешно! ---"
 
 logs:
 	ssh $(SSH_OPTS) $(REMOTE_USER)@$(SERVER_IP) "journalctl -u $(SERVICE_NAME) -f"
+
+logs-masque:
+	ssh $(SSH_OPTS) $(REMOTE_USER)@$(SERVER_IP) "journalctl -u $(MASQUE_SERVICE_NAME) -f"
 
 ssh:
 	ssh $(SSH_OPTS) $(REMOTE_USER)@$(SERVER_IP)
