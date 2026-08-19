@@ -33,19 +33,24 @@
 
 use netrunner_logger::{AppError, ERR_AUTH_FAILED};
 use x25519_dalek::{PublicKey, StaticSecret};
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::crypto::ecdh::ECDH;
 
 /// Разбирает 32-байтовое значение из hex-строки конфига.
 #[allow(clippy::result_large_err)]
 fn parse_key_hex(what: &str, value: &str) -> Result<[u8; 32], AppError> {
-    let raw = hex::decode(value.trim()).map_err(|e| {
+    // Раскодированный секрет живёт здесь в открытом виде до конца функции.
+    // `Zeroizing` затирает буфер на выходе по любой ветке, включая отказ по
+    // длине ниже. Саму строку `value` мы не владеем — её затирает вызывающий
+    // код (конфиг/`.env`), сюда она приходит уже разобранной.
+    let raw = Zeroizing::new(hex::decode(value.trim()).map_err(|e| {
         AppError::new(
             ERR_AUTH_FAILED,
             "Ошибка конфигурации",
             format!("{what}: ожидался hex, {e}"),
         )
-    })?;
+    })?);
     raw.as_slice().try_into().map_err(|_| {
         AppError::new(
             ERR_AUTH_FAILED,
@@ -129,6 +134,28 @@ pub enum Identity {
     Peer(PeerIdentity),
     /// Серверная роль: держим приватный статический ключ ноды.
     Local(LocalIdentity),
+}
+
+/// Затирание общего секрета ноды при уничтожении.
+///
+/// `secret` — долговременный симметричный секрет: он не меняется от сессии к
+/// сессии, поэтому его утечка из дампа памяти стоит дороже, чем утечка ключей
+/// одной сессии, — она открывает барьер на входе для всей ноды до ротации.
+/// `static_public` затирать нечего: это публичное значение.
+impl Drop for PeerIdentity {
+    fn drop(&mut self) {
+        self.secret.zeroize();
+    }
+}
+
+/// То же для серверной половины.
+///
+/// `static_private` здесь не трогаем намеренно: `StaticSecret` у `x25519-dalek`
+/// сам `ZeroizeOnDrop`, и его поле затрётся сразу после этого тела.
+impl Drop for LocalIdentity {
+    fn drop(&mut self) {
+        self.secret.zeroize();
+    }
 }
 
 impl Identity {

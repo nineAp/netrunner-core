@@ -1937,11 +1937,13 @@ dependencies = [
  "serde_json",
  "sha2",
  "socket2 0.5.10",
+ "subtle",
  "tokio",
  "tokio-util",
  "tracing",
  "web-time",
  "x25519-dalek",
+ "zeroize",
 ]
 
 [[package]]

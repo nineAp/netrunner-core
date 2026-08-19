@@ -22,7 +22,9 @@
 //! ключей идёт на tx, а какой на rx.
 
 use netrunner_logger::{AppError, ERR_NET_TLS_TAMPER};
+use subtle::{Choice, ConditionallySelectable, ConstantTimeEq};
 use x25519_dalek::PublicKey;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
     crypto::{ecdh::ECDH, hkdf::HKDF, identity::Identity},
@@ -146,11 +148,13 @@ impl SessionKeys {
     /// Аутентифицированная схема (протокол v3): в хендшейк входят секрет ноды
     /// (тег `ClientHello`) и её статический ключ (второй DH).
     pub(crate) fn with_identity(is_initiator: bool, identity: Identity) -> Self {
-        Self {
-            identity: Some(identity),
-            peer_version: crate::PROTOCOL_VERSION,
-            ..Self::new(is_initiator)
-        }
+        // Не `..Self::new(is_initiator)`: functional record update вытаскивает
+        // поля из временного значения, а у типа с `Drop` (см. impl ниже —
+        // затирание ключей) это запрещено (E0509). Присваиваем поверх.
+        let mut keys = Self::new(is_initiator);
+        keys.identity = Some(identity);
+        keys.peer_version = crate::PROTOCOL_VERSION;
+        keys
     }
 
     /// Версия протокола, которую эта сторона заявляет в `session_id[0]`.
@@ -369,23 +373,33 @@ impl SessionKeys {
         public_key: &PublicKey,
         is_server: bool,
     ) -> Result<DirectionalAeadKeys, AppError> {
-        let ephemeral_dh = self
+        let mut ephemeral_dh = self
             .ecdh
             .dh(public_key)
             .ok_or_else(|| AppError::new(ERR_NET_TLS_TAMPER, "Сбой", "No shared secret"))?;
 
-        let mut ikm = Vec::with_capacity(64 + IKM_DOMAIN_V3.len());
+        // `Zeroizing`, а не голый `Vec`: в `ikm` лежит сырой результат DH —
+        // самый ценный материал всего хендшейка, из него выводится вообще всё
+        // остальное. Утёкший `ikm` эквивалентен утёкшей сессии целиком, а
+        // обычный `Vec` при drop только вернул бы страницы аллокатору.
+        //
+        // Ёмкость взята с запасом под оба слагаемых и домен, поэтому `Vec` не
+        // реаллоцируется: иначе старый буфер с секретом остался бы в куче
+        // нетронутым — `Zeroizing` затирает только текущий.
+        let mut ikm = Zeroizing::new(Vec::with_capacity(64 + IKM_DOMAIN_V3.len()));
         ikm.extend_from_slice(&ephemeral_dh);
+        ephemeral_dh.zeroize();
 
         if self.uses_static_dh() {
             let identity = self
                 .identity
                 .as_ref()
                 .expect("uses_static_dh() implies identity is present");
-            let static_dh = identity
+            let mut static_dh = identity
                 .static_dh(&self.ecdh, public_key)
                 .ok_or_else(|| AppError::new(ERR_NET_TLS_TAMPER, "Сбой", "No static secret"))?;
             ikm.extend_from_slice(&static_dh);
+            static_dh.zeroize();
             ikm.extend_from_slice(IKM_DOMAIN_V3);
         }
 
@@ -395,13 +409,13 @@ impl SessionKeys {
 
         let hkdf = HKDF::extract_key(&self.salt.get_total(), &ikm);
 
-        let c_key = HKDF::expand_key::<32>(&hkdf, b"client_aead")
+        let mut c_key = HKDF::expand_key::<32>(&hkdf, b"client_aead")
             .map_err(|e| AppError::new(ERR_NET_TLS_TAMPER, "Ошибка ключей", e))?;
-        let c_iv = HKDF::expand_key::<12>(&hkdf, b"client_iv")
+        let mut c_iv = HKDF::expand_key::<12>(&hkdf, b"client_iv")
             .map_err(|e| AppError::new(ERR_NET_TLS_TAMPER, "Ошибка ключей", e))?;
-        let s_key = HKDF::expand_key::<32>(&hkdf, b"server_aead")
+        let mut s_key = HKDF::expand_key::<32>(&hkdf, b"server_aead")
             .map_err(|e| AppError::new(ERR_NET_TLS_TAMPER, "Ошибка ключей", e))?;
-        let s_iv = HKDF::expand_key::<12>(&hkdf, b"server_iv")
+        let mut s_iv = HKDF::expand_key::<12>(&hkdf, b"server_iv")
             .map_err(|e| AppError::new(ERR_NET_TLS_TAMPER, "Ошибка ключей", e))?;
 
         self.auth_key = HKDF::expand_key::<32>(&hkdf, b"auth_key")
@@ -412,6 +426,15 @@ impl SessionKeys {
         } else {
             (c_key, c_iv, s_key, s_iv)
         };
+
+        // Локальные копии отработали: их значения уже лежат в `keys`. За копию,
+        // уходящую наружу, отвечает вызывающий код (она попадает в
+        // `ChaChaCipher`, который `ZeroizeOnDrop`); наша забота — не оставить
+        // лишних копий здесь, на стеке.
+        c_key.zeroize();
+        c_iv.zeroize();
+        s_key.zeroize();
+        s_iv.zeroize();
 
         self.current_aead = Some(keys);
         Ok(keys)
@@ -427,6 +450,34 @@ impl SessionKeys {
 
     pub(crate) fn auth_key_fingerprint(&self) -> String {
         hex::encode(&self.auth_key[..4])
+    }
+}
+
+/// Затирание ключевого материала при уничтожении сессии.
+///
+/// # Инвариант безопасности (НЕ ЛОМАТЬ)
+///
+/// `auth_key` и `current_aead` — выведенные ключи сессии. Без явного затирания
+/// `drop` лишь освобождает память, и ключи остаются читаемыми до тех пор, пока
+/// страницу кто-нибудь не переиспользует: они уезжают в core dump, в swap и в
+/// снапшот виртуальной машины. Forward secrecy отвечает на вопрос «достанут
+/// сервер завтра», а не «снимут дамп памяти сейчас» — это вторая половина.
+///
+/// Эфемерный ключ X25519 сюда не входит намеренно: он уничтожается раньше и
+/// явно, в [`ECDH::burn`](super::ecdh::ECDH::burn) сразу после вывода ключей, а
+/// `StaticSecret` у `x25519-dalek` сам по себе `ZeroizeOnDrop`.
+///
+/// Наличие `Drop` у этого типа запрещает functional record update — см.
+/// [`SessionKeys::with_identity`].
+impl Drop for SessionKeys {
+    fn drop(&mut self) {
+        self.auth_key.zeroize();
+        if let Some((tx_key, tx_iv, rx_key, rx_iv)) = self.current_aead.as_mut() {
+            tx_key.zeroize();
+            tx_iv.zeroize();
+            rx_key.zeroize();
+            rx_iv.zeroize();
+        }
     }
 }
 
@@ -545,10 +596,11 @@ impl SessionAuth {
     /// # Инвариант безопасности (НЕ ЛОМАТЬ)
     ///
     /// Тот же, что у [`verify_tag`](SessionAuth::verify_tag): цикл всегда
-    /// прогоняет все `2*AUTH_WINDOW_SIZE + 1` кандидатов, сравнение побайтовое
-    /// через накопление `diff |= a ^ b`, без раннего `break`. Здесь это важнее,
-    /// чем в data-фазе: метод стоит на неаутентифицированном вводе и вызывается
-    /// на каждой пробе сканера.
+    /// прогоняет все `2*AUTH_WINDOW_SIZE + 1` кандидатов, сравнение идёт через
+    /// [`subtle::ConstantTimeEq`], накопление результата — через [`Choice`], без
+    /// раннего `break` и без единого ветвления по секрету. Здесь это важнее, чем
+    /// в data-фазе: метод стоит на неаутентифицированном вводе и вызывается на
+    /// каждой пробе сканера.
     pub fn verify_handshake_tag(
         &self,
         received_tag: &[u8; 16],
@@ -557,32 +609,34 @@ impl SessionAuth {
     ) -> bool {
         let current_step = now_unix_secs() / AUTH_TIME_STEP;
 
-        let mut matched = 0u8;
+        let mut matched = Choice::from(0u8);
         for step in (current_step.saturating_sub(AUTH_WINDOW_SIZE))
             ..=(current_step.saturating_add(AUTH_WINDOW_SIZE))
         {
             let candidate =
                 Self::compute_handshake_tag(&self.auth_key, step, random, peer_public);
-            let mut diff = 0u8;
-            for (a, b) in candidate.iter().zip(received_tag.iter()) {
-                diff |= a ^ b;
-            }
             // Никакого раннего выхода: накапливаем результат по всем шагам.
-            matched |= (diff == 0) as u8;
+            matched |= candidate[..].ct_eq(&received_tag[..]);
         }
 
-        matched != 0
+        matched.unwrap_u8() == 1
     }
 
     /// Проверяет тег входящего кадра против окна `[step-W .. step+W]`.
     ///
     /// # Инвариант безопасности (НЕ ЛОМАТЬ)
     ///
-    /// Цикл **всегда** прогоняет все `2*AUTH_WINDOW_SIZE + 1` кандидатов и
-    /// сравнивает теги побайтово через накопление `diff |= a ^ b`, без раннего
-    /// `break` и без ветвления по результату внутри цикла. Это постоянное по
-    /// времени сравнение: длительность `verify_tag` не зависит от того, какой шаг
-    /// (и совпал ли вообще) подошёл, иначе по таймингу можно подбирать тег.
+    /// Цикл **всегда** прогоняет все `2*AUTH_WINDOW_SIZE + 1` кандидатов,
+    /// сравнивает теги через [`subtle::ConstantTimeEq`] и запоминает совпавший
+    /// шаг через [`ConditionallySelectable`] — без раннего `break` и без единого
+    /// ветвления по результату сравнения внутри цикла. Длительность `verify_tag`
+    /// не зависит от того, какой шаг (и совпал ли вообще) подошёл, иначе по
+    /// таймингу можно подбирать тег.
+    ///
+    /// Раньше здесь стояло `if diff == 0 && matched_step.is_none()`. Полный
+    /// прогон окна это сохраняло, но само `if` — уже ветвление по результату
+    /// сравнения с секретом, а `is_none()` вдобавок давал short-circuit. Ровно
+    /// та утечка, которую цикл был призван закрыть.
     pub fn verify_tag(&self, received_tag: &[u8; 16]) -> bool {
         let now = now_unix_secs();
 
@@ -590,35 +644,165 @@ impl SessionAuth {
 
         // Constant-time path: always evaluate ALL 2*AUTH_WINDOW_SIZE+1 candidates
         // so the loop duration doesn't leak which step (if any) matched.
-        let mut matched_step: Option<u64> = None;
+        let mut matched = Choice::from(0u8);
+        let mut matched_step = 0u64;
         for step in (current_step.saturating_sub(AUTH_WINDOW_SIZE))
             ..=(current_step.saturating_add(AUTH_WINDOW_SIZE))
         {
             let candidate = Self::compute_tag(&self.auth_key, step);
-            let mut diff = 0u8;
-            for (a, b) in candidate.iter().zip(received_tag.iter()) {
-                diff |= a ^ b;
-            }
-            if diff == 0 && matched_step.is_none() {
-                matched_step = Some(step);
-                // Do NOT break — iterate full window for constant time.
-            }
+            let eq = candidate[..].ct_eq(&received_tag[..]);
+            // Запоминаем ПЕРВЫЙ совпавший шаг, не ветвясь: `take` истинно только
+            // если совпало сейчас и не совпадало ни на одном предыдущем шаге.
+            // `conditional_select` — арифметика с масками, а не `if`.
+            let take = eq & !matched;
+            matched_step = u64::conditional_select(&matched_step, &step, take);
+            matched |= eq;
         }
 
-        match matched_step {
-            Some(step) => {
-                if step != current_step {
-                    netrunner_logger::debug!(expected = %current_step, matched = %step, "Auth tag valid with time offset");
-                }
-                true
+        // Здесь ветвиться уже можно: сам факт «тег валиден» — это возвращаемое
+        // наружу значение, а не секрет. Внутри окна не осталось ни одного
+        // ветвления, зависящего от того, какой именно шаг подошёл.
+        if matched.unwrap_u8() == 1 {
+            if matched_step != current_step {
+                netrunner_logger::debug!(expected = %current_step, matched = %matched_step, "Auth tag valid with time offset");
             }
-            None => {
-                netrunner_logger::warn!(
-                    current_step = %current_step,
-                    "AUTH MISMATCH: All tags rejected for current window"
-                );
-                false
+            true
+        } else {
+            netrunner_logger::warn!(
+                current_step = %current_step,
+                "AUTH MISMATCH: All tags rejected for current window"
+            );
+            false
+        }
+    }
+}
+
+// ==========================================
+// 3. ТЕСТЫ ОКНА АУТЕНТИФИКАЦИИ
+// ==========================================
+
+/// # Чего эти тесты НЕ проверяют
+///
+/// Они фиксируют **семантику** окна: какие теги принимаются, какие нет. Доказать
+/// постоянство времени они не могут в принципе — утечка живёт в машинном коде и
+/// зависит от `-C opt-level`, версии LLVM и целевой архитектуры, а тест на Rust
+/// наблюдает только поведение. Постоянство времени здесь обеспечивается
+/// конструктивно (`subtle` ставит оптимизационные барьеры), а проверяется —
+/// измерением на целевой платформе (`dudect`/`cachegrind` на aarch64 в релизной
+/// сборке), а не отсюда.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Прогоняет замер и повторяет его, если шаг времени переехал прямо посреди
+    /// прогона. `verify_tag` берёт время сама, поэтому на смене минуты граничные
+    /// случаи `±AUTH_WINDOW_SIZE` иначе изредка флапали бы. Ассерты вынесены
+    /// наружу намеренно: паника внутри замера лишила бы нас повтора.
+    fn stable<T>(probe: impl Fn(u64) -> T) -> T {
+        for _ in 0..8 {
+            let before = now_unix_secs() / AUTH_TIME_STEP;
+            let out = probe(before);
+            if now_unix_secs() / AUTH_TIME_STEP == before {
+                return out;
             }
         }
+        panic!("шаг времени переезжал на каждой попытке — часы идут неправдоподобно быстро");
+    }
+
+    /// Все `2*AUTH_WINDOW_SIZE + 1` шагов окна принимаются: это и есть допуск на
+    /// рассинхрон часов, ради которого окно существует.
+    #[test]
+    fn tag_is_accepted_across_the_whole_window() {
+        let key = [7u8; 32];
+        let auth = SessionAuth::new(key);
+
+        let verdicts = stable(|step| {
+            (0..=(2 * AUTH_WINDOW_SIZE))
+                .map(|i| {
+                    let candidate = step.saturating_sub(AUTH_WINDOW_SIZE) + i;
+                    auth.verify_tag(&SessionAuth::compute_tag(&key, candidate))
+                })
+                .collect::<Vec<_>>()
+        });
+
+        assert!(
+            verdicts.iter().all(|&ok| ok),
+            "окно обязано принимать все 2W+1 шагов, получено: {verdicts:?}"
+        );
+    }
+
+    /// Ровно за границей окна тег недействителен — иначе допуск на часы тихо
+    /// превратился бы в бесконечное окно повтора.
+    #[test]
+    fn tag_is_rejected_just_outside_the_window() {
+        let key = [9u8; 32];
+        let auth = SessionAuth::new(key);
+
+        let (too_old, too_new) = stable(|step| {
+            (
+                auth.verify_tag(&SessionAuth::compute_tag(
+                    &key,
+                    step.saturating_sub(AUTH_WINDOW_SIZE + 1),
+                )),
+                auth.verify_tag(&SessionAuth::compute_tag(&key, step + AUTH_WINDOW_SIZE + 1)),
+            )
+        });
+
+        assert!(!too_old, "шаг -(W+1) обязан отвергаться");
+        assert!(!too_new, "шаг +(W+1) обязан отвергаться");
+    }
+
+    /// Тег на чужом ключе не проходит ни на одном шаге окна.
+    #[test]
+    fn tag_computed_with_another_key_is_rejected() {
+        let auth = SessionAuth::new([1u8; 32]);
+        let accepted = stable(|step| auth.verify_tag(&SessionAuth::compute_tag(&[2u8; 32], step)));
+        assert!(!accepted, "чужой ключ обязан отвергаться");
+    }
+
+    /// То же окно для тега `ClientHello` — метода, который стоит на
+    /// неаутентифицированном вводе и вызывается на каждой пробе сканера.
+    #[test]
+    fn handshake_tag_is_accepted_across_the_whole_window() {
+        let secret = [3u8; 32];
+        let auth = SessionAuth::new(secret);
+        let random = [4u8; 32];
+        let peer_public = [5u8; 32];
+
+        let verdicts = stable(|step| {
+            (0..=(2 * AUTH_WINDOW_SIZE))
+                .map(|i| {
+                    let candidate = step.saturating_sub(AUTH_WINDOW_SIZE) + i;
+                    auth.verify_handshake_tag(
+                        &SessionAuth::compute_handshake_tag(
+                            &secret,
+                            candidate,
+                            &random,
+                            &peer_public,
+                        ),
+                        &random,
+                        &peer_public,
+                    )
+                })
+                .collect::<Vec<_>>()
+        });
+
+        assert!(
+            verdicts.iter().all(|&ok| ok),
+            "окно тега хендшейка обязано совпадать с окном кадра, получено: {verdicts:?}"
+        );
+    }
+
+    /// Разделение доменов: на одном ключе и одном шаге пер-кадровый тег и тег
+    /// хендшейка не должны совпадать, иначе один переиспользуется вместо другого.
+    #[test]
+    fn frame_and_handshake_tags_do_not_collide_on_the_same_key_and_step() {
+        let secret = [6u8; 32];
+        let step = 30_000_000u64;
+
+        assert_ne!(
+            SessionAuth::compute_tag(&secret, step),
+            SessionAuth::compute_handshake_tag(&secret, step, &[0u8; 32], &[0u8; 32]),
+        );
     }
 }

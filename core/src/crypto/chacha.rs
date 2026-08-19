@@ -14,6 +14,7 @@
 use bytes::BytesMut;
 use chacha20poly1305::aead::generic_array::GenericArray;
 use chacha20poly1305::{AeadInPlace, ChaCha20Poly1305, Key, KeyInit, Nonce};
+use zeroize::Zeroize;
 
 use crate::crypto::aead::AeadPacker;
 
@@ -39,6 +40,8 @@ impl NonceState {
 
     /// Возвращает nonce для текущего кадра и инкрементирует счётчик.
     ///
+    /// Затирание `base_iv` см. в [`Drop for NonceState`](NonceState#impl-Drop).
+    ///
     /// XOR накладывается на байты `iv[4..12]` (младшие 8 байт 12-байтового IV),
     /// старшие 4 байта остаются «солью» из IV. После вызова `counter`
     /// увеличивается, поэтому следующий кадр получит другой nonce.
@@ -52,6 +55,18 @@ impl NonceState {
 
         self.counter += 1;
         *GenericArray::from_slice(&iv)
+    }
+}
+
+/// Затирание базового IV.
+///
+/// IV — не ключ, но выводится тем же HKDF из того же секрета сессии, и вместе с
+/// утёкшим ключом даёт готовый nonce для каждого кадра. Сам ключ `ChaCha20Poly1305`
+/// затирает уже сам (`ZeroizeOnDrop` в `chacha20poly1305`), так что это добирает
+/// вторую половину пары.
+impl Drop for NonceState {
+    fn drop(&mut self) {
+        self.base_iv.zeroize();
     }
 }
 
@@ -169,9 +184,21 @@ impl ChaChaCipher {
 
     /// Заряжает реальные ключи/IV после хендшейка: `w_*` — на запись (tx),
     /// `r_*` — на чтение (rx). Сбрасывает счётчики nonce в 0 для обоих направлений.
-    pub fn set_keys(&mut self, w_key: [u8; 32], w_iv: [u8; 12], r_key: [u8; 32], r_iv: [u8; 12]) {
+    pub fn set_keys(
+        &mut self,
+        mut w_key: [u8; 32],
+        w_iv: [u8; 12],
+        mut r_key: [u8; 32],
+        r_iv: [u8; 12],
+    ) {
         self.tx = ChaChaStream::new(&w_key, w_iv);
         self.rx = ChaChaStream::new(&r_key, r_iv);
+        // Ключи пришли по значению — это копии на стеке поверх тех, что уже
+        // легли внутрь шифра. Свои копии затираем сразу: дальше они не нужны,
+        // а `[u8; 32]` при выходе из области видимости не затирается сам.
+        // IV затрутся вместе с `NonceState` предыдущих потоков (Drop выше).
+        w_key.zeroize();
+        r_key.zeroize();
         netrunner_logger::debug!("Cipher keys and IVs updated for both directions");
     }
 

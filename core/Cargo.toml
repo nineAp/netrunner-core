@@ -11,6 +11,17 @@ aead = { version = "0.5.2", features = ["bytes"] }
 hkdf = "0.12"
 hmac = "0.12"
 sha2 = "0.10"
+# Constant-time primitives. The hand-rolled `diff |= a ^ b` accumulator that
+# used to live in `crypto::session` was correct as written, but nothing stopped
+# LLVM from turning the final `(diff == 0)` back into a branch — a Rust-level
+# test cannot observe that. `subtle` carries optimisation barriers, so the
+# invariant survives the optimiser instead of depending on its mood.
+subtle = "2.6"
+# Wiping key material on drop. Derived session keys used to be plain `[u8; 32]`
+# fields: dropping them just released the memory, leaving keys readable in core
+# dumps, swap and VM snapshots. That contradicts the forward-secrecy claim,
+# which is about "recover the server later", not "read RAM now".
+zeroize = { version = "1.8", features = ["derive"] }
 bytes = "1.5"
 # `net::connection` (tokio net/rt/socket-driven tunnel orchestration) is
 # compiled only for non-wasm targets — see the `#[cfg]` in `core/src/net/mod.rs`.
