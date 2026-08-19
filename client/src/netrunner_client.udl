@@ -7,33 +7,41 @@ dictionary VpnTrafficStats {
     u64 tx_packets;
 };
 
+// Параметры одной сессии одной структурой. Двенадцать отдельных аргументов
+// (как было) на arm64 ломали вызов через JNA: RustBuffer крупнее 16 байт,
+// такие аргументы передаются указателем на копию, и те из них, что уезжали
+// на стек, раскладывались вызывающей стороной не так, как ждал Rust —
+// подключение падало с SIGSEGV прямо во входной точке FFI. Подробности — в
+// doc-комментарии `SessionParams` в lib.rs.
+dictionary SessionParams {
+    string remote_address;
+    // Домен-декой для ClientHello.
+    string sni;
+    // FD туннеля с мобильной стороны; на десктопе null.
+    i32? tun_fd;
+    string cache_dir;
+    boolean killswitch_enabled;
+    sequence<string> excluded_apps;
+    sequence<string> excluded_domains;
+    string? auth_token;
+    // Учётные данные ноды из списка серверов бэкенда (hex по 64 символа):
+    // включают аутентифицированный хендшейк. Оба null — старая анонимная
+    // схема, сервер клиенту ничем себя не подтверждает.
+    string? node_secret;
+    string? node_public_key;
+    // Корпоративный (managed) режим: "all" | "resources" | "bypass_lan".
+    // Строка, а не enum, сознательно — значение приезжает с бэкенда как
+    // строка политики и здесь только пробрасывается. Неизвестное значение
+    // трактуется как "all".
+    string? tunnel_mode;
+    // Подсети ресурсов организации (CIDR). Нужны только в режиме
+    // "resources"; в остальных игнорируются.
+    sequence<string> routed_cidrs;
+};
+
 interface SessionManager {
     constructor();
-    // Добавлены параметры для Killswitch и исключений, и sni (декой ClientHello)
-    Session spawn_session(
-        string remote_address,
-        string sni,
-        i32? tun_fd,
-        string cache_path,
-        boolean killswitch_enabled,
-        sequence<string> excluded_apps,
-        sequence<string> excluded_domains,
-        string? auth_token,
-        // Учётные данные ноды из списка серверов бэкенда (hex по 64 символа):
-        // включают аутентифицированный хендшейк. Оба null — старая анонимная
-        // схема, сервер клиенту ничем себя не подтверждает.
-        string? node_secret,
-        string? node_public_key,
-        // Корпоративный (managed) режим: "all" | "resources" | "bypass_lan".
-        // Строка, а не enum, сознательно — значение приезжает с бэкенда как
-        // строка политики и здесь только пробрасывается; лишний тип в UDL
-        // означал бы конвертацию в каждом из трёх мостов (Kotlin/Swift/Rust)
-        // без единой выгоды. Неизвестное значение трактуется как "all".
-        string? tunnel_mode,
-        // Подсети ресурсов организации (CIDR). Нужны только в режиме
-        // "resources"; в остальных игнорируются.
-        sequence<string> routed_cidrs
-    );
+    Session spawn_session(SessionParams params);
     VpnTrafficStats get_traffic_stats();
 };
 

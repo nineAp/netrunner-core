@@ -231,6 +231,50 @@ impl Drop for Session {
     }
 }
 
+/// Все параметры одной VPN-сессии одной структурой.
+///
+/// Раньше это были двенадцать отдельных аргументов FFI-метода, и именно на
+/// них приложение падало с SIGSEGV на Android (arm64): по AAPCS64 структура
+/// больше 16 байт передаётся указателем на копию, у `RustBuffer` (24 байта)
+/// таких аргументов набралось одиннадцать, и пять из них уезжали за границу
+/// восьми регистров — на стек. Стековую часть JNA раскладывала не так, как
+/// ждал скомпилированный Rust: вместо указателей там оказывалось содержимое
+/// структур, и первое же разыменование давало нулевой адрес (`fault addr
+/// 0x4`, `0x14` — это поля `capacity`/`len` пустых буферов, прочитанные как
+/// указатели). С десятью аргументами (версия 0.2.21) на стек уезжали два, и
+/// это ещё как-то работало; двенадцатый аргумент сломал подключение
+/// полностью.
+///
+/// Одна запись = ровно один `RustBuffer` в регистре, стековых структур нет
+/// вообще. Это не обход бага, а нормальная форма: набор параметров сессии
+/// растёт (organization policy уже добавила два поля), и каждый новый
+/// аргумент раньше приближал ту же самую границу.
+#[derive(uniffi::Record, Debug, Clone)]
+pub struct SessionParams {
+    /// `ip:port` выбранной ноды.
+    pub remote_address: String,
+    /// Домен-декой для `ClientHello`.
+    pub sni: String,
+    /// FD туннеля с мобильной стороны (`VpnService`); на десктопе `None` —
+    /// TUN поднимает сам клиент.
+    pub tun_fd: Option<i32>,
+    pub cache_dir: String,
+    pub killswitch_enabled: bool,
+    pub excluded_apps: Vec<String>,
+    pub excluded_domains: Vec<String>,
+    /// Bearer-токен клиента для нод с `--require-auth`.
+    pub auth_token: Option<String>,
+    /// `nrxp_secret` и `nrxp_public_key` ноды (hex по 64 символа). Переданы
+    /// оба — хендшейк аутентифицированный; нет — старая анонимная схема.
+    pub node_secret: Option<String>,
+    pub node_public_key: Option<String>,
+    /// Корпоративный режим: "all" | "resources" | "bypass_lan". `None` —
+    /// частный пользователь, трактуется как "all".
+    pub tunnel_mode: Option<String>,
+    /// Подсети ресурсов организации, только для режима "resources".
+    pub routed_cidrs: Vec<String>,
+}
+
 /// Фабрика VPN-сессий — главная точка входа FFI.
 #[derive(uniffi::Object)]
 pub struct SessionManager;
@@ -258,22 +302,22 @@ impl SessionManager {
     /// хендшейк аутентифицированный: клиент проверяемо отличает свою ноду от
     /// чужой. Не переданы — старый анонимный хендшейк, для нод, которым в
     /// админке ещё не завели ключи.
-    #[allow(clippy::too_many_arguments)]
-    pub fn spawn_session(
-        &self,
-        remote_address: String,
-        sni: String,
-        _tun_fd: Option<i32>,
-        cache_dir: String,
-        killswitch_enabled: bool,
-        excluded_apps: Vec<String>,
-        excluded_domains: Vec<String>,
-        auth_token: Option<String>,
-        node_secret: Option<String>,
-        node_public_key: Option<String>,
-        tunnel_mode: Option<String>,
-        routed_cidrs: Vec<String>,
-    ) -> Arc<Session> {
+    pub fn spawn_session(&self, params: SessionParams) -> Arc<Session> {
+        let SessionParams {
+            remote_address,
+            sni,
+            tun_fd: _tun_fd,
+            cache_dir,
+            killswitch_enabled,
+            excluded_apps,
+            excluded_domains,
+            auth_token,
+            node_secret,
+            node_public_key,
+            tunnel_mode,
+            routed_cidrs,
+        } = params;
+
         // На мобильных Logger::init здесь — первый и единственный вызов (нет
         // отдельного main.rs), поэтому production-флаг должен зависеть от
         // профиля сборки, а не быть жёстко `false` (иначе релизная сборка
