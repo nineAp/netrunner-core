@@ -38,7 +38,7 @@ use crate::{
 use netrunner_logger::{error, info};
 use std::sync::{
     Arc, OnceLock,
-    atomic::{AtomicU8, Ordering},
+    atomic::{AtomicU8, AtomicU64, Ordering},
 };
 use tokio::runtime::Runtime;
 use tokio_util::sync::CancellationToken;
@@ -58,6 +58,31 @@ pub const CONN_FAILED: u8 = 3;
 /// вообще ронял процесс. Теперь задача не паникует, а публикует сюда исход,
 /// который desktop-плагин опрашивает и превращает в статус UI.
 pub static CONNECTION_STATE: AtomicU8 = AtomicU8::new(CONN_IDLE);
+
+/// Номер последней запущенной сессии. [`CONNECTION_STATE`] — глобальное
+/// состояние процесса, а сессий за время жизни процесса много, и они
+/// ПЕРЕСЕКАЮТСЯ во времени: приложение поднимает новую (переподключение,
+/// смена ноды, рестарт сервиса системой) раньше, чем задача старой успела
+/// доработать после отмены.
+///
+/// Без этого счётчика доигрывающая старая задача записывала свой финальный
+/// `CONN_IDLE` поверх `CONN_CONNECTED` уже работающей новой сессии. На
+/// Android это не косметика: сервис глушит туннель на любом статусе, кроме
+/// рабочего (см. `startStatsLoop` в VpnPlugin.kt), — то есть живой туннель
+/// убивал себя сам через какое-то время после переподключения.
+static SESSION_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// Публикует состояние, только если сессия `generation` всё ещё актуальна.
+///
+/// Возвращает `true`, если запись состоялась (нужно тестам и логам: «моя
+/// сессия уже не последняя» — штатная ситуация, а не ошибка).
+fn publish_state(generation: u64, state: u8) -> bool {
+    if SESSION_GENERATION.load(Ordering::SeqCst) != generation {
+        return false;
+    }
+    CONNECTION_STATE.store(state, Ordering::Relaxed);
+    true
+}
 
 /// Снимок [`CONNECTION_STATE`] для приложения/плагина.
 pub fn connection_state() -> u8 {
@@ -122,6 +147,42 @@ fn parse_tunnel_mode(raw: Option<&str>) -> TunnelMode {
             netrunner_logger::warn!("Неизвестный режим туннеля {:?} — работаем как all", other);
             TunnelMode::All
         }
+    }
+}
+
+#[cfg(test)]
+mod session_state_tests {
+    use super::*;
+
+    /// Ровно тот сценарий, из-за которого туннель умирал «сам собой» через
+    /// время: приложение подняло новую сессию, а задача предыдущей (уже
+    /// отменённой) доигрывает и публикует свой финальный статус.
+    ///
+    /// Тест один на весь модуль сознательно: состояние здесь глобальное на
+    /// процесс, и два таких теста в параллельном раннере мешали бы друг другу.
+    #[test]
+    fn stale_session_cannot_overwrite_a_newer_one() {
+        let old = SESSION_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+        assert!(publish_state(old, CONN_CONNECTED));
+
+        // Переподключение: приложение стартует новую сессию.
+        let current = SESSION_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+        assert!(publish_state(current, CONN_CONNECTED));
+
+        // Старая задача просыпается по отмене и хочет записать свой исход.
+        assert!(
+            !publish_state(old, CONN_IDLE),
+            "устаревшая сессия не должна публиковать статус"
+        );
+        assert_eq!(
+            connection_state(),
+            CONN_CONNECTED,
+            "живая сессия осталась подключённой"
+        );
+
+        // А актуальная — может.
+        assert!(publish_state(current, CONN_IDLE));
+        assert_eq!(connection_state(), CONN_IDLE);
     }
 }
 
@@ -224,8 +285,12 @@ impl SessionManager {
         let cancel_token = CancellationToken::new();
         let session_token = cancel_token.clone();
 
-        // Начинаем попытку подключения — сбрасываем прошлый исход.
-        CONNECTION_STATE.store(CONN_CONNECTING, Ordering::Relaxed);
+        // Начинаем попытку подключения — сбрасываем прошлый исход. Заодно
+        // объявляем себя последней сессией: всё, что успеет дописать
+        // предыдущая (она могла быть отменена мгновение назад и ещё
+        // доигрывает), с этого момента отбрасывается — см. SESSION_GENERATION.
+        let generation = SESSION_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+        publish_state(generation, CONN_CONNECTING);
 
         let remote_proxy_ip = match remote_address.parse::<std::net::SocketAddr>() {
             Ok(addr) => addr.ip().to_string(),
@@ -233,7 +298,7 @@ impl SessionManager {
                 // Раньше был `.expect(...)` в вызывающем потоке — с panic=abort
                 // это ронял всё приложение. Отдаём неактивную сессию и failed.
                 error!("Invalid remote address '{}': {}", remote_address, e);
-                CONNECTION_STATE.store(CONN_FAILED, Ordering::Relaxed);
+                publish_state(generation, CONN_FAILED);
                 return Arc::new(Session {
                     cancel_token: session_token,
                     proxy_ip: String::new(),
@@ -314,7 +379,7 @@ impl SessionManager {
                         "Failed to create TUN device (нужны права CAP_NET_ADMIN/root?): {}",
                         e
                     );
-                    CONNECTION_STATE.store(CONN_FAILED, Ordering::Relaxed);
+                    publish_state(generation, CONN_FAILED);
                     return;
                 }
             };
@@ -327,7 +392,7 @@ impl SessionManager {
             match builder_result {
                 Ok((mut engine, tun)) => {
                     info!("Engine built successfully, starting loop...");
-                    CONNECTION_STATE.store(CONN_CONNECTED, Ordering::Relaxed);
+                    publish_state(generation, CONN_CONNECTED);
 
                     // Исход цикла различается по причине, и это важно: движок,
                     // завершившийся САМ, — это отказ (мёртвый туннель, отвергнутый
@@ -346,11 +411,18 @@ impl SessionManager {
                         }
                     }
                     let outcome = if engine_failed { CONN_FAILED } else { CONN_IDLE };
-                    CONNECTION_STATE.store(outcome, Ordering::Relaxed);
+                    // Только если эта сессия всё ещё последняя: иначе мы бы
+                    // погасили статус УЖЕ РАБОТАЮЩЕЙ новой сессии, а Android
+                    // на этом глушит живой туннель (см. SESSION_GENERATION).
+                    if !publish_state(generation, outcome) {
+                        info!(
+                            "Session generation {generation} finished after a newer one started — статус не трогаем"
+                        );
+                    }
                 }
                 Err(e) => {
                     error!("Failed to build VPN Engine: {}", e);
-                    CONNECTION_STATE.store(CONN_FAILED, Ordering::Relaxed);
+                    publish_state(generation, CONN_FAILED);
                 }
             }
         });

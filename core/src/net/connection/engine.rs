@@ -331,6 +331,16 @@ impl TunnelEngine {
                 }
 
                 self.leg_status = LegStatus::Reconnecting;
+                // Снимаем ногу с учёта на время переподключения. Регистрация
+                // в муксере означает «сюда можно писать», а писать сюда сейчас
+                // некуда: сокета нет. Пока этого не делали, счётчик живых ног
+                // показывал 4 при полностью мёртвом туннеле, и детектор
+                // `TUNNEL_DEAD_AFTER` в клиентском движке не срабатывал в
+                // единственном случае, ради которого писался (проверено
+                // локально: сервер убит, клиент минутами считает ноги живыми).
+                // Обратно нога встаёт после успешного хендшейка — `add_leg` в
+                // ветке `Ok` ниже.
+                self.muxer.force_remove_leg(self.leg_id);
                 match self.attempt_reconnect().await {
                     Ok((new_in, new_out, new_rx, new_tx, new_tail)) => {
                         internal_attempt = 0; // successful reconnect — reset counter
