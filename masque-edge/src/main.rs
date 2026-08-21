@@ -84,12 +84,9 @@ struct ProfileArgs {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // The root release image builds this binary together with netrunner-server.
-    // Cargo feature unification can therefore compile rustls with both Ring and
-    // AWS-LC providers, in which case rustls deliberately refuses to guess at
-    // runtime. MASQUE is configured for Ring, so select it explicitly before
-    // parsing certificates or accepting QUIC connections.
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    // Провайдер выбирается до разбора сертификатов и приёма QUIC — см.
+    // `server::install_crypto_provider`, там же разбор, почему это нужно.
+    server::install_crypto_provider();
 
     tracing_subscriber::fmt()
         .with_env_filter(

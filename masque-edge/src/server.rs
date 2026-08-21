@@ -24,6 +24,29 @@ use crate::{auth::BearerAuth, target};
 
 type Sessions = Arc<RwLock<HashMap<StreamId, Arc<UdpSocket>>>>;
 
+/// Выбирает Ring как криптопровайдер rustls — ровно один раз на процесс.
+///
+/// Корневой релизный образ собирает этот бинарь вместе с `netrunner-server`, а
+/// тот через `reqwest`/`hyper-rustls` тянет AWS-LC. Из-за унификации фич
+/// Cargo rustls оказывается собран сразу с двумя провайдерами, и тогда он
+/// принципиально отказывается угадывать нужный в рантайме — падает с «no
+/// process-level CryptoProvider available».
+///
+/// MASQUE настроен на Ring, поэтому выбор делается явно. Вызывать обязаны и
+/// `main`, и тесты: тесты `main` не исполняют, и без этого вызова любой тест,
+/// поднимающий QUIC, падает — но только при сборке всего воркспейса, а по
+/// отдельности крейт собирается с одним провайдером и проходит. Такое
+/// расхождение между `cargo test -p` и `cargo test --workspace` дороже всего
+/// искать, поэтому точка входа одна.
+pub fn install_crypto_provider() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        // Ошибка здесь означает, что провайдер уже кем-то установлен — для
+        // нашей цели это тот же успех.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
 pub struct Config {
     pub bind: SocketAddr,
     pub cert: PathBuf,
@@ -391,6 +414,10 @@ mod tests {
     }
 
     async fn start_test_server() -> Result<TestServer> {
+        // Без этого тесты падают при `cargo test --workspace` — см.
+        // `install_crypto_provider`.
+        install_crypto_provider();
+
         let CertifiedKey { cert, signing_key } =
             generate_simple_self_signed(vec!["localhost".to_owned()])?;
         let directory = tempfile::tempdir()?;
