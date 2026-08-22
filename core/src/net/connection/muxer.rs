@@ -50,17 +50,17 @@
 use arc_swap::ArcSwap;
 use bytes::Bytes;
 use dashmap::DashMap;
-use netrunner_logger::{AppError, ERR_INFRA_TIMEOUT, info, instrument, trace, warn};
+use netrunner_logger::{info, instrument, trace, warn, AppError, ERR_INFRA_TIMEOUT};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tokio::sync::mpsc::{error::TrySendError, Sender};
 use tokio::sync::Notify;
-use tokio::sync::mpsc::{Sender, error::TrySendError};
 use tokio_util::sync::CancellationToken;
 
+use crate::net::diagnostics::{self, DiagnosticsEvent, LegMetrics, TunnelMetrics, DIAG_COUNTERS};
 use crate::net::INITIAL_RTT_MS;
-use crate::net::diagnostics::{self, DIAG_COUNTERS, DiagnosticsEvent, LegMetrics, TunnelMetrics};
 use crate::net::{
     BACKLOG_REAPER_IDLE_TIMEOUT, BACKLOG_REAPER_INTERVAL, BACKLOG_STUCK_GRACE, BRIDGE_READ_CHUNK,
     MAX_TUNNEL_LEGS, STREAM_BACKLOG_MAX_BYTES,

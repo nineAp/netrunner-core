@@ -5,7 +5,7 @@
 #   netrunner-masque-edge -> UDP/${MASQUE_BIND:-0.0.0.0:443}
 #
 # MASQUE включается явно (MASQUE_ENABLED=true) либо автоматически, когда
-# одновременно переданы токен, сертификат и ключ. Поэтому обновление образа
+# одновременно переданы авторизация, сертификат и ключ. Поэтому обновление образа
 # через watchtower безопасно для старых нод без MASQUE-конфигурации.
 
 set -u
@@ -57,12 +57,13 @@ case "$masque_mode" in
         masque_start=false
         ;;
     auto|AUTO)
-        if [ -n "${MASQUE_TOKEN:-}" ] && \
+        if { [ -n "${MASQUE_TOKEN:-}" ] || \
+             { [ -n "${MASQUE_AUTH_URL:-}" ] && [ -n "${MASQUE_AUTH_SECRET:-${PROXY_INTERNAL_SECRET:-}}" ]; }; } && \
            [ -n "${MASQUE_CERT_FILE:-}" ] && \
            [ -n "${MASQUE_KEY_FILE:-}" ]; then
             masque_start=true
-        elif [ -n "${MASQUE_TOKEN:-}${MASQUE_CERT_FILE:-}${MASQUE_KEY_FILE:-}" ]; then
-            echo "MASQUE configuration is incomplete: token, certificate and key are all required" >&2
+        elif [ -n "${MASQUE_TOKEN:-}${MASQUE_AUTH_URL:-}${MASQUE_AUTH_SECRET:-}${MASQUE_CERT_FILE:-}${MASQUE_KEY_FILE:-}" ]; then
+            echo "MASQUE configuration is incomplete: auth, certificate and key are required" >&2
             exit 64
         fi
         ;;
@@ -73,9 +74,13 @@ case "$masque_mode" in
 esac
 
 if [ "$masque_start" = true ]; then
-    : "${MASQUE_TOKEN:?MASQUE_TOKEN is required when MASQUE is enabled}"
     : "${MASQUE_CERT_FILE:?MASQUE_CERT_FILE is required when MASQUE is enabled}"
     : "${MASQUE_KEY_FILE:?MASQUE_KEY_FILE is required when MASQUE is enabled}"
+
+    if [ -z "${MASQUE_TOKEN:-}" ] && [ -z "${MASQUE_AUTH_URL:-}" ]; then
+        echo "MASQUE_TOKEN or MASQUE_AUTH_URL is required when MASQUE is enabled" >&2
+        exit 64
+    fi
 
     if [ ! -r "$MASQUE_CERT_FILE" ]; then
         echo "MASQUE certificate is not readable: $MASQUE_CERT_FILE" >&2

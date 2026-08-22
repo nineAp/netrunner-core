@@ -28,7 +28,9 @@ pub fn render(options: &ProfileOptions) -> String {
             .iter()
             .map(|domain| format!("\n                <string>{}</string>", xml_escape(domain)))
             .collect::<String>();
-        format!("\n            <key>MatchDomains</key>\n            <array>{domains}\n            </array>")
+        format!(
+            "\n            <key>MatchDomains</key>\n            <array>{domains}\n            </array>"
+        )
     };
 
     format!(

@@ -447,7 +447,12 @@ async fn connect_backend(
         connect_backend_inner(cfg, target_addr, target_host),
     )
     .await
-    .map_err(|_| format!("connecting via {} timed out after {BACKEND_CONNECT_TIMEOUT:?}", cfg.vpn_node_addr))?
+    .map_err(|_| {
+        format!(
+            "connecting via {} timed out after {BACKEND_CONNECT_TIMEOUT:?}",
+            cfg.vpn_node_addr
+        )
+    })?
 }
 
 async fn connect_backend_inner(

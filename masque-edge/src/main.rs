@@ -45,6 +45,21 @@ struct ServeArgs {
     #[arg(long)]
     token: Option<String>,
 
+    /// Control-plane endpoint which validates per-device tokens.
+    /// MASQUE_AUTH_URL is used when omitted.
+    #[arg(long)]
+    auth_url: Option<String>,
+
+    /// Control-plane endpoint for traffic accounting. MASQUE_USAGE_URL is
+    /// used when omitted, then it is derived from the validation URL.
+    #[arg(long)]
+    usage_url: Option<String>,
+
+    /// Per-node X-Internal-Secret for the control-plane auth endpoint.
+    /// MASQUE_AUTH_SECRET (or PROXY_INTERNAL_SECRET) is used when omitted.
+    #[arg(long)]
+    auth_secret: Option<String>,
+
     /// Explicitly run as an open proxy. Intended only for isolated local tests.
     #[arg(long, default_value_t = false)]
     allow_anonymous: bool,
@@ -52,6 +67,11 @@ struct ServeArgs {
     /// Permit loopback, private, link-local and other non-public destinations.
     #[arg(long, default_value_t = false)]
     allow_private_targets: bool,
+
+    /// Maximum simultaneous QUIC connections. MASQUE_MAX_CONNECTIONS is
+    /// used when omitted.
+    #[arg(long)]
+    max_connections: Option<usize>,
 }
 
 #[derive(Debug, Args)]
@@ -103,17 +123,60 @@ async fn main() -> Result<()> {
                 .token
                 .or_else(|| std::env::var("MASQUE_TOKEN").ok())
                 .filter(|token| !token.trim().is_empty());
-
-            if token.is_none() && !args.allow_anonymous {
-                bail!("--token or MASQUE_TOKEN is required unless --allow-anonymous is explicit");
+            let auth_url = args
+                .auth_url
+                .or_else(|| std::env::var("MASQUE_AUTH_URL").ok())
+                .filter(|value| !value.trim().is_empty());
+            let auth_secret = args
+                .auth_secret
+                .or_else(|| std::env::var("MASQUE_AUTH_SECRET").ok())
+                .or_else(|| std::env::var("PROXY_INTERNAL_SECRET").ok())
+                .filter(|value| !value.trim().is_empty());
+            let usage_url = args
+                .usage_url
+                .or_else(|| std::env::var("MASQUE_USAGE_URL").ok())
+                .filter(|value| !value.trim().is_empty());
+            let max_connections = args
+                .max_connections
+                .or_else(|| {
+                    std::env::var("MASQUE_MAX_CONNECTIONS")
+                        .ok()
+                        .and_then(|value| value.parse().ok())
+                })
+                .unwrap_or(4096);
+            if max_connections == 0 || max_connections > 100_000 {
+                bail!("MASQUE_MAX_CONNECTIONS must be between 1 and 100000");
             }
+
+            let auth = match (auth_url, auth_secret, token, args.allow_anonymous) {
+                (Some(url), Some(secret), None, false) => {
+                    let usage_url = usage_url.unwrap_or_else(|| {
+                        url.strip_suffix("/validate")
+                            .map(|prefix| format!("{prefix}/usage"))
+                            .unwrap_or_else(|| format!("{url}/usage"))
+                    });
+                    auth::BearerAuth::remote(url, usage_url, secret)?
+                }
+                (None, None, Some(token), false) => auth::BearerAuth::new(Some(token)),
+                (None, None, None, true) => auth::BearerAuth::new(None),
+                (Some(_), None, _, _) | (None, Some(_), _, _) => {
+                    bail!("MASQUE_AUTH_URL and MASQUE_AUTH_SECRET must be configured together")
+                }
+                (Some(_), Some(_), Some(_), _) => {
+                    bail!("remote auth and a static MASQUE_TOKEN cannot be enabled together")
+                }
+                _ => bail!(
+                    "remote auth or --token/MASQUE_TOKEN is required unless --allow-anonymous is explicit"
+                ),
+            };
 
             server::run(server::Config {
                 bind: args.bind,
                 cert: args.cert,
                 key: args.key,
-                auth: auth::BearerAuth::new(token),
+                auth,
                 allow_private_targets: args.allow_private_targets,
+                max_connections,
             })
             .await
         }

@@ -613,8 +613,7 @@ impl SessionAuth {
         for step in (current_step.saturating_sub(AUTH_WINDOW_SIZE))
             ..=(current_step.saturating_add(AUTH_WINDOW_SIZE))
         {
-            let candidate =
-                Self::compute_handshake_tag(&self.auth_key, step, random, peer_public);
+            let candidate = Self::compute_handshake_tag(&self.auth_key, step, random, peer_public);
             // Никакого раннего выхода: накапливаем результат по всем шагам.
             matched |= candidate[..].ct_eq(&received_tag[..]);
         }

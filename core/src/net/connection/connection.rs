@@ -23,15 +23,15 @@ use std::{net::Ipv4Addr, sync::Arc, time::Instant};
 use crate::{
     crypto::{ChaChaCipher, Identity, SessionKeys},
     net::{
-        DNS_LOOKUP_TIMEOUT, FALLBACK_CONNECT_TIMEOUT, HTTPS_PORT, LEG_RECONNECT_DELAY,
-        LEG_STAGGER_DELAY, MAX_TUNNEL_LEGS, NETWORK_WATCHER_INTERVAL, NetworkConfig,
-        SECURE_HANDSHAKE_TIMEOUT, SESSION_CLEANUP_DELAY, STREAM_PAUSE_BUDGET, STREAM_PAUSE_RETRY,
-        TLS_HELLO_TIMEOUT, TOPOLOGY_PRINT_INTERVAL,
         connection::{
             engine::TunnelEngine,
             handler::{RemoteOpener, StreamHandler},
             muxer::{MuxMessage, Muxer},
         },
+        NetworkConfig, DNS_LOOKUP_TIMEOUT, FALLBACK_CONNECT_TIMEOUT, HTTPS_PORT,
+        LEG_RECONNECT_DELAY, LEG_STAGGER_DELAY, MAX_TUNNEL_LEGS, NETWORK_WATCHER_INTERVAL,
+        SECURE_HANDSHAKE_TIMEOUT, SESSION_CLEANUP_DELAY, STREAM_PAUSE_BUDGET, STREAM_PAUSE_RETRY,
+        TLS_HELLO_TIMEOUT, TOPOLOGY_PRINT_INTERVAL,
     },
     nrxp::{Codec, Frame, FrameType, TlsBridge},
     rawcast::{LocalProtocol, RawCastAdapter, RawCastFrame},
@@ -40,14 +40,14 @@ use crate::{
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use netrunner_logger::{
-    AppError, ERR_AUTH_FAILED, ERR_INFRA_TIMEOUT, ERR_NET_TLS_TAMPER, debug, error, info, warn,
+    debug, error, info, warn, AppError, ERR_AUTH_FAILED, ERR_INFRA_TIMEOUT, ERR_NET_TLS_TAMPER,
 };
 use rand::{Rng, RngExt};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{
-        TcpStream,
         tcp::{OwnedReadHalf, OwnedWriteHalf},
+        TcpStream,
     },
     sync::mpsc,
 };

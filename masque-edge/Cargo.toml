@@ -15,14 +15,18 @@ h3 = "0.0.8"
 h3-datagram = "0.0.2"
 h3-quinn = { version = "0.0.10", features = ["datagram"] }
 http = "1"
+hex = "0.4"
 percent-encoding = "2"
 quinn = { version = "0.11.9", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rustls-pemfile = "2"
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
 tokio = { version = "1.49", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "serde"] }
 
 [dev-dependencies]
 rcgen = "0.14"

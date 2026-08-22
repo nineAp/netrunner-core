@@ -555,7 +555,10 @@ mod tests {
         // добавляет padding последним.
         for profile in BrowserProfile::ALL {
             let order = profile.extension_order.0;
-            if let Some(pos) = order.iter().position(|&e| e == crate::tlseng::types::TlsExtensions::PADDING) {
+            if let Some(pos) = order
+                .iter()
+                .position(|&e| e == crate::tlseng::types::TlsExtensions::PADDING)
+            {
                 assert_eq!(
                     pos,
                     order.len() - 1,
@@ -646,7 +649,11 @@ mod tests {
 
     /// Пара учётных данных одной ноды: то, что лежит на ней самой, и то, что
     /// бэкенд отдаёт её клиентам.
-    fn identity_pair(node_secret: [u8; 32], node_private: [u8; 32], strict: bool) -> (Identity, Identity) {
+    fn identity_pair(
+        node_secret: [u8; 32],
+        node_private: [u8; 32],
+        strict: bool,
+    ) -> (Identity, Identity) {
         let local = LocalIdentity::from_hex(
             &hex::encode(node_secret),
             &hex::encode(node_private),
@@ -669,8 +676,11 @@ mod tests {
             Some(id) => SessionKeys::with_identity(true, id),
             None => SessionKeys::new(true),
         };
-        let ch_wire =
-            ClientHello::make_client_hello(&BrowserProfile::CHROME_131, "example.com", &client_keys);
+        let ch_wire = ClientHello::make_client_hello(
+            &BrowserProfile::CHROME_131,
+            "example.com",
+            &client_keys,
+        );
         let (client_hello, client_ext) = parse_client_hello_record(&ch_wire);
 
         let mut server_keys = match server_identity {
@@ -704,8 +714,11 @@ mod tests {
         let (peer, local) = identity_pair([7u8; 32], [9u8; 32], true);
 
         let client_keys = SessionKeys::with_identity(true, peer.clone());
-        let ch_wire =
-            ClientHello::make_client_hello(&BrowserProfile::CHROME_131, "example.com", &client_keys);
+        let ch_wire = ClientHello::make_client_hello(
+            &BrowserProfile::CHROME_131,
+            "example.com",
+            &client_keys,
+        );
         let (client_hello, _) = parse_client_hello_record(&ch_wire);
         assert_eq!(
             client_hello.session_id[0],
@@ -781,8 +794,11 @@ mod tests {
         let (_, other_node) = identity_pair([8u8; 32], [9u8; 32], true);
 
         let client_keys = SessionKeys::with_identity(true, peer);
-        let ch_wire =
-            ClientHello::make_client_hello(&BrowserProfile::CHROME_131, "example.com", &client_keys);
+        let ch_wire = ClientHello::make_client_hello(
+            &BrowserProfile::CHROME_131,
+            "example.com",
+            &client_keys,
+        );
         let (client_hello, client_ext) = parse_client_hello_record(&ch_wire);
 
         let mut tag = [0u8; 16];
@@ -811,8 +827,11 @@ mod tests {
         let (peer, local) = identity_pair([7u8; 32], [9u8; 32], true);
 
         let client_keys = SessionKeys::with_identity(true, peer);
-        let ch_wire =
-            ClientHello::make_client_hello(&BrowserProfile::CHROME_131, "example.com", &client_keys);
+        let ch_wire = ClientHello::make_client_hello(
+            &BrowserProfile::CHROME_131,
+            "example.com",
+            &client_keys,
+        );
         let (client_hello, client_ext) = parse_client_hello_record(&ch_wire);
 
         let mut tag = [0u8; 16];
@@ -852,7 +871,11 @@ mod tests {
                 node.verify_handshake_tag(&tag, &client_hello.random, &peer_public),
                 expected,
                 "strict={strict}: анонимный клиент должен быть {}",
-                if expected { "принят" } else { "отвергнут" }
+                if expected {
+                    "принят"
+                } else {
+                    "отвергнут"
+                }
             );
         }
     }

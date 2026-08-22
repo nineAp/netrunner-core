@@ -4,7 +4,10 @@ use std::{
     io::BufReader,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::PathBuf,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 
@@ -16,13 +19,21 @@ use http::{Method, Request, Response, StatusCode};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpStream, UdpSocket},
-    sync::RwLock,
+    sync::{RwLock, Semaphore},
 };
 use tracing::{debug, info, warn};
 
-use crate::{auth::BearerAuth, target};
+use crate::{
+    auth::{AuthGrant, BearerAuth},
+    target,
+};
 
-type Sessions = Arc<RwLock<HashMap<StreamId, Arc<UdpSocket>>>>;
+type Sessions = Arc<RwLock<HashMap<StreamId, Arc<UdpSession>>>>;
+
+struct UdpSession {
+    socket: UdpSocket,
+    unreported_bytes: AtomicU64,
+}
 
 /// Выбирает Ring как криптопровайдер rustls — ровно один раз на процесс.
 ///
@@ -53,6 +64,7 @@ pub struct Config {
     pub key: PathBuf,
     pub auth: BearerAuth,
     pub allow_private_targets: bool,
+    pub max_connections: usize,
 }
 
 pub async fn run(config: Config) -> Result<()> {
@@ -60,11 +72,27 @@ pub async fn run(config: Config) -> Result<()> {
     let endpoint = quinn::Endpoint::server(server_config, config.bind)
         .with_context(|| format!("failed to bind HTTP/3 endpoint at {}", config.bind))?;
 
-    info!(bind = %config.bind, "MASQUE HTTP/3 edge listening");
+    let connection_slots = Arc::new(Semaphore::new(config.max_connections));
+    info!(bind = %config.bind, max_connections = config.max_connections, "MASQUE HTTP/3 edge listening");
     while let Some(incoming) = endpoint.accept().await {
+        // QUIC Retry validates the source address before the server allocates
+        // connection state, limiting spoofed-address amplification and memory
+        // pressure on the public UDP/443 socket.
+        if !incoming.remote_address_validated() {
+            if let Err(error) = incoming.retry() {
+                warn!(%error, "failed to send QUIC Retry");
+            }
+            continue;
+        }
+        let Ok(connection_slot) = Arc::clone(&connection_slots).try_acquire_owned() else {
+            warn!(remote = %incoming.remote_address(), "MASQUE connection limit reached");
+            incoming.refuse();
+            continue;
+        };
         let auth = config.auth.clone();
         let allow_private_targets = config.allow_private_targets;
         tokio::spawn(async move {
+            let _connection_slot = connection_slot;
             match incoming.await {
                 Ok(connection) => {
                     let remote = connection.remote_address();
@@ -150,12 +178,16 @@ async fn handle_connection(
                 );
                 continue;
             };
-            let socket = uplink_sessions.read().await.get(&stream_id).cloned();
-            if let Some(socket) = socket {
-                socket
+            let session = uplink_sessions.read().await.get(&stream_id).cloned();
+            if let Some(session) = session {
+                session
+                    .socket
                     .send(&payload)
                     .await
                     .context("failed to forward CONNECT-UDP datagram")?;
+                session
+                    .unreported_bytes
+                    .fetch_add(payload.len() as u64, Ordering::Relaxed);
             } else {
                 debug!(
                     ?stream_id,
@@ -215,10 +247,10 @@ async fn handle_request(
     auth: BearerAuth,
     allow_private_targets: bool,
 ) -> Result<()> {
-    if !auth.authorize(&request) {
+    let Some(grant) = auth.authorize(&request).await else {
         send_status(&mut stream, StatusCode::UNAUTHORIZED).await?;
         return Ok(());
-    }
+    };
     if request.method() != Method::CONNECT {
         send_status(&mut stream, StatusCode::METHOD_NOT_ALLOWED).await?;
         return Ok(());
@@ -231,6 +263,8 @@ async fn handle_request(
                 stream,
                 datagram_sender,
                 sessions,
+                auth,
+                grant,
                 allow_private_targets,
             )
             .await
@@ -239,13 +273,15 @@ async fn handle_request(
             warn!(?protocol, "unsupported extended CONNECT protocol");
             send_status(&mut stream, StatusCode::NOT_IMPLEMENTED).await
         }
-        None => handle_connect_tcp(request, stream, allow_private_targets).await,
+        None => handle_connect_tcp(request, stream, auth, grant, allow_private_targets).await,
     }
 }
 
 async fn handle_connect_tcp(
     request: Request<()>,
     mut stream: RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    auth: BearerAuth,
+    grant: AuthGrant,
     allow_private_targets: bool,
 ) -> Result<()> {
     let authority = request
@@ -267,6 +303,9 @@ async fn handle_connect_tcp(
 
     let (mut h3_send, mut h3_recv) = stream.split();
     let (mut tcp_read, mut tcp_write) = tcp.into_split();
+    let unreported_bytes = Arc::new(AtomicU64::new(0));
+    let upload_bytes = Arc::clone(&unreported_bytes);
+    let download_bytes = Arc::clone(&unreported_bytes);
 
     let upload = async {
         while let Some(mut data) = h3_recv.recv_data().await? {
@@ -274,6 +313,7 @@ async fn handle_connect_tcp(
                 let chunk = data.chunk();
                 tcp_write.write_all(chunk).await?;
                 let len = chunk.len();
+                upload_bytes.fetch_add(len as u64, Ordering::Relaxed);
                 data.advance(len);
             }
         }
@@ -291,13 +331,36 @@ async fn handle_connect_tcp(
             h3_send
                 .send_data(Bytes::copy_from_slice(&buffer[..read]))
                 .await?;
+            download_bytes.fetch_add(read as u64, Ordering::Relaxed);
         }
         h3_send.finish().await?;
         Ok::<(), anyhow::Error>(())
     };
 
-    tokio::try_join!(upload, download)?;
-    Ok(())
+    let transfer = async {
+        tokio::try_join!(upload, download)?;
+        Ok::<(), anyhow::Error>(())
+    };
+    let reporter = async {
+        let mut interval = tokio::time::interval(Duration::from_secs(10));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            let delta = unreported_bytes.swap(0, Ordering::Relaxed);
+            if auth.report_usage(grant, delta).await {
+                bail!("traffic limit reached");
+            }
+        }
+    };
+    let result = tokio::select! {
+        result = transfer => result,
+        result = reporter => result,
+    };
+    let remaining = unreported_bytes.swap(0, Ordering::Relaxed);
+    if auth.report_usage(grant, remaining).await {
+        bail!("traffic limit reached");
+    }
+    result
 }
 
 async fn handle_connect_udp(
@@ -308,6 +371,8 @@ async fn handle_connect_udp(
         Bytes,
     >,
     sessions: Sessions,
+    auth: BearerAuth,
+    grant: AuthGrant,
     allow_private_targets: bool,
 ) -> Result<()> {
     let target = target::from_connect_udp_path(request.uri().path())?;
@@ -316,7 +381,7 @@ async fn handle_connect_udp(
         IpAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
         IpAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
     };
-    let socket = Arc::new(UdpSocket::bind(bind).await?);
+    let socket = UdpSocket::bind(bind).await?;
     socket
         .connect(resolved)
         .await
@@ -332,18 +397,25 @@ async fn handle_connect_udp(
         .context("failed to accept CONNECT-UDP")?;
 
     let stream_id = stream.id();
+    let session = Arc::new(UdpSession {
+        socket,
+        unreported_bytes: AtomicU64::new(0),
+    });
     sessions
         .write()
         .await
-        .insert(stream_id, Arc::clone(&socket));
+        .insert(stream_id, Arc::clone(&session));
     info!(%target, ?stream_id, "CONNECT-UDP established");
 
     let result = async {
         let mut buffer = vec![0_u8; 65_535];
+        let mut usage_interval = tokio::time::interval(Duration::from_secs(10));
+        usage_interval.tick().await;
         loop {
             tokio::select! {
-                received = socket.recv(&mut buffer) => {
+                received = session.socket.recv(&mut buffer) => {
                     let received = received?;
+                    session.unreported_bytes.fetch_add(received as u64, Ordering::Relaxed);
                     let mut payload = BytesMut::with_capacity(received + 1);
                     payload.put_u8(0); // RFC 9298 context ID 0.
                     payload.put_slice(&buffer[..received]);
@@ -357,6 +429,12 @@ async fn handle_connect_udp(
                         None => break,
                     }
                 }
+                _ = usage_interval.tick() => {
+                    let delta = session.unreported_bytes.swap(0, Ordering::Relaxed);
+                    if auth.report_usage(grant, delta).await {
+                        bail!("traffic limit reached");
+                    }
+                }
             }
         }
         Ok::<(), anyhow::Error>(())
@@ -364,7 +442,12 @@ async fn handle_connect_udp(
     .await;
 
     sessions.write().await.remove(&stream_id);
+    let remaining = session.unreported_bytes.swap(0, Ordering::Relaxed);
+    let over_limit = auth.report_usage(grant, remaining).await;
     let _ = stream.finish().await;
+    if over_limit {
+        bail!("traffic limit reached");
+    }
     result
 }
 
@@ -436,6 +519,7 @@ mod tests {
             key: key_path,
             auth: BearerAuth::new(Some("test-token".into())),
             allow_private_targets: true,
+            max_connections: 32,
         }));
         tokio::time::sleep(Duration::from_millis(30)).await;
 

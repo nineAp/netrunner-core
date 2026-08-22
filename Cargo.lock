@@ -1424,6 +1424,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower-service",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -1888,7 +1889,7 @@ dependencies = [
  "lru",
  "netrunner-core",
  "netrunner-logger",
- "reqwest",
+ "reqwest 0.13.2",
  "shlex",
  "smoltcp",
  "thiserror 2.0.18",
@@ -2004,12 +2005,16 @@ dependencies = [
  "h3",
  "h3-datagram",
  "h3-quinn",
+ "hex",
  "http",
  "percent-encoding",
  "quinn",
  "rcgen",
+ "reqwest 0.12.28",
  "rustls",
  "rustls-pemfile",
+ "serde",
+ "sha2",
  "tempfile",
  "tokio",
  "tracing",
@@ -2028,7 +2033,7 @@ dependencies = [
  "metrics-exporter-prometheus",
  "netrunner-core",
  "netrunner-logger",
- "reqwest",
+ "reqwest 0.13.2",
  "serde",
  "serde_json",
  "tokio",
@@ -2534,6 +2539,44 @@ name = "regex-syntax"
 version = "0.8.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
+
+[[package]]
+name = "reqwest"
+version = "0.12.28"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eddd3ca559203180a307f12d114c268abf583f59b03cb906fd0b3ff8646c1147"
+dependencies = [
+ "base64",
+ "bytes",
+ "futures-core",
+ "http",
+ "http-body",
+ "http-body-util",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
+ "js-sys",
+ "log",
+ "percent-encoding",
+ "pin-project-lite",
+ "quinn",
+ "rustls",
+ "rustls-pki-types",
+ "serde",
+ "serde_json",
+ "serde_urlencoded",
+ "sync_wrapper",
+ "tokio",
+ "tokio-rustls",
+ "tower",
+ "tower-http",
+ "tower-service",
+ "url",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+ "webpki-roots",
+]
 
 [[package]]
 name = "reqwest"
@@ -3709,6 +3752,7 @@ checksum = "2cefc03fd367c0c6d4305de1b312cf00248c4114f4a0418ce6a6af769e3b0bd9"
 dependencies = [
  "getrandom 0.4.2",
  "js-sys",
+ "serde_core",
  "wasm-bindgen",
 ]
 
