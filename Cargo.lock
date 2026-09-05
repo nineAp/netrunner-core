@@ -1890,10 +1890,10 @@ dependencies = [
  "lru",
  "netrunner-core",
  "netrunner-logger",
+ "nxrp-smoltcp",
  "reqwest 0.13.2",
  "serde",
  "shlex",
- "smoltcp",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
@@ -2107,6 +2107,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
 dependencies = [
  "autocfg",
+]
+
+[[package]]
+name = "nxrp-smoltcp"
+version = "0.13.0"
+source = "git+https://gitea.netrunner-vpn.com/nineap/nxrp-smoltcp.git?branch=main#59e8a20131ef13295eeca30cbc48930c32b5c35d"
+dependencies = [
+ "bitflags 1.3.2",
+ "byteorder",
+ "bytes",
+ "cfg-if",
+ "defmt 0.3.100",
+ "heapless",
+ "log",
+ "managed",
 ]
 
 [[package]]
@@ -3015,21 +3030,6 @@ name = "smawk"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b7c388c1b5e93756d0c740965c41e8822f866621d41acbdf6336a6a168f8840c"
-
-[[package]]
-name = "smoltcp"
-version = "0.13.0"
-source = "git+https://gitea.netrunner-vpn.com/nineap/nxrp-smoltcp.git?branch=main#c8093df6ec24f75c13bedf0e74e53cefe26997e0"
-dependencies = [
- "bitflags 1.3.2",
- "byteorder",
- "bytes",
- "cfg-if",
- "defmt 0.3.100",
- "heapless",
- "log",
- "managed",
-]
 
 [[package]]
 name = "socket2"

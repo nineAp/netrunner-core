@@ -18,7 +18,7 @@ cli = ["dep:clap", "dep:serde", "dep:toml"]
 
 [dependencies]
 netrunner-core = { path = "../core" }
-smoltcp = { git = "https://gitea.netrunner-vpn.com/nineap/nxrp-smoltcp.git", branch = "main", default-features = false, features = [
+smoltcp = { package = "nxrp-smoltcp", git = "https://gitea.netrunner-vpn.com/nineap/nxrp-smoltcp.git", branch = "main", default-features = false, features = [
     "std",
     "log",
     "medium-ip",
