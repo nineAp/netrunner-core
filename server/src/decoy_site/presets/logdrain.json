@@ -1,0 +1,17 @@
+{
+  "name": "logdrain",
+  "note": "Log/metrics ingestion. Постоянный входящий поток телеметрии от агентов — оправдывает долгоживущие соединения и ровный трафик.",
+  "sni": "logdrain.io",
+  "elements": ["header", "hero", "logos", "features", "pricing", "footer"],
+  "theme": { "accent": "#22c55e", "accent2": "#38bdf8" },
+  "page_title": "LogDrain — logs that don't cost a mortgage",
+  "page_description": "Ship logs and metrics from anywhere. Query in real time. Flat pricing.",
+  "content": {
+    "header": { "brand_glyph": "≋", "brand_name": "LogDrain", "link_1": "Features", "link_2": "Pricing", "link_3": "Docs", "cta_login": "Log in", "cta_signup": "Get an endpoint" },
+    "hero": { "eyebrow": "🟢 Ingest 50k events/sec on the free tier", "headline": "Your logs, drained somewhere sane", "subhead": "Point your agents at one endpoint and query everything in real time. No index tax, no per-seat nonsense.", "cta_primary": "Grab a free endpoint", "cta_secondary": "Read the docs", "reassurance": "5GB/day free · no card" },
+    "logos": { "label": "Draining logs for", "logo_1": "Kettle", "logo_2": "Fathom", "logo_3": "Roundup", "logo_4": "Nimbus", "logo_5": "Coilbase" },
+    "features": { "title": "Observability without the invoice shock", "icon_1": "🔌", "feat_1_title": "One endpoint, any source", "feat_1_body": "OTLP, syslog, fluentbit, a curl in a cron job — if it speaks HTTP, we drain it.", "icon_2": "🔎", "feat_2_title": "Live tail + query", "feat_2_body": "Search across billions of lines with sub-second tail. No cold storage penalty.", "icon_3": "💸", "feat_3_title": "Flat, boring pricing", "feat_3_body": "You pay for volume, not seats, not indexes, not 'enterprise'. Same price at 3am." },
+    "pricing": { "title": "Pick a lane", "p1_name": "Hobby", "p1_price": "$0", "p1_meta": "5GB/day · 3d retention", "p1_cta": "Start draining", "p2_tag": "Best value", "p2_name": "Growth", "p2_price": "$29", "p2_meta": "100GB/day · 30d", "p2_cta": "Start free trial", "p3_name": "Scale", "p3_price": "Custom", "p3_meta": "Dedicated · BYOC", "p3_cta": "Talk to us" },
+    "footer": { "brand_name": "LogDrain", "tagline": "Logs and metrics for people who hate their observability bill.", "copyright": "© 2026 LogDrain", "built_with": "Made by 3 engineers and a very tired on-call rotation ☕" }
+  }
+}

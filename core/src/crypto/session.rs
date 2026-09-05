@@ -285,6 +285,8 @@ impl SessionKeys {
         is_server: bool,
     ) -> Result<[u8; 32], AppError> {
         const EXT_KEY_SHARE: u16 = 0x0033;
+        const GROUP_X25519: u16 = 0x001d;
+        const X25519_LEN: usize = 32;
 
         let Some(dh_data) = extensions.find_by_type(EXT_KEY_SHARE) else {
             return Err(AppError::new(
@@ -294,24 +296,55 @@ impl SessionKeys {
             ));
         };
 
-        let mut key_bytes = [0u8; 32];
+        // Разбор по структуре, а не поиском байтовой сигнатуры.
+        //
+        // Раньше серверная ветка искала подстроку `00 1d 00 20` в произвольном
+        // месте расширения. Пока `key_share` нёс единственную запись на 32
+        // байта, это работало. С постквантовым профилем клиент кладёт туда ещё
+        // 1216 байт балласта ML-KEM (см. `tlseng::mlkem`), и внутри них та же
+        // четвёрка байт может встретиться случайно — примерно раз на 3,6 млн
+        // хендшейков на узел. Последствие не «редкая ошибка», а вывод ключей
+        // из мусора: сессия молча не собирается, а причина невоспроизводима.
+        //
+        // Формат (RFC 8446 §4.2.8): у клиента — `list_len(2)`, затем записи
+        // `group(2) | key_len(2) | key`; у сервера — одна запись без внешней
+        // длины списка.
+        let mut key_bytes = [0u8; X25519_LEN];
 
         if is_server {
-            if dh_data.len() < 38 {
+            if dh_data.len() < 2 {
                 return Err(AppError::new(
                     ERR_NET_TLS_TAMPER,
                     "Ошибка маскировки",
                     format!("Client KeyShare too short: {}", dh_data.len()),
                 ));
             }
+            let list_len = u16::from_be_bytes([dh_data[0], dh_data[1]]) as usize;
+            let Some(list) = dh_data.get(2..2 + list_len) else {
+                return Err(AppError::new(
+                    ERR_NET_TLS_TAMPER,
+                    "Ошибка маскировки",
+                    "KeyShare list_len exceeds extension body",
+                ));
+            };
 
+            let mut off = 0usize;
             let mut found = false;
-            for i in 2..=(dh_data.len() - 34) {
-                if dh_data[i..i + 4] == [0x00, 0x1d, 0x00, 0x20] {
-                    key_bytes.copy_from_slice(&dh_data[i + 4..i + 36]);
+            while off + 4 <= list.len() {
+                let group = u16::from_be_bytes([list[off], list[off + 1]]);
+                let key_len = u16::from_be_bytes([list[off + 2], list[off + 3]]) as usize;
+                off += 4;
+                let Some(entry) = list.get(off..off + key_len) else {
+                    break;
+                };
+                // GREASE-запись и постквантовый балласт проходят мимо: нас
+                // интересует ровно x25519 нужной длины.
+                if group == GROUP_X25519 && key_len == X25519_LEN {
+                    key_bytes.copy_from_slice(entry);
                     found = true;
                     break;
                 }
+                off += key_len;
             }
 
             if !found {
@@ -322,14 +355,23 @@ impl SessionKeys {
                 ));
             }
         } else {
-            if dh_data.len() < 36 {
+            // ServerHello: ровно одна запись `group(2) | len(2) | key`.
+            if dh_data.len() < 4 + X25519_LEN {
                 return Err(AppError::new(
                     ERR_NET_TLS_TAMPER,
                     "Ошибка маскировки",
                     "Server KeyShare too short",
                 ));
             }
-            key_bytes.copy_from_slice(&dh_data[4..36]);
+            let key_len = u16::from_be_bytes([dh_data[2], dh_data[3]]) as usize;
+            if key_len != X25519_LEN {
+                return Err(AppError::new(
+                    ERR_NET_TLS_TAMPER,
+                    "Ошибка маскировки",
+                    format!("Server KeyShare has unexpected key length {key_len}"),
+                ));
+            }
+            key_bytes.copy_from_slice(&dh_data[4..4 + X25519_LEN]);
         }
 
         if key_bytes.iter().all(|&x| x == 0) {

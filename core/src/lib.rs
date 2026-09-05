@@ -129,4 +129,14 @@ pub mod nrxp;
 pub mod parser;
 pub mod rawcast;
 mod tlseng;
+
+/// Публичная поверхность decoy-подсистемы: каталог допустимых SNI, проверенный
+/// [`DecoySni`](tlseng::decoy::DecoySni), описание витрины и cover-flight.
+/// Наружу отдаётся только этот модуль tlseng — остальное (сборка отпечатка)
+/// остаётся деталью реализации ядра.
+pub mod decoy {
+    pub use crate::tlseng::decoy::{
+        CoverFlight, Decoy, DecoyCatalog, DecoyError, DecoyMode, DecoySni, DECOY_DOMAINS_ENV,
+    };
+}
 mod utils;

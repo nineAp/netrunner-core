@@ -15,6 +15,9 @@
 //! |-----------------|---------------------------------------------------------------------|
 //! | [`types`]       | Wire-константы и enum'ы TLS (content-type, версии, группы, расширения).|
 //! | [`consts`]      | Прочие фиксированные значения протокола.                            |
+//! | [`decoy`]       | Домен узла, каталог допустимых SNI и cover-flight.                  |
+//! | [`grease`]      | Жребий GREASE-значений соединения (RFC 8701).                       |
+//! | [`mlkem`]       | Балласт постквантовой доли `key_share` (FIPS 203).                  |
 //! | [`tls_record`]  | Слой TLS-записи: (де)сериализация заголовка `type|version|len`.      |
 //! | [`extension`]   | Сборка и парсинг TLS Extensions ([`ExtensionStack`]) — ядро отпечатка.|
 //! | [`handshake`]   | `ClientHello`/`ServerHello`: сборка и разбор hello-сообщений.        |
@@ -34,8 +37,11 @@
 //! чтобы пройти DPI, а защищённость обеспечивает кастомный протокол поверх.
 
 mod consts;
+pub mod decoy;
 mod extension;
+mod grease;
 mod handshake;
+mod mlkem;
 mod profile;
 mod tls_record;
 mod types;
@@ -43,9 +49,5 @@ mod types;
 pub(crate) use extension::ExtensionStack;
 pub(crate) use handshake::{ClientHello, HelloHeader, ServerHello};
 pub(crate) use profile::{BrowserProfile, ServerProfile};
-// Нужен только серверной стороне (`net::connection`), которой на
-// wasm32-unknown-unknown нет вовсе — там этот реэкспорт был бы unused.
-#[cfg(not(target_arch = "wasm32"))]
-pub(crate) use profile::sample_server_flight;
 pub(crate) use tls_record::{ApplicationData, TlsRecord};
 pub(crate) use types::{ContentType, HelloType};

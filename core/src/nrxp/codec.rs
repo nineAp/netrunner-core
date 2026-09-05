@@ -260,7 +260,7 @@ impl TxCodec {
     /// вышла **ровно** `target_record_len`.
     ///
     /// Cover-кадры имитируют flight настоящего TLS-сервера, поэтому их размер
-    /// задаётся снаружи профилем ([`crate::tlseng::sample_server_flight`]) и
+    /// задаётся снаружи ([`crate::decoy::CoverFlight`]) и
     /// не проходит через [`PadShaper`]: тот выравнивает наш собственный
     /// трафик, а здесь надо попасть в заранее посчитанную длину.
     pub(crate) fn encode_cover(&mut self, target_record_len: usize) -> Result<Bytes, TlsError> {

@@ -83,6 +83,12 @@ pub struct Network {
     /// `PROXY_NRXP_PRIVATE_KEY`), заведённые в админке бэкенда. `None` — не
     /// настроены, нода принимает только старый анонимный хендшейк.
     identity: Option<Identity>,
+    /// Длины записей cover-flight — одни на весь узел (см. `ServerHandler`).
+    cover_flight: Arc<[usize]>,
+    /// Режим маскировки: ретранслировать ли fallback на запрошенный SNI
+    /// (`Relay`) или всегда отдавать свой сайт (`SelfHosted`). См.
+    /// `netrunner_core::decoy::DecoyMode`.
+    honor_requested_sni: bool,
 }
 
 impl Network {
@@ -93,6 +99,8 @@ impl Network {
         auth: Option<Arc<dyn AuthValidator>>,
         health_port: Option<u16>,
         identity: Option<Identity>,
+        cover_flight: Arc<[usize]>,
+        honor_requested_sni: bool,
     ) -> Self {
         Self {
             host,
@@ -101,6 +109,8 @@ impl Network {
             auth,
             health_port,
             identity,
+            cover_flight,
+            honor_requested_sni,
         }
     }
 
@@ -268,12 +278,15 @@ impl Network {
                         let conn = Connection::new(stream);
 
                         // Pass the Arc clone down to the ServerHandler
+                        let cover_flight = self.cover_flight.clone();
                         let handler = ServerHandler::new(
                             conn,
                             session_manager.clone(),
                             self.decoy_host.clone(),
                             self.auth.clone(),
                             self.identity.clone(),
+                            cover_flight,
+                            self.honor_requested_sni,
                         );
 
                         let active_now = active_connections.fetch_add(1, Ordering::Relaxed) + 1;

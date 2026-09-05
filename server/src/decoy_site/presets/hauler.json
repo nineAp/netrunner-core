@@ -1,0 +1,17 @@
+{
+  "name": "hauler",
+  "note": "Large-file transfer. Многогигабайтные загрузки/выгрузки — нормальный профиль, маскирует крупный симметричный трафик.",
+  "sni": "hauler.tools",
+  "elements": ["header", "hero", "features", "stats", "cta", "footer"],
+  "theme": { "accent": "#ff7a45", "accent2": "#ffd25f" },
+  "page_title": "Hauler — move big files, fast",
+  "page_description": "Send files up to 200GB. Resumable, encrypted, no account needed.",
+  "content": {
+    "header": { "brand_glyph": "⇈", "brand_name": "Hauler", "link_1": "How it works", "link_2": "Pricing", "link_3": "API", "cta_login": "Sign in", "cta_signup": "Send a file" },
+    "hero": { "eyebrow": "📦 Up to 200GB per transfer", "headline": "Move big files without the drama", "subhead": "Drag, drop, share a link. Resumable transfers that survive flaky wifi and don't care how large your export is.", "cta_primary": "Send a file free", "cta_secondary": "See the API", "reassurance": "No account for transfers under 5GB" },
+    "features": { "title": "Built for files that don't fit anywhere else", "icon_1": "🚚", "feat_1_title": "Resumable by default", "feat_1_body": "Lost connection at 87%? We pick up exactly where the last chunk landed.", "icon_2": "🛡️", "feat_2_title": "Encrypted end to end", "feat_2_body": "Files are sealed in your browser before a single byte leaves. We can't read them.", "icon_3": "🌍", "feat_3_title": "Edge everywhere", "feat_3_body": "Uploads hit the nearest of 40 regions, so a 60GB push isn't a coffee break." },
+    "stats": { "stat_1_num": "3.1PB", "stat_1_lbl": "moved this month", "stat_2_num": "40", "stat_2_lbl": "edge regions", "stat_3_num": "0", "stat_3_lbl": "size limits on Pro" },
+    "cta": { "headline": "Stop zipping things into Google Drive", "subhead": "Send your first haul in under a minute.", "cta": "Send a file" },
+    "footer": { "brand_name": "Hauler", "tagline": "The dumb-simple way to move files that are too big to email.", "copyright": "© 2026 Hauler", "built_with": "Shipped from a garage in Lisbon 🛠️" }
+  }
+}

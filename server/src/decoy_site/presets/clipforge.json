@@ -1,0 +1,19 @@
+{
+  "name": "clipforge",
+  "note": "Screen-recording + video clip hosting. Тяжёлый исходящий видеотрафик оправдан по определению — ровно поэтому такой decoy правдоподобен для узла с большим egress.",
+  "sni": "clipforge.app",
+  "elements": ["header", "hero", "logos", "features", "stats", "pricing", "cta", "footer"],
+  "theme": { "accent": "#7c5cff", "accent2": "#4bc8ff" },
+  "page_title": "ClipForge — record, share, done",
+  "page_description": "Record your screen and share a link in seconds. No installs.",
+  "content": {
+    "header": { "brand_glyph": "◐", "brand_name": "ClipForge", "link_1": "Features", "link_2": "Pricing", "link_3": "Docs", "cta_login": "Log in", "cta_signup": "Start free" },
+    "hero": { "eyebrow": "🎬 Now with 4K + auto-captions", "headline": "Record. Share. Done.", "subhead": "Screen recordings that turn into a shareable link before you finish talking. No downloads, no render queue.", "cta_primary": "Start recording free", "cta_secondary": "Watch 60s demo", "reassurance": "Free forever up to 25 clips · no card" },
+    "logos": { "label": "Teams that ship with ClipForge", "logo_1": "Northwind", "logo_2": "Hopper", "logo_3": "Basecase", "logo_4": "Loopware", "logo_5": "Pixeldot" },
+    "features": { "title": "Everything the loop needs", "icon_1": "⚡", "feat_1_title": "Instant links", "feat_1_body": "Your clip is streaming before the upload bar finishes. We transcode on the edge.", "icon_2": "🎯", "feat_2_title": "Auto-captions", "feat_2_body": "Every recording is transcribed and searchable. 30+ languages out of the box.", "icon_3": "🔒", "feat_3_title": "Private by default", "feat_3_body": "Clips are unlisted until you say otherwise. SSO and domain locks on Pro." },
+    "stats": { "stat_1_num": "8.4M", "stat_1_lbl": "clips recorded", "stat_2_num": "190+", "stat_2_lbl": "edge regions", "stat_3_num": "99.98%", "stat_3_lbl": "stream uptime" },
+    "pricing": { "title": "Pricing that scales with your team", "p1_name": "Free", "p1_price": "$0", "p1_meta": "25 clips · 720p", "p1_cta": "Get started", "p2_tag": "Most popular", "p2_name": "Pro", "p2_price": "$12", "p2_meta": "Unlimited · 4K · captions", "p2_cta": "Start Pro trial", "p3_name": "Team", "p3_price": "Let's talk", "p3_meta": "SSO · admin · SLA", "p3_cta": "Contact sales" },
+    "cta": { "headline": "Your next update is a recording away", "subhead": "Join 40,000 teams who replaced the status meeting with a link.", "cta": "Record your first clip" },
+    "footer": { "brand_name": "ClipForge", "tagline": "Async video for teams that would rather build than meet.", "copyright": "© 2026 ClipForge Labs, Inc.", "built_with": "Built with 🩵 and way too much coffee" }
+  }
+}

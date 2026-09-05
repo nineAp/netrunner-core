@@ -99,8 +99,26 @@ impl TlsGroups {
     pub const SECP256R1: u16 = 0x0017;
     pub const SECP384R1: u16 = 0x0018;
     pub const SECP521R1: u16 = 0x0019;
+    /// Гибридная постквантовая группа (draft-kwiatkowski-tls-ecdhe-mlkem).
+    /// Chrome предлагает её первой в `supported_groups` с версии ~131, и
+    /// именно она делает его `ClientHello` ~1700-байтовым. Профиль без неё не
+    /// совпадает ни с одним живым Chromium — см. [`super::mlkem`].
+    pub const X25519_MLKEM768: u16 = 0x11ec;
 
+    /// Chromium **до** постквантового перехода. Оставлен только для
+    /// исторических профилей: живой браузер так не выглядит с 2024 года.
     pub const CHROMIUM: Self = Self(&[Self::X25519, Self::SECP256R1, Self::SECP384R1]);
+
+    /// Актуальный Chromium: PQ-группа первой, затем классические.
+    /// GREASE-группа сюда не входит — она своя на каждое соединение и
+    /// подставляется билдером ([`ExtensionBuilder::supported_groups`]), потому
+    /// что обязана совпадать со значением в `key_share`.
+    pub const CHROMIUM_PQ: Self = Self(&[
+        Self::X25519_MLKEM768,
+        Self::X25519,
+        Self::SECP256R1,
+        Self::SECP384R1,
+    ]);
 
     pub const MODERN: Self = Self(&[Self::X25519, Self::SECP256R1]);
 
@@ -130,6 +148,34 @@ impl TlsSignatures {
     pub const RSA_PSS_RSAE_SHA384: u16 = 0x0805;
     pub const RSA_PKCS1_SHA384: u16 = 0x0501;
     pub const RSA_PSS_RSAE_SHA512: u16 = 0x0806;
+
+    /// ML-DSA (FIPS 204). Chrome рекламирует все три уровня первыми в списке —
+    /// снято с живого захвата, см. doc [`CHROME_PQ`](Self::CHROME_PQ).
+    pub const MLDSA44: u16 = 0x0904;
+    pub const MLDSA65: u16 = 0x0905;
+    pub const MLDSA87: u16 = 0x0906;
+    pub const RSA_PKCS1_SHA512: u16 = 0x0601;
+
+    /// Точный список живого Chrome (11 алгоритмов, 24 байта расширения),
+    /// снятый с захвата трафика: три ML-DSA, затем классические в порядке
+    /// ECDSA/PSS/PKCS1 по возрастанию длины хеша.
+    ///
+    /// Отличается от [`BROWSER_STANDARD`](Self::BROWSER_STANDARD) не только
+    /// содержимым, но и длиной — а длина расширения входит в размер
+    /// `ClientHello`, поэтому подменять один список другим «на глаз» нельзя.
+    pub const CHROME_PQ: Self = Self(&[
+        Self::MLDSA44,
+        Self::MLDSA65,
+        Self::MLDSA87,
+        Self::ECDSA_SECP256R1_SHA256,
+        Self::RSA_PSS_RSAE_SHA256,
+        Self::RSA_PKCS1_SHA256,
+        Self::ECDSA_SECP384R1_SHA384,
+        Self::RSA_PSS_RSAE_SHA384,
+        Self::RSA_PKCS1_SHA384,
+        Self::RSA_PSS_RSAE_SHA512,
+        Self::RSA_PKCS1_SHA512,
+    ]);
 
     pub const BROWSER_STANDARD: Self = Self(&[
         Self::ECDSA_SECP256R1_SHA256,
@@ -189,7 +235,21 @@ impl TlsExtensions {
     pub const PSK_MODES: u16 = 0x002d;
     pub const KEY_SHARE: u16 = 0x0033;
     pub const ALPS: u16 = 0x44cd;
+    /// `encrypted_client_hello` (RFC 9180 / draft-ietf-tls-esni). Chrome шлёт
+    /// это расширение **всегда**: при отсутствии HTTPS-RR с реальным
+    /// ECHConfig — в GREASE-виде, неотличимом на проводе от настоящего.
+    /// Его отсутствие в 2026 году отделяет нас от браузера само по себе.
+    pub const ECH: u16 = 0xfe0d;
     pub const RENEGOTIATION_INFO: u16 = 0xff01;
+
+    /// Слот под GREASE-расширение, открывающее список (у Chrome — нулевой
+    /// длины). В [`ExtensionOrder`] это **маркер позиции**, а не значение:
+    /// конкретный id свой на каждое соединение и приходит из
+    /// [`GreaseSet`](super::grease::GreaseSet).
+    pub const GREASE_SLOT_FIRST: u16 = 0x0a0a;
+    /// Слот под замыкающее GREASE-расширение (у Chrome — один байт `0x00`).
+    /// Тоже маркер позиции, см. [`GREASE_SLOT_FIRST`](Self::GREASE_SLOT_FIRST).
+    pub const GREASE_SLOT_LAST: u16 = 0x2a2a;
 
     /// Является ли id GREASE-значением (RFC 8701).
     ///
@@ -247,6 +307,46 @@ impl ExtensionOrder {
         TlsExtensions::SCT,
         TlsExtensions::DELEGATED_CREDENTIAL,
         TlsExtensions::PADDING,
+    ]);
+
+    /// Актуальный Chromium (снято с живого захвата, сентябрь 2026).
+    ///
+    /// Набор из 18 расширений; крайние два — GREASE-слоты (см.
+    /// [`TlsExtensions::GREASE_SLOT_FIRST`]). Отличия от исторического
+    /// [`CHROMIUM_131`](Self::CHROMIUM_131), каждое из которых само по себе
+    /// отделяло профиль от браузера:
+    ///
+    /// - появился [`ECH`](TlsExtensions::ECH) — Chrome шлёт его всегда;
+    /// - **нет** `PADDING`: с 1216-байтовой PQ-долей `ClientHello` весит около
+    ///   1700 байт и в диапазон 256..511, ради выхода из которого RFC 7685 и
+    ///   существует, не попадает в принципе. Добивать паддингом здесь нечего,
+    ///   и живой Chrome его действительно не шлёт;
+    /// - `DELEGATED_CREDENTIAL` убран — в захвате его нет.
+    ///
+    /// **Порядок середины не фиксирован.** Chromium перемешивает расширения на
+    /// каждое соединение (кроме крайних GREASE), поэтому этот массив задаёт
+    /// *набор*, а перестановку делает [`ExtensionBuilder::apply_profile`] при
+    /// `shuffle_extensions`. Зафиксировать порядок означало бы получить
+    /// стабильный JA3 там, где у браузера он гуляет от коннекта к коннекту.
+    pub const CHROME_140: Self = Self(&[
+        TlsExtensions::GREASE_SLOT_FIRST,
+        TlsExtensions::ALPS,
+        TlsExtensions::COMPRESS_CERT,
+        TlsExtensions::PSK_MODES,
+        TlsExtensions::SUPPORTED_VERSIONS,
+        TlsExtensions::STATUS_REQUEST,
+        TlsExtensions::SNI,
+        TlsExtensions::RENEGOTIATION_INFO,
+        TlsExtensions::SCT,
+        TlsExtensions::EMS,
+        TlsExtensions::ALPN,
+        TlsExtensions::SESSION_TICKET,
+        TlsExtensions::KEY_SHARE,
+        TlsExtensions::SUPPORTED_GROUPS,
+        TlsExtensions::ECH,
+        TlsExtensions::EC_POINT_FORMATS,
+        TlsExtensions::SIGNATURE_ALGORITHMS,
+        TlsExtensions::GREASE_SLOT_LAST,
     ]);
 
     /// Edge — тот же Chromium-движок, порядок идентичен Chrome с поправкой на

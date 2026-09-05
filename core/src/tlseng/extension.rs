@@ -14,11 +14,15 @@
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
+use aead::{rand_core::RngCore, OsRng};
+
 use crate::{
     nrxp::{ErrorAction, ErrorStage, TlsError},
     parser::Parser,
     tlseng::{
         consts::{CERT_COMPRESSION_BROTLI, OCSP_STATUS_TYPE, PSK_DHE_KE_MODE, TYPE_HOST_NAME},
+        grease::GreaseSet,
+        mlkem,
         profile::BrowserProfile,
         types::{TlsExtensions, TlsGroups, TlsSignatures, TlsVersions},
     },
@@ -144,12 +148,21 @@ impl Extension {
 /// [`apply_profile`](ExtensionBuilder::apply_profile), а не самими методами.
 pub(crate) struct ExtensionBuilder {
     payload: BytesMut,
+    /// Жребий GREASE этого соединения. Живёт в билдере, а не берётся по месту,
+    /// потому что одно и то же значение обязано попасть и в `supported_groups`,
+    /// и в `key_share` — см. [`GreaseSet`].
+    grease: GreaseSet,
 }
 
 impl ExtensionBuilder {
     pub fn new() -> Self {
+        Self::with_grease(GreaseSet::random())
+    }
+
+    pub fn with_grease(grease: GreaseSet) -> Self {
         Self {
             payload: BytesMut::with_capacity(2048),
+            grease,
         }
     }
 
@@ -192,9 +205,16 @@ impl ExtensionBuilder {
         self.add_extension(TlsExtensions::EMS, &[]);
     }
 
-    pub fn supported_groups(&mut self, groups: TlsGroups) {
-        let mut data = BytesMut::with_capacity(2 + groups.0.len() * 2);
-        data.put_u16((groups.0.len() * 2) as u16);
+    /// `supported_groups`. При `has_grease` первым идёт GREASE-значение
+    /// соединения — то же самое, что попадёт в `key_share`.
+    pub fn supported_groups(&mut self, groups: TlsGroups, has_grease: bool) {
+        let extra = usize::from(has_grease);
+        let count = groups.0.len() + extra;
+        let mut data = BytesMut::with_capacity(2 + count * 2);
+        data.put_u16((count * 2) as u16);
+        if has_grease {
+            data.put_u16(self.grease.group);
+        }
         for &g in groups.0 {
             data.put_u16(g);
         }
@@ -210,33 +230,98 @@ impl ExtensionBuilder {
         self.add_extension(TlsExtensions::SIGNATURE_ALGORITHMS, &data);
     }
 
-    pub fn supported_versions(&mut self, versions: TlsVersions) {
-        let mut data = BytesMut::with_capacity(1 + versions.0.len() * 2);
-        data.put_u8((versions.0.len() * 2) as u8);
+    /// `supported_versions`. При `has_grease` первым идёт GREASE-версия.
+    pub fn supported_versions(&mut self, versions: TlsVersions, has_grease: bool) {
+        let extra = usize::from(has_grease);
+        let count = versions.0.len() + extra;
+        let mut data = BytesMut::with_capacity(1 + count * 2);
+        data.put_u8((count * 2) as u8);
+        if has_grease {
+            data.put_u16(self.grease.version);
+        }
         for &v in versions.0 {
             data.put_u16(v);
         }
         self.add_extension(TlsExtensions::SUPPORTED_VERSIONS, &data);
     }
 
-    /// KeyShare (`0x0033`): **самое важное** расширение — несёт наш публичный
-    /// ключ X25519. Группа берётся первой из профиля (по умолчанию `0x001d`).
-    /// Именно отсюда удалённая сторона достаёт ключ для ECDH.
+    /// KeyShare (`0x0033`): несёт наш настоящий публичный ключ X25519 — именно
+    /// отсюда удалённая сторона достаёт его для ECDH.
+    ///
+    /// Список записей строится точно как у живого Chromium и в том же порядке,
+    /// что и `supported_groups`:
+    ///
+    /// 1. GREASE-группа соединения с однобайтовым значением `0x00`;
+    /// 2. `X25519MLKEM768` — 1216 байт балласта (только если группа есть в
+    ///    профиле), см. [`mlkem`];
+    /// 3. `x25519` — 32 байта, наш реальный ключ.
+    ///
+    /// Порядок здесь не косметика: `key_share` обязан идти в том же порядке
+    /// предпочтений, что и `supported_groups`, иначе получается клиент,
+    /// который предлагает долю для группы раньше, чем саму группу.
     pub fn key_share(&mut self, profile: &BrowserProfile, pub_key: &[u8]) {
-        let key_len = pub_key.len() as u16;
+        let mut list = BytesMut::with_capacity(1400);
 
-        let mut entry = BytesMut::with_capacity(key_len as usize + 4);
-        let group = profile.groups.0.first().cloned().unwrap_or(0x001d);
-        entry.put_u16(group);
-        entry.put_u16(key_len);
-        entry.put_slice(pub_key);
+        if profile.has_grease {
+            list.put_u16(self.grease.group);
+            list.put_u16(1);
+            list.put_u8(0x00);
+        }
 
-        let mut list = BytesMut::with_capacity(entry.len() + 2);
-        list.put_u16(entry.len() as u16);
-        list.put_slice(&entry);
+        if profile.groups.0.contains(&TlsGroups::X25519_MLKEM768) {
+            let share = mlkem::sample_x25519_mlkem768_share();
+            list.put_u16(TlsGroups::X25519_MLKEM768);
+            list.put_u16(share.len() as u16);
+            list.put_slice(&share);
+        }
 
-        self.add_extension(TlsExtensions::KEY_SHARE, &list);
+        list.put_u16(TlsGroups::X25519);
+        list.put_u16(pub_key.len() as u16);
+        list.put_slice(pub_key);
+
+        let mut data = BytesMut::with_capacity(list.len() + 2);
+        data.put_u16(list.len() as u16);
+        data.put_slice(&list);
+
+        self.add_extension(TlsExtensions::KEY_SHARE, &data);
     }
+
+    /// GREASE-вариант `encrypted_client_hello` — то, что Chrome шлёт, когда у
+    /// него нет настоящего ECHConfig из HTTPS-RR (то есть в подавляющем
+    /// большинстве соединений). На проводе он неотличим от настоящего ECH:
+    /// это и есть смысл GREASE-режима в draft-ietf-tls-esni.
+    ///
+    /// Раскладка (всего 186 байт при `payload_len` = 144):
+    /// `type(1)=0x00 | kdf(2) | aead(2) | config_id(1) | enc_len(2) | enc(32) |
+    /// payload_len(2) | payload`.
+    ///
+    /// **Длина payload откалибрована по одному захвату.** У настоящего Chrome
+    /// она равна длине зашифрованного внутреннего `ClientHello` и потому
+    /// зависит от его размера; вывести точную формулу по единственному образцу
+    /// нельзя. Константа здесь — компромисс: она правдоподобна, но при
+    /// накоплении captures её стоит заменить наблюдаемой зависимостью, иначе
+    /// одинаковый размер ECH во всех наших соединениях сам станет признаком.
+    pub fn ech_grease(&mut self) {
+        const ENC_LEN: usize = 32;
+        const PAYLOAD_LEN: usize = 144;
+
+        let mut data = BytesMut::with_capacity(10 + ENC_LEN + PAYLOAD_LEN);
+        data.put_u8(0x00); // ECHClientHelloType::outer
+        data.put_u16(0x0001); // HKDF-SHA256
+        data.put_u16(0x0001); // AES-128-GCM
+
+        let mut rnd = [0u8; 1 + ENC_LEN + PAYLOAD_LEN];
+        OsRng.fill_bytes(&mut rnd);
+
+        data.put_u8(rnd[0]); // config_id
+        data.put_u16(ENC_LEN as u16);
+        data.put_slice(&rnd[1..1 + ENC_LEN]);
+        data.put_u16(PAYLOAD_LEN as u16);
+        data.put_slice(&rnd[1 + ENC_LEN..]);
+
+        self.add_extension(TlsExtensions::ECH, &data);
+    }
+
     /// ALPS (`application_settings`): формат идентичен `alpn()` — вектор с
     /// 2-байтовой длиной, содержащий длину-префиксные имена протоколов.
     ///
@@ -336,12 +421,35 @@ impl ExtensionBuilder {
         }
     }
 
-    /// Собирает весь блок расширений строго в порядке профиля.
+    /// Перемешивает середину списка расширений (всё, кроме крайних
+    /// GREASE-слотов) — Фишер—Йейтс на системной энтропии.
     ///
-    /// Проходит по [`profile.extension_order`](BrowserProfile::extension_order) и
-    /// для каждого id вызывает соответствующий метод-«рецепт». GREASE-id
-    /// вставляются только при `profile.has_grease`, ALPS/Padding — только если
-    /// профиль их задаёт. Порядок здесь = порядок на проводе = отпечаток.
+    /// Chromium перемешивает порядок расширений на каждое соединение начиная с
+    /// версии 110. Для нас это не украшение: JA3 считается по порядку, и
+    /// фиксированная перестановка дала бы стабильный JA3 там, где у браузера
+    /// он гуляет. JA4 сортирует расширения и к перестановке нечувствителен —
+    /// поэтому перемешивание совместимо с попаданием в браузерный JA4.
+    fn shuffle_middle(order: &mut [u16]) {
+        let len = order.len();
+        if len < 4 {
+            return;
+        }
+        let middle = &mut order[1..len - 1];
+        let mut rnd = vec![0u8; middle.len() * 2];
+        OsRng.fill_bytes(&mut rnd);
+        for i in (1..middle.len()).rev() {
+            let r = u16::from_le_bytes([rnd[i * 2], rnd[i * 2 + 1]]) as usize;
+            middle.swap(i, r % (i + 1));
+        }
+    }
+
+    /// Собирает весь блок расширений по профилю.
+    ///
+    /// Порядок берётся из [`profile.extension_order`](BrowserProfile::extension_order);
+    /// при `profile.shuffle_extensions` середина перемешивается (см.
+    /// [`shuffle_middle`](Self::shuffle_middle)), крайние GREASE-слоты остаются
+    /// на местах. GREASE-слоты — это маркеры позиции, а не значения: реальные
+    /// id подставляются из [`GreaseSet`] этого соединения.
     pub fn apply_profile(
         &mut self,
         profile: &BrowserProfile,
@@ -349,16 +457,37 @@ impl ExtensionBuilder {
         pub_key: &[u8],
         overhead: usize,
     ) {
-        for &ext_id in &profile.extension_order {
+        let mut order: Vec<u16> = profile.extension_order.0.to_vec();
+        if profile.shuffle_extensions {
+            Self::shuffle_middle(&mut order);
+        }
+
+        for ext_id in order {
             match ext_id {
+                TlsExtensions::GREASE_SLOT_FIRST => {
+                    if profile.has_grease {
+                        self.grease_with_id(self.grease.ext_first);
+                    }
+                }
+                TlsExtensions::GREASE_SLOT_LAST => {
+                    if profile.has_grease {
+                        // У Chrome замыкающее GREASE несёт ровно один байт 0x00,
+                        // в отличие от открывающего (нулевой длины).
+                        let id = self.grease.ext_last;
+                        self.add_extension(id, &[0x00]);
+                    }
+                }
                 TlsExtensions::SNI => self.server_name(host),
-                TlsExtensions::SUPPORTED_GROUPS => self.supported_groups(profile.groups),
+                TlsExtensions::SUPPORTED_GROUPS => {
+                    self.supported_groups(profile.groups, profile.has_grease)
+                }
                 TlsExtensions::SIGNATURE_ALGORITHMS => {
                     self.signature_algorithms(profile.signatures)
                 }
                 TlsExtensions::ALPN => self.alpn(profile.alpn),
                 TlsExtensions::SCT => self.signed_certificate_timestamp(),
                 TlsExtensions::EMS => self.extended_main_secret(),
+                TlsExtensions::ECH => self.ech_grease(),
                 TlsExtensions::COMPRESS_CERT => {
                     self.compress_certificate(&[CERT_COMPRESSION_BROTLI])
                 }
@@ -366,7 +495,9 @@ impl ExtensionBuilder {
                     self.delegated_credential(profile.delegated_signatures)
                 }
                 TlsExtensions::SESSION_TICKET => self.session_ticket(),
-                TlsExtensions::SUPPORTED_VERSIONS => self.supported_versions(profile.versions),
+                TlsExtensions::SUPPORTED_VERSIONS => {
+                    self.supported_versions(profile.versions, profile.has_grease)
+                }
                 TlsExtensions::PSK_MODES => self.psk_key_exchange_modes(),
                 TlsExtensions::KEY_SHARE => self.key_share(profile, pub_key),
                 TlsExtensions::ALPS => {
@@ -382,7 +513,6 @@ impl ExtensionBuilder {
                         self.padding(profile.target_padding_len as usize, overhead);
                     }
                 }
-
                 id if TlsExtensions::is_grease(id) => {
                     if profile.has_grease {
                         self.grease_with_id(id);

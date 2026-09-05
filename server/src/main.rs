@@ -11,6 +11,7 @@
 #![allow(dead_code)]
 
 mod backend_client;
+mod decoy_site;
 mod diagnostics;
 mod health;
 mod metrics_server;
@@ -72,6 +73,34 @@ struct Args {
     /// атрибут ноды, можно задавать разный на каждом развёртывании.
     #[arg(long, default_value = netrunner_core::net::DEFAULT_DECOY_HOST)]
     decoy_host: String,
+
+    /// Имя витрины-пресета, под которую маскируется узел (`clipforge`,
+    /// `hauler`, `logdrain`). SNI пресета обязан входить в каталог доменов
+    /// узла (`NETRUNNER_DECOY_DOMAINS`) — иначе узел не поднимется: под домен,
+    /// которым он не владеет, нет валидного сертификата. Не задан — узел
+    /// работает как раньше (сборка витрины пропускается).
+    #[arg(long)]
+    decoy_preset: Option<String>,
+
+    /// Режим маскировки: `relay` (REALITY-style — ретрансляция на чужой
+    /// реальный сайт, историческое поведение по умолчанию) или `self-hosted`
+    /// (узел сам обслуживает свою витрину под своим доменом). Не задан —
+    /// `relay`, обратная совместимость.
+    #[arg(long, default_value = "relay")]
+    decoy_mode: String,
+
+    /// Только для `--decoy-mode self-hosted`: адрес локального TLS-терминатора
+    /// (co-located nginx/caddy с сертификатом своего домена), который отдаёт
+    /// собранную витрину. Fallback ретранслируется СЮДА, а не на внешний сайт.
+    #[arg(long, default_value = "127.0.0.1:8443")]
+    decoy_local_site: String,
+
+    /// Только для `--decoy-mode self-hosted`: домен узла (SNI и CN сертификата).
+    /// Обязан входить в каталог `NETRUNNER_DECOY_DOMAINS`. Не задан — берётся
+    /// SNI из самого пресета. Именно этот домен, а не захардкоженный в пресете,
+    /// делает витрину «своей» для конкретного узла.
+    #[arg(long)]
+    decoy_sni: Option<String>,
 
     /// Требовать валидный Bearer-токен (выданный `netrunner-backend`) от
     /// каждого клиента и отчитываться о расходе трафика для динамических
@@ -192,13 +221,111 @@ fn main() {
     metrics::gauge!("netrunner_nrxp_identity_configured").set(nrxp_configured_flag as u8 as f64);
     metrics::gauge!("netrunner_nrxp_strict").set(nrxp_strict_flag as u8 as f64);
 
+    // ── Витрина узла и допустимые SNI ──────────────────────────────────────
+    //
+    // Каталог доменов приходит из окружения (тот же список, что и у админки).
+    // Если задан --decoy-preset, собираем его страницу ОДИН РАЗ здесь, на
+    // старте, и на этом же шаге проверяем, что SNI пресета принадлежит узлу:
+    // это и есть барьер «нельзя указать любой SNI» — валидный сертификат есть
+    // только под свой домен.
+    // ── Режим маскировки ──────────────────────────────────────────────────
+    //
+    // Два взаимоисключающих режима (см. DecoyMode). Relay — исторический
+    // REALITY-style: ретрансляция «не наших» соединений на чужой реальный
+    // сайт (--decoy-host). SelfHosted — узел сам обслуживает витрину под своим
+    // доменом: fallback ведёт на ЛОКАЛЬНЫЙ сайт (--decoy-local-site), витрина
+    // собирается здесь один раз, а SNI обязан принадлежать узлу.
+    let decoy_mode = netrunner_core::decoy::DecoyMode::parse(&args.decoy_mode)
+        .unwrap_or_else(|e| panic!("--decoy-mode: {e}"));
+    let decoy_catalog = netrunner_core::decoy::DecoyCatalog::from_env();
+
+    // Куда ретранслируется fallback и учитывать ли запрошенный SNI — зависит
+    // от режима. Дефолт (Relay + внешний decoy_host + honor=true) идентичен
+    // прежнему поведению узла.
+    let (fallback_host, honor_requested_sni): (String, bool) = match decoy_mode {
+        netrunner_core::decoy::DecoyMode::Relay => {
+            // Собрать витрину всё равно можно (например, узел и владеет
+            // доменом, и одновременно одалживает чужой) — но по умолчанию в
+            // Relay витрина не нужна: сайт отдаёт заимствованный decoy_host.
+            if args.decoy_preset.is_some() {
+                info!("ℹ️  --decoy-preset в режиме relay игнорируется: fallback идёт на внешний --decoy-host");
+            } else if decoy_catalog.is_empty() {
+                info!(
+                    "ℹ️  режим relay (REALITY-style): маскировка под внешний --decoy-host {}",
+                    args.decoy_host
+                );
+            }
+            (args.decoy_host.clone(), decoy_mode.honor_requested_sni())
+        }
+        netrunner_core::decoy::DecoyMode::SelfHosted => {
+            // SelfHosted требует пресет витрины и владение его SNI: собрать и
+            // проверить здесь, на старте, иначе узел не поднимется.
+            let preset_name = args.decoy_preset.as_deref().unwrap_or_else(|| {
+                panic!("--decoy-mode self-hosted требует --decoy-preset (какую витрину обслуживать)")
+            });
+            let preset = decoy_site::preset::Preset::load(preset_name)
+                .unwrap_or_else(|e| panic!("не удалось загрузить пресет '{preset_name}': {e}"));
+            // SNI узла: явный --decoy-sni (домен ЭТОГО узла) важнее захардкоженного
+            // в пресете. Пресет даёт только КОНТЕНТ витрины; под каким доменом её
+            // показывать — атрибут узла. Домен обязан принадлежать узлу (каталог).
+            let sni_str = args.decoy_sni.as_deref().unwrap_or(&preset.sni);
+            let sni = decoy_catalog.validate(sni_str).unwrap_or_else(|e| {
+                panic!(
+                    "self-hosted: домен '{sni_str}' которым узел не владеет: {e}. \
+                     Добавьте его в {}",
+                    netrunner_core::decoy::DECOY_DOMAINS_ENV
+                )
+            });
+            let decoy = netrunner_core::decoy::Decoy {
+                sni,
+                elements: preset.elements.clone(),
+            };
+            let page = preset
+                .render()
+                .unwrap_or_else(|e| panic!("сборка витрины '{preset_name}': {e}"));
+
+            // Витрина отдаётся локальным TLS-терминатором своего домена;
+            // публикуем собранную страницу туда, где его конфиг её заберёт.
+            // Один раз при деплое, не на каждый запрос.
+            let out = std::env::var("NETRUNNER_DECOY_SITE_OUT")
+                .unwrap_or_else(|_| "/var/www/netrunner-decoy/index.html".to_string());
+            if let Some(parent) = std::path::Path::new(&out).parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            match std::fs::write(&out, &page) {
+                Ok(()) => info!(
+                    preset = preset_name, sni = %decoy.sni, blocks = decoy.elements.len(),
+                    bytes = page.len(), out = %out,
+                    "🪧 SelfHosted: витрина собрана, SNI подтверждён, страница опубликована"
+                ),
+                Err(e) => info!(
+                    error = %e, out = %out,
+                    "⚠️  SelfHosted: не удалось записать витрину (локальный сайт отдаст своё содержимое); продолжаю"
+                ),
+            }
+            // Fallback — на локальный сайт узла; запрошенный SNI игнорируется.
+            (args.decoy_local_site.clone(), decoy_mode.honor_requested_sni())
+        }
+    };
+
+    // Cover-flight — один на весь узел, детерминированный (см. ServerHandler).
+    // Пока считается из типовой цепочки; правильный следующий шаг — измерить
+    // настоящую цепочку своего домена (см. CoverFlight::node_default).
+    let cover_flight: std::sync::Arc<[usize]> =
+        netrunner_core::decoy::CoverFlight::node_default()
+            .as_records()
+            .to_vec()
+            .into();
+
     let net = Network::new(
         args.host.clone(),
         args.port,
-        args.decoy_host,
+        fallback_host,
         auth,
         args.health_port,
         identity,
+        cover_flight,
+        honor_requested_sni,
     );
 
     let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");

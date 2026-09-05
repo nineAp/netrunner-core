@@ -36,11 +36,65 @@ pub(crate) struct BrowserProfile {
     pub alps_protocols: &'static [&'static str],
     /// Вставлять ли GREASE-значения (обязательно для Chromium).
     pub has_grease: bool,
+    /// Перемешивать ли середину списка расширений на каждое соединение.
+    /// Chromium делает это с версии 110; не-Chromium стеки (Firefox, Safari)
+    /// шлют фиксированный порядок, и для них флаг обязан быть `false`.
+    pub shuffle_extensions: bool,
 }
 
 impl BrowserProfile {
+    /// Актуальный Chrome, снятый с живого захвата (сентябрь 2026).
+    ///
+    /// Это **эталонный** профиль: остальные оставлены ради разнообразия пула,
+    /// но живому браузеру сегодня соответствует только этот.
+    ///
+    /// Что отличает его от [`CHROME_131`](Self::CHROME_131) — и почему каждое
+    /// отличие было самостоятельным детектором:
+    ///
+    /// | Поле | Было (131) | Стало (140) | Чем выдавало |
+    /// |------|-----------|-------------|--------------|
+    /// | `groups` | x25519, p256, p384 | + `X25519MLKEM768` первой | JA3/JA4 не совпадал ни с одним живым Chrome |
+    /// | `key_share` | 32 B | 1263 B | `ClientHello` 517 B против ~1700 B у браузера, один TCP-сегмент вместо двух |
+    /// | `signatures` | 7 алгоритмов | 11, включая ML-DSA | длина расширения 16 B против 24 B |
+    /// | `versions` | только TLS 1.3 | 1.3 + 1.2 (+GREASE) | ни один браузер не предлагает одну версию |
+    /// | GREASE | только 2 слота расширений | + ciphers, groups, versions, key_share | GREASE лишь в расширениях — сам по себе аномалия для Chromium |
+    /// | ECH | нет | GREASE-ECH | Chrome шлёт ECH всегда |
+    /// | `target_padding_len` | 512 | 0 | см. ниже |
+    ///
+    /// **Про паддинг.** Он здесь не «забыт», а не нужен: RFC 7685 добивает
+    /// `ClientHello` до 512 байт только чтобы выйти из диапазона 256..511, а с
+    /// PQ-долей сообщение весит около 1700 байт и в этот диапазон не попадает
+    /// физически. Живой Chrome в захвате действительно не шлёт `padding`.
+    /// Вернуть его сюда — значит получить расширение, которого у браузера нет.
+    pub const CHROME_140: Self = Self {
+        groups: TlsGroups::CHROMIUM_PQ,
+        signatures: TlsSignatures::CHROME_PQ,
+        delegated_signatures: TlsSignatures::CHROME_PQ,
+        versions: TlsVersions::MODERN,
+
+        record_layer_version: ProtocolVersion::Tls10,
+
+        cipher_suites: &[
+            0x1301, 0x1302, 0x1303, 0xc02b, 0xc02f, 0xc02c, 0xc030, 0xcca9, 0xcca8, 0xc013,
+            0xc014, 0x009c, 0x009d, 0x002f, 0x0035,
+        ],
+
+        alpn: &["h2", "http/1.1"],
+        extension_order: ExtensionOrder::CHROME_140,
+
+        has_grease: true,
+        shuffle_extensions: true,
+
+        alps_protocols: &["h2"],
+
+        target_padding_len: 0,
+    };
+
     /// Отпечаток Chrome 131: GREASE + ALPS, паддинг до 512, только TLS 1.3,
     /// версия записи маскируется под TLS 1.0 — как у настоящего Chrome.
+    ///
+    /// **Исторический.** Живому браузеру не соответствует с 2024 года: нет
+    /// постквантовой группы. Оставлен как образец до-PQ отпечатка.
     pub const CHROME_131: Self = Self {
         groups: TlsGroups::CHROMIUM,
         signatures: TlsSignatures::BROWSER_STANDARD,
@@ -57,6 +111,7 @@ impl BrowserProfile {
         extension_order: ExtensionOrder::CHROMIUM_131,
 
         has_grease: true,
+        shuffle_extensions: true,
 
         alps_protocols: &["h2"],
 
@@ -81,6 +136,7 @@ impl BrowserProfile {
         extension_order: ExtensionOrder::FIREFOX_133,
 
         has_grease: false,
+        shuffle_extensions: false,
         alps_protocols: &[],
         target_padding_len: 0,
     };
@@ -104,6 +160,7 @@ impl BrowserProfile {
         extension_order: ExtensionOrder::EDGE_130,
 
         has_grease: true,
+        shuffle_extensions: true,
 
         alps_protocols: &["h2"],
 
@@ -128,18 +185,28 @@ impl BrowserProfile {
         extension_order: ExtensionOrder::SAFARI_17,
 
         has_grease: false,
+        shuffle_extensions: false,
         alps_protocols: &[],
         target_padding_len: 0,
     };
 
-    /// Пул профилей для ротации между разными туннельными сессиями — чтобы не
-    /// долбить DPI вечно одним и тем же Chrome-отпечатком.
-    pub const ALL: &'static [&'static Self] = &[
-        &Self::CHROME_131,
-        &Self::EDGE_130,
-        &Self::FIREFOX_130,
-        &Self::SAFARI_17,
-    ];
+    /// Пул профилей для ротации между туннельными сессиями.
+    ///
+    /// **Сейчас в пуле ровно один профиль, и это не недосмотр.** Ротация имеет
+    /// смысл, только если каждый её элемент сам по себе неотличим от живого
+    /// браузера. Замер сентября 2026 показал, что этому условию отвечает
+    /// единственный профиль — [`CHROME_140`](Self::CHROME_140): у остальных нет
+    /// постквантовой группы, то есть их `ClientHello` не совпадает ни с одним
+    /// существующим браузером ни по JA3/JA4, ни по размеру. Ротация по такому
+    /// пулу не размывала бы отпечаток, а раздавала бы трём четвертям сессий
+    /// заведомо палевный.
+    ///
+    /// Чтобы вернуть сюда профиль, нужен свежий захват соответствующего
+    /// браузера и перенос из него точных списков (см. историю правок
+    /// `TlsSignatures::CHROME_PQ` — значения снимались с провода, а не
+    /// восстанавливались по памяти). Профили ниже по файлу оставлены как
+    /// образцы структуры и намеренно исключены из пула.
+    pub const ALL: &'static [&'static Self] = &[&Self::CHROME_140];
 
     /// Выбирает профиль детерминированно по `session_id` — один и тот же
     /// стабильный отпечаток браузера на все ноги и все переподключения одной
@@ -221,90 +288,9 @@ impl ServerProfile {
     };
 }
 
-/// Длины TLS-записей, которыми настоящий сервер TLS 1.3 отвечает сразу после
-/// `ServerHello` — то, что имитирует cover-flight (см. `nrxp::FrameType::Cover`).
-///
-/// ## Что имитируется
-///
-/// После `ServerHello` (и фиктивного CCS) сервер шлёт `EncryptedExtensions`,
-/// `Certificate`, `CertificateVerify` и `Finished`. Все они уже зашифрованы,
-/// поэтому на проводе едут записями с content-type `ApplicationData`. Отсюда
-/// два свойства, которые и надо воспроизвести:
-///
-/// 1. **первую запись `ApplicationData` в сессии всегда отправляет сервер**;
-/// 2. его первый flight весит порядка 1–5 КБ, а не 133 байта.
-///
-/// ## Откуда числа
-///
-/// Размер определяется цепочкой сертификатов: ECDSA P-256 (лист +
-/// промежуточный) — примерно 1,5–2,5 КБ, RSA-2048 — 3–4,5 КБ; сверху
-/// `CertificateVerify` (порядка 80–270 Б) и `Finished` (около 40–55 Б), плюс
-/// SCT/OCSP-stapling, если сервер их отдаёт. Часть стеков укладывает весь
-/// flight в одну запись, часть отделяет `Finished` в свою.
-///
-/// **Границы здесь эвристические.** Они выбраны так, чтобы накрыть обе
-/// типовые конфигурации, но не сняты с живого захвата конкретного decoy'я.
-/// Правильный следующий шаг — калибровать их по реальному ответу
-/// `decoy_host`: наблюдать длины записей его flight'а (заголовок записи не
-/// шифруется, читать содержимое не нужно) и воспроизводить именно их.
-pub(crate) fn sample_server_flight() -> Vec<usize> {
-    use rand::RngExt;
-    let mut rng = rand::rng();
-
-    // Разделять ли Finished в отдельную запись — примерно поровну, как и
-    // распределены сами стеки.
-    if rng.random_range(0..100) < 55 {
-        vec![rng.random_range(1500..=4200)]
-    } else {
-        vec![rng.random_range(1400..=3900), rng.random_range(50..=130)]
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn server_flight_looks_like_a_real_certificate_flight() {
-        let mut seen_split = false;
-        let mut seen_single = false;
-
-        for _ in 0..2000 {
-            let flight = sample_server_flight();
-            assert!(
-                (1..=2).contains(&flight.len()),
-                "настоящий flight — одна или две записи, а не {}",
-                flight.len()
-            );
-
-            let total: usize = flight.iter().sum();
-            assert!(
-                (1400..=4400).contains(&total),
-                "суммарный flight {total} B вне правдоподобного диапазона для \
-                 цепочки сертификатов (ECDSA ~1,5–2,5 КБ, RSA-2048 ~3–4,5 КБ)"
-            );
-            assert!(
-                total > 1000,
-                "flight обязан быть на порядок больше прежних 133 B — иначе он \
-                 не решает задачу, ради которой введён"
-            );
-
-            for &len in &flight {
-                assert!(len <= 16401, "запись {len} длиннее максимума TLS 1.3");
-            }
-
-            match flight.len() {
-                1 => seen_single = true,
-                _ => seen_split = true,
-            }
-        }
-
-        assert!(
-            seen_single && seen_split,
-            "обе формы flight'а (одной записью и с отдельным Finished) должны \
-             встречаться — иначе это не распределение, а константа"
-        );
-    }
 
     #[test]
     fn for_session_is_deterministic_for_the_same_session_id() {

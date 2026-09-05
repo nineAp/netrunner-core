@@ -23,6 +23,7 @@ use crate::{
     tlseng::{
         consts::{HANDSHAKE_TYPE_CLIENT_HELLO, HANDSHAKE_TYPE_SERVER_HELLO},
         extension::ExtensionBuilder,
+        grease::GreaseSet,
         profile::{BrowserProfile, ServerProfile},
         tls_record::TlsRecord,
         types::{ContentType, HelloType, ProtocolVersion},
@@ -158,12 +159,24 @@ impl ClientHello {
         // Настоящий Chromium туда попасть не может по построению, так что
         // проверка «отпечаток Chromium И payload записи в 256..511» отделяла
         // нас от браузера одним пакетом и без единого ложного срабатывания.
+        // Жребий GREASE тянется один раз и обслуживает и список шифронаборов,
+        // и блок расширений: значение группы обязано совпасть в
+        // `supported_groups` и `key_share` (см. `GreaseSet`), а строить их из
+        // двух независимых жребиев — значит выдать себя рассогласованием.
+        let grease = GreaseSet::random();
+
+        let mut cipher_suites = Vec::with_capacity(profile.cipher_suites.len() + 1);
+        if profile.has_grease {
+            cipher_suites.push(grease.cipher);
+        }
+        cipher_suites.extend_from_slice(profile.cipher_suites);
+
         let handshake_header = 4;
-        let client_hello_fixed = 2 + 32 + 1 + 32 + 2 + (profile.cipher_suites.len() * 2) + 2 + 2;
+        let client_hello_fixed = 2 + 32 + 1 + 32 + 2 + (cipher_suites.len() * 2) + 2 + 2;
 
         let total_overhead = handshake_header + client_hello_fixed;
 
-        let mut ext_builder = ExtensionBuilder::new();
+        let mut ext_builder = ExtensionBuilder::with_grease(grease);
 
         ext_builder.apply_profile(profile, host, &keys.public_key_bytes(), total_overhead);
 
@@ -173,7 +186,7 @@ impl ClientHello {
             _version: ProtocolVersion::Tls12,
             random: tls_random,
             session_id: Bytes::copy_from_slice(&session_id_bytes),
-            cipher_suites: profile.cipher_suites.to_vec(),
+            cipher_suites,
             extensions: extensions_bytes,
         };
 
@@ -582,7 +595,23 @@ mod tests {
                 client_hello.session_id[0],
                 crate::PROTOCOL_VERSION_ANONYMOUS
             );
-            assert_eq!(client_hello.cipher_suites, profile.cipher_suites);
+            // GREASE-шифронабор идёт первым, за ним — список профиля без
+            // изменений. Так делает Chromium; сравнивать весь вектор с
+            // `profile.cipher_suites` больше нельзя — этот тест кодировал
+            // допущение «GREASE только в расширениях», из-за которого профиль
+            // и не совпадал с живым браузером.
+            if profile.has_grease {
+                assert!(
+                    crate::tlseng::types::TlsExtensions::is_grease(
+                        client_hello.cipher_suites[0]
+                    ),
+                    "первым шифронабором Chromium кладёт GREASE, получено 0x{:04x}",
+                    client_hello.cipher_suites[0]
+                );
+                assert_eq!(&client_hello.cipher_suites[1..], profile.cipher_suites);
+            } else {
+                assert_eq!(client_hello.cipher_suites, profile.cipher_suites);
+            }
 
             let mut server_keys = SessionKeys::new(false);
             server_keys
@@ -879,4 +908,39 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn chrome_client_hello_matches_the_live_capture_shape() {
+        use crate::tlseng::types::TlsExtensions;
+        let keys = SessionKeys::new(true);
+        let wire = ClientHello::make_client_hello(
+            &BrowserProfile::CHROME_140,
+            "chrome.cloudflare-dns.com",
+            &keys,
+        );
+        assert!(
+            (1650..=1850).contains(&wire.len()),
+            "ClientHello {} B — вне диапазона живого Chrome (~1741)",
+            wire.len()
+        );
+        let (ch, ext) = parse_client_hello_record(&wire);
+        assert!(TlsExtensions::is_grease(ch.cipher_suites[0]));
+        assert_eq!(ch.cipher_suites.len(), 16);
+        let groups = ext
+            .find_by_type(TlsExtensions::SUPPORTED_GROUPS)
+            .expect("supported_groups обязан быть");
+        let g0 = u16::from_be_bytes([groups[2], groups[3]]);
+        let g1 = u16::from_be_bytes([groups[4], groups[5]]);
+        assert!(TlsExtensions::is_grease(g0), "первая группа — GREASE");
+        assert_eq!(g1, 0x11ec, "за GREASE идёт X25519MLKEM768");
+        let ks = ext
+            .find_by_type(TlsExtensions::KEY_SHARE)
+            .expect("key_share обязан быть");
+        let ks_g0 = u16::from_be_bytes([ks[2], ks[3]]);
+        assert_eq!(ks_g0, g0, "GREASE-группа в key_share совпадает с supported_groups");
+        assert!(ks.windows(2).any(|w| w == [0x11, 0xec]), "key_share несёт X25519MLKEM768");
+        assert!(ks.len() > 1240, "key_share без PQ-балласта мал: {}", ks.len());
+        assert!(ext.find_by_type(TlsExtensions::ECH).is_some(), "ECH есть всегда");
+    }
+
 }

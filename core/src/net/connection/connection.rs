@@ -993,6 +993,24 @@ pub struct ServerHandler {
     /// нода их не настроила и работает по старой анонимной схеме: хендшейк без
     /// аутентификации сервера, как до v3.
     pub(crate) identity: Option<Identity>,
+    /// Длины записей cover-flight — **одни на всю ноду**, а не свои на каждое
+    /// соединение. Это ключевое свойство: у настоящего сервера цепочка
+    /// сертификатов фиксирована, поэтому его flight имеет постоянную длину.
+    /// Прежний `sample_server_flight()` тянул случайные длины на каждую ногу —
+    /// замер показал четыре разных «сертификата» (3627/3217/1910/1493 B) в
+    /// одной сессии за три секунды, чего у сервера быть не может. Считается
+    /// один раз при старте узла из его настоящей цепочки (см.
+    /// [`crate::decoy::CoverFlight`]) и копируется сюда как есть.
+    pub(crate) cover_flight: Arc<[usize]>,
+    /// Ретранслировать ли stealth-fallback на **запрошенный клиентом** SNI.
+    ///
+    /// `true` — историческое поведение (режим `Relay`, REALITY-style): узел
+    /// одалживает чужой сертификат, проксируя на тот хост, который зонд назвал
+    /// в SNI. `false` — режим `SelfHosted`: узел всегда отдаёт свой собственный
+    /// сайт (`decoy_host` указывает на локальный сайт узла), и запрошенный SNI
+    /// игнорируется, поэтому открытого релея не возникает. Управляется
+    /// [`crate::decoy::DecoyMode::honor_requested_sni`].
+    pub(crate) honor_requested_sni: bool,
 }
 
 impl ServerHandler {
@@ -1002,6 +1020,8 @@ impl ServerHandler {
         decoy_host: Arc<str>,
         auth: Option<Arc<dyn crate::net::AuthValidator>>,
         identity: Option<Identity>,
+        cover_flight: Arc<[usize]>,
+        honor_requested_sni: bool,
     ) -> Self {
         Self {
             conn: connection,
@@ -1009,6 +1029,8 @@ impl ServerHandler {
             decoy_host,
             auth,
             identity,
+            cover_flight,
+            honor_requested_sni,
         }
     }
 
@@ -1038,6 +1060,7 @@ impl ServerHandler {
         initial_data: Bytes,
         decoy_host: &str,
         requested_sni: Option<&str>,
+        honor_requested_sni: bool,
     ) {
         // Единая точка для всех трёх причин fallback (невалидный ClientHello,
         // TLS_HELLO_TIMEOUT, парсинг не удался) — та, кто сюда попал, ПО
@@ -1047,7 +1070,15 @@ impl ServerHandler {
         // `netrunner_auth_failed_total` (см. ниже в `run`) — граница между
         // "реальный VPN-трафик" и "сканеры/DPI-пробы, долбящиеся на порт".
         metrics::counter!("netrunner_scanner_fallback_total").increment(1);
-        let sni_target = requested_sni.filter(|h| is_plausible_hostname(h));
+        // В режиме SelfHosted запрошенный SNI не учитывается вовсе: узел всегда
+        // отдаёт свой собственный сайт (decoy_host → локальный сайт узла).
+        // Именно это отличает корректную маскировку от открытого релея —
+        // разные SNI получают один и тот же наш сайт, как у настоящего сервера.
+        let sni_target = if honor_requested_sni {
+            requested_sni.filter(|h| is_plausible_hostname(h))
+        } else {
+            None
+        };
 
         // Приватность: не логируем ни запрошенный SNI, ни разрешённый адрес —
         // это то же самое "куда идёт клиент", просто на пути анти-DPI decoy'я,
@@ -1108,6 +1139,8 @@ impl TunnelHandler for ServerHandler {
         debug!("Acting as TLS Server with Stealth Fallback");
 
         let decoy_host = self.decoy_host;
+        let cover_flight = self.cover_flight;
+        let honor_requested_sni = self.honor_requested_sni;
         let Connection {
             mut inbound,
             mut outbound,
@@ -1158,6 +1191,7 @@ impl TunnelHandler for ServerHandler {
                                 buf_snapshot,
                                 &decoy_host,
                                 requested_sni.as_deref(),
+                                honor_requested_sni,
                             )
                             .await;
                             return Ok(());
@@ -1185,6 +1219,7 @@ impl TunnelHandler for ServerHandler {
                                 buf_snapshot,
                                 &decoy_host,
                                 None,
+                                honor_requested_sni,
                             )
                             .await;
                             return Ok(());
@@ -1201,6 +1236,7 @@ impl TunnelHandler for ServerHandler {
                         buf_snapshot,
                         &decoy_host,
                         None,
+                        honor_requested_sni,
                     )
                     .await;
                     return Ok(());
@@ -1263,7 +1299,7 @@ impl TunnelHandler for ServerHandler {
         // Только клиентам, объявившим версию ≥ 2: старый клиент не знает типа
         // кадра Cover и уронил бы ногу на неизвестном байте.
         if peer_version >= crate::MIN_VERSION_FOR_COVER {
-            for record_len in crate::tlseng::sample_server_flight() {
+            for &record_len in cover_flight.iter() {
                 let cover = tx_codec.encode_cover(record_len).map_err(|e| {
                     AppError::new(
                         ERR_NET_TLS_TAMPER,
@@ -1626,6 +1662,8 @@ mod tests {
                 Arc::from("example.com"),
                 None,
                 node_identity,
+                crate::decoy::CoverFlight::node_default().records.into(),
+                true,
             );
             // run() продолжает в muxer/engine после хендшейка и вернётся сам,
             // как только клиент закроет сокет (наш тест-клиент не шлёт
@@ -1707,6 +1745,8 @@ mod tests {
                 Arc::from("this-host-does-not-resolve.invalid"),
                 None,
                 None,
+                crate::decoy::CoverFlight::node_default().records.into(),
+                true,
             );
             handler.run().await
         });
