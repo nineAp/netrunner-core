@@ -1,0 +1,28 @@
+# Netrunner headless client. Файл с токеном/ключами должен быть доступен
+# только root: chmod 600 /etc/netrunner/client.toml
+
+# Только числовой IPv4:port — адрес используется и в policy routing/nftables.
+remote_address = "192.0.2.10:443"
+sni = "www.debian.org"
+
+# Заполните значениями, полученными от control-plane. Пустая пара ключей
+# включает legacy anonymous handshake и работает только с совместимой нодой.
+auth_token = ""
+node_secret = ""
+node_public_key = ""
+
+cache_dir = "/tmp/netrunner"
+mtu = 1450
+killswitch_enabled = true
+log_level = "info"
+
+# all — весь IPv4-трафик через VPN; bypass_lan — приватные сети напрямую.
+tunnel_mode = "bypass_lan"
+excluded_uids = []
+excluded_domains = []
+routed_cidrs = []
+
+# true перехватывает транзитный трафик клиентов OpenWrt. Без этого флага
+# туннелируется только трафик процессов, запущенных на самом роутере.
+router_mode = true
+lan_interfaces = ["br-lan"]

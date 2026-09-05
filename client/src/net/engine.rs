@@ -795,7 +795,7 @@ impl Engine {
 // ─── EngineConfig & EngineBuilder (unchanged API surface) ──────────────────
 
 /// Параметры запуска движка (билдер-стайл через `with_*`).
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct EngineConfig {
     /// Адрес прокси-сервера (`host:port`).
     pub remote_address: String,
@@ -824,6 +824,12 @@ pub struct EngineConfig {
     /// Подсети ресурсов организации. Используются исключительно в
     /// [`TunnelMode::Resources`]; в остальных режимах игнорируются.
     pub routed_cidrs: Vec<String>,
+    /// Перехватывать ли не только локальный `output`, но и IPv4-трафик,
+    /// пришедший с LAN-интерфейсов роутера. Выключено для обычного desktop.
+    pub router_mode: bool,
+    /// LAN-интерфейсы для [`Self::router_mode`] (`br-lan` по умолчанию в
+    /// OpenWrt-профиле CLI). Имена валидируются перед передачей в nftables.
+    pub lan_interfaces: Vec<String>,
     /// SNI поддельного `ClientHello` (домен-декой, под который маскируется
     /// хендшейк). Пока статический атрибут конфигурации — раньше был
     /// захардкожен константой глубоко в TLS-слое ядра. В перспективе будет
@@ -865,6 +871,8 @@ impl EngineConfig {
             excluded_domains: Vec::new(),
             tunnel_mode: TunnelMode::All,
             routed_cidrs: Vec::new(),
+            router_mode: false,
+            lan_interfaces: Vec::new(),
             decoy_sni: netrunner_core::net::DEFAULT_DECOY_HOST.to_string(),
             auth_token: None,
             node_secret: None,
@@ -933,6 +941,70 @@ impl EngineConfig {
         self.routed_cidrs = routed_cidrs;
         self
     }
+
+    /// Включает перехват транзитного трафика на Linux-роутере.
+    pub fn with_router_mode(mut self, enabled: bool, lan_interfaces: Vec<String>) -> Self {
+        self.router_mode = enabled;
+        self.lan_interfaces = lan_interfaces;
+        self
+    }
+}
+
+/// Не выводим секреты узла/JWT через `{:?}`: конфиг логируется при каждом
+/// запуске движка, а OpenWrt направляет stdout/stderr сервиса в системный лог.
+impl std::fmt::Debug for EngineConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EngineConfig")
+            .field("remote_address", &self.remote_address)
+            .field("cache_path", &self.cache_path)
+            .field("mtu", &self.mtu)
+            .field("setup_routing", &self.setup_routing)
+            .field("any_ip", &self.any_ip)
+            .field("transparent_mode", &self.transparent_mode)
+            .field("default_gateway", &self.default_gateway)
+            .field("killswitch_enabled", &self.killswitch_enabled)
+            .field("excluded_apps", &self.excluded_apps)
+            .field("excluded_domains", &self.excluded_domains)
+            .field("tunnel_mode", &self.tunnel_mode)
+            .field("routed_cidrs", &self.routed_cidrs)
+            .field("router_mode", &self.router_mode)
+            .field("lan_interfaces", &self.lan_interfaces)
+            .field("decoy_sni", &self.decoy_sni)
+            .field(
+                "auth_token",
+                &self.auth_token.as_ref().map(|_| "[redacted]"),
+            )
+            .field(
+                "node_secret",
+                &self.node_secret.as_ref().map(|_| "[redacted]"),
+            )
+            .field(
+                "node_public_key",
+                &self.node_public_key.as_ref().map(|_| "[configured]"),
+            )
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod engine_config_tests {
+    use super::*;
+
+    #[test]
+    fn debug_output_redacts_credentials() {
+        let config = EngineConfig::new("198.51.100.10:443")
+            .with_auth_token(Some("jwt-secret-value".to_owned()))
+            .with_node_credentials(
+                Some("node-secret-value".to_owned()),
+                Some("node-public-value".to_owned()),
+            );
+        let debug = format!("{config:?}");
+
+        assert!(!debug.contains("jwt-secret-value"));
+        assert!(!debug.contains("node-secret-value"));
+        assert!(!debug.contains("node-public-value"));
+        assert!(debug.contains("[redacted]"));
+    }
 }
 
 /// Сборщик [`Engine`]: подготавливает DNS, маршрутизацию, туннель и интерфейс.
@@ -987,6 +1059,8 @@ impl EngineBuilder {
                 &self.config.excluded_apps,
                 self.config.tunnel_mode,
                 &self.config.routed_cidrs,
+                self.config.router_mode,
+                &self.config.lan_interfaces,
             )
             .map_err(|e| format!("Routing setup failed: {}", e))?;
         }

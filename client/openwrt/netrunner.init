@@ -1,0 +1,33 @@
+#!/bin/sh /etc/rc.common
+
+START=95
+STOP=10
+USE_PROCD=1
+
+PROG=/usr/bin/netrunner-client
+CONFIG=/etc/netrunner/client.toml
+
+start_service() {
+    [ -x "$PROG" ] || {
+        echo "Netrunner: $PROG не найден или не исполняемый" >&2
+        return 1
+    }
+    [ -r "$CONFIG" ] || {
+        echo "Netrunner: заполните $CONFIG" >&2
+        return 1
+    }
+
+    procd_open_instance
+    procd_set_param command "$PROG" --config "$CONFIG"
+    procd_set_param file "$CONFIG"
+    procd_set_param stdout 1
+    procd_set_param stderr 1
+    procd_set_param term_timeout 10
+    procd_set_param respawn 3600 5 5
+    procd_close_instance
+}
+
+reload_service() {
+    stop
+    start
+}

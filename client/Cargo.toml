@@ -7,6 +7,15 @@ edition = "2024"
 path = "src/lib.rs"
 crate-type = ["cdylib", "rlib", "staticlib"]
 
+[[bin]]
+name = "netrunner-client"
+path = "src/main.rs"
+required-features = ["cli"]
+
+[features]
+default = []
+cli = ["dep:clap", "dep:serde", "dep:toml"]
+
 [dependencies]
 netrunner-core = { path = "../core" }
 smoltcp = { git = "https://gitea.netrunner-vpn.com/nineap/nxrp-smoltcp.git", branch = "main", default-features = false, features = [
@@ -36,6 +45,9 @@ uniffi = { version = "0.31.0", features = ["tokio"] }
 reqwest = { version = "0.13.2", features = ["json"] } 
 dashmap = "6.1.0"
 anyhow = "1.0"
+clap = { version = "4.4", features = ["derive", "env"], optional = true }
+serde = { version = "1.0", features = ["derive"], optional = true }
+toml = { version = "0.9", optional = true }
 
 netrunner-logger = { path = "../tools/log" }
 tracing = "0.1"

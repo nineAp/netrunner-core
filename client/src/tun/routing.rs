@@ -103,6 +103,15 @@ pub fn get_default_gateway_linux() -> Option<String> {
     stdout.split_whitespace().nth(2).map(|s| s.to_string())
 }
 
+#[cfg(target_os = "linux")]
+fn is_valid_interface_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 15
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+}
+
 /// Добавляет уже разрешённый (через публичный DNS, см. dns.rs) реальный IP
 /// исключённого домена в nftables-set `excluded_ips`, созданный в
 /// [`setup_platform_routing`] — вызывается фоновой задачей в engine.rs по мере
@@ -135,10 +144,11 @@ pub enum TunnelMode {
     BypassLan,
 }
 
-/// Диапазоны RFC 1918 + loopback — то, что считается «локальной сетью».
+/// Диапазоны RFC 1918, loopback, link-local, multicast и broadcast/reserved —
+/// то, что нельзя уводить из локального хоста/роутера в туннель.
 /// Один список на оба места, где он нужен ([`TunnelMode::BypassLan`] и
 /// kill-switch), чтобы они не разъехались.
-const LAN_RANGES: &str = "127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16";
+const LAN_RANGES: &str = "0.0.0.0/8, 10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 240.0.0.0/4";
 
 /// Пропускает только то, что заведомо безопасно подставить в команду.
 ///
@@ -215,17 +225,48 @@ pub fn setup_platform_routing(
     excluded_apps: &[String],
     mode: TunnelMode,
     routed_cidrs: &[String],
+    router_mode: bool,
+    lan_interfaces: &[String],
 ) -> io::Result<()> {
     let proxy_ip = remote_address.split(':').next().unwrap_or(remote_address);
 
     #[cfg(target_os = "linux")]
     {
+        let lan_interfaces = if router_mode {
+            let interfaces: Vec<&str> = lan_interfaces
+                .iter()
+                .map(String::as_str)
+                .filter(|name| is_valid_interface_name(name))
+                .collect();
+            if interfaces.len() != lan_interfaces.len() || interfaces.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "router mode requires valid Linux interface names",
+                ));
+            }
+            interfaces
+        } else {
+            Vec::new()
+        };
+
         let _ = run_cmd_ext("sysctl -w net.ipv4.conf.all.rp_filter=0", true);
         let _ = run_cmd_ext("sysctl -w net.ipv4.conf.netr0.rp_filter=0", true);
         let _ = run_cmd_ext("sysctl -w net.ipv4.ip_forward=1", true);
 
-        let _ = run_cmd_ext("ip rule add fwmark 0x1 table 100", true);
+        // Фиксированный priority делает правило идемпотентным после crash +
+        // procd respawn: повторный `add` вернёт EEXIST, а не создаст дубликат,
+        // который пережил бы одинарный `del` при штатной остановке.
+        let _ = run_cmd_ext("ip rule add priority 10000 fwmark 0x1 table 100", true);
         let _ = run_cmd_ext("ip route add default dev netr0 table 100", true);
+        // При аварийном завершении TUN-маршрут исчезает вместе с интерфейсом.
+        // Без запасного unreachable policy-rule провалился бы в main table и
+        // трафик утёк бы в WAN. Штатный stop удалит всю table 100 ниже.
+        if killswitch {
+            let _ = run_cmd_ext(
+                "ip route add unreachable default table 100 metric 32767",
+                true,
+            );
+        }
 
         run_cmd_ext("nft add table ip netrunner", true)?;
 
@@ -239,6 +280,17 @@ pub fn setup_platform_routing(
             "nft add chain ip netrunner nat_out { type nat hook output priority -100; }",
             false,
         )?;
+
+        if router_mode {
+            run_cmd_ext(
+                "nft add chain ip netrunner prerouting { type filter hook prerouting priority -150; }",
+                false,
+            )?;
+            run_cmd_ext(
+                "nft add chain ip netrunner nat_pre { type nat hook prerouting priority -100; }",
+                false,
+            )?;
+        }
 
         // 1. Исключения для приложений (Split-Tunneling)
         // Ожидается, что для Linux в excluded_apps передаются UID пользователей
@@ -276,13 +328,53 @@ pub fn setup_platform_routing(
             false,
         )?;
 
+        for interface in &lan_interfaces {
+            // Доступ к самому роутеру (LuCI/SSH/DNS/DHCP) нельзя отправлять в
+            // TUN даже в full-tunnel. `fib ... local` не привязан к тому,
+            // какой именно IPv4 назначен br-lan на конкретном устройстве.
+            run_cmd_ext(
+                &format!(
+                    "nft add rule ip netrunner prerouting iifname \"{}\" fib daddr type local accept",
+                    interface
+                ),
+                false,
+            )?;
+            run_cmd_ext(
+                &format!(
+                    "nft add rule ip netrunner prerouting iifname \"{}\" ip daddr {} accept",
+                    interface, proxy_ip
+                ),
+                false,
+            )?;
+            run_cmd_ext(
+                &format!(
+                    "nft add rule ip netrunner prerouting iifname \"{}\" ip daddr @excluded_ips accept",
+                    interface
+                ),
+                false,
+            )?;
+        }
+
         // 3. Локальная сеть мимо туннеля — до маркировки, потому что
         // `accept` терминален: домашний принтер и NAS остаются доступны.
-        if mode == TunnelMode::BypassLan {
+        // На роутере LAN всегда остаётся локальным: иначе full-tunnel с
+        // выключенным killswitch маркировал бы ответы LuCI/SSH/DHCP и лишал
+        // администратора доступа к устройству. На desktop это по-прежнему
+        // зависит от явно выбранного BypassLan (либо killswitch ниже).
+        if mode == TunnelMode::BypassLan || router_mode {
             run_cmd_ext(
                 &format!("nft add rule ip netrunner output ip daddr {{ {LAN_RANGES} }} accept"),
                 false,
             )?;
+            for interface in &lan_interfaces {
+                run_cmd_ext(
+                    &format!(
+                        "nft add rule ip netrunner prerouting iifname \"{}\" ip daddr {{ {LAN_RANGES} }} accept",
+                        interface
+                    ),
+                    false,
+                )?;
+            }
         }
 
         // 4. Маркировка трафика для отправки в TUN — здесь и проходит
@@ -294,6 +386,15 @@ pub fn setup_platform_routing(
                     proxy_ip
                 );
                 run_cmd_ext(&mark_rule, false)?;
+                for interface in &lan_interfaces {
+                    run_cmd_ext(
+                        &format!(
+                            "nft add rule ip netrunner prerouting iifname \"{}\" ip daddr != {} mark set 0x1",
+                            interface, proxy_ip
+                        ),
+                        false,
+                    )?;
+                }
             }
             TunnelMode::Resources => {
                 // `flags interval` обязателен: без него set хранит только
@@ -323,6 +424,15 @@ pub fn setup_platform_routing(
                         "nft add rule ip netrunner output ip daddr @tunneled_nets oifname != \"netr0\" mark set 0x1",
                         false,
                     )?;
+                    for interface in &lan_interfaces {
+                        run_cmd_ext(
+                            &format!(
+                                "nft add rule ip netrunner prerouting iifname \"{}\" ip daddr @tunneled_nets mark set 0x1",
+                                interface
+                            ),
+                            false,
+                        )?;
+                    }
                     netrunner_logger::info!(
                         "🎯 Режим resources: в туннель маршрутизировано подсетей: {}",
                         safe.len()
@@ -375,6 +485,40 @@ pub fn setup_platform_routing(
             proxy_ip
         );
         run_cmd_ext(&dns_redir, false)?;
+
+        // LAN-клиенты не используют systemd-resolved роутера. Перехватываем
+        // их UDP DNS до маршрутизации и отдаём тому же fake-DNS на netr0;
+        // conntrack сам восстановит исходный адрес DNS в ответе.
+        if router_mode && mode != TunnelMode::Resources {
+            for interface in &lan_interfaces {
+                run_cmd_ext(
+                    &format!(
+                        "nft add rule ip netrunner nat_pre iifname \"{}\" udp dport 53 ip daddr != {} dnat to 10.0.0.2:53",
+                        interface, proxy_ip
+                    ),
+                    false,
+                )?;
+            }
+
+            // Ядро клиента сейчас маршрутизирует только IPv4. Не позволяем
+            // IPv6 незаметно обойти full-tunnel на LAN; таблица существует
+            // только пока работает клиент и удаляется в reset ниже.
+            run_cmd_ext("nft add table ip6 netrunner", true)?;
+            run_cmd_ext("nft flush table ip6 netrunner", true)?;
+            run_cmd_ext(
+                "nft add chain ip6 netrunner forward { type filter hook forward priority 0; }",
+                false,
+            )?;
+            for interface in &lan_interfaces {
+                run_cmd_ext(
+                    &format!(
+                        "nft add rule ip6 netrunner forward iifname \"{}\" drop",
+                        interface
+                    ),
+                    false,
+                )?;
+            }
+        }
 
         let _ = run_cmd_ext("resolvectl dns netr0 10.0.0.2", true);
         let _ = run_cmd_ext("resolvectl domain netr0 ~.", true);
@@ -500,9 +644,10 @@ pub fn reset_platform_routing(_proxy_ip: Option<&str>, _was_killswitch: bool) ->
     #[cfg(target_os = "linux")]
     {
         let _ = run_cmd_ext("ip link delete netr0", true);
-        let _ = run_cmd_ext("ip rule del fwmark 0x1 table 100", true);
+        let _ = run_cmd_ext("ip rule del priority 10000 fwmark 0x1 table 100", true);
         let _ = run_cmd_ext("ip route flush table 100", true);
         let _ = run_cmd_ext("nft delete table ip netrunner", true);
+        let _ = run_cmd_ext("nft delete table ip6 netrunner", true);
         info!("Linux routing reset.");
     }
 
@@ -602,5 +747,15 @@ mod tests {
     #[test]
     fn default_mode_is_full_tunnel() {
         assert_eq!(TunnelMode::default(), TunnelMode::All);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn openwrt_interface_names_are_strictly_validated() {
+        assert!(is_valid_interface_name("br-lan"));
+        assert!(is_valid_interface_name("eth0.10"));
+        assert!(!is_valid_interface_name(""));
+        assert!(!is_valid_interface_name("interface-name-is-too-long"));
+        assert!(!is_valid_interface_name("br-lan;drop"));
     }
 }

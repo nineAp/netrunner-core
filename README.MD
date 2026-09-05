@@ -75,6 +75,9 @@ make debug-client
 | `make debug-client`  | Сборка клиента в режиме отладки, установка прав (`setcap`) и запуск.                                    |
 | `make debug-server`  | Сборка и локальный запуск сервера на порту 8443.                                                        |
 | `make build-android` | Кросс-компиляция `.so` библиотек для Android (arm64, armv7, x86, x86_64) и генерация Kotlin-биндингов.  |
+| `make build-openwrt` | Статический headless musl-клиент и installable tar-архив для OpenWrt (`OPENWRT_TARGET=...`).           |
+| `make test-router-wsl` | End-to-end router-mode тест в изолированных WSL/Linux network namespace: tunnel, crash-killswitch, restart и cleanup. |
+| `make test-openwrt-qemu` | Тот же сценарий внутри настоящей OpenWrt в QEMU: install.sh, procd, зависимости, fw4.        |
 | `make build-server`  | Сборка релизной версии сервера (`--release`).                                                           |
 | `make setup-server`  | Установка необходимых пакетов (`build-essential`, `libssl-dev`) на удаленном сервере.                   |
 | `make deploy-server` | Остановка текущего сервиса, загрузка нового бинарника и конфигурации, старт через `systemctl`.          |

@@ -23,7 +23,7 @@ SSH_OPTS = -o IPQoS=throughput -o ServerAliveInterval=30
 RSYNC_OPTS = -avz --inplace --progress -e "ssh $(SSH_OPTS)"
 
 
-.PHONY: debug-client debug-server build-android build-server build-edge deploy-server deploy-dev logs logs-masque ssh setup-server release-all
+.PHONY: debug-client debug-server build-android build-openwrt test-router-wsl test-openwrt-qemu build-server build-edge deploy-server deploy-dev logs logs-masque ssh setup-server release-all
 
 # --- Релизный цикл ---
 # --- Релизный цикл ---
@@ -48,7 +48,7 @@ release-all: build-server deploy-server build-android
 
 debug-client:
 	@echo "--- Сборка клиента (Debug) ---"
-	cargo build --bin netrunner-client
+	cargo build --features cli --bin netrunner-client
 	@echo "--- Применение прав ---"
 	sudo setcap cap_net_admin,cap_net_raw,cap_dac_override=eip ./target/debug/netrunner-client
 	@echo "--- Запуск клиента ---"
@@ -94,6 +94,45 @@ build-android:
 build-server:
 	@echo "--- Сборка серверных бинарников (Release) ---"
 	cargo build --release -p netrunner-server -p netrunner-masque-edge
+
+# Локальная сборка одного статического OpenWrt-архива. Пример:
+#   make build-openwrt OPENWRT_TARGET=aarch64-unknown-linux-musl
+OPENWRT_TARGET ?= x86_64-unknown-linux-musl
+build-openwrt:
+	@command -v cargo-zigbuild >/dev/null || { echo "Установите cargo-zigbuild: cargo install --locked cargo-zigbuild --version 0.23.3"; exit 1; }
+	@case "$(OPENWRT_TARGET)" in \
+		x86_64-unknown-linux-musl) arch=x86_64 ;; \
+		aarch64-unknown-linux-musl) arch=aarch64 ;; \
+		armv7-unknown-linux-musleabihf) arch=armv7 ;; \
+		*) echo "Неподдерживаемый OPENWRT_TARGET=$(OPENWRT_TARGET)"; exit 1 ;; \
+	esac; \
+	cargo zigbuild --locked --release -p netrunner-client --features cli --bin netrunner-client --target "$(OPENWRT_TARGET)"; \
+	sh scripts/package-openwrt-client.sh "target/$(OPENWRT_TARGET)/release/netrunner-client" "$$arch" dist-openwrt
+
+# Полный router-mode тест в изолированных Linux network namespace. По умолчанию
+# использует быстрый native debug-бинарник. Точный x86_64 musl-бинарник можно
+# проверить так:
+#   make build-openwrt OPENWRT_TARGET=x86_64-unknown-linux-musl
+#   make test-router-wsl ROUTER_CLIENT_BIN=target/x86_64-unknown-linux-musl/release/netrunner-client
+ROUTER_CLIENT_BIN ?= target/debug/netrunner-client
+test-router-wsl:
+	cargo build --locked -p netrunner-server --bin netrunner-server
+	@if [ "$(ROUTER_CLIENT_BIN)" = "target/debug/netrunner-client" ]; then \
+		cargo build --locked -p netrunner-client --features cli --bin netrunner-client; \
+	fi
+	sh scripts/test-router-wsl.sh "$(ROUTER_CLIENT_BIN)" target/debug/netrunner-server
+
+# Тот же router-mode сценарий, но внутри настоящей OpenWrt в QEMU: проверяет
+# то, чего netns-стенд не видит в принципе — musl-бинарник на musl-системе,
+# install.sh, procd-сервис, opkg/apk-зависимости и сосуществование с fw4.
+#   make test-openwrt-qemu OPENWRT_VERSION=24.10.8
+OPENWRT_VERSION ?= 25.12.5
+test-openwrt-qemu:
+	cargo build --locked -p netrunner-server --bin netrunner-server
+	$(MAKE) build-openwrt OPENWRT_TARGET=x86_64-unknown-linux-musl
+	OPENWRT_VERSION=$(OPENWRT_VERSION) sh scripts/test-openwrt-qemu.sh \
+		dist-openwrt/netrunner-client-openwrt-x86_64.tar.gz \
+		target/debug/netrunner-server
 
 # Сборка wasm-клиента для Cloudflare Workers (client-edge/) — тот же
 # worker-build, что и wrangler.toml::[build].command запускает сам при

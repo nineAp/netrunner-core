@@ -1,4 +1,6 @@
 /target
+/dist-openwrt
+/dist-openwrt-local
 things.txt
 hosts_cache.txt
 /gen
