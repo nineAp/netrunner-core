@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "netrunner-app-dev",
+      "runtimeExecutable": "bash",
+      "runtimeArgs": ["-c", "cd ../netrunner-app && pnpm exec vite --port 5183 --strictPort"],
+      "port": 5183
+    }
+  ]
+}

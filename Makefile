@@ -12,6 +12,10 @@ MASQUE_SERVICE_NAME := $(strip $(MASQUE_SERVICE_NAME))
 ANDROID_ADB_HOST := $(strip $(ANDROID_ADB_HOST))
 ANDROID_BUILD_SRC := $(strip $(ANDROID_BUILD_SRC))
 ANDROID_PROJECT_LIBS := $(strip $(ANDROID_PROJECT_LIBS))
+# Соседний с jniLibs каталог (.../src/main/java/uniffi), куда Kotlin-плагин
+# netrunner-app реально ждёт biндинги (jniLibs — для .so, Gradle не собирает
+# из него .kt) — см. комментарий у build-android ниже.
+ANDROID_PROJECT_JAVA_UNIFFI := $(dir $(ANDROID_PROJECT_LIBS))java/uniffi
 
 # Дев-авторизация прокси (см. netrunner-proxy/.env) — секрет общий с
 # netrunner-backend/.env.dev, адрес — дев-стек backend (make dev там).
@@ -23,7 +27,7 @@ SSH_OPTS = -o IPQoS=throughput -o ServerAliveInterval=30
 RSYNC_OPTS = -avz --inplace --progress -e "ssh $(SSH_OPTS)"
 
 
-.PHONY: debug-client debug-server build-android build-openwrt test-router-wsl test-openwrt-qemu build-server build-edge deploy-server deploy-dev logs logs-masque ssh setup-server release-all
+.PHONY: debug-client debug-server local-server build-android build-openwrt test-router-wsl test-openwrt-qemu build-server build-edge deploy-server deploy-dev logs logs-masque ssh setup-server release-all
 
 # --- Релизный цикл ---
 # --- Релизный цикл ---
@@ -62,6 +66,22 @@ debug-server:
 		--port=8443 --host=0.0.0.0 \
 		--require-auth --backend-url $(DEV_BACKEND_URL)
 
+# Анонимный (v2, без --require-auth и без бэкенда) сервер на LAN — не трогает
+# ни прод-, ни дев-инфру. Совпадает по режиму хендшейка со статическими
+# узлами netrunner-app (nrxpSecret/nrxpPublicKey: null, см. STATIC_NODES в
+# useNodesStore.ts и build-android-arm64-local в netrunner-app/Makefile) —
+# существует именно для связки с ними, чтобы гонять новую UDP-ногу под
+# отладочным логом, не дожидаясь выкладки на реальную ноду. --decoy-host не
+# указан нарочно — дефолт (www.debian.org, см. server/src/main.rs) совпадает
+# с SNI, который для локального узла ждёт netrunner-app.
+LOCAL_SERVER_PORT ?= 8443
+local-server:
+	@echo "--- Локальный анонимный сервер: 0.0.0.0:$(LOCAL_SERVER_PORT) ---"
+	@echo "--- IP этой машины в LAN (вписать в VITE_LOCAL_NODE_IP на стороне netrunner-app): ---"
+	@ip -4 -o addr show scope global | awk '{print "    " $$4}' | cut -d/ -f1
+	RUST_LOG=debug,netrunner_core=trace cargo run --bin netrunner-server -- \
+		--port=$(LOCAL_SERVER_PORT) --host=0.0.0.0
+
 ABIS = arm64-v8a armeabi-v7a x86_64 x86
 
 # ВАЖНО: `--bin netrunner-client` (как было раньше) НЕ собирает cdylib вообще —
@@ -90,6 +110,20 @@ build-android:
 	# Используем rsync локально: это безопаснее и быстрее, чем cp -r
 	# Удалит в jniLibs всё, чего нет в gen, чтобы билд был чистым
 	rsync -av "$(ANDROID_BUILD_SRC)/" "$(ANDROID_PROJECT_LIBS)/"
+
+	# jniLibs/uniffi/... (выше) — не то же самое, что реально собирает Gradle:
+	# jniLibs — каталог для ПРЕДСОБРАННЫХ .so, Kotlin-исходники из него не
+	# компилируются. VpnPlugin.kt импортирует биндинги из java/uniffi/ —
+	# отдельного каталога, который эта цель раньше не трогала вообще (в
+	# отличие от fetch-client-libs.mjs в netrunner-app, который всегда
+	# раскладывал скачанный пакет в оба места). Без этого шага здесь остаётся
+	# старый .kt — при разошедшейся FFI-сигнатуре Kotlin не компилируется
+	# ("Unresolved reference: SessionParams" и т.п.), а не просто использует
+	# старый код. --delete: здесь нет ничего, кроме сгенерированного,
+	# vs. jniLibs-рsync выше, который трогать не стал — не хотелось менять
+	# поведение шага, не имеющего отношения к найденному багу.
+	@mkdir -p $(ANDROID_PROJECT_JAVA_UNIFFI)
+	rsync -av --delete "$(ANDROID_BUILD_SRC)/uniffi/" "$(ANDROID_PROJECT_JAVA_UNIFFI)/"
 
 build-server:
 	@echo "--- Сборка серверных бинарников (Release) ---"
