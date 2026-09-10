@@ -47,13 +47,13 @@
 //! [`adaptive_batch_chunk`] (под высоким RTT слать кадры большими пачками,
 //! экономя syscalls).
 
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use bytes::Bytes;
 use dashmap::DashMap;
 use netrunner_logger::{info, instrument, trace, warn, AppError, ERR_INFRA_TIMEOUT};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{error::TrySendError, Sender};
 use tokio::sync::Notify;
@@ -63,7 +63,7 @@ use crate::net::diagnostics::{self, DiagnosticsEvent, LegMetrics, TunnelMetrics,
 use crate::net::INITIAL_RTT_MS;
 use crate::net::{
     BACKLOG_REAPER_IDLE_TIMEOUT, BACKLOG_REAPER_INTERVAL, BACKLOG_STUCK_GRACE, BRIDGE_READ_CHUNK,
-    MAX_TUNNEL_LEGS, STREAM_BACKLOG_MAX_BYTES,
+    DATAGRAM_LEG_ID, MAX_TUNNEL_LEGS, STREAM_BACKLOG_MAX_BYTES,
 };
 use crate::nrxp::FrameType;
 
@@ -439,6 +439,27 @@ pub struct Muxer {
     /// поэтому отмена мгновенно рвёт reader/writer и отправляет ногу на
     /// переподключение по новому маршруту.
     network_epoch: Arc<ArcSwap<CancellationToken>>,
+    /// Единственная физическая UDP-нога сессии — НЕ часть `legs`.
+    ///
+    /// В отличие от TCP (несколько ног ради throughput/отказоустойчивости,
+    /// см. [`MAX_TUNNEL_LEGS`]), UDP-нога — один опциональный быстрый путь
+    /// (см. `docs/UDP_LEG_RESEARCH.md` §1), а не то, что можно
+    /// мультиплицировать так же. Она сознательно вне `legs`/`active_legs_cache`:
+    /// `select_leg`/`pick_leg` (TCP-семантичные потоки — `Data`/`Connect`) не
+    /// должны её увидеть ни при каких обстоятельствах — общей гарантии
+    /// доставки/порядка, на которую полагается TCP-мост, у датаграммной ноги
+    /// нет. Единственная точка входа к ней — [`select_udp_leg`](Self::select_udp_leg),
+    /// и только для `FrameType::UdpData`.
+    datagram_leg: Arc<ArcSwapOption<MuxLeg>>,
+    /// Демультиплексирующий токен UDP-ноги — устанавливается РОВНО ОДИН раз
+    /// (см. [`try_claim_datagram_leg_token`](Self::try_claim_datagram_leg_token)),
+    /// первой TCP-ногой сессии, чей хендшейк завершится. Дальнейшие
+    /// переподключения ЛЮБОЙ TCP-ноги (в том числе именно той, что выставила
+    /// значение) больше его не трогают — иначе UDP-нога рвалась бы и
+    /// пересобиралась при каждом реконнекте одной конкретной TCP-ноги, хотя
+    /// её собственное физическое состояние с этим никак не связано (см.
+    /// `ClientHandler::establish_leg`/`ServerHandler::run` за точкой вызова).
+    datagram_leg_token: Arc<OnceLock<[u8; 16]>>,
 }
 
 impl Muxer {
@@ -460,6 +481,8 @@ impl Muxer {
             quota_reported_bytes: Arc::new(AtomicU64::new(0)),
             fatal: Arc::new(AtomicBool::new(false)),
             network_epoch: Arc::new(ArcSwap::from_pointee(CancellationToken::new())),
+            datagram_leg: Arc::new(ArcSwapOption::from(None)),
+            datagram_leg_token: Arc::new(OnceLock::new()),
         };
         muxer.spawn_backlog_reaper();
         muxer
@@ -709,6 +732,82 @@ impl Muxer {
         previous.cancel();
     }
 
+    /// Пытается зарезервировать право поднимать UDP-ногу этой сессии за
+    /// вызывающей TCP-ногой. `true` — вызывающий выиграл гонку (это первая
+    /// TCP-нога, чей хендшейк завершился) и обязан сам поднять UDP-попытку;
+    /// `false` — кто-то другой уже либо поднимает её, либо уже поднял, либо
+    /// уже провалил (мы не переигрываем попытку — см. докстринг поля
+    /// `datagram_leg_token`).
+    pub fn try_claim_datagram_leg_token(&self, token: [u8; 16]) -> bool {
+        self.datagram_leg_token.set(token).is_ok()
+    }
+
+    /// Токен UDP-ноги, если хоть одна TCP-нога уже успела его выставить.
+    /// Нужен серверу при уборке сессии — снять запись из глобального
+    /// демультиплексирующего реестра (см. `server`-сторону вызова).
+    pub fn datagram_leg_token(&self) -> Option<[u8; 16]> {
+        self.datagram_leg_token.get().copied()
+    }
+
+    /// Регистрирует физически установленную UDP-ногу. Вызывается один раз
+    /// по завершении её собственного хендшейка (см. точку вызова на
+    /// клиенте/сервере) — до этого момента `select_udp_leg` использует
+    /// исключительно TCP-переносимый фолбэк.
+    pub fn set_datagram_leg(&self, control_tx: Sender<MuxMessage>, data_tx: Sender<MuxMessage>) {
+        self.datagram_leg.store(Some(Arc::new(MuxLeg {
+            id: DATAGRAM_LEG_ID,
+            control_tx,
+            data_tx,
+            stats: Arc::new(LegStats::default()),
+        })));
+        info!("MUXER: Physical UDP leg registered");
+    }
+
+    /// Снимает UDP-ногу (эвикт по мёртвому health-check'у или физическая
+    /// смерть движка) — `select_udp_leg` немедленно откатывается на
+    /// TCP-переносимый фолбэк для следующей же датаграммы, ничего больше
+    /// делать не нужно (в отличие от TCP-ног, здесь нет привязок потоков,
+    /// которые нужно было бы расчищать: `udp_flowlets` адресует TCP-ноги по
+    /// их `leg_id`, датаграммная нога никогда там не встречается).
+    pub fn clear_datagram_leg(&self) {
+        if self.datagram_leg.swap(None).is_some() {
+            info!("MUXER: Physical UDP leg cleared, falling back to TCP-carried UdpData");
+        }
+    }
+
+    /// Статистика текущей UDP-ноги — нужна её собственному health-check'у
+    /// (см. точку вызова), чтобы отмечать PING/PONG тем же способом, что и
+    /// TCP-ноги (`LegStats::last_pong_ms`/`rtt_ms`), не изобретая параллельный
+    /// формат метрик только ради одной ноги.
+    pub fn datagram_leg_stats(&self) -> Option<Arc<LegStats>> {
+        self.datagram_leg.load_full().map(|leg| leg.stats.clone())
+    }
+
+    /// Отмечает UDP-ногу живой прямо сейчас — вызывается её собственным
+    /// читателем (`net::connection::dgram_engine`) на КАЖДУЮ успешно
+    /// расшифрованную датаграмму, не только на явный PONG (см. докстринг
+    /// `dgram_engine` за тем, почему этого достаточно). Инкапсулирует
+    /// `process_uptime_ms()` — он приватен этому файлу, чтобы единственным
+    /// источником "текущего времени для свежести ноги" всегда оставался этот
+    /// модуль, а не что-то, независимо считающее время снаружи.
+    pub fn mark_datagram_leg_alive(&self) {
+        if let Some(stats) = self.datagram_leg_stats() {
+            stats
+                .last_pong_ms
+                .store(process_uptime_ms().max(1), Ordering::Relaxed);
+        }
+    }
+
+    /// Жива ли UDP-нога прямо сейчас: недавний PONG в пределах того же окна
+    /// свежести, что и у TCP-ног (`LEG_PONG_FRESHNESS`) — единый критерий
+    /// "жива", не два разных под два транспорта.
+    fn datagram_leg_is_fresh(&self, leg: &MuxLeg) -> bool {
+        let last_pong = leg.stats.last_pong_ms.load(Ordering::Relaxed);
+        last_pong != 0
+            && process_uptime_ms().saturating_sub(last_pong)
+                < crate::net::LEG_PONG_FRESHNESS.as_millis() as u64
+    }
+
     /// Число активных ног.
     pub fn active_legs_count(&self) -> usize {
         self.legs.len()
@@ -778,10 +877,25 @@ impl Muxer {
         Some(leg)
     }
 
-    /// Chooses a leg for one UDP datagram.  During a short burst the flowlet
-    /// stays on one leg to limit reordering; after a quiet gap, or immediately
-    /// when that leg builds a standing queue, the next datagram may move.
+    /// Chooses a leg for one UDP datagram: prefers the physical UDP-native
+    /// leg while it's alive (см. [`datagram_leg_is_fresh`](Self::datagram_leg_is_fresh)
+    /// — приоритетная лестница из `docs/UDP_LEG_RESEARCH.md` §1), иначе
+    /// откатывается на TCP-переносимый фолбэк
+    /// ([`select_udp_leg_over_tcp`](Self::select_udp_leg_over_tcp), прежняя
+    /// реализация этого метода целиком).
     fn select_udp_leg(&self, stream_id: u32) -> Option<MuxLeg> {
+        if let Some(native) = self.datagram_leg.load_full() {
+            if self.datagram_leg_is_fresh(&native) {
+                return Some((*native).clone());
+            }
+        }
+        self.select_udp_leg_over_tcp(stream_id)
+    }
+
+    /// During a short burst the flowlet stays on one leg to limit
+    /// reordering; after a quiet gap, or immediately when that leg builds a
+    /// standing queue, the next datagram may move.
+    fn select_udp_leg_over_tcp(&self, stream_id: u32) -> Option<MuxLeg> {
         let now = process_uptime_ms().max(1);
         let gap_ms = (GLOBAL_MIN_RTT.load(Ordering::Relaxed) as u64 / 2).clamp(10, 100);
         let previous = self.udp_flowlets.get(&stream_id).map(|state| *state);
@@ -1661,6 +1775,77 @@ mod scheduling_tests {
 
         let second = muxer.select_udp_leg(13).unwrap().id;
         assert_ne!(first, second);
+    }
+
+    #[tokio::test]
+    async fn select_udp_leg_prefers_a_fresh_native_datagram_leg_over_tcp() {
+        let muxer = muxer_with_two_legs();
+        let (control_tx, _control_rx) = tokio::sync::mpsc::channel(8);
+        let (data_tx, _data_rx) = tokio::sync::mpsc::channel(8);
+        muxer.set_datagram_leg(control_tx, data_tx);
+        muxer
+            .datagram_leg_stats()
+            .unwrap()
+            .last_pong_ms
+            // Не `process_uptime_ms()`: в первую же миллисекунду свежего
+            // тестового процесса он сам может вернуть 0, что неотличимо от
+            // "PONG ещё не приходил" (см. докстринг `last_pong_ms`/
+            // `datagram_leg_is_fresh`) — гарантированно ненулевое значение
+            // тестирует именно "недавно" вне этой гонки.
+            .store(1, Ordering::Relaxed);
+
+        let selected = muxer.select_udp_leg(99).unwrap();
+        assert_eq!(selected.id, DATAGRAM_LEG_ID);
+    }
+
+    #[tokio::test]
+    async fn select_udp_leg_falls_back_to_tcp_when_native_leg_is_stale() {
+        let muxer = muxer_with_two_legs();
+        let (control_tx, _control_rx) = tokio::sync::mpsc::channel(8);
+        let (data_tx, _data_rx) = tokio::sync::mpsc::channel(8);
+        muxer.set_datagram_leg(control_tx, data_tx);
+        // Никогда не отмечался живым (last_pong_ms остаётся 0) — тот же
+        // критерий "не жива", что и у TCP-ног в perform_health_check.
+
+        let selected = muxer.select_udp_leg(99).unwrap();
+        assert_ne!(
+            selected.id, DATAGRAM_LEG_ID,
+            "a native leg with no fresh PONG must not be selected"
+        );
+    }
+
+    #[tokio::test]
+    async fn select_udp_leg_falls_back_to_tcp_after_native_leg_is_cleared() {
+        let muxer = muxer_with_two_legs();
+        let (control_tx, _control_rx) = tokio::sync::mpsc::channel(8);
+        let (data_tx, _data_rx) = tokio::sync::mpsc::channel(8);
+        muxer.set_datagram_leg(control_tx, data_tx);
+        muxer
+            .datagram_leg_stats()
+            .unwrap()
+            .last_pong_ms
+            // Не `process_uptime_ms()`: в первую же миллисекунду свежего
+            // тестового процесса он сам может вернуть 0, что неотличимо от
+            // "PONG ещё не приходил" (см. докстринг `last_pong_ms`/
+            // `datagram_leg_is_fresh`) — гарантированно ненулевое значение
+            // тестирует именно "недавно" вне этой гонки.
+            .store(1, Ordering::Relaxed);
+        assert_eq!(muxer.select_udp_leg(99).unwrap().id, DATAGRAM_LEG_ID);
+
+        muxer.clear_datagram_leg();
+        let selected = muxer.select_udp_leg(99).unwrap();
+        assert_ne!(selected.id, DATAGRAM_LEG_ID);
+    }
+
+    #[tokio::test]
+    async fn try_claim_datagram_leg_token_is_first_writer_wins() {
+        let muxer = Muxer::new(true, "claim-test".into());
+        assert!(muxer.try_claim_datagram_leg_token([1u8; 16]));
+        // Вторая попытка — даже с ДРУГИМ токеном — обязана проиграть: гонка
+        // решается один раз на всю жизнь Muxer'а, а не в пользу
+        // "последнего/лучшего" значения.
+        assert!(!muxer.try_claim_datagram_leg_token([2u8; 16]));
+        assert_eq!(muxer.datagram_leg_token(), Some([1u8; 16]));
     }
 
     #[tokio::test]

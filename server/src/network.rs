@@ -7,15 +7,15 @@
 //! спавнит `ServerHandler::run` из ядра под отдельным tracing-span клиента.
 
 use netrunner_core::net::{
-    AuthValidator, Connection, NetworkConfig, NodeHealthReport, ServerHandler, SessionManager,
-    TunnelHandler, TOPOLOGY_PRINT_INTERVAL,
+    run_datagram_listener, AuthValidator, Connection, NetworkConfig, NodeHealthReport,
+    ServerHandler, SessionManager, TunnelHandler, TOPOLOGY_PRINT_INTERVAL,
 };
 use netrunner_core::Identity;
 use netrunner_logger::{debug, error, info, warn};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, UdpSocket};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
@@ -240,6 +240,31 @@ impl Network {
         });
         info!("🌐 Netrunner Server: Listening on {}", addr);
         let listener = TcpListener::bind(&addr).await.expect("Server bind failed");
+
+        // Тот же адрес и порт, что и у TCP — опциональная UDP-нога (см.
+        // `netrunner_core::net::run_datagram_listener`) существует ровно
+        // поверх уже установленных TCP-сессий этого же `session_manager`, а
+        // не как отдельный сервис: она не может подняться раньше первой
+        // TCP-ноги сессии (см. `SessionManager::register_datagram_session`).
+        // Бинд может не удаться (например, порт занят другим процессом под
+        // UDP, или платформа режет UDP отдельно от TCP) — это не должно
+        // ронять сервер целиком, только оставлять всех клиентов на TCP.
+        match UdpSocket::bind(&addr).await {
+            Ok(udp_socket) => {
+                let udp_session_manager = session_manager.clone();
+                let udp_token = token.clone();
+                tokio::spawn(async move {
+                    if let Err(e) =
+                        run_datagram_listener(udp_socket, udp_session_manager, udp_token).await
+                    {
+                        warn!(error = %e, "UDP datagram leg listener stopped");
+                    }
+                });
+            }
+            Err(e) => {
+                warn!(error = %e, "UDP datagram leg listener failed to bind, continuing TCP-only");
+            }
+        }
 
         // Число реально обслуживаемых физических соединений прямо сейчас — не
         // "процесс жив", а "сколько клиентов на нём висит". Отдаётся в /health

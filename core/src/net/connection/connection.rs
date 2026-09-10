@@ -52,9 +52,39 @@ use tokio::{
     sync::mpsc,
 };
 
+/// Одна запись серверного демультиплексирующего реестра UDP-ног (см.
+/// [`SessionManager::register_datagram_session`]): муксер сессии плюс уже
+/// собранный приёмник ОДНОГО конкретного движка. Общий тип для всех трёх
+/// карт (`dgram_by_quic_dcid`/`dgram_by_webrtc_ssrc`/`dgram_by_raw_token`) —
+/// [`crate::dgram_leg::DgramRx`] уже стирает разницу между движками.
+pub(crate) struct DgramSessionEntry {
+    pub(crate) muxer: Arc<Muxer>,
+    pub(crate) rx: crate::dgram_leg::DgramRx,
+    /// Нужен, чтобы вывести СИММЕТРИЧНЫЙ `DgramTx` (та же роль — сервер, тот
+    /// же движок, что и у `rx`) в момент, когда нога впервые устанавливается
+    /// (см. `dgram_engine::build_matching_tx`) — раньше этого момента писать
+    /// в ответ попросту некому.
+    pub(crate) datagram_root: [u8; 32],
+    /// `None` до первой успешно расшифрованной датаграммы этой сессии;
+    /// `Some` — нога поднята, здесь всё, что нужно для ответа и
+    /// диспетчеризации дальнейших пакетов (см.
+    /// `dgram_engine::EstablishedDgramSession`).
+    pub(crate) established: Option<crate::net::connection::dgram_engine::EstablishedDgramSession>,
+}
+
 /// Реестр активных сессий сервера: `session_id` → общий на сессию [`Muxer`].
+///
+/// Также — демультиплексирующий реестр UDP-ног ВСЕХ сессий процесса: один
+/// общий UDP-сокет (см. `net::connection::dgram_engine::run_datagram_listener`)
+/// принимает датаграммы от кого угодно, и единственный способ понять, какой
+/// сессии она принадлежит ДО расшифровки — заглянуть в один из этих трёх
+/// реестров (см. докстринг [`register_datagram_session`](Self::register_datagram_session)
+/// за тем, почему их три, а не один).
 pub struct SessionManager {
     sessions: DashMap<String, Arc<Muxer>>,
+    dgram_by_quic_dcid: DashMap<[u8; 8], DgramSessionEntry>,
+    dgram_by_webrtc_ssrc: DashMap<u32, DgramSessionEntry>,
+    dgram_by_raw_token: DashMap<[u8; 16], DgramSessionEntry>,
 }
 
 impl Default for SessionManager {
@@ -67,6 +97,9 @@ impl SessionManager {
     pub fn new() -> Self {
         Self {
             sessions: DashMap::new(),
+            dgram_by_quic_dcid: DashMap::new(),
+            dgram_by_webrtc_ssrc: DashMap::new(),
+            dgram_by_raw_token: DashMap::new(),
         }
     }
 
@@ -88,10 +121,110 @@ impl SessionManager {
             .clone()
     }
 
+    /// Готовит UDP-ногу сессии сразу под все три движка (см.
+    /// [`crate::dgram_leg::DgramEngineKind`]) — сервер не знает заранее,
+    /// какой из них выберет клиент (см. `dgram_leg::choose_engine`, бросается
+    /// НА КЛИЕНТЕ), поэтому регистрирует приёмники под все три
+    /// демультиплексирующих ключа сразу. Реально сработает только тот, на
+    /// чей ключ действительно придёт первая датаграмма — остальные два
+    /// молча простаивают до уборки сессии.
+    ///
+    /// Вызывается из [`ServerHandler::run`] сразу по завершении хендшейка
+    /// КАЖДОЙ TCP-ноги; фактическая регистрация происходит только для
+    /// первой, выигравшей гонку за [`Muxer::try_claim_datagram_leg_token`] —
+    /// остальные вызовы для той же сессии — no-op.
+    pub(crate) fn register_datagram_session(&self, muxer: &Arc<Muxer>, datagram_root: [u8; 32]) {
+        use crate::crypto::DatagramKeyMaterial;
+        use crate::nrxp::DatagramRx as CoreDatagramRx;
+
+        // `derive_from_root` детерминирована — используется только чтобы
+        // узнать `leg_token` заранее и провести гонку заявок; фактические
+        // приёмники ниже выводятся заново каждый раз перед тем, как
+        // консьюмировать материал в `DatagramRx::new`.
+        let leg_token = DatagramKeyMaterial::derive_from_root(datagram_root, false).leg_token();
+        if !muxer.try_claim_datagram_leg_token(leg_token) {
+            return;
+        }
+
+        let quic_material = DatagramKeyMaterial::derive_from_root(datagram_root, false);
+        let quic_hp = quic_material.hp_key_rx();
+        let quic_rx = crate::quiceng::QuicRx::new(
+            CoreDatagramRx::new(quic_material),
+            quic_hp,
+            crate::quiceng::QuicProfile::CHROME.dcid_len as usize,
+        );
+        self.dgram_by_quic_dcid.insert(
+            crate::dgram_leg::quic_dcid_client(&leg_token),
+            DgramSessionEntry {
+                muxer: muxer.clone(),
+                rx: crate::dgram_leg::DgramRx::Quic(quic_rx),
+                datagram_root,
+                established: None,
+            },
+        );
+
+        let webrtc_material = DatagramKeyMaterial::derive_from_root(datagram_root, false);
+        let webrtc_rx = crate::webrtceng::WebrtcRx::new(CoreDatagramRx::new(webrtc_material));
+        self.dgram_by_webrtc_ssrc.insert(
+            crate::dgram_leg::webrtc_ssrc_client(&leg_token),
+            DgramSessionEntry {
+                muxer: muxer.clone(),
+                rx: crate::dgram_leg::DgramRx::WebRtc(webrtc_rx),
+                datagram_root,
+                established: None,
+            },
+        );
+
+        let raw_material = DatagramKeyMaterial::derive_from_root(datagram_root, false);
+        let raw_rx = crate::rawdgram::RawDgramRx::new(CoreDatagramRx::new(raw_material));
+        self.dgram_by_raw_token.insert(
+            leg_token,
+            DgramSessionEntry {
+                muxer: muxer.clone(),
+                rx: crate::dgram_leg::DgramRx::Raw(raw_rx),
+                datagram_root,
+                established: None,
+            },
+        );
+    }
+
     pub fn remove(&self, session_id: &str) {
-        if self.sessions.remove(session_id).is_some() {
+        if let Some((_, muxer)) = self.sessions.remove(session_id) {
+            if let Some(leg_token) = muxer.datagram_leg_token() {
+                self.dgram_by_quic_dcid
+                    .remove(&crate::dgram_leg::quic_dcid_client(&leg_token));
+                self.dgram_by_webrtc_ssrc
+                    .remove(&crate::dgram_leg::webrtc_ssrc_client(&leg_token));
+                self.dgram_by_raw_token.remove(&leg_token);
+            }
             info!("🧹 Session {} completely closed and cleaned up", session_id);
         }
+    }
+
+    /// Точки доступа к демультиплексирующим картам для
+    /// `dgram_engine::run_datagram_listener` — поля приватны нарочно (эта
+    /// структура — единственное место, знающее, как их заполнять и
+    /// прибирать, см. [`register_datagram_session`](Self::register_datagram_session)/[`remove`](Self::remove)),
+    /// эти три метода — единственный путь снаружи их ПРОЧЕСТЬ.
+    pub(crate) fn dgram_quic_entry(
+        &self,
+        dcid: &[u8; 8],
+    ) -> Option<dashmap::mapref::one::RefMut<'_, [u8; 8], DgramSessionEntry>> {
+        self.dgram_by_quic_dcid.get_mut(dcid)
+    }
+
+    pub(crate) fn dgram_webrtc_entry(
+        &self,
+        ssrc: &u32,
+    ) -> Option<dashmap::mapref::one::RefMut<'_, u32, DgramSessionEntry>> {
+        self.dgram_by_webrtc_ssrc.get_mut(ssrc)
+    }
+
+    pub(crate) fn dgram_raw_entry(
+        &self,
+        token: &[u8; 16],
+    ) -> Option<dashmap::mapref::one::RefMut<'_, [u8; 16], DgramSessionEntry>> {
+        self.dgram_by_raw_token.get_mut(token)
     }
 
     pub fn print_all_sessions(&self) {
@@ -335,6 +468,7 @@ impl ClientHandler {
             crate::nrxp::RxCodec,
             crate::nrxp::TxCodec,
             BytesMut,
+            [u8; 32],
         ),
         AppError,
     > {
@@ -412,6 +546,14 @@ impl ClientHandler {
         consume_middlebox_ccs(&mut conn.inbound, &mut conn.read_buf).await?;
 
         let (tx_key, tx_iv, rx_key, rx_iv) = session_keys.get_aead_parameters();
+        // Единственная точка, где `datagram_root` ещё достижим — `session_keys`
+        // дропается на выходе из этой функции (см. её докстринг на поле в
+        // `crypto::session`), а UDP-нога выводит из него свой материал позже,
+        // когда для ЭТОЙ ноги уже давно всё кончилось. Копия — 32 байта на
+        // стеке, не секрет отдельно от остального, что уже возвращает эта
+        // функция (AEAD-ключи), поэтому дополнительных мер защиты в передаче
+        // не требует.
+        let datagram_root = session_keys.datagram_root();
         let mut cipher = ChaChaCipher::new();
         cipher.set_keys(tx_key, tx_iv, rx_key, rx_iv);
         let codec = Codec::new(cipher, session_keys.get_auth_key());
@@ -442,6 +584,7 @@ impl ClientHandler {
             rx_codec,
             tx_codec,
             conn.read_buf,
+            datagram_root,
         ))
     }
 
@@ -507,16 +650,48 @@ impl ClientHandler {
             .map_err(|e| AppError::new(ERR_INFRA_TIMEOUT, "Сбой сокета", e.to_string()))?;
 
         let profile = BrowserProfile::for_session(session_id);
-        let (inbound, outbound, rx_codec, tx_codec, handshake_tail) = Self::perform_handshake(
-            stream,
-            session_id,
-            leg_id,
-            profile,
-            decoy_sni,
-            auth_token,
-            identity.as_ref(),
-        )
-        .await?;
+        let (inbound, outbound, rx_codec, tx_codec, handshake_tail, datagram_root) =
+            Self::perform_handshake(
+                stream,
+                session_id,
+                leg_id,
+                profile,
+                decoy_sni,
+                auth_token,
+                identity.as_ref(),
+            )
+            .await?;
+
+        // Ровно одна попытка UDP-ноги на всю жизнь сессии, за какую бы
+        // TCP-ногу она ни выиграла гонку — см. докстринг
+        // `Muxer::try_claim_datagram_leg_token`. Реконнект ЭТОЙ ноги позже
+        // не переигрывает попытку: `datagram_root` каждый раз новый (свежий
+        // ECDH), но UDP-нога, если уже поднята, живёт независимо от него.
+        let claim_material =
+            crate::crypto::DatagramKeyMaterial::derive_from_root(datagram_root, true);
+        if muxer.try_claim_datagram_leg_token(claim_material.leg_token()) {
+            let muxer = muxer.clone();
+            // Тот же IP И тот же порт, на который уже легла TCP-нога — не
+            // второй DNS-lookup, и естественно совпадает с тем, как настоящий
+            // сайт отдаёт UDP и TCP с одного адреса И одного номера порта.
+            // Порт сервера настраиваемый (`--port`, необязательно 443) — если
+            // бы UDP-нога стучалась в захардкоженный 443 отдельно от того,
+            // что реально слушает сервер, она бы просто никогда не работала
+            // на нестандартном порту.
+            let udp_addr = addr;
+            let decoy_sni = decoy_sni.clone();
+            let session_id = session_id.to_string();
+            tokio::spawn(async move {
+                crate::net::connection::dgram_engine::attempt_client_datagram_leg(
+                    muxer,
+                    udp_addr,
+                    decoy_sni,
+                    session_id,
+                    datagram_root,
+                )
+                .await;
+            });
+        }
 
         let cap = NetworkConfig::global().channel_capacity;
         let (control_tx, control_rx) = mpsc::channel::<MuxMessage>(cap);
@@ -1278,6 +1453,10 @@ impl TunnelHandler for ServerHandler {
         }
 
         let (tx_key, tx_iv, rx_key, rx_iv) = session_keys.get_aead_parameters();
+        // См. симметричный комментарий в клиентском `perform_handshake`:
+        // `session_keys` не переживёт конец этой функции, а UDP-нога
+        // выводит свой материал из её корня позже.
+        let datagram_root = session_keys.datagram_root();
         let mut cipher = ChaChaCipher::new();
         cipher.set_keys(tx_key, tx_iv, rx_key, rx_iv);
 
@@ -1380,6 +1559,8 @@ impl TunnelHandler for ServerHandler {
         };
 
         let muxer = self.session_manager.get_or_create(&session_id);
+        self.session_manager
+            .register_datagram_session(&muxer, datagram_root);
 
         // Проверка личности клиента у бэкенда — только если этот инстанс
         // запущен с `--require-auth`. До этой точки соединение прошло
@@ -1689,7 +1870,7 @@ mod tests {
         .expect("handshake must not hang")
         .expect("legitimate handshake must succeed");
 
-        let (_inbound, _outbound, mut rx_codec, _tx_codec, mut tail) = handshake;
+        let (_inbound, _outbound, mut rx_codec, _tx_codec, mut tail, _datagram_root) = handshake;
 
         // Регрессия на потерю хвоста хендшейка. Сервер шлёт cover-flight сразу
         // за ServerHello/CCS, и эти записи приезжают тем же TCP-сегментом, то

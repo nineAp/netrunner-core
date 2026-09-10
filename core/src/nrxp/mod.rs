@@ -50,10 +50,17 @@
 
 mod bridge;
 mod codec;
+mod datagram;
 mod errors;
 mod frame;
 
 pub(crate) use bridge::TlsBridge;
 pub(crate) use codec::{Codec, RxCodec, TxCodec};
+// `expand_counter`/`SealedDatagram` are used only inside `datagram` itself —
+// full counter reconstruction and the seal result stay internal to
+// `DatagramTx::seal`/`DatagramRx::open`; callers outside this module only
+// ever need `truncate_counter` (to place a wire-width seq/PN) and the two
+// codec types themselves.
+pub(crate) use datagram::{truncate_counter, DatagramRx, DatagramTx};
 pub(crate) use errors::{ErrorAction, ErrorStage, TlsError};
 pub(crate) use frame::{Frame, FrameType, MAX_FRAME_PAYLOAD};

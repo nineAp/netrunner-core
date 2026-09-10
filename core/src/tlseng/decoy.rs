@@ -127,7 +127,6 @@ impl DecoyMode {
     }
 }
 
-
 /// Почему SNI отвергнут. Отдельный тип, а не `bool`/`String`: админке нужно
 /// показать причину, а не просто «нельзя».
 #[derive(Debug, PartialEq, Eq)]
@@ -377,7 +376,10 @@ mod tests {
     #[test]
     fn owned_domain_validates_case_insensitively() {
         let c = catalog();
-        assert_eq!(c.validate("ClipForge.app").unwrap().as_str(), "clipforge.app");
+        assert_eq!(
+            c.validate("ClipForge.app").unwrap().as_str(),
+            "clipforge.app"
+        );
         assert_eq!(c.validate("logdrain.io").unwrap().as_str(), "logdrain.io");
     }
 
@@ -400,7 +402,10 @@ mod tests {
         assert_eq!(c.validate("").unwrap_err(), DecoyError::Empty);
         assert_eq!(c.validate("10.0.0.1").unwrap_err(), DecoyError::IpLiteral);
         assert_eq!(c.validate("a_b.com").unwrap_err(), DecoyError::BadSyntax);
-        assert_eq!(c.validate(&"a".repeat(254)).unwrap_err(), DecoyError::TooLong);
+        assert_eq!(
+            c.validate(&"a".repeat(254)).unwrap_err(),
+            DecoyError::TooLong
+        );
     }
 
     #[test]
@@ -417,7 +422,10 @@ mod tests {
     fn relay_mode_is_the_backward_compatible_default() {
         // Узел без явного выбора обязан вести себя как исторический REALITY-релей.
         assert_eq!(DecoyMode::default(), DecoyMode::Relay);
-        assert!(DecoyMode::Relay.honor_requested_sni(), "relay учитывает запрошенный SNI (как раньше)");
+        assert!(
+            DecoyMode::Relay.honor_requested_sni(),
+            "relay учитывает запрошенный SNI (как раньше)"
+        );
     }
 
     #[test]
@@ -436,7 +444,10 @@ mod tests {
             assert_eq!(DecoyMode::parse(s).unwrap(), DecoyMode::SelfHosted);
         }
         // Опечатка не должна молча поднять узел не в том режиме.
-        assert_eq!(DecoyMode::parse("realyy").unwrap_err(), DecoyError::UnknownMode);
+        assert_eq!(
+            DecoyMode::parse("realyy").unwrap_err(),
+            DecoyError::UnknownMode
+        );
     }
 
     #[test]

@@ -259,7 +259,17 @@ impl TunnelEngine {
     /// а не новый на каждую попытку реконнекта (см. doc на `for_session`).
     pub async fn attempt_reconnect(
         &mut self,
-    ) -> Result<(OwnedReadHalf, OwnedWriteHalf, RxCodec, TxCodec, BytesMut), AppError> {
+    ) -> Result<
+        (
+            OwnedReadHalf,
+            OwnedWriteHalf,
+            RxCodec,
+            TxCodec,
+            BytesMut,
+            [u8; 32],
+        ),
+        AppError,
+    > {
         info!("🔄 Attempting reconnect to {}", self.remote_addr);
 
         // Re-resolve the hostname each time so a server IP change or DNS
@@ -342,7 +352,12 @@ impl TunnelEngine {
                 // ветке `Ok` ниже.
                 self.muxer.force_remove_leg(self.leg_id);
                 match self.attempt_reconnect().await {
-                    Ok((new_in, new_out, new_rx, new_tx, new_tail)) => {
+                    // Реконнект НЕ переигрывает попытку UDP-ноги (см.
+                    // `Muxer::try_claim_datagram_leg_token` — она разыгрывается
+                    // только один раз на всю жизнь сессии, в
+                    // `ClientHandler::establish_leg`), поэтому свежий корень
+                    // этой конкретной пересобранной TCP-ноги здесь просто не нужен.
+                    Ok((new_in, new_out, new_rx, new_tx, new_tail, _new_datagram_root)) => {
                         internal_attempt = 0; // successful reconnect — reset counter
 
                         let cap = crate::net::NetworkConfig::global().channel_capacity;

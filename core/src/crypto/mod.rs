@@ -41,6 +41,7 @@
 
 mod aead;
 mod chacha;
+mod datagram_keys;
 mod ecdh;
 mod hkdf;
 pub mod identity;
@@ -48,5 +49,6 @@ mod session;
 
 pub(crate) use aead::AeadPacker;
 pub(crate) use chacha::{ChaChaCipher, ChaChaStream};
+pub(crate) use datagram_keys::{DatagramEpochKeys, DatagramKeyMaterial};
 pub use identity::{Identity, LocalIdentity, PeerIdentity};
 pub(crate) use session::{SessionAuth, SessionKeys};

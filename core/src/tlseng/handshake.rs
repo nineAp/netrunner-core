@@ -602,9 +602,7 @@ mod tests {
             // и не совпадал с живым браузером.
             if profile.has_grease {
                 assert!(
-                    crate::tlseng::types::TlsExtensions::is_grease(
-                        client_hello.cipher_suites[0]
-                    ),
+                    crate::tlseng::types::TlsExtensions::is_grease(client_hello.cipher_suites[0]),
                     "первым шифронабором Chromium кладёт GREASE, получено 0x{:04x}",
                     client_hello.cipher_suites[0]
                 );
@@ -937,10 +935,22 @@ mod tests {
             .find_by_type(TlsExtensions::KEY_SHARE)
             .expect("key_share обязан быть");
         let ks_g0 = u16::from_be_bytes([ks[2], ks[3]]);
-        assert_eq!(ks_g0, g0, "GREASE-группа в key_share совпадает с supported_groups");
-        assert!(ks.windows(2).any(|w| w == [0x11, 0xec]), "key_share несёт X25519MLKEM768");
-        assert!(ks.len() > 1240, "key_share без PQ-балласта мал: {}", ks.len());
-        assert!(ext.find_by_type(TlsExtensions::ECH).is_some(), "ECH есть всегда");
+        assert_eq!(
+            ks_g0, g0,
+            "GREASE-группа в key_share совпадает с supported_groups"
+        );
+        assert!(
+            ks.windows(2).any(|w| w == [0x11, 0xec]),
+            "key_share несёт X25519MLKEM768"
+        );
+        assert!(
+            ks.len() > 1240,
+            "key_share без PQ-балласта мал: {}",
+            ks.len()
+        );
+        assert!(
+            ext.find_by_type(TlsExtensions::ECH).is_some(),
+            "ECH есть всегда"
+        );
     }
-
 }

@@ -118,6 +118,7 @@ pub(crate) const MIN_VERSION_FOR_CCS: u8 = 1;
 pub(crate) const MIN_VERSION_FOR_COVER: u8 = 2;
 
 mod crypto;
+mod dgram_leg;
 /// Учётные данные ноды, которые заводит админка бэкенда: секрет входа и
 /// статическая пара X25519. Собирают их связывающие бинари (`netrunner-server`
 /// из `.env`, клиент — из конфига, полученного от бэкенда), поэтому типы видны
@@ -127,8 +128,11 @@ pub mod edge;
 pub mod net;
 pub mod nrxp;
 pub mod parser;
+mod quiceng;
 pub mod rawcast;
+mod rawdgram;
 mod tlseng;
+mod webrtceng;
 
 /// Публичная поверхность decoy-подсистемы: каталог допустимых SNI, проверенный
 /// [`DecoySni`](tlseng::decoy::DecoySni), описание витрины и cover-flight.

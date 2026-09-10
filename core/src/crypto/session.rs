@@ -130,6 +130,17 @@ pub struct SessionKeys {
     /// сервера проставляется из `session_id[0]` разобранного `ClientHello`
     /// до вывода ключей — см. [`SessionKeys::set_peer_version`].
     peer_version: u8,
+    /// `PRK` того же HKDF-extract, что породил `current_aead` (см.
+    /// [`generate_keys`](Self::generate_keys)). `None` до хендшейка.
+    ///
+    /// Единственный потребитель — [`crate::crypto::datagram_keys`]: UDP-нога
+    /// не гоняет второй хендшейк, а выводит свой ключевой материал из этого
+    /// же секрета по отдельным HKDF-меткам. Хранить именно `PRK`, а не
+    /// исходный `ikm`/ECDH-секрет — важно для forward secrecy: `ikm`
+    /// уничтожается сразу после [`generate_keys`], а `PRK` — уже необратимая
+    /// (в криптографическом смысле) функция от него, как и любой другой
+    /// производный ключ сессии, которые точно так же живут до `Drop`.
+    datagram_root: Option<Zeroizing<[u8; 32]>>,
 }
 
 impl SessionKeys {
@@ -142,6 +153,7 @@ impl SessionKeys {
             current_aead: None,
             identity: None,
             peer_version: crate::PROTOCOL_VERSION_ANONYMOUS,
+            datagram_root: None,
         }
     }
 
@@ -236,6 +248,27 @@ impl SessionKeys {
 
     pub fn get_auth_key(&self) -> [u8; 32] {
         self.auth_key
+    }
+
+    /// `true` — эта сторона инициатор (клиент) хендшейка.
+    ///
+    /// Нужен [`crate::crypto::datagram_keys`], который так же, как
+    /// [`generate_keys`](Self::generate_keys) здесь, разводит `client_*`/
+    /// `server_*` метки HKDF по ролям на tx/rx.
+    pub(crate) fn is_initiator(&self) -> bool {
+        self.salt.is_initiator
+    }
+
+    /// Копия `PRK`, из которого выведен `current_aead` (см.
+    /// [`datagram_root`](Self::datagram_root) на поле). Паникует, если вызвана
+    /// до хендшейка — тот же контракт, что у [`get_aead_parameters`](Self::get_aead_parameters).
+    pub(crate) fn datagram_root(&self) -> [u8; 32] {
+        let root: &Zeroizing<[u8; 32]> = self
+            .datagram_root
+            .as_ref()
+            .expect("Keys not generated yet. Call update_keys first.");
+        let bytes: [u8; 32] = **root;
+        bytes
     }
 
     /// Завершает хендшейк: принимает удалённую соль и публичный ключ из
@@ -449,7 +482,15 @@ impl SessionKeys {
         // ветке — уничтожаем его здесь, а не «когда-нибудь на Drop».
         self.ecdh.burn();
 
-        let hkdf = HKDF::extract_key(&self.salt.get_total(), &ikm);
+        let (prk_bytes, hkdf) = HKDF::extract_key(&self.salt.get_total(), &ikm);
+        // Датаграммная (UDP) нога выводит свой ключевой материал из этого же
+        // PRK — см. `crypto::datagram_keys` — но делает это позже, чем живёт
+        // `ikm`/`hkdf` этого вызова (та же причина, по которой tx/rx ключи
+        // сессии выводятся здесь: `ikm` уничтожается сразу после). Храним
+        // только 32-байтный `PRK`, а не сам `Hkdf<Sha256>` — из него в любой
+        // момент восстанавливается `Hkdf::from_prk`, а обратного пути (достать
+        // из готового `Hkdf` его входной `PRK`) в API крейта `hkdf` нет.
+        self.datagram_root = Some(Zeroizing::new(prk_bytes));
 
         let mut c_key = HKDF::expand_key::<32>(&hkdf, b"client_aead")
             .map_err(|e| AppError::new(ERR_NET_TLS_TAMPER, "Ошибка ключей", e))?;
@@ -520,6 +561,11 @@ impl Drop for SessionKeys {
             rx_key.zeroize();
             rx_iv.zeroize();
         }
+        // `Zeroizing<[u8; 32]>` already zeroizes itself on drop; dropping the
+        // `Option` here is enough. Spelled out so the invariant above ("НЕ
+        // ЛОМАТЬ") stays visibly true for every secret this struct carries,
+        // not just the two it had before `datagram_root` existed.
+        self.datagram_root = None;
     }
 }
 

@@ -20,6 +20,18 @@ pub const MUXER_CONGESTION_WEIGHT: f64 = 2000.0;
 /// Initial RTT estimate used before any real measurement arrives.
 pub const INITIAL_RTT_MS: u32 = 250;
 
+// ── Datagram (UDP) leg ───────────────────────────────────────────────────────
+/// Зарезервированный `leg_id` физической UDP-ноги в диагностике/логах —
+/// никогда не пересекается с TCP-ногами (`0..MAX_TUNNEL_LEGS`), потому что
+/// она не часть `Muxer::legs` вообще (см. докстринг поля `datagram_leg`).
+pub const DATAGRAM_LEG_ID: u32 = u32::MAX;
+/// Сколько ждать ЛЮБОЙ успешно расшифрованной датаграммы в ответ на первую
+/// отправленную, прежде чем считать попытку установки UDP-ноги неудавшейся
+/// и остаться на TCP. Одна попытка на сессию (см. `docs/UDP_LEG_RESEARCH.md`
+/// §1) — без агрессивных ретраев, потому что блокировка UDP в сети обычно
+/// постоянна на весь сеанс, а не транзиентна.
+pub const DATAGRAM_LEG_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
+
 // ── Timeouts ─────────────────────────────────────────────────────────────────
 /// Тайм-аут TCP-хендшейка к целевому хосту (серверная сторона).
 pub const TCP_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);

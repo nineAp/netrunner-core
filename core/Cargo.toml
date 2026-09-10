@@ -1,11 +1,16 @@
 [package]
 name = "netrunner-core"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
 
 
 [dependencies]
 chacha20poly1305 = "0.10.1"
+# Raw ChaCha20 keystream (no Poly1305), already in the tree transitively via
+# chacha20poly1305 0.10 — pinned as a direct dependency for `quiceng`'s QUIC-style
+# header protection (RFC 9001 §5.4.4 defines the mask as a raw ChaCha20 block,
+# not an AEAD call, so `chacha20poly1305`'s AEAD-only API doesn't cover it).
+chacha20 = "0.9"
 x25519-dalek = { version = "2.0", features = ["static_secrets"] }
 aead = { version = "0.5.2", features = ["bytes"] }
 hkdf = "0.12"
