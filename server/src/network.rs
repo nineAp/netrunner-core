@@ -8,7 +8,7 @@
 
 use netrunner_core::net::{
     run_datagram_listener, AuthValidator, Connection, NetworkConfig, NodeHealthReport,
-    ServerHandler, SessionManager, TunnelHandler, TOPOLOGY_PRINT_INTERVAL,
+    ServerHandler, SessionManager, TunnelHandler, MAX_TUNNEL_LEGS, TOPOLOGY_PRINT_INTERVAL,
 };
 use netrunner_core::Identity;
 use netrunner_logger::{debug, error, info, warn};
@@ -145,6 +145,27 @@ impl Network {
                 for entry in sm_clone.get_session().iter() {
                     active_muxers.push(entry.value().clone());
                 }
+
+                // Aggregate leg health across every session on this node —
+                // Prometheus already scrapes this node's /metrics (see
+                // netrunner-data/observability/prometheus.yml), so this is
+                // enough to alert on "legs died and did not come back"
+                // without reading logs by hand. `netrunner_sessions_leg_degraded`
+                // is the actionable one: a session sitting below
+                // MAX_TUNNEL_LEGS is one `TunnelEngine::run` failure away from
+                // the requeue path (see `TunnelEngine::requeue_pending`)
+                // having fewer and fewer legs to fail over onto.
+                let total_active_legs: usize =
+                    active_muxers.iter().map(|m| m.active_legs_count()).sum();
+                let expected_legs = active_muxers.len() * MAX_TUNNEL_LEGS as usize;
+                let degraded_sessions = active_muxers
+                    .iter()
+                    .filter(|m| m.active_legs_count() < MAX_TUNNEL_LEGS as usize)
+                    .count();
+                metrics::gauge!("netrunner_legs_active").set(total_active_legs as f64);
+                metrics::gauge!("netrunner_legs_expected").set(expected_legs as f64);
+                metrics::gauge!("netrunner_sessions_leg_degraded").set(degraded_sessions as f64);
+
                 // Заимствуем, а не потребляем `active_muxers` — он ещё нужен
                 // ниже, для отчёта об использовании трафика.
                 for muxer in &active_muxers {

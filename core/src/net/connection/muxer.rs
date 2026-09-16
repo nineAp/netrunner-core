@@ -325,18 +325,30 @@ pub(crate) struct TcpSocketStats {
 
 pub static GLOBAL_MIN_RTT: AtomicU32 = AtomicU32::new(INITIAL_RTT_MS);
 
-/// Write timeout that scales with the observed network RTT.
+/// Write timeout that scales with a given RTT sample — the shared scaling
+/// rule behind [`adaptive_write_timeout`] and [`Muxer::adaptive_leg_write_timeout`].
+/// Allowing ~8 RTT of drain time (capped at 60 s) keeps a slow-but-alive path
+/// from being evicted under high latency, while still reaping genuinely stuck
+/// sockets.
+fn scale_write_timeout(rtt_ms: u32, floor: Duration) -> Duration {
+    let scaled = Duration::from_millis((rtt_ms as u64).saturating_mul(8));
+    scaled.clamp(floor, Duration::from_secs(60))
+}
+
+/// Write timeout that scales with the process-wide minimum observed RTT
+/// ([`GLOBAL_MIN_RTT`]) — appropriate for a local-socket write that isn't tied
+/// to any one physical leg (bridge writes to the real destination). For a
+/// tunnel leg's own write, prefer [`Muxer::adaptive_leg_write_timeout`]: this
+/// function's RTT input is the *best* leg in the whole process, which can be
+/// far below the RTT of the specific — possibly much slower — leg actually
+/// doing the write, defeating the point documented below.
 ///
 /// On a healthy path (RTT ~50 ms) this stays at `floor`. When the path degrades
 /// to multi-second RTT (the > 2500 ms peaks seen in production), a flat 20 s
 /// timeout fires on a leg that is merely *slow*, not dead — and a killed leg
-/// triggers the leg-drop → stream-close cascade ("domino effect"). Allowing
-/// ~8 RTT of drain time (capped at 60 s) keeps slow-but-alive legs from being
-/// evicted under high latency, while still reaping genuinely stuck sockets.
+/// triggers the leg-drop → stream-close cascade ("domino effect").
 pub fn adaptive_write_timeout(floor: Duration) -> Duration {
-    let rtt_ms = GLOBAL_MIN_RTT.load(Ordering::Relaxed) as u64;
-    let scaled = Duration::from_millis(rtt_ms.saturating_mul(8));
-    scaled.clamp(floor, Duration::from_secs(60))
+    scale_write_timeout(GLOBAL_MIN_RTT.load(Ordering::Relaxed), floor)
 }
 
 /// Interleave/batch chunk size that grows with RTT.
@@ -1482,6 +1494,35 @@ impl Muxer {
         if let Some(leg) = self.legs.get(&leg_id) {
             leg.stats.rx_bytes.fetch_add(bytes, Ordering::Relaxed);
         }
+    }
+
+    /// This leg's own smoothed RTT (EWMA over PONGs, see `record_pong`), if
+    /// it's still registered. `None` before its first PONG, or once it has
+    /// been evicted — callers fall back to [`GLOBAL_MIN_RTT`] in that case.
+    pub fn leg_rtt_ms(&self, leg_id: u32) -> Option<u32> {
+        self.legs
+            .get(&leg_id)
+            .map(|leg| leg.stats.rtt_ms.load(Ordering::Relaxed))
+    }
+
+    /// Write timeout for a write on THIS specific leg, scaled by its own RTT
+    /// rather than the process-wide [`GLOBAL_MIN_RTT`].
+    ///
+    /// `adaptive_write_timeout(floor)` scales off the *fastest* leg in the
+    /// whole process — fine for a local-socket write with no single leg to
+    /// attribute it to, wrong for a leg's own write: a session with one fast
+    /// leg (RTT ~700 ms) and three legs limping at 10-20 s RTT to a degraded
+    /// path computed every leg's timeout from that 700 ms figure, so the
+    /// slow-but-alive legs kept tripping the same flat-timeout kill this
+    /// function exists to avoid (see `adaptive_write_timeout`'s doc and the
+    /// leg-death RCA). Falls back to the global figure only when this leg
+    /// hasn't reported an RTT yet (first write, before any PONG).
+    pub fn adaptive_leg_write_timeout(&self, leg_id: u32, floor: Duration) -> Duration {
+        let rtt_ms = self
+            .leg_rtt_ms(leg_id)
+            .filter(|&rtt| rtt > 0)
+            .unwrap_or_else(|| GLOBAL_MIN_RTT.load(Ordering::Relaxed));
+        scale_write_timeout(rtt_ms, floor)
     }
 
     /// Следующий свободный `stream_id` (с учётом чётности роли).

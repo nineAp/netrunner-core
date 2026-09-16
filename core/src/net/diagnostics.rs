@@ -215,6 +215,16 @@ pub struct ErrorCounters {
     pub control_channel_full_drops: u64,
     pub tunnel_write_stalls: u64,
     pub stream_errors: u64,
+    /// Messages that were still in a leg's writer buffer or unconsumed
+    /// channel when the leg died (stuck-write kill, cancellation, panic —
+    /// see `TunnelEngine::requeue_pending`) and were successfully handed to
+    /// a surviving leg instead of being dropped with the dead one.
+    pub leg_death_requeued: u64,
+    /// Same population as `leg_death_requeued`, but no live leg existed
+    /// anywhere in the session to hand them to — genuinely lost. Should
+    /// track close to zero; a sustained nonzero rate means legs are dying
+    /// faster than they can be replenished for some sessions.
+    pub leg_death_lost: u64,
 }
 
 /// Полный срез состояния системы на момент триггер-события.
@@ -262,6 +272,9 @@ pub struct DiagnosticsCounters {
     pub mux_dispatch_full_closed: AtomicU64,
     /// Frames dropped because the stream's receiver was already closed.
     pub mux_dispatch_recv_closed: AtomicU64,
+    // ── Leg-death requeue outcome (TunnelEngine::requeue_pending) ───────────
+    pub leg_death_requeued: AtomicU64,
+    pub leg_death_lost: AtomicU64,
 }
 
 impl DiagnosticsCounters {
@@ -277,6 +290,8 @@ impl DiagnosticsCounters {
             mux_dispatch_no_stream: AtomicU64::new(0),
             mux_dispatch_full_closed: AtomicU64::new(0),
             mux_dispatch_recv_closed: AtomicU64::new(0),
+            leg_death_requeued: AtomicU64::new(0),
+            leg_death_lost: AtomicU64::new(0),
         }
     }
 
@@ -288,6 +303,8 @@ impl DiagnosticsCounters {
             control_channel_full_drops: self.control_full_drops.load(Ordering::Relaxed),
             tunnel_write_stalls: self.tunnel_write_stalls.load(Ordering::Relaxed),
             stream_errors: self.stream_errors.load(Ordering::Relaxed),
+            leg_death_requeued: self.leg_death_requeued.load(Ordering::Relaxed),
+            leg_death_lost: self.leg_death_lost.load(Ordering::Relaxed),
         }
     }
 }

@@ -24,7 +24,7 @@ use std::{
 
 use bytes::{Bytes, BytesMut};
 use netrunner_logger::{
-    error, info, AppError, ERR_INFRA_TIMEOUT, ERR_NET_TLS_TAMPER, ERR_SYS_PANIC,
+    error, info, warn, AppError, ERR_INFRA_TIMEOUT, ERR_NET_TLS_TAMPER, ERR_SYS_PANIC,
 };
 use rand::RngExt;
 use tokio::{
@@ -87,6 +87,28 @@ impl FairDataQueue {
 
     fn active_streams(&self) -> usize {
         self.streams.len()
+    }
+
+    /// Empties the whole queue, preserving per-stream FIFO order (cross-stream
+    /// order is irrelevant here — this only runs on the leg-death/shutdown path,
+    /// never on the hot loop).  Used to hand back everything a dying leg's
+    /// writer had already pulled off the mpsc channel but not yet written to
+    /// the socket, so the caller can requeue it onto a surviving leg instead of
+    /// silently dropping it with the writer task — see `TunnelEngine::run`.
+    fn drain_all(&mut self) -> Vec<MuxMessage> {
+        let mut out = Vec::with_capacity(self.queued_messages);
+        let stream_ids: Vec<u32> = self
+            .new_streams
+            .drain(..)
+            .chain(self.old_streams.drain(..))
+            .collect();
+        for stream_id in stream_ids {
+            if let Some(queue) = self.streams.remove(&stream_id) {
+                out.extend(queue);
+            }
+        }
+        self.queued_messages = 0;
+        out
     }
 
     /// Returns at most `quantum` bytes for stream-oriented Data.  UDP datagrams
@@ -306,6 +328,91 @@ impl TunnelEngine {
             self.identity.as_ref(),
         )
         .await
+    }
+
+    /// Non-blocking drain of whatever is still sitting in a leg's own mpsc
+    /// channel when the leg dies — separate from `FairDataQueue`, which only
+    /// holds what the writer had already pulled *out* of the channel. Without
+    /// this, anything still queued but not yet dequeued at the moment of
+    /// death was invisible to the writer's own hand-back and would be lost
+    /// the same way `fair_data` used to be.
+    fn drain_channel(rx: Option<&mut Receiver<MuxMessage>>) -> Vec<MuxMessage> {
+        let mut out = Vec::new();
+        if let Some(rx) = rx {
+            while let Ok(msg) = rx.try_recv() {
+                out.push(msg);
+            }
+        }
+        out
+    }
+
+    /// Hands back everything a just-died leg was still holding — the
+    /// writer's `FairDataQueue` plus its unconsumed channel tail — onto a
+    /// surviving leg, via the same anti-domino failover
+    /// [`Muxer::send_to_network`](super::muxer::Muxer::send_to_network)
+    /// already uses when a channel send fails outright. Before this, that
+    /// data (up to a full channel's worth — ~4 MB, see `CHANNEL_PACKETS`)
+    /// was simply dropped with the dead leg's task: silently, with no error
+    /// surfaced to the stream's sender or the client, corrupting whatever
+    /// application response happened to be mid-flight (see docs/leg-death
+    /// RCA — this is what turned a transient leg hiccup into a stream that
+    /// hangs forever waiting for bytes that will never arrive).
+    ///
+    /// MUST run after `force_remove_leg` for this leg (it calls it itself,
+    /// idempotently) so `select_leg` never hands these messages straight
+    /// back to the leg they were just recovered from.
+    async fn requeue_pending(&self, pending: Vec<MuxMessage>) {
+        if pending.is_empty() {
+            return;
+        }
+        self.muxer.force_remove_leg(self.leg_id);
+
+        let mut recovered = 0u64;
+        let mut lost = 0u64;
+        for msg in pending {
+            // Ephemeral — the next heartbeat on whichever leg picks up the
+            // stream supersedes it, no point resending a stale one.
+            if msg.frame_type == FrameType::Heartbeat {
+                continue;
+            }
+            let stream_id = msg.stream_id;
+            match self.muxer.send_to_network(msg).await {
+                Ok(()) => {
+                    recovered += 1;
+                    crate::net::diagnostics::DIAG_COUNTERS
+                        .leg_death_requeued
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    metrics::counter!("netrunner_leg_death_requeued_total").increment(1);
+                }
+                Err(_) => {
+                    // No live leg anywhere in the session — physically
+                    // nothing to hand this to. Clean up the stream's
+                    // registration immediately rather than leaving a zombie
+                    // entry for whatever idle-timeout would otherwise catch
+                    // it, and let the client's own retry (once it notices
+                    // the hang) start clean instead of finding stale state.
+                    lost += 1;
+                    self.muxer.remove_stream(stream_id);
+                    crate::net::diagnostics::DIAG_COUNTERS
+                        .leg_death_lost
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    metrics::counter!("netrunner_leg_death_lost_total").increment(1);
+                }
+            }
+        }
+
+        if lost > 0 {
+            warn!(
+                leg_id = self.leg_id,
+                recovered, lost,
+                "Leg death: some in-flight data could not be requeued — no live legs left in session"
+            );
+        } else {
+            info!(
+                leg_id = self.leg_id,
+                recovered, "Leg death: in-flight data requeued onto surviving legs"
+            );
+        }
     }
 
     /// Главный цикл ноги: переподключение (при нужде) → запуск reader/writer →
@@ -558,13 +665,19 @@ impl TunnelEngine {
 
                             muxer_pong.record_ping_sent(leg_id);
                             let msg = MuxMessage { stream_id: 0, frame_type: FrameType::Heartbeat, data: Bytes::new() };
-                            if let Err(e) = Self::handle_outbound(&mut outbound, &mut tx_codec, msg).await {
+                            if let Err(e) = Self::handle_outbound(&mut outbound, &mut tx_codec, msg, leg_id, &muxer_pong).await {
                                 crate::net::diagnostics::send_diag_event(
                                     crate::net::diagnostics::DiagnosticsEvent::TunnelWriteStuck {
                                         leg_id, stream_id: 0,
                                     },
                                 );
-                                return Err((e, control_rx, data_rx, tx_codec));
+                                // Heartbeat carries no application data — nothing to
+                                // requeue, but whatever real Data/Control the fair
+                                // queue was still holding for OTHER streams must not
+                                // be thrown away with this leg. See the Data arm
+                                // below for why this hand-back exists at all.
+                                let pending = fair_data.drain_all();
+                                return Err((e, control_rx, data_rx, tx_codec, pending));
                             }
                         }
 
@@ -578,13 +691,21 @@ impl TunnelEngine {
                             if let Some(msg) = msg_opt {
                                 let sid = msg.stream_id;
                                 wrote_since_hb = true;
-                                if let Err(e) = Self::handle_outbound(&mut outbound, &mut tx_codec, msg).await {
+                                // Cheap: MuxMessage's payload is Bytes (refcounted),
+                                // so this is a pointer/len copy, not a memcpy. Kept
+                                // so a Close/control frame lost to a dying leg can
+                                // still be handed to a surviving one instead of
+                                // vanishing with no signal to the peer.
+                                let retry_msg = msg.clone();
+                                if let Err(e) = Self::handle_outbound(&mut outbound, &mut tx_codec, msg, leg_id, &muxer_pong).await {
                                     crate::net::diagnostics::send_diag_event(
                                         crate::net::diagnostics::DiagnosticsEvent::TunnelWriteStuck {
                                             leg_id, stream_id: sid,
                                         },
                                     );
-                                    return Err((e, control_rx, data_rx, tx_codec));
+                                    let mut pending = vec![retry_msg];
+                                    pending.extend(fair_data.drain_all());
+                                    return Err((e, control_rx, data_rx, tx_codec, pending));
                                 }
                             } else { break; }
                         }
@@ -607,14 +728,26 @@ impl TunnelEngine {
                                 .expect("fair data queue became empty during dequeue");
                             let chunk_sid = chunk_msg.stream_id;
                             let chunk_len = chunk_msg.data.len() as u64;
+                            // See the control-frame arm above: kept so this exact
+                            // chunk can be requeued onto a live leg instead of
+                            // disappearing mid-stream if the write below stalls.
+                            let retry_chunk = chunk_msg.clone();
 
-                            if let Err(e) = Self::handle_outbound(&mut outbound, &mut tx_codec, chunk_msg).await {
+                            if let Err(e) = Self::handle_outbound(&mut outbound, &mut tx_codec, chunk_msg, leg_id, &muxer_pong).await {
                                 crate::net::diagnostics::send_diag_event(
                                     crate::net::diagnostics::DiagnosticsEvent::TunnelWriteStuck {
                                         leg_id, stream_id: chunk_sid,
                                     },
                                 );
-                                return Err((e, control_rx, data_rx, tx_codec));
+                                // `retry_chunk` is this stream's earliest unsent
+                                // byte range; anything still in `fair_data` for the
+                                // same stream (e.g. the rest of a split Data
+                                // message) is strictly later, so it must follow —
+                                // not precede — `retry_chunk` to keep per-stream
+                                // order intact once requeued (see `run`'s caller).
+                                let mut pending = vec![retry_chunk];
+                                pending.extend(fair_data.drain_all());
+                                return Err((e, control_rx, data_rx, tx_codec, pending));
                             }
                             muxer_pong.record_leg_data_drained(leg_id, chunk_len);
 
@@ -632,6 +765,12 @@ impl TunnelEngine {
                         }
                     }
                 }
+                // The writer can also exit cleanly here (cancellation on leg
+                // teardown/reconnect, or the channel closing) with data still
+                // sitting in `fair_data` — that path used to drop it silently
+                // same as the error path; hand it back here too so the caller
+                // can requeue it regardless of which way the loop ended.
+                let leftover = fair_data.drain_all();
                 Ok::<
                     _,
                     (
@@ -639,52 +778,105 @@ impl TunnelEngine {
                         Receiver<MuxMessage>,
                         Receiver<MuxMessage>,
                         TxCodec,
+                        Vec<MuxMessage>,
                     ),
-                >((control_rx, data_rx, tx_codec))
+                >((control_rx, data_rx, tx_codec, leftover))
             });
 
-            let res: Result<(), AppError> = tokio::select! {
+            // Second element of the tuple is whatever the losing side of this
+            // select was still holding in flight — see `requeue_pending` doc
+            // for why letting it fall on the floor here was the actual bug.
+            let (res, mut pending): (Result<(), AppError>, Vec<MuxMessage>) = tokio::select! {
                 res_reader = &mut reader_handle => {
                     match res_reader {
                         Ok(Ok((is_eof, r_buf, returned_rx_codec))) => {
                             self.read_buf = r_buf;
                             self.rx_codec = Some(returned_rx_codec);
-                            if is_eof {
-                                token.cancel();
-                                let w_res = writer_handle.await.unwrap();
-                                let (c_rx, d_rx, returned_tx_codec) = match w_res {
-                                    Ok((c, d, t)) => (c, d, t),
-                                    Err((_, c, d, t)) => (c, d, t),
-                                };
-                                self.control_rx = Some(c_rx);
-                                self.data_rx = Some(d_rx);
-                                self.tx_codec = Some(returned_tx_codec);
 
+                            // Reader ended first (EOF or error) — cancel the
+                            // writer and let it exit through its own
+                            // cancellation branch (checked first in its
+                            // `select!`, so this is near-instant unless it's
+                            // mid-write, in which case it's bounded by its
+                            // own adaptive write timeout) instead of
+                            // hard-aborting it and losing whatever it was
+                            // still holding.
+                            token.cancel();
+                            let w_res = (&mut writer_handle).await.unwrap();
+                            let (c_rx, d_rx, returned_tx_codec, leftover) = match w_res {
+                                Ok((c, d, t, l)) => (c, d, t, l),
+                                Err((_, c, d, t, l)) => (c, d, t, l),
+                            };
+                            self.control_rx = Some(c_rx);
+                            self.data_rx = Some(d_rx);
+                            self.tx_codec = Some(returned_tx_codec);
+
+                            if is_eof {
                                 self.inbound = None;
                                 self.outbound = None;
+                                let mut pending = leftover;
+                                pending.extend(Self::drain_channel(self.control_rx.as_mut()));
+                                pending.extend(Self::drain_channel(self.data_rx.as_mut()));
+                                self.requeue_pending(pending).await;
                                 continue;
                             }
-                            Ok(())
+                            (Ok(()), leftover)
                         },
-                        Ok(Err(e)) => Err(e),
-                        Err(e) => Err(AppError::new(ERR_SYS_PANIC, "Сбой", format!("Reader panic: {}", e))),
+                        Ok(Err(e)) => {
+                            token.cancel();
+                            let leftover = match (&mut writer_handle).await {
+                                Ok(Ok((c, d, t, l))) => {
+                                    self.control_rx = Some(c);
+                                    self.data_rx = Some(d);
+                                    self.tx_codec = Some(t);
+                                    l
+                                }
+                                Ok(Err((_, c, d, t, l))) => {
+                                    self.control_rx = Some(c);
+                                    self.data_rx = Some(d);
+                                    self.tx_codec = Some(t);
+                                    l
+                                }
+                                Err(_) => Vec::new(),
+                            };
+                            (Err(e), leftover)
+                        }
+                        Err(e) => {
+                            token.cancel();
+                            let leftover = match (&mut writer_handle).await {
+                                Ok(Ok((c, d, t, l))) => {
+                                    self.control_rx = Some(c);
+                                    self.data_rx = Some(d);
+                                    self.tx_codec = Some(t);
+                                    l
+                                }
+                                Ok(Err((_, c, d, t, l))) => {
+                                    self.control_rx = Some(c);
+                                    self.data_rx = Some(d);
+                                    self.tx_codec = Some(t);
+                                    l
+                                }
+                                Err(_) => Vec::new(),
+                            };
+                            (Err(AppError::new(ERR_SYS_PANIC, "Сбой", format!("Reader panic: {}", e))), leftover)
+                        }
                     }
                 },
                 res_writer = &mut writer_handle => {
                     match res_writer {
-                        Ok(Ok((c_rx, d_rx, returned_tx_codec))) => {
+                        Ok(Ok((c_rx, d_rx, returned_tx_codec, leftover))) => {
                             self.control_rx = Some(c_rx);
                             self.data_rx = Some(d_rx);
                             self.tx_codec = Some(returned_tx_codec);
-                            Ok(())
+                            (Ok(()), leftover)
                         }
-                        Ok(Err((e, c_rx, d_rx, returned_tx_codec))) => {
+                        Ok(Err((e, c_rx, d_rx, returned_tx_codec, leftover))) => {
                             self.control_rx = Some(c_rx);
                             self.data_rx = Some(d_rx);
                             self.tx_codec = Some(returned_tx_codec);
-                            Err(e)
+                            (Err(e), leftover)
                         }
-                        Err(e) => Err(AppError::new(ERR_SYS_PANIC, "Сбой", format!("Writer panic: {}", e))),
+                        Err(e) => (Err(AppError::new(ERR_SYS_PANIC, "Сбой", format!("Writer panic: {}", e))), Vec::new()),
                     }
                 }
             };
@@ -692,6 +884,13 @@ impl TunnelEngine {
             token.cancel();
             reader_handle.abort();
             writer_handle.abort();
+
+            // Whatever never even made it out of this leg's own channels
+            // (queued by `send_to_network`, never dequeued into `fair_data`)
+            // is the same loss vector one step earlier — pick it up here too.
+            pending.extend(Self::drain_channel(self.control_rx.as_mut()));
+            pending.extend(Self::drain_channel(self.data_rx.as_mut()));
+            self.requeue_pending(pending).await;
 
             if let Err(e) = res {
                 error!("TunnelEngine critical failure: {}", e);
@@ -753,12 +952,14 @@ impl TunnelEngine {
     /// syscalls) и меньше заголовков записей на проводе.
     ///
     /// Срабатывает адаптивный по RTT дедлайн записи
-    /// ([`adaptive_write_timeout`](super::muxer::adaptive_write_timeout)) — чтобы
-    /// медленная, но живая нога не убивалась по жёсткому тайм-ауту.
+    /// ([`Muxer::adaptive_leg_write_timeout`](super::muxer::Muxer::adaptive_leg_write_timeout))
+    /// — чтобы медленная, но живая нога не убивалась по жёсткому тайм-ауту.
     async fn handle_outbound(
         outbound: &mut OwnedWriteHalf,
         tx_codec: &mut TxCodec,
         msg: MuxMessage,
+        leg_id: u32,
+        muxer: &super::muxer::Muxer,
     ) -> Result<(), AppError> {
         let mut data = msg.data;
         let stream_id = msg.stream_id;
@@ -784,12 +985,14 @@ impl TunnelEngine {
         })?;
 
         // Adaptive write deadline: floor of 20 s (BBR-friendly), but scales with
-        // the live RTT so a high-latency path (RTT > 2.5 s) doesn't trip a flat
-        // timeout on a leg that is slow rather than dead. Killing such a leg is
-        // what set off the leg-drop → stream-close cascade.
-        let write_timeout = crate::net::connection::muxer::adaptive_write_timeout(
-            std::time::Duration::from_secs(20),
-        );
+        // THIS leg's own live RTT — not the fastest leg in the process — so a
+        // high-latency path (RTT > 2.5 s) doesn't trip a flat timeout on a leg
+        // that is slow rather than dead. Killing such a leg is what set off
+        // the leg-drop → stream-close cascade; scoring it off some other,
+        // faster leg's RTT (the previous behaviour) reintroduced exactly that
+        // failure mode for any session with mixed-quality legs.
+        let write_timeout =
+            muxer.adaptive_leg_write_timeout(leg_id, std::time::Duration::from_secs(20));
         let stuck = || -> AppError {
             error!(stream_id, "🔥 Physical leg STUCK on write. Killing leg.");
             // Increment counter; the call site in run() emits the full event
@@ -883,5 +1086,37 @@ mod fair_data_queue_tests {
         assert_eq!(datagram.frame_type, FrameType::UdpData);
         assert_eq!(&datagram.data[..], b"one-datagram");
         assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn drain_all_preserves_per_stream_order_and_empties_the_queue() {
+        let mut queue = FairDataQueue::default();
+        queue.push(message(1, FrameType::Data, b"a1"));
+        queue.push(message(3, FrameType::Data, b"b1"));
+        queue.push(message(1, FrameType::Data, b"a2"));
+        queue.push(message(3, FrameType::Data, b"b2"));
+
+        let drained = queue.drain_all();
+        assert!(queue.is_empty());
+        assert_eq!(queue.queued_messages(), 0);
+
+        let stream1: Vec<&[u8]> = drained
+            .iter()
+            .filter(|m| m.stream_id == 1)
+            .map(|m| &m.data[..])
+            .collect();
+        let stream3: Vec<&[u8]> = drained
+            .iter()
+            .filter(|m| m.stream_id == 3)
+            .map(|m| &m.data[..])
+            .collect();
+        assert_eq!(stream1, vec![b"a1".as_slice(), b"a2".as_slice()]);
+        assert_eq!(stream3, vec![b"b1".as_slice(), b"b2".as_slice()]);
+    }
+
+    #[test]
+    fn drain_all_on_empty_queue_returns_empty_vec() {
+        let mut queue = FairDataQueue::default();
+        assert!(queue.drain_all().is_empty());
     }
 }
