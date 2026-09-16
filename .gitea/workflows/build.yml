@@ -74,8 +74,17 @@ jobs:
           distribution: temurin
           java-version: 17
 
+      # `packages: ""` — Google в середине сентября 2026 выпилил legacy-пакет
+      # `tools` из манифеста SDK-репозитория; дефолтный список этого action'а
+      # его всё ещё запрашивает и падает на отсутствующем пакете (известная
+      # массовая проблема, см. android-actions/setup-android#537). Пустой
+      # `packages` пропускает этот сломанный дефолтный install, но всё ещё
+      # поднимает ANDROID_HOME/cmdline-tools и принимает лицензии — этого
+      # достаточно, конкретные пакеты (NDK) ставим отдельным шагом ниже.
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          packages: ""
 
       - name: Install Android NDK
         run: sdkmanager "ndk;26.1.10909125"
