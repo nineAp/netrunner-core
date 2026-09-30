@@ -228,6 +228,19 @@ impl DatagramTx {
         Self { keys, counter: 0 }
     }
 
+    /// Сдвигает НАЧАЛЬНЫЙ счётчик эпохи 0 — нужно `webrtceng`, чтобы RTP `seq`
+    /// на проводе начинался не с 0 (RFC 3550 требует случайного старта, bug #16),
+    /// а с произвольного значения. Приёмник восстанавливает полный счётчик из
+    /// усечённого `seq` по [`expand_counter`] (первый пакет — от `highest = 0`),
+    /// поэтому любой стартовый счётчик реконструируется корректно, а nonce
+    /// остаётся уникальным. Звать ТОЛЬКО до первого [`seal`](Self::seal).
+    /// Rekey сбрасывает счётчик в 0 (см. `seal`) — случайный старт живёт лишь у
+    /// эпохи 0, но это единственная эпоха, чей «старт» вообще наблюдаем.
+    pub(crate) fn reseed_counter(&mut self, start: u64) {
+        debug_assert_eq!(self.counter, 0, "reseed must precede the first seal");
+        self.counter = start;
+    }
+
     pub(crate) fn leg_token(&self) -> [u8; 16] {
         self.keys.leg_token()
     }

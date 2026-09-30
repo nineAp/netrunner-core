@@ -53,7 +53,7 @@ use dashmap::DashMap;
 use netrunner_logger::{info, instrument, trace, warn, AppError, ERR_INFRA_TIMEOUT};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{error::TrySendError, Sender};
 use tokio::sync::Notify;
@@ -63,7 +63,8 @@ use crate::net::diagnostics::{self, DiagnosticsEvent, LegMetrics, TunnelMetrics,
 use crate::net::INITIAL_RTT_MS;
 use crate::net::{
     BACKLOG_REAPER_IDLE_TIMEOUT, BACKLOG_REAPER_INTERVAL, BACKLOG_STUCK_GRACE, BRIDGE_READ_CHUNK,
-    DATAGRAM_LEG_ID, MAX_TUNNEL_LEGS, STREAM_BACKLOG_MAX_BYTES,
+    DATAGRAM_LEG_ID, MAX_DATAGRAM_LEG_PAYLOAD, MAX_PENDING_UDP_STREAMS, MAX_TUNNEL_LEGS,
+    PENDING_UDP_STREAM_MAX_BYTES, PENDING_UDP_TTL, STREAM_BACKLOG_MAX_BYTES,
 };
 use crate::nrxp::FrameType;
 
@@ -164,6 +165,17 @@ impl StreamBacklog {
         self.last_progress_ms
             .store(diagnostics::current_timestamp_ms(), Ordering::Relaxed);
     }
+}
+
+/// Ранние `UdpData` потока, чей `UdpConnect` (по TCP) ещё не зарегистрировал его
+/// (bug #4). Держится недолго и под жёсткими границами — см.
+/// [`crate::net::PENDING_UDP_TTL`] и соседние константы.
+struct PendingUdp {
+    queue: VecDeque<Bytes>,
+    bytes: usize,
+    /// Момент создания записи — по нему `spawn_backlog_reaper` подметает
+    /// протухшие (поток так и не открылся).
+    since_ms: u64,
 }
 
 /// Кредитное окно одного потока на СТОРОНЕ ОТПРАВИТЕЛЯ: сколько байт ещё можно
@@ -463,15 +475,25 @@ pub struct Muxer {
     /// нет. Единственная точка входа к ней — [`select_udp_leg`](Self::select_udp_leg),
     /// и только для `FrameType::UdpData`.
     datagram_leg: Arc<ArcSwapOption<MuxLeg>>,
-    /// Демультиплексирующий токен UDP-ноги — устанавливается РОВНО ОДИН раз
-    /// (см. [`try_claim_datagram_leg_token`](Self::try_claim_datagram_leg_token)),
-    /// первой TCP-ногой сессии, чей хендшейк завершится. Дальнейшие
-    /// переподключения ЛЮБОЙ TCP-ноги (в том числе именно той, что выставила
-    /// значение) больше его не трогают — иначе UDP-нога рвалась бы и
-    /// пересобиралась при каждом реконнекте одной конкретной TCP-ноги, хотя
-    /// её собственное физическое состояние с этим никак не связано (см.
-    /// `ClientHandler::establish_leg`/`ServerHandler::run` за точкой вызова).
-    datagram_leg_token: Arc<OnceLock<[u8; 16]>>,
+    /// Сервер: ранние `UdpData`, обогнавшие свой `UdpConnect` (bug #4). Ключ —
+    /// `stream_id`; сливается в поток при его регистрации (`register_stream*`) и
+    /// подметается по TTL фоновым `spawn_backlog_reaper`. На клиенте карта
+    /// просто пустует (клиент регистрирует потоки сам, до отправки данных).
+    pending_udp: Arc<DashMap<u32, PendingUdp>>,
+    /// Клиентский гейт «одна UDP-попытка за раз»: заявка первой TCP-ноги, чей
+    /// хендшейк завершился. Реконнект ОТДЕЛЬНОЙ TCP-ноги его не трогает — иначе
+    /// UDP-нога рвалась бы при каждом реконнекте, хотя её физическое состояние с
+    /// этим не связано (см. `ClientHandler::establish_leg`).
+    ///
+    /// В отличие от прежнего `OnceLock`, заявка СБРАСЫВАЕТСЯ при смене сети
+    /// ([`remove_all_legs`](Self::remove_all_legs) зовёт
+    /// [`reset_datagram_leg_claim`](Self::reset_datagram_leg_claim)): старая
+    /// попытка уже мертва вместе с эпохой, и ровно одна переподключившаяся нога
+    /// поднимает НОВУЮ попытку со свежим корнем (→ свежие ключи) — без этого
+    /// UDP-нога была одноразовой и умирала на первом же переключении сети
+    /// (bug #2). На сервере это поле не используется (демультиплексирование там
+    /// ведёт `SessionManager`).
+    datagram_leg_token: Arc<Mutex<Option<[u8; 16]>>>,
 }
 
 impl Muxer {
@@ -494,7 +516,8 @@ impl Muxer {
             fatal: Arc::new(AtomicBool::new(false)),
             network_epoch: Arc::new(ArcSwap::from_pointee(CancellationToken::new())),
             datagram_leg: Arc::new(ArcSwapOption::from(None)),
-            datagram_leg_token: Arc::new(OnceLock::new()),
+            pending_udp: Arc::new(DashMap::new()),
+            datagram_leg_token: Arc::new(Mutex::new(None)),
         };
         muxer.spawn_backlog_reaper();
         muxer
@@ -589,6 +612,12 @@ impl Muxer {
             let mut idle_since: Option<Instant> = None;
             loop {
                 tokio::time::sleep(BACKLOG_REAPER_INTERVAL).await;
+
+                // Подметаем протухшие ранние UDP-буферы всегда, даже на простое:
+                // поток мог так и не открыться, и запись висела бы до следующей
+                // активности (bug #4 — буфер обязан быть строго ограничен во
+                // времени).
+                muxer.sweep_expired_pending_udp();
 
                 if muxer.active_legs_count() == 0 && muxer.streams.is_empty() {
                     let since = *idle_since.get_or_insert_with(Instant::now);
@@ -734,6 +763,13 @@ impl Muxer {
         self.stream_bindings.clear();
         self.udp_flowlets.clear();
         self.update_legs_cache();
+        // Физическая UDP-нога тоже привязана к старой эпохе и сейчас умрёт —
+        // снимаем её из выбора немедленно, не дожидаясь, пока её собственный
+        // читатель заметит отмену токена.
+        self.clear_datagram_leg();
+        // Снимаем заявку на UDP-попытку: старая попытка мертва вместе с эпохой,
+        // и следующая переподключившаяся нога поднимет новую (bug #2).
+        self.reset_datagram_leg_claim();
 
         // И действительно убить задачи ног, а не только вычистить карту:
         // старый сокет после смены сети не отдаёт ошибку, он просто молчит.
@@ -745,20 +781,31 @@ impl Muxer {
     }
 
     /// Пытается зарезервировать право поднимать UDP-ногу этой сессии за
-    /// вызывающей TCP-ногой. `true` — вызывающий выиграл гонку (это первая
-    /// TCP-нога, чей хендшейк завершился) и обязан сам поднять UDP-попытку;
-    /// `false` — кто-то другой уже либо поднимает её, либо уже поднял, либо
-    /// уже провалил (мы не переигрываем попытку — см. докстринг поля
-    /// `datagram_leg_token`).
+    /// вызывающей TCP-ногой. `true` — вызывающий выиграл гонку (заявки ещё не
+    /// было) и обязан сам поднять UDP-попытку; `false` — заявку уже кто-то
+    /// держит (поднимает/поднял/провалил в рамках ТЕКУЩЕЙ эпохи сети). Заявка
+    /// снимается [`reset_datagram_leg_claim`](Self::reset_datagram_leg_claim)
+    /// при смене сети, позволяя следующей попытке (см. докстринг поля).
     pub fn try_claim_datagram_leg_token(&self, token: [u8; 16]) -> bool {
-        self.datagram_leg_token.set(token).is_ok()
+        let mut guard = self.datagram_leg_token.lock().unwrap();
+        if guard.is_some() {
+            false
+        } else {
+            *guard = Some(token);
+            true
+        }
     }
 
-    /// Токен UDP-ноги, если хоть одна TCP-нога уже успела его выставить.
-    /// Нужен серверу при уборке сессии — снять запись из глобального
-    /// демультиплексирующего реестра (см. `server`-сторону вызова).
+    /// Снимает заявку — вызывается из [`remove_all_legs`](Self::remove_all_legs)
+    /// при смене сети, чтобы ровно одна переподключившаяся нога подняла НОВУЮ
+    /// UDP-попытку со свежим корнем (bug #2).
+    pub fn reset_datagram_leg_claim(&self) {
+        *self.datagram_leg_token.lock().unwrap() = None;
+    }
+
+    /// Текущее значение заявки, если она есть.
     pub fn datagram_leg_token(&self) -> Option<[u8; 16]> {
-        self.datagram_leg_token.get().copied()
+        *self.datagram_leg_token.lock().unwrap()
     }
 
     /// Регистрирует физически установленную UDP-ногу. Вызывается один раз
@@ -895,9 +942,14 @@ impl Muxer {
     /// откатывается на TCP-переносимый фолбэк
     /// ([`select_udp_leg_over_tcp`](Self::select_udp_leg_over_tcp), прежняя
     /// реализация этого метода целиком).
-    fn select_udp_leg(&self, stream_id: u32) -> Option<MuxLeg> {
+    fn select_udp_leg(&self, stream_id: u32, payload_len: usize) -> Option<MuxLeg> {
         if let Some(native) = self.datagram_leg.load_full() {
-            if self.datagram_leg_is_fresh(&native) {
+            // Кадр, не влезающий в потолок физической датаграммы, НЕ отдаём на
+            // native-ногу: её писатель отправил бы его одной UDP-датаграммой,
+            // которая при DF упёрлась бы в PMTU (EMSGSIZE/чёрная дыра), а без DF
+            // фрагментировалась бы (сам по себе признак для DPI). Такой кадр
+            // уходит по TCP-переносимому фолбэку — правило §1.3 (bug #5).
+            if payload_len <= MAX_DATAGRAM_LEG_PAYLOAD && self.datagram_leg_is_fresh(&native) {
                 return Some((*native).clone());
             }
         }
@@ -1075,7 +1127,7 @@ impl Muxer {
             // never hand back the same dead leg, and it terminates at None.
             loop {
                 let leg = match if message.frame_type == FrameType::UdpData {
-                    self.select_udp_leg(message.stream_id)
+                    self.select_udp_leg(message.stream_id, message.data.len())
                 } else {
                     self.select_leg(message.stream_id)
                 } {
@@ -1117,9 +1169,20 @@ impl Muxer {
                             stream_id,
                             reason: "data channel closed (leg dropped) — failing over".into(),
                         });
-                        // Evict the dead leg (also unbinds its streams) so the
-                        // next select_leg re-balances onto a healthy leg.
-                        self.remove_leg(leg.id, &leg.control_tx);
+                        if leg.id == DATAGRAM_LEG_ID {
+                            // Физическая UDP-нога НЕ живёт в `legs`, поэтому
+                            // `remove_leg(DATAGRAM_LEG_ID)` — no-op: раньше при
+                            // мёртвом писателе UDP-ноги, пока она ещё «свежая»,
+                            // `select_udp_leg` бесконечно отдавал её снова, а
+                            // reserve снова падал — холостой цикл на ~1.3 млн
+                            // итераций/с (bug #6). Снимаем именно датаграммную
+                            // ногу — следующий `select_udp_leg` откатится на TCP.
+                            self.clear_datagram_leg();
+                        } else {
+                            // Evict the dead leg (also unbinds its streams) so the
+                            // next select_leg re-balances onto a healthy leg.
+                            self.remove_leg(leg.id, &leg.control_tx);
+                        }
                         // loop → pick another leg, or return Err if none remain.
                     }
                 }
@@ -1291,6 +1354,12 @@ impl Muxer {
                 backlog,
             },
         );
+        // Слить ранние UDP-датаграммы, пришедшие ДО этой регистрации (bug #4).
+        // Строго после вставки в `streams`: иначе `dispatch_to_local` внутри
+        // flush не нашёл бы поток. Гонку с `buffer_early_udp` (тот тоже
+        // перепроверяет регистрацию после вставки в буфер) закрывает то, что
+        // обе стороны финализируют через атомарный `pending_udp.remove`.
+        self.flush_pending_udp(stream_id);
         token
     }
 
@@ -1346,6 +1415,8 @@ impl Muxer {
         }
         self.stream_bindings.remove(&stream_id);
         self.udp_flowlets.remove(&stream_id);
+        // Поток закрыт — держать под ним ранний UDP-буфер незачем.
+        self.pending_udp.remove(&stream_id);
     }
 
     // ORDERING CONTRACT: preserved by construction — each stream has exactly one
@@ -1366,6 +1437,103 @@ impl Muxer {
     // deadlocking against that shard's write-lock (DashMap locks are not
     // reentrant). An earlier version held the `Ref` across a nested
     // `remove_stream` call here and could self-deadlock the calling task.
+    /// Доставка входящей UDP-датаграммы. Отличается от [`dispatch_to_local`]
+    /// (её путь для TCP `Data`) ровно одним: если поток ещё не зарегистрирован,
+    /// кадр не отбрасывается, а коротко буферизуется — первый `UdpData` нового
+    /// потока часто обгоняет свой `UdpConnect`, едущий по TCP (bug #4). TCP
+    /// `Data` так буферизовать нельзя (там порядок и надёжность гарантируются
+    /// иначе), поэтому это отдельный вход, а не флаг внутри `dispatch_to_local`.
+    pub fn dispatch_to_local_udp(&self, stream_id: u32, data: Bytes) {
+        if self.streams.contains_key(&stream_id) {
+            self.dispatch_to_local(stream_id, data);
+        } else {
+            self.buffer_early_udp(stream_id, data);
+        }
+    }
+
+    /// Кладёт раннюю UDP-датаграмму в буфер ожидания под жёсткими границами (см.
+    /// [`PendingUdp`]). После вставки перепроверяет регистрацию потока: если он
+    /// успел появиться между нашей проверкой и вставкой, сливаем немедленно —
+    /// так гонка «зарегистрировали ровно сейчас» не оставляет кадр висеть до
+    /// TTL/подметания.
+    fn buffer_early_udp(&self, stream_id: u32, data: Bytes) {
+        let size = data.len();
+        // Слишком большой одиночный кадр в буфер ожидания не помещается вовсе.
+        if size > PENDING_UDP_STREAM_MAX_BYTES {
+            DIAG_COUNTERS
+                .mux_dispatch_no_stream
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+
+        // ВАЖНО: не звать `pending_udp.len()`/`.insert()` под guard'ом `get_mut`
+        // из той же DashMap — это шардовый лок, он не реентерабельный, и len()
+        // (обход всех шардов) на нём самоблокируется. Поэтому guard из ветки
+        // Some дропается до выхода из `if let`, а len()/insert() живут в else,
+        // где guard'а уже нет.
+        if let Some(mut p) = self.pending_udp.get_mut(&stream_id) {
+            if p.bytes + size > PENDING_UDP_STREAM_MAX_BYTES {
+                // Переполнение буфера потока — дропаем именно этот кадр,
+                // сохраняя уже накопленный префикс (у UDP нет гарантии доставки,
+                // потеря отдельной датаграммы допустима).
+                DIAG_COUNTERS
+                    .mux_dispatch_no_stream
+                    .fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            p.bytes += size;
+            p.queue.push_back(data);
+        } else {
+            // guard'а нет (get_mut вернул None) — len()/insert() безопасны.
+            if self.pending_udp.len() >= MAX_PENDING_UDP_STREAMS {
+                // Слишком много ожидающих потоков — не заводим новый (анти-DoS:
+                // иначе `UdpData` на случайные id раздувал бы память). Кадр
+                // отбрасываем.
+                DIAG_COUNTERS
+                    .mux_dispatch_no_stream
+                    .fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            let mut queue = VecDeque::with_capacity(1);
+            queue.push_back(data);
+            self.pending_udp.insert(
+                stream_id,
+                PendingUdp {
+                    queue,
+                    bytes: size,
+                    since_ms: process_uptime_ms().max(1),
+                },
+            );
+        }
+
+        // Закрываем гонку с регистрацией потока (см. докстринг). Guard из
+        // веток выше здесь уже дропнут — `flush_pending_udp` может снова
+        // локать `pending_udp` без реентерабельности.
+        if self.streams.contains_key(&stream_id) {
+            self.flush_pending_udp(stream_id);
+        }
+    }
+
+    /// Сливает ранее буферизованные ранние UDP-датаграммы в уже
+    /// зарегистрированный поток, по порядку прихода, и снимает запись буфера.
+    /// Идемпотентна: нет записи — ничего не делает.
+    fn flush_pending_udp(&self, stream_id: u32) {
+        if let Some((_, pending)) = self.pending_udp.remove(&stream_id) {
+            for data in pending.queue {
+                self.dispatch_to_local(stream_id, data);
+            }
+        }
+    }
+
+    /// Подметает протухшие записи буфера ожидания (поток так и не открылся за
+    /// [`PENDING_UDP_TTL`]) — вызывается фоновым `spawn_backlog_reaper`.
+    fn sweep_expired_pending_udp(&self) {
+        let now = process_uptime_ms();
+        let ttl_ms = PENDING_UDP_TTL.as_millis() as u64;
+        self.pending_udp
+            .retain(|_, p| now.saturating_sub(p.since_ms) < ttl_ms);
+    }
+
     pub fn dispatch_to_local(&self, stream_id: u32, data: Bytes) {
         let size = data.len() as u64;
 
@@ -1794,11 +1962,108 @@ mod scheduling_tests {
         muxer
     }
 
+    /// bug #4: ранний `UdpData`, пришедший ДО регистрации потока, обязан быть
+    /// буферизован и слит по порядку в момент регистрации (которую делает
+    /// `UdpConnect`, едущий по TCP), а не отброшен.
+    #[tokio::test]
+    async fn early_udp_data_is_buffered_then_flushed_in_order_on_registration() {
+        let muxer = Muxer::new(false, "pending-test".into());
+
+        muxer.dispatch_to_local_udp(7, Bytes::from_static(b"early-1"));
+        muxer.dispatch_to_local_udp(7, Bytes::from_static(b"early-2"));
+        assert_eq!(
+            muxer.pending_udp.len(),
+            1,
+            "early UdpData for an unregistered stream must be buffered, not dropped"
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Bytes>(8);
+        let _tok = muxer.register_stream(7, tx);
+
+        assert!(
+            muxer.pending_udp.get(&7).is_none(),
+            "registration must drain and remove the pending buffer"
+        );
+        assert_eq!(rx.recv().await.unwrap(), Bytes::from_static(b"early-1"));
+        assert_eq!(rx.recv().await.unwrap(), Bytes::from_static(b"early-2"));
+    }
+
+    /// Уже зарегистрированный поток идёт быстрым путём, без буфера ожидания.
+    #[tokio::test]
+    async fn udp_for_a_registered_stream_bypasses_the_pending_buffer() {
+        let muxer = Muxer::new(false, "pending-fast".into());
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Bytes>(8);
+        let _tok = muxer.register_stream(3, tx);
+
+        muxer.dispatch_to_local_udp(3, Bytes::from_static(b"live"));
+        assert!(muxer.pending_udp.is_empty());
+        assert_eq!(rx.recv().await.unwrap(), Bytes::from_static(b"live"));
+    }
+
+    /// Анти-DoS: буфер ожидания ограничен и по числу потоков, и по байтам на
+    /// поток — переполнение отбрасывает лишнее, не раздувая память.
+    #[tokio::test]
+    async fn pending_udp_buffer_enforces_its_caps() {
+        let muxer = Muxer::new(false, "pending-caps".into());
+
+        // Заполняем ровно до лимита числа ожидающих потоков.
+        for id in 0..MAX_PENDING_UDP_STREAMS as u32 {
+            muxer.dispatch_to_local_udp(id, Bytes::from_static(b"x"));
+        }
+        assert_eq!(muxer.pending_udp.len(), MAX_PENDING_UDP_STREAMS);
+        // Ещё один НОВЫЙ поток сверх лимита не заводится.
+        muxer.dispatch_to_local_udp(999_999, Bytes::from_static(b"x"));
+        assert_eq!(muxer.pending_udp.len(), MAX_PENDING_UDP_STREAMS);
+        assert!(muxer.pending_udp.get(&999_999).is_none());
+
+        // Байтовый потолок одного потока: одиночный кадр больше потолка не
+        // помещается вовсе.
+        let muxer2 = Muxer::new(false, "pending-bytes".into());
+        let huge = Bytes::from(vec![0u8; PENDING_UDP_STREAM_MAX_BYTES + 1]);
+        muxer2.dispatch_to_local_udp(1, huge);
+        assert!(muxer2.pending_udp.is_empty(), "oversized early datagram must be dropped");
+    }
+
+    /// TTL: свежая запись НЕ подметается, протухшая — подметается.
+    #[tokio::test]
+    async fn pending_udp_is_swept_after_ttl_but_fresh_entries_survive() {
+        let muxer = Muxer::new(false, "pending-sweep".into());
+
+        // Свежая запись переживает подметание.
+        muxer.pending_udp.insert(
+            10,
+            PendingUdp {
+                queue: std::collections::VecDeque::from(vec![Bytes::from_static(b"fresh")]),
+                bytes: 5,
+                since_ms: process_uptime_ms().max(1),
+            },
+        );
+        muxer.sweep_expired_pending_udp();
+        assert_eq!(muxer.pending_udp.len(), 1, "fresh entry must survive a sweep");
+
+        // Протухшая (старше TTL) — уходит.
+        let stale_since = process_uptime_ms().max(1);
+        muxer.pending_udp.insert(
+            11,
+            PendingUdp {
+                queue: std::collections::VecDeque::from(vec![Bytes::from_static(b"stale")]),
+                bytes: 5,
+                since_ms: stale_since,
+            },
+        );
+        tokio::time::sleep(PENDING_UDP_TTL + std::time::Duration::from_millis(150)).await;
+        muxer.sweep_expired_pending_udp();
+        assert!(
+            muxer.pending_udp.get(&11).is_none(),
+            "entry older than PENDING_UDP_TTL must be swept"
+        );
+    }
+
     #[tokio::test]
     async fn healthy_udp_burst_stays_in_one_flowlet() {
         let muxer = muxer_with_two_legs();
-        let first = muxer.select_udp_leg(11).unwrap().id;
-        let second = muxer.select_udp_leg(11).unwrap().id;
+        let first = muxer.select_udp_leg(11, 100).unwrap().id;
+        let second = muxer.select_udp_leg(11, 100).unwrap().id;
 
         assert_eq!(first, second);
     }
@@ -1806,7 +2071,7 @@ mod scheduling_tests {
     #[tokio::test]
     async fn congested_udp_flowlet_moves_to_another_leg() {
         let muxer = muxer_with_two_legs();
-        let first = muxer.select_udp_leg(13).unwrap().id;
+        let first = muxer.select_udp_leg(13, 100).unwrap().id;
         let leg = muxer.legs.get(&first).unwrap();
         leg.stats.queued_data_bytes.store(
             (leg.data_tx.max_capacity() * BRIDGE_READ_CHUNK) as u64,
@@ -1814,7 +2079,7 @@ mod scheduling_tests {
         );
         drop(leg);
 
-        let second = muxer.select_udp_leg(13).unwrap().id;
+        let second = muxer.select_udp_leg(13, 100).unwrap().id;
         assert_ne!(first, second);
     }
 
@@ -1835,7 +2100,7 @@ mod scheduling_tests {
             // тестирует именно "недавно" вне этой гонки.
             .store(1, Ordering::Relaxed);
 
-        let selected = muxer.select_udp_leg(99).unwrap();
+        let selected = muxer.select_udp_leg(99, 100).unwrap();
         assert_eq!(selected.id, DATAGRAM_LEG_ID);
     }
 
@@ -1848,7 +2113,7 @@ mod scheduling_tests {
         // Никогда не отмечался живым (last_pong_ms остаётся 0) — тот же
         // критерий "не жива", что и у TCP-ног в perform_health_check.
 
-        let selected = muxer.select_udp_leg(99).unwrap();
+        let selected = muxer.select_udp_leg(99, 100).unwrap();
         assert_ne!(
             selected.id, DATAGRAM_LEG_ID,
             "a native leg with no fresh PONG must not be selected"
@@ -1871,22 +2136,123 @@ mod scheduling_tests {
             // `datagram_leg_is_fresh`) — гарантированно ненулевое значение
             // тестирует именно "недавно" вне этой гонки.
             .store(1, Ordering::Relaxed);
-        assert_eq!(muxer.select_udp_leg(99).unwrap().id, DATAGRAM_LEG_ID);
+        assert_eq!(muxer.select_udp_leg(99, 100).unwrap().id, DATAGRAM_LEG_ID);
 
         muxer.clear_datagram_leg();
-        let selected = muxer.select_udp_leg(99).unwrap();
+        let selected = muxer.select_udp_leg(99, 100).unwrap();
         assert_ne!(selected.id, DATAGRAM_LEG_ID);
+    }
+
+    /// Кадр крупнее потолка датаграммы обязан обойти свежую native-ногу и уйти
+    /// на TCP-фолбэк (bug #5), а кадр в пределах потолка — остаться на native.
+    #[tokio::test]
+    async fn select_udp_leg_routes_oversized_payload_over_tcp() {
+        let muxer = muxer_with_two_legs();
+        let (control_tx, _control_rx) = tokio::sync::mpsc::channel(8);
+        let (data_tx, _data_rx) = tokio::sync::mpsc::channel(8);
+        muxer.set_datagram_leg(control_tx, data_tx);
+        muxer
+            .datagram_leg_stats()
+            .unwrap()
+            .last_pong_ms
+            .store(1, Ordering::Relaxed);
+
+        // В пределах потолка — native.
+        assert_eq!(
+            muxer
+                .select_udp_leg(7, MAX_DATAGRAM_LEG_PAYLOAD)
+                .unwrap()
+                .id,
+            DATAGRAM_LEG_ID
+        );
+        // На байт больше — TCP-фолбэк, несмотря на свежую native-ногу.
+        assert_ne!(
+            muxer
+                .select_udp_leg(7, MAX_DATAGRAM_LEG_PAYLOAD + 1)
+                .unwrap()
+                .id,
+            DATAGRAM_LEG_ID,
+            "кадр больше потолка не должен уходить на физическую UDP-ногу"
+        );
+    }
+
+    /// Регрессия на bug #6: если писатель native-ноги умер (его приёмники
+    /// сброшены), но нога ещё числится «свежей», `send_to_network(UdpData)`
+    /// раньше крутился вхолодную — `remove_leg(DATAGRAM_LEG_ID)` был no-op, и
+    /// `select_udp_leg` бесконечно отдавал ту же мёртвую ногу. Теперь первый же
+    /// отказ снимает датаграммную ногу через `clear_datagram_leg`.
+    #[tokio::test]
+    async fn dead_datagram_writer_clears_the_leg_instead_of_spinning() {
+        let muxer = Muxer::new(true, "spin-test".into());
+        let (control_tx, control_rx) = tokio::sync::mpsc::channel(8);
+        let (data_tx, data_rx) = tokio::sync::mpsc::channel(8);
+        muxer.set_datagram_leg(control_tx, data_tx);
+        muxer
+            .datagram_leg_stats()
+            .unwrap()
+            .last_pong_ms
+            .store(1, Ordering::Relaxed); // «свежая»
+        // Писатель мёртв: роняем приёмники, канал закрыт.
+        drop(control_rx);
+        drop(data_rx);
+        assert!(muxer.datagram_leg_stats().is_some());
+
+        // Нет TCP-ног вовсе → после снятия native-ноги остаётся только Err,
+        // а НЕ бесконечный цикл. Тест завершается — значит спина нет.
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            muxer.send_to_network(MuxMessage {
+                stream_id: 7,
+                frame_type: FrameType::UdpData,
+                data: Bytes::from_static(b"x"),
+            }),
+        )
+        .await
+        .expect("send_to_network must not spin forever on a dead datagram leg");
+        assert!(res.is_err(), "no legs left → Err, not success");
+        assert!(
+            muxer.datagram_leg_stats().is_none(),
+            "мёртвая датаграммная нога должна быть снята"
+        );
     }
 
     #[tokio::test]
     async fn try_claim_datagram_leg_token_is_first_writer_wins() {
         let muxer = Muxer::new(true, "claim-test".into());
         assert!(muxer.try_claim_datagram_leg_token([1u8; 16]));
-        // Вторая попытка — даже с ДРУГИМ токеном — обязана проиграть: гонка
-        // решается один раз на всю жизнь Muxer'а, а не в пользу
-        // "последнего/лучшего" значения.
+        // Вторая попытка — даже с ДРУГИМ токеном — обязана проиграть в пределах
+        // одной эпохи сети (а не в пользу "последнего/лучшего" значения).
         assert!(!muxer.try_claim_datagram_leg_token([2u8; 16]));
         assert_eq!(muxer.datagram_leg_token(), Some([1u8; 16]));
+    }
+
+    /// bug #2: заявку можно СБРОСИТЬ (это делает смена сети), и тогда следующая
+    /// нога поднимает новую попытку.
+    #[tokio::test]
+    async fn resetting_the_claim_allows_a_fresh_attempt() {
+        let muxer = Muxer::new(true, "reclaim-test".into());
+        assert!(muxer.try_claim_datagram_leg_token([1u8; 16]));
+        assert!(!muxer.try_claim_datagram_leg_token([2u8; 16]));
+
+        muxer.reset_datagram_leg_claim();
+        assert!(
+            muxer.try_claim_datagram_leg_token([3u8; 16]),
+            "after reset a new attempt must be claimable"
+        );
+        assert_eq!(muxer.datagram_leg_token(), Some([3u8; 16]));
+    }
+
+    /// Смена сети (`remove_all_legs`) обязана освободить заявку — иначе
+    /// UDP-нога была бы одноразовой (bug #2).
+    #[tokio::test]
+    async fn network_change_frees_the_datagram_claim() {
+        let muxer = Muxer::new(true, "nc-test".into());
+        assert!(muxer.try_claim_datagram_leg_token([1u8; 16]));
+        muxer.remove_all_legs();
+        assert!(
+            muxer.try_claim_datagram_leg_token([2u8; 16]),
+            "network change must free the datagram-leg claim for a re-attempt"
+        );
     }
 
     #[tokio::test]

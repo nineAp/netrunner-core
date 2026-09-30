@@ -140,6 +140,16 @@ pub(crate) fn choose_engine() -> DgramEngineKind {
     }
 }
 
+/// Другой движок мимикрии. Клиент пробует оба до отката на raw: монета задаёт
+/// лишь порядок, а не «мимикрия либо ничего» (см.
+/// `dgram_engine::attempt_client_datagram_leg`).
+pub(crate) fn other_engine(kind: DgramEngineKind) -> DgramEngineKind {
+    match kind {
+        DgramEngineKind::Quic => DgramEngineKind::WebRtc,
+        DgramEngineKind::WebRtc => DgramEngineKind::Quic,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -194,10 +194,18 @@ impl StreamHandler {
                     .await
             }
 
-            FrameType::Data | FrameType::UdpData => {
+            FrameType::Data => {
                 // Non-blocking: in-order delivery is guaranteed by the stream's
                 // single persistent backlog-drainer task, not by awaiting here.
                 self.muxer.dispatch_to_local(stream_id, frame.payload);
+            }
+
+            FrameType::UdpData => {
+                // Как `Data`, но с коротким буфером ожидания на сервере: первый
+                // `UdpData` нового потока часто обгоняет свой `UdpConnect`,
+                // едущий по TCP и регистрирующий поток (bug #4). На клиенте
+                // буфер не используется — поток там уже зарегистрирован.
+                self.muxer.dispatch_to_local_udp(stream_id, frame.payload);
             }
 
             FrameType::Close => {

@@ -330,6 +330,50 @@ impl TunnelEngine {
         .await
     }
 
+    /// Пере-поднимает физическую UDP-ногу после успешного реконнекта, если
+    /// заявка на попытку свободна. Заявку снимает только смена сети
+    /// (`remove_all_legs` → `Muxer::reset_datagram_leg_claim`), поэтому обычный
+    /// реконнект одной ноги сюда не приводит (заявка занята → `try_claim`
+    /// вернёт false), а смена сети — приводит: ровно одна переподключившаяся
+    /// нога выигрывает заявку и поднимает попытку со свежим корнем ЭТОЙ ноги, а
+    /// значит свежими ключами (bug #2).
+    ///
+    /// Только клиент: у сервера `remote_addr` пуст и до реконнекта дело не
+    /// доходит (см. ветку `remote_addr.is_empty()` в [`run`](Self::run)).
+    fn rearm_datagram_leg(&self, datagram_root: [u8; 32]) {
+        if self.remote_addr.is_empty() {
+            return;
+        }
+        let claim =
+            crate::crypto::DatagramKeyMaterial::derive_from_root(datagram_root, true).leg_token();
+        if !self.muxer.try_claim_datagram_leg_token(claim) {
+            return;
+        }
+        let muxer = self.muxer.clone();
+        let remote_addr = self.remote_addr.clone();
+        let decoy_sni = self.decoy_sni.clone();
+        let session_id = self.session_id.clone();
+        tokio::spawn(async move {
+            // Тот же адрес, что и у пересобранной TCP-ноги — резолвим заново
+            // (роуминг/DNS-failover мог сменить IP), как и `attempt_reconnect`.
+            let addr = match tokio::net::lookup_host(&remote_addr).await {
+                Ok(mut it) => match it.next() {
+                    Some(a) => a,
+                    None => return,
+                },
+                Err(_) => return,
+            };
+            crate::net::connection::dgram_engine::attempt_client_datagram_leg(
+                muxer,
+                addr,
+                decoy_sni,
+                session_id,
+                datagram_root,
+            )
+            .await;
+        });
+    }
+
     /// Non-blocking drain of whatever is still sitting in a leg's own mpsc
     /// channel when the leg dies — separate from `FairDataQueue`, which only
     /// holds what the writer had already pulled *out* of the channel. Without
@@ -459,12 +503,7 @@ impl TunnelEngine {
                 // ветке `Ok` ниже.
                 self.muxer.force_remove_leg(self.leg_id);
                 match self.attempt_reconnect().await {
-                    // Реконнект НЕ переигрывает попытку UDP-ноги (см.
-                    // `Muxer::try_claim_datagram_leg_token` — она разыгрывается
-                    // только один раз на всю жизнь сессии, в
-                    // `ClientHandler::establish_leg`), поэтому свежий корень
-                    // этой конкретной пересобранной TCP-ноги здесь просто не нужен.
-                    Ok((new_in, new_out, new_rx, new_tx, new_tail, _new_datagram_root)) => {
+                    Ok((new_in, new_out, new_rx, new_tx, new_tail, new_datagram_root)) => {
                         internal_attempt = 0; // successful reconnect — reset counter
 
                         let cap = crate::net::NetworkConfig::global().channel_capacity;
@@ -485,6 +524,16 @@ impl TunnelEngine {
                         self.read_buf = new_tail;
                         self.leg_status = LegStatus::Active;
                         info!("✅ Leg {} reconnected successfully", self.leg_id);
+
+                        // Пере-поднять UDP-ногу, если заявка свободна. При смене
+                        // сети `remove_all_legs` снимает её (`reset_datagram_leg_claim`),
+                        // и ровно одна переподключившаяся нога выигрывает заявку
+                        // заново и поднимает НОВУЮ попытку — со свежим корнем
+                        // ЭТОЙ ноги, а значит свежими ключами (bug #2). Обычный
+                        // реконнект одной ноги (не смена сети) заявку не снимал,
+                        // поэтому здесь `try_claim` вернёт false и лишней попытки
+                        // не будет — UDP-нога не рвётся на каждом реконнекте.
+                        self.rearm_datagram_leg(new_datagram_root);
                     }
                     Err(e) => {
                         internal_attempt += 1;

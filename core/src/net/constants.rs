@@ -32,6 +32,47 @@ pub const DATAGRAM_LEG_ID: u32 = u32::MAX;
 /// постоянна на весь сеанс, а не транзиентна.
 pub const DATAGRAM_LEG_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Потолок полезной нагрузки (байт прикладной UdpData) для одной датаграммы
+/// физической UDP-ноги. Кадр крупнее уходит по TCP-ноге как `UdpData`, а не
+/// фрагментируется (правило §1.3 исследования, bug #5).
+///
+/// Считаем консервативно от целевого внешнего размера UDP-пейлоада ~1250 байт
+/// (с запасом под самый агрессивный DPI и типичный туннельный MTU 1400+):
+/// ```text
+///   1250  внешний UDP-пейлоад
+///  -  21  худшая обвязка движка (raw: 16 leg_token + 1 epoch + 4 counter;
+///         quic ~13, rtp 12+1 — все меньше)
+///  -  25  заголовок кадра NRXP (FRAME_HEADER_SIZE)
+///  -  16  AEAD-тег
+///  = 1188  → округляем вниз до 1150 ради запаса на будущую обвязку
+/// ```
+/// UdpData не паддится (`padding_len == 0` в `nrxp::datagram`), поэтому иных
+/// слагаемых нет. С IP+UDP-заголовками (28 v4 / 48 v6) внешний пакет остаётся
+/// заметно ниже 1500 даже на IPv6.
+pub const MAX_DATAGRAM_LEG_PAYLOAD: usize = 1150;
+
+/// Сервер: первый `UdpData` нового потока может обогнать по быстрой UDP-ноге
+/// свой же `UdpConnect`, который едет по TCP и регистрирует поток (bug #4).
+/// Такие ранние датаграммы буферизуются вместо отбрасывания и сливаются в поток
+/// при его регистрации. Границы буфера жёсткие — это защита от DoS
+/// (аутентифицированный клиент иначе слал бы `UdpData` на случайные stream_id,
+/// раздувая память): не больше [`MAX_PENDING_UDP_STREAMS`] ожидающих потоков,
+/// не больше [`PENDING_UDP_STREAM_MAX_BYTES`] на поток, и не дольше
+/// [`PENDING_UDP_TTL`] (после — подметает `spawn_backlog_reaper`).
+pub const MAX_PENDING_UDP_STREAMS: usize = 256;
+pub const PENDING_UDP_STREAM_MAX_BYTES: usize = 16 * 1024;
+pub const PENDING_UDP_TTL: Duration = Duration::from_secs(2);
+
+/// Keepalive физической UDP-ноги на ПРОСТОЕ: интервал берётся случайно из
+/// `[MIN, MAX]` на каждую пробу, а не фиксированные 3 с. Жёсткий период
+/// PING/PONG раз в 3 с — сам по себе признак туннеля (bug #14); настоящий QUIC
+/// шлёт keepalive реже и вразброс. Таймер сбрасывается любым реальным кадром,
+/// поэтому под нагрузкой PING почти не уходит — freshness держат данные.
+/// Верхняя граница с запасом ниже `LEG_PONG_FRESHNESS` (45 с) и типичного
+/// UDP-NAT-таймаута (~30 с), чтобы нога не «протухала» и mapping не закрывался.
+pub const DATAGRAM_KEEPALIVE_MIN: Duration = Duration::from_secs(15);
+pub const DATAGRAM_KEEPALIVE_MAX: Duration = Duration::from_secs(25);
+
 // ── Timeouts ─────────────────────────────────────────────────────────────────
 /// Тайм-аут TCP-хендшейка к целевому хосту (серверная сторона).
 pub const TCP_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);

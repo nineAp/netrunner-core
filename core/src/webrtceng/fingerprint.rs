@@ -28,10 +28,22 @@ impl WebrtcProfile {
         timestamp_increment: 960,
     };
 
+    /// Видеопрофиль (VP8, динамический PT=96, тактовая 90 кГц — RFC 7741 §6.1).
+    /// Именно он используется физической ногой: большие пакеты (~1.2 КБ) с
+    /// timestamp по РЕАЛЬНОМУ времени и заголовочным расширением (X=1)
+    /// правдоподобнее для медиатрафика в мегабиты, чем аудио-Opus с крошечными
+    /// кадрами (bug #16). `timestamp_increment` для видео не используется —
+    /// timestamp считается из тактовой и настоящего времени (см. `WebrtcTx`).
+    pub(crate) const VP8_VIDEO: Self = Self {
+        payload_type: 96,
+        clock_rate: 90_000,
+        timestamp_increment: 0,
+    };
+
     /// Пул из одного профиля — та же причина, что у `BrowserProfile::ALL` и
     /// `QuicProfile::ALL`: расширять пул стоит только откалиброванными по
     /// живому захвату профилями, а не количеством ради количества.
-    pub(crate) const ALL: &'static [&'static Self] = &[&Self::OPUS_48K];
+    pub(crate) const ALL: &'static [&'static Self] = &[&Self::VP8_VIDEO];
 
     /// Один стабильный профиль на всю жизнь туннельной сессии — см.
     /// `BrowserProfile::for_session` за тем, почему смена отпечатка посреди

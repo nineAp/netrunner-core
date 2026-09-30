@@ -49,6 +49,8 @@ mod session;
 
 pub(crate) use aead::AeadPacker;
 pub(crate) use chacha::{ChaChaCipher, ChaChaStream};
-pub(crate) use datagram_keys::{DatagramEpochKeys, DatagramKeyMaterial};
+pub(crate) use datagram_keys::{
+    DatagramEpochKeys, DatagramKeyMaterial, DgramEngineLabel, DgramKdfContext,
+};
 pub use identity::{Identity, LocalIdentity, PeerIdentity};
 pub(crate) use session::{SessionAuth, SessionKeys};

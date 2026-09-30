@@ -11,6 +11,14 @@ chacha20poly1305 = "0.10.1"
 # header protection (RFC 9001 §5.4.4 defines the mask as a raw ChaCha20 block,
 # not an AEAD call, so `chacha20poly1305`'s AEAD-only API doesn't cover it).
 chacha20 = "0.9"
+# QUIC Initial-пакеты (`quiceng::initial`) шифруются AES-128-GCM с
+# AES-ECB header protection (RFC 9001 §5), а не нашим ChaCha20-Poly1305: ключи
+# Initial публичны (выводятся из соли и открытого DCID), поэтому пакет обязан
+# быть НАСТОЯЩИМ QUIC Initial, который расшифровывает и разбирает любой QUIC-стек
+# (в т.ч. DPI) — иначе по содержимому он не проходит проверку как QUIC. Обе —
+# чистый Rust RustCrypto, работают и на wasm.
+aes-gcm = "0.10"
+aes = "0.8"
 x25519-dalek = { version = "2.0", features = ["static_secrets"] }
 aead = { version = "0.5.2", features = ["bytes"] }
 hkdf = "0.12"
@@ -79,3 +87,15 @@ metrics = "0.24.3"
 # on a path client-edge (Cloudflare Workers) actually exercises.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 web-time = "1.1"
+
+# Инструментальная фича: включает `pub mod devtools` (эмиттеры QUIC-пакетов для
+# ручной проверки в Wireshark/tshark). Выключена по умолчанию — в обычные
+# сборки/тесты не попадает, прод-путь не трогает.
+[features]
+dev-dump = []
+
+# Пример собирается ТОЛЬКО с `--features dev-dump`, иначе `cargo build --examples`
+# не тянет его в обычных сборках.
+[[example]]
+name = "quic_initial_dump"
+required-features = ["dev-dump"]

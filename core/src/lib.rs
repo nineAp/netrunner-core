@@ -134,6 +134,12 @@ mod rawdgram;
 mod tlseng;
 mod webrtceng;
 
+/// Инструментальные эмиттеры для ручной проверки формата (QUIC Initial и др.)
+/// в Wireshark/tshark. Гейтится фичей `dev-dump` — вне обычных сборок; см.
+/// `examples/quic_initial_dump.rs`.
+#[cfg(feature = "dev-dump")]
+pub mod devtools;
+
 /// Публичная поверхность decoy-подсистемы: каталог допустимых SNI, проверенный
 /// [`DecoySni`](tlseng::decoy::DecoySni), описание витрины и cover-flight.
 /// Наружу отдаётся только этот модуль tlseng — остальное (сборка отпечатка)

@@ -70,6 +70,10 @@ pub(crate) struct DgramSessionEntry {
     /// диспетчеризации дальнейших пакетов (см.
     /// `dgram_engine::EstablishedDgramSession`).
     pub(crate) established: Option<crate::net::connection::dgram_engine::EstablishedDgramSession>,
+    /// Отправляли ли уже декоративный ответ сервера на QUIC Initial этой сессии
+    /// (bug #12). Только для quic-записи (Initial адресуется её DCID); шлём
+    /// ровно один раз, чтобы дубликат Initial не породил повторный flight.
+    pub(crate) responded_to_initial: bool,
 }
 
 /// Реестр активных сессий сервера: `session_id` → общий на сессию [`Muxer`].
@@ -85,6 +89,17 @@ pub struct SessionManager {
     dgram_by_quic_dcid: DashMap<[u8; 8], DgramSessionEntry>,
     dgram_by_webrtc_ssrc: DashMap<u32, DgramSessionEntry>,
     dgram_by_raw_token: DashMap<[u8; 16], DgramSessionEntry>,
+    /// `(session_id, leg_id)` → `leg_token`, зарегистрированный сейчас для
+    /// корня ЭТОЙ ноги. Нужен, чтобы (а) заменить демультиплексирующие записи
+    /// ноги при её реконнекте со свежим корнем и (б) снять записи ВСЕХ ног
+    /// сессии при её закрытии. Регистрация корня КАЖДОЙ ноги (а не только
+    /// первой, как раньше через `OnceLock`) — то, что убирает гонку №3: какую
+    /// бы ногу клиент ни выбрал для своей единственной UDP-попытки, сервер уже
+    /// держит корень именно этой ноги в демультиплексирующих картах. Это
+    /// достигает той же цели, что предложенная в доке сигнализация
+    /// `DgramOffer`/`DgramAccept`, но без нового типа кадра и бампа версии
+    /// протокола.
+    dgram_tokens_by_leg: DashMap<(String, u32), [u8; 16]>,
 }
 
 impl Default for SessionManager {
@@ -100,6 +115,7 @@ impl SessionManager {
             dgram_by_quic_dcid: DashMap::new(),
             dgram_by_webrtc_ssrc: DashMap::new(),
             dgram_by_raw_token: DashMap::new(),
+            dgram_tokens_by_leg: DashMap::new(),
         }
     }
 
@@ -126,27 +142,54 @@ impl SessionManager {
     /// какой из них выберет клиент (см. `dgram_leg::choose_engine`, бросается
     /// НА КЛИЕНТЕ), поэтому регистрирует приёмники под все три
     /// демультиплексирующих ключа сразу. Реально сработает только тот, на
-    /// чей ключ действительно придёт первая датаграмма — остальные два
-    /// молча простаивают до уборки сессии.
+    /// чей ключ действительно придёт первая датаграмма — остальные молча
+    /// простаивают до уборки сессии.
     ///
     /// Вызывается из [`ServerHandler::run`] сразу по завершении хендшейка
-    /// КАЖДОЙ TCP-ноги; фактическая регистрация происходит только для
-    /// первой, выигравшей гонку за [`Muxer::try_claim_datagram_leg_token`] —
-    /// остальные вызовы для той же сессии — no-op.
-    pub(crate) fn register_datagram_session(&self, muxer: &Arc<Muxer>, datagram_root: [u8; 32]) {
-        use crate::crypto::DatagramKeyMaterial;
+    /// КАЖДОЙ TCP-ноги, и регистрирует корень ИМЕННО ЭТОЙ ноги (а не только
+    /// первой). Так убирается гонка №3: клиент выбирает для своей единственной
+    /// UDP-попытки корень своей первой завершившейся ноги, и раньше сервер мог
+    /// выбрать (через `OnceLock`) корень ДРУГОЙ ноги — тогда `leg_token` не
+    /// совпадали и UDP не поднимался. Теперь сервер держит корни всех ног, и
+    /// какой бы клиент ни выбрал — попадёт. Реконнект ноги со свежим корнем
+    /// заменяет её прежние записи (см. `dgram_tokens_by_leg`), а не плодит
+    /// мёртвые.
+    pub(crate) fn register_datagram_session(
+        &self,
+        muxer: &Arc<Muxer>,
+        leg_id: u32,
+        datagram_root: [u8; 32],
+    ) {
+        use crate::crypto::{DatagramKeyMaterial, DgramEngineLabel, DgramKdfContext};
         use crate::nrxp::DatagramRx as CoreDatagramRx;
 
-        // `derive_from_root` детерминирована — используется только чтобы
-        // узнать `leg_token` заранее и провести гонку заявок; фактические
-        // приёмники ниже выводятся заново каждый раз перед тем, как
-        // консьюмировать материал в `DatagramRx::new`.
+        // `leg_token` НЕ зависит от контекста движка (см. `DgramEngineLabel`) —
+        // считаем его один раз (нейтральным выводом) и по нему заводим все три
+        // демультиплексирующих ключа.
         let leg_token = DatagramKeyMaterial::derive_from_root(datagram_root, false).leg_token();
-        if !muxer.try_claim_datagram_leg_token(leg_token) {
-            return;
+
+        // Идемпотентность и замена при реконнекте: если у этой (session, leg)
+        // уже зарегистрирован ТОТ ЖЕ корень — ничего не делаем; если ДРУГОЙ
+        // (нога переподключилась со свежим ECDH) — сначала снимаем прежние
+        // записи, потом заводим новые, чтобы мёртвые корни не копились (bug #8).
+        let key = (muxer.session_id().to_string(), leg_id);
+        if let Some(prev) = self.dgram_tokens_by_leg.get(&key).map(|r| *r) {
+            if prev == leg_token {
+                return;
+            }
+            self.remove_dgram_entries_for_token(&prev);
         }
 
-        let quic_material = DatagramKeyMaterial::derive_from_root(datagram_root, false);
+        // AEAD/HP-материал КАЖДОЙ карты выводится под меткой СВОЕГО движка:
+        // клиент выбирает один движок и выводит ключи под его меткой, поэтому
+        // сервер обязан приготовить приёмник каждого движка на его собственном
+        // ключевом материале (bug #18 — иначе raw и мимикрия делили бы ключ).
+        // `attempt = 0`: установка ноги пока одноразовая (Этап 1 введёт рост).
+        let quic_material = DatagramKeyMaterial::derive_from_root_ctx(
+            datagram_root,
+            false,
+            DgramKdfContext::new(DgramEngineLabel::Quic, 0),
+        );
         let quic_hp = quic_material.hp_key_rx();
         let quic_rx = crate::quiceng::QuicRx::new(
             CoreDatagramRx::new(quic_material),
@@ -160,10 +203,15 @@ impl SessionManager {
                 rx: crate::dgram_leg::DgramRx::Quic(quic_rx),
                 datagram_root,
                 established: None,
+                responded_to_initial: false,
             },
         );
 
-        let webrtc_material = DatagramKeyMaterial::derive_from_root(datagram_root, false);
+        let webrtc_material = DatagramKeyMaterial::derive_from_root_ctx(
+            datagram_root,
+            false,
+            DgramKdfContext::new(DgramEngineLabel::WebRtc, 0),
+        );
         let webrtc_rx = crate::webrtceng::WebrtcRx::new(CoreDatagramRx::new(webrtc_material));
         self.dgram_by_webrtc_ssrc.insert(
             crate::dgram_leg::webrtc_ssrc_client(&leg_token),
@@ -172,10 +220,15 @@ impl SessionManager {
                 rx: crate::dgram_leg::DgramRx::WebRtc(webrtc_rx),
                 datagram_root,
                 established: None,
+                responded_to_initial: false,
             },
         );
 
-        let raw_material = DatagramKeyMaterial::derive_from_root(datagram_root, false);
+        let raw_material = DatagramKeyMaterial::derive_from_root_ctx(
+            datagram_root,
+            false,
+            DgramKdfContext::new(DgramEngineLabel::Raw, 0),
+        );
         let raw_rx = crate::rawdgram::RawDgramRx::new(CoreDatagramRx::new(raw_material));
         self.dgram_by_raw_token.insert(
             leg_token,
@@ -184,18 +237,39 @@ impl SessionManager {
                 rx: crate::dgram_leg::DgramRx::Raw(raw_rx),
                 datagram_root,
                 established: None,
+                responded_to_initial: false,
             },
         );
+
+        self.dgram_tokens_by_leg.insert(key, leg_token);
+    }
+
+    /// Снимает все три демультиплексирующие записи одного корня по его
+    /// `leg_token`. Общая точка для реконнект-замены и уборки сессии.
+    fn remove_dgram_entries_for_token(&self, leg_token: &[u8; 16]) {
+        self.dgram_by_quic_dcid
+            .remove(&crate::dgram_leg::quic_dcid_client(leg_token));
+        self.dgram_by_webrtc_ssrc
+            .remove(&crate::dgram_leg::webrtc_ssrc_client(leg_token));
+        self.dgram_by_raw_token.remove(leg_token);
     }
 
     pub fn remove(&self, session_id: &str) {
-        if let Some((_, muxer)) = self.sessions.remove(session_id) {
-            if let Some(leg_token) = muxer.datagram_leg_token() {
-                self.dgram_by_quic_dcid
-                    .remove(&crate::dgram_leg::quic_dcid_client(&leg_token));
-                self.dgram_by_webrtc_ssrc
-                    .remove(&crate::dgram_leg::webrtc_ssrc_client(&leg_token));
-                self.dgram_by_raw_token.remove(&leg_token);
+        if self.sessions.remove(session_id).is_some() {
+            // Снимаем записи ВСЕХ ног сессии (каждая нога регистрировала свой
+            // корень — см. `register_datagram_session`). Собираем ключи в
+            // owned-вектор до удаления, чтобы не держать итератор одной
+            // DashMap во время `.remove` из неё же.
+            let leg_keys: Vec<(String, u32)> = self
+                .dgram_tokens_by_leg
+                .iter()
+                .filter(|kv| kv.key().0 == session_id)
+                .map(|kv| kv.key().clone())
+                .collect();
+            for key in leg_keys {
+                if let Some((_, token)) = self.dgram_tokens_by_leg.remove(&key) {
+                    self.remove_dgram_entries_for_token(&token);
+                }
             }
             info!("🧹 Session {} completely closed and cleaned up", session_id);
         }
@@ -1560,7 +1634,7 @@ impl TunnelHandler for ServerHandler {
 
         let muxer = self.session_manager.get_or_create(&session_id);
         self.session_manager
-            .register_datagram_session(&muxer, datagram_root);
+            .register_datagram_session(&muxer, leg_id, datagram_root);
 
         // Проверка личности клиента у бэкенда — только если этот инстанс
         // запущен с `--require-auth`. До этой точки соединение прошло

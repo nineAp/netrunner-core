@@ -34,6 +34,7 @@
 //! поэтому наш `ClientHello` внутри обязан быть той же настоящей мимикрией
 //! под браузер, а не отдельной, хуже откалиброванной подделкой.
 
+mod client_hello;
 mod fingerprint;
 mod header;
 mod initial;
@@ -42,7 +43,7 @@ mod real;
 
 pub(crate) use fingerprint::QuicProfile;
 pub(crate) use header::{QuicRx, QuicTx};
-pub(crate) use initial::build_client_initial;
+pub(crate) use initial::{build_client_initial, build_server_initial_flight};
 // Никто пока не вызывает — `QuicMode::Real` не подключён к жизненному циклу
 // ноги (см. докстринг модуля `real`, там же — что именно для этого нужно).
 // Экспорт оставлен как обозначенная точка расширения, а не удалён вместе с

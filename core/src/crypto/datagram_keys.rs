@@ -38,6 +38,83 @@ use zeroize::Zeroizing;
 use crate::crypto::hkdf::HKDF;
 use crate::crypto::session::SessionKeys;
 
+/// Метка движка UDP-ноги, вплетаемая в вывод AEAD/HP-ключей (НЕ в `leg_token`).
+///
+/// Зачем: попытка через мимикрию и запасной raw выводят ключи из одного и того
+/// же `datagram_root` и оба начинают счётчик nonce с 0. Без разделяющей метки
+/// первый же PING (`counter == 0`) шифруется дважды под ОДНИМ ключом с разным
+/// AAD — повторное использование одноразового ключа Poly1305 (bug #18). Метка
+/// делает ключевой материал каждого движка криптографически независимым, и
+/// совпадение счётчиков между движками перестаёт что-либо значить.
+///
+/// `leg_token` в контекст НЕ входит намеренно: сервер ищет по нему сессию во
+/// входящей датаграмме ДО расшифровки и обязан вывести тот же токен, не зная
+/// заранее, какой движок выбрал клиент, — поэтому токен остаётся функцией
+/// только корня, а расходятся лишь ключи шифрования, привязанные к уже
+/// известной обеим сторонам записи (у сервера — по одной на движок, см.
+/// `SessionManager::register_datagram_session`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DgramEngineLabel {
+    /// Нейтральный контекст: используется там, где нужен только `leg_token`
+    /// (демультиплексирующая заявка/уборка), а конкретный движок ещё неизвестен
+    /// или неважен, и в тестах, которым безразлична межмоторная независимость.
+    Base,
+    Quic,
+    WebRtc,
+    Raw,
+}
+
+impl DgramEngineLabel {
+    fn as_bytes(self) -> &'static [u8] {
+        match self {
+            Self::Base => b"base",
+            Self::Quic => b"quic",
+            Self::WebRtc => b"webrtc",
+            Self::Raw => b"raw",
+        }
+    }
+}
+
+/// Контекст вывода ключей UDP-ноги помимо самого корня: движок и номер попытки.
+///
+/// `attempt` пока всегда 0 (в этой правке установка ноги одноразовая — см.
+/// `Muxer::try_claim_datagram_leg_token`). Поле заведено под Этап 1: повторные
+/// попытки после смены сети обязаны получать свежие ключи, а сигнализация
+/// `attempt_id` по управляющему каналу как раз и будет подставлять сюда
+/// растущий номер. До тех пор обе стороны используют 0.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DgramKdfContext {
+    pub(crate) engine: DgramEngineLabel,
+    pub(crate) attempt: u16,
+}
+
+impl DgramKdfContext {
+    pub(crate) fn new(engine: DgramEngineLabel, attempt: u16) -> Self {
+        Self { engine, attempt }
+    }
+
+    /// Нейтральный контекст (`Base`, попытка 0) — для путей, которым нужен
+    /// только `leg_token`.
+    const BASE: Self = Self {
+        engine: DgramEngineLabel::Base,
+        attempt: 0,
+    };
+
+    /// Складывает базовую метку HKDF с контекстом в единый `info`. Разделитель
+    /// `0x00` между частями исключает коллизию вида `base="chain-c2s" + engine`
+    /// с другим разбиением тех же байт.
+    fn info(&self, base: &[u8]) -> Vec<u8> {
+        let engine = self.engine.as_bytes();
+        let mut v = Vec::with_capacity(base.len() + 1 + engine.len() + 1 + 2);
+        v.extend_from_slice(base);
+        v.push(0);
+        v.extend_from_slice(engine);
+        v.push(0);
+        v.extend_from_slice(&self.attempt.to_be_bytes());
+        v
+    }
+}
+
 /// Ключи одной эпохи ratchet'а, готовые к использованию AEAD-примитивом
 /// [`crate::nrxp::datagram`]: `salt` играет ту же роль, что `base_iv` в
 /// [`super::chacha::ChaChaStream`] — базовый nonce, XOR'имый со счётчиком.
@@ -132,6 +209,11 @@ impl DatagramKeyMaterial {
     /// Выводит корень UDP-ноги из уже установленной сессии. Требует
     /// завершённого хендшейка (паникует иначе — тот же контракт, что у
     /// [`SessionKeys::datagram_root`]).
+    ///
+    /// Нейтральный контекст (`Base`): используется тестами и путями, которым
+    /// важен только `leg_token`. Реальная оркестровка ноги выводит материал
+    /// через [`derive_from_root_ctx`](Self::derive_from_root_ctx) с меткой
+    /// конкретного движка.
     pub(crate) fn derive(session_keys: &SessionKeys) -> Self {
         Self::derive_from_root(session_keys.datagram_root(), session_keys.is_initiator())
     }
@@ -145,17 +227,33 @@ impl DatagramKeyMaterial {
     /// каждый из которых владеет своей копией целиком). `derive` выше — тонкая
     /// обёртка поверх этого метода.
     pub(crate) fn derive_from_root(root: [u8; 32], is_initiator: bool) -> Self {
+        Self::derive_from_root_ctx(root, is_initiator, DgramKdfContext::BASE)
+    }
+
+    /// То же, что [`derive_from_root`](Self::derive_from_root), но с явным
+    /// [`DgramKdfContext`] (метка движка + номер попытки), вплетаемым во ВСЕ
+    /// выводы, КРОМЕ `leg_token`. Именно этот метод зовёт реальная оркестровка
+    /// ноги: клиентские `build_*_pair`, серверная `register_datagram_session` и
+    /// `build_matching_tx` — каждый со своей меткой движка, чтобы raw и мимикрия
+    /// не делили ключ (bug #18). См. докстринг [`DgramEngineLabel`].
+    pub(crate) fn derive_from_root_ctx(
+        root: [u8; 32],
+        is_initiator: bool,
+        ctx: DgramKdfContext,
+    ) -> Self {
         let hk = HKDF::from_prk(&root);
 
+        // `leg_token` — БЕЗ контекста: сервер выводит его, не зная выбранного
+        // клиентом движка (см. докстринг `DgramEngineLabel`).
         let leg_token = HKDF::expand_key::<16>(&hk, b"dgram-leg-token")
             .expect("fixed-length HKDF-expand cannot fail");
-        let c2s0 = HKDF::expand_key::<32>(&hk, b"dgram-chain-c2s")
+        let c2s0 = HKDF::expand_key::<32>(&hk, &ctx.info(b"dgram-chain-c2s"))
             .expect("fixed-length HKDF-expand cannot fail");
-        let s2c0 = HKDF::expand_key::<32>(&hk, b"dgram-chain-s2c")
+        let s2c0 = HKDF::expand_key::<32>(&hk, &ctx.info(b"dgram-chain-s2c"))
             .expect("fixed-length HKDF-expand cannot fail");
-        let hp_c2s = HKDF::expand_key::<32>(&hk, b"dgram-hp-c2s")
+        let hp_c2s = HKDF::expand_key::<32>(&hk, &ctx.info(b"dgram-hp-c2s"))
             .expect("fixed-length HKDF-expand cannot fail");
-        let hp_s2c = HKDF::expand_key::<32>(&hk, b"dgram-hp-s2c")
+        let hp_s2c = HKDF::expand_key::<32>(&hk, &ctx.info(b"dgram-hp-s2c"))
             .expect("fixed-length HKDF-expand cannot fail");
 
         // Та же симметрия ролей, что в `SessionKeys::generate_keys`: клиент
@@ -335,5 +433,81 @@ mod tests {
             DatagramKeyMaterial::derive(&client_a).leg_token(),
             DatagramKeyMaterial::derive(&client_b).leg_token(),
         );
+    }
+
+    /// Регрессия на bug #18: движки, выведенные из ОДНОГО корня, обязаны иметь
+    /// РАЗНЫЕ ключи (иначе счётчик nonce у каждого стартует с 0 под общим
+    /// ключом — повтор одноразового ключа Poly1305), но ОДИН И ТОТ ЖЕ
+    /// `leg_token` (это демультиплексор сервера, он обязан совпасть до
+    /// расшифровки).
+    #[test]
+    fn distinct_engines_get_distinct_keys_but_share_the_leg_token() {
+        let root = [0x5Au8; 32];
+        let quic = DatagramKeyMaterial::derive_from_root_ctx(
+            root,
+            true,
+            DgramKdfContext::new(DgramEngineLabel::Quic, 0),
+        );
+        let webrtc = DatagramKeyMaterial::derive_from_root_ctx(
+            root,
+            true,
+            DgramKdfContext::new(DgramEngineLabel::WebRtc, 0),
+        );
+        let raw = DatagramKeyMaterial::derive_from_root_ctx(
+            root,
+            true,
+            DgramKdfContext::new(DgramEngineLabel::Raw, 0),
+        );
+
+        // Демультиплексор общий на все движки.
+        assert_eq!(quic.leg_token(), webrtc.leg_token());
+        assert_eq!(quic.leg_token(), raw.leg_token());
+
+        // А вот ключи (и HP-ключи) — попарно различны.
+        let keys = [
+            quic.tx_current().key,
+            webrtc.tx_current().key,
+            raw.tx_current().key,
+        ];
+        assert_ne!(keys[0], keys[1]);
+        assert_ne!(keys[0], keys[2]);
+        assert_ne!(keys[1], keys[2]);
+        assert_ne!(quic.hp_key_tx(), raw.hp_key_tx());
+    }
+
+    /// Разные номера попытки (Этап 1) тоже обязаны давать разные ключи при том
+    /// же движке и корне — фиксируем это заранее, пока сигнализация attempt_id
+    /// ещё не подключена.
+    #[test]
+    fn distinct_attempts_get_distinct_keys() {
+        let root = [0x5Au8; 32];
+        let a0 = DatagramKeyMaterial::derive_from_root_ctx(
+            root,
+            true,
+            DgramKdfContext::new(DgramEngineLabel::Quic, 0),
+        );
+        let a1 = DatagramKeyMaterial::derive_from_root_ctx(
+            root,
+            true,
+            DgramKdfContext::new(DgramEngineLabel::Quic, 1),
+        );
+        assert_eq!(a0.leg_token(), a1.leg_token());
+        assert_ne!(a0.tx_current().key, a1.tx_current().key);
+    }
+
+    /// Нейтральный `derive_from_root` эквивалентен явному `Base`-контексту —
+    /// значит тесты и пути, зовущие старое API, не разъезжаются с новым.
+    #[test]
+    fn neutral_derive_matches_explicit_base_context() {
+        let root = [0x33u8; 32];
+        let neutral = DatagramKeyMaterial::derive_from_root(root, true);
+        let base = DatagramKeyMaterial::derive_from_root_ctx(
+            root,
+            true,
+            DgramKdfContext::new(DgramEngineLabel::Base, 0),
+        );
+        assert_eq!(neutral.leg_token(), base.leg_token());
+        assert_eq!(neutral.tx_current().key, base.tx_current().key);
+        assert_eq!(neutral.hp_key_tx(), base.hp_key_tx());
     }
 }
