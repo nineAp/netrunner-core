@@ -52,7 +52,7 @@ pub use auth::{AuthValidator, NodeHealthReport, UsageReport, UserQuota};
 pub use config::NetworkConfig;
 #[cfg(not(target_arch = "wasm32"))]
 pub use connection::{
-    run_datagram_listener, ClientHandler, Connection, Muxer, ServerHandler, SessionManager,
+    run_datagram_listener, BUF_CAP, ClientHandler, Connection, Muxer, ServerHandler, SessionManager,
     TunnelHandler, GLOBAL_MIN_RTT,
 };
 pub use constants::*;

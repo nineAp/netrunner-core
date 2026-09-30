@@ -72,10 +72,38 @@ const TUN_READ_BUF_SIZE: usize = 65536;
 /// 2 ms is a good balance: low enough for interactive traffic (<5ms added RTT),
 /// high enough to avoid spinning the CPU under light load.
 const MAX_POLL_SLEEP: Duration = Duration::from_millis(2);
-/// Per-socket download backlog cap. A socket whose channel stays full for more
-/// than this many queued frames is treated as a dead/stuck consumer and dropped,
-/// so it can never stall the shared download pipe for other sockets.
-const MAX_PENDING_FRAMES_PER_SOCKET: usize = 64;
+/// Per-socket download backlog byte cap: a last-resort OOM guard only. The
+/// end-to-end credit window already bounds what the server may have in flight per
+/// stream, so a healthy (merely slow) consumer never gets near this.
+///
+/// This used to be a frame COUNT (64 frames), which killed perfectly live
+/// downloads whenever the local smoltcp socket drained a little slower than the
+/// tunnel delivered — a slow consumer is not a dead one.
+const MAX_PENDING_BYTES_PER_SOCKET: usize = 16 * 1024 * 1024;
+/// A socket is judged dead only when it has a backlog AND has accepted not a
+/// single frame for this long (the app stopped reading entirely).
+const PENDING_STALL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Ordered backlog of download frames for one socket whose channel was full.
+struct Backlog {
+    q: std::collections::VecDeque<Bytes>,
+    bytes: usize,
+    /// Last time the consumer accepted a frame (or the backlog was created).
+    last_progress: StdInstant,
+}
+
+impl Backlog {
+    fn new(first: Bytes) -> Self {
+        let bytes = first.len();
+        let mut q = std::collections::VecDeque::with_capacity(8);
+        q.push_back(first);
+        Self {
+            q,
+            bytes,
+            last_progress: StdInstant::now(),
+        }
+    }
+}
 /// Max diagnostics snapshots buffered locally awaiting upload to the server.
 /// The most useful triggers (leg disconnect/reconnect) fire exactly when no leg
 /// is up to carry them, so snapshots wait here and flush once a leg recovers.
@@ -116,9 +144,10 @@ pub struct Engine {
     /// shared download pipe for other sockets — the old single global slot did
     /// exactly that: one stuck socket (e.g. an app that stopped reading after a
     /// speedtest) froze rx_tunnel draining for everyone, killing all download.
-    /// Frames per socket stay in order; a backlog past
-    /// MAX_PENDING_FRAMES_PER_SOCKET means the consumer is dead → socket dropped.
-    pending_download: std::collections::HashMap<u64, std::collections::VecDeque<Bytes>>,
+    /// Frames per socket stay in order; a socket is dropped only when its backlog
+    /// exceeds MAX_PENDING_BYTES_PER_SOCKET or makes no progress for
+    /// PENDING_STALL_TIMEOUT (the consumer is dead).
+    pending_download: std::collections::HashMap<u64, Backlog>,
     /// Cumulative download diagnostics (logged every STATS_LOG_INTERVAL).
     dl_dispatched: u64,
     dl_dropped_stuck: u64,
@@ -289,30 +318,50 @@ impl Engine {
                             continue;
                         }
                     };
-                    if let Some(q) = self.pending_download.get_mut(&sid) {
-                        while let Some(front) = q.pop_front() {
+                    let mut stalled = false;
+                    if let Some(b) = self.pending_download.get_mut(&sid) {
+                        while let Some(front) = b.q.pop_front() {
+                            let len = front.len();
                             match tx.try_send(front) {
                                 Ok(_) => {
                                     work_done = true;
                                     self.dl_dispatched += 1;
+                                    b.bytes = b.bytes.saturating_sub(len);
+                                    b.last_progress = StdInstant::now();
                                 }
                                 Err(mpsc::error::TrySendError::Full(p)) => {
-                                    q.push_front(p);
+                                    b.q.push_front(p);
                                     break;
                                 }
                                 Err(mpsc::error::TrySendError::Closed(_)) => {
                                     self.dl_recv_closed += 1;
-                                    q.clear();
+                                    b.q.clear();
+                                    b.bytes = 0;
                                     break;
                                 }
                             }
                         }
+                        stalled =
+                            !b.q.is_empty() && b.last_progress.elapsed() > PENDING_STALL_TIMEOUT;
                     }
-                    // Drop the backlog entry once fully drained (borrow of q ended).
+                    if stalled {
+                        // The consumer accepted nothing for PENDING_STALL_TIMEOUT: the
+                        // app really stopped reading. Free the pipe for other sockets.
+                        self.dl_dropped_stuck += 1;
+                        warn!(
+                            "📥 Download: socket {} made no progress for {:?} — consumer dead, dropping",
+                            sid, PENDING_STALL_TIMEOUT
+                        );
+                        self.pending_download.remove(&sid);
+                        local_cache.remove(&sid);
+                        inbound_map.remove(&sid);
+                        continue;
+                    }
+                    // Drop the backlog entry once fully drained (borrow ended).
                     if self
                         .pending_download
                         .get(&sid)
-                        .is_some_and(|q| q.is_empty())
+                        .is_some_and(|b| b.q.is_empty())
                     {
                         self.pending_download.remove(&sid);
                     }
@@ -416,11 +465,11 @@ impl Engine {
                 // climb while TunDevice ↓ is flat, the stall is at the smoltcp/app
                 // boundary; if they stay ~0, look upstream (muxer/leg dispatch).
                 let pending_sockets = self.pending_download.len();
-                let pending_frames: usize = self.pending_download.values().map(|q| q.len()).sum();
+                let pending_frames: usize = self.pending_download.values().map(|b| b.q.len()).sum();
                 let worst_backlog = self
                     .pending_download
                     .values()
-                    .map(|q| q.len())
+                    .map(|b| b.q.len())
                     .max()
                     .unwrap_or(0);
                 info!(
@@ -534,7 +583,7 @@ impl Engine {
     /// Deliver ONE download frame to its local socket without ever blocking
     /// other sockets. If the socket already has a backlog, the frame is appended
     /// (preserving in-order delivery). If the channel is full a per-socket
-    /// backlog is started. A backlog past MAX_PENDING_FRAMES_PER_SOCKET means the
+    /// backlog is started. A backlog past MAX_PENDING_BYTES_PER_SOCKET (or stalled for PENDING_STALL_TIMEOUT) means the
     /// consumer is dead → the socket is dropped so it can't stall the shared pipe.
     fn route_download(
         &mut self,
@@ -552,12 +601,13 @@ impl Engine {
         // Preserve order: once a socket has a backlog, everything queues behind it.
         // (Borrow of `q` ends inside this block; the over-cap drop happens after,
         //  so we never re-borrow self.pending_download while `q` is live.)
-        if let Some(q) = self.pending_download.get_mut(&socket_id) {
-            if q.len() < MAX_PENDING_FRAMES_PER_SOCKET {
-                q.push_back(payload);
+        if let Some(b) = self.pending_download.get_mut(&socket_id) {
+            if b.bytes + payload.len() <= MAX_PENDING_BYTES_PER_SOCKET {
+                b.bytes += payload.len();
+                b.q.push_back(payload);
                 return;
             }
-            // Over cap → fall through to drop the stuck socket.
+            // Over the byte cap → fall through to drop the socket (OOM guard).
         } else {
             // No backlog yet: resolve the sender (local cache → shared map).
             let tx = match local_cache.get(&socket_id).map(|(t, _)| t.clone()) {
@@ -576,9 +626,7 @@ impl Engine {
                 Ok(_) => self.dl_dispatched += 1,
                 Err(mpsc::error::TrySendError::Full(p)) => {
                     // Start a per-socket backlog; OTHER sockets stay unaffected.
-                    let mut q = std::collections::VecDeque::with_capacity(8);
-                    q.push_back(p);
-                    self.pending_download.insert(socket_id, q);
+                    self.pending_download.insert(socket_id, Backlog::new(p));
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => {
                     self.dl_recv_closed += 1;
@@ -588,12 +636,12 @@ impl Engine {
             return;
         }
 
-        // Reached only when an existing backlog is at/over cap: the consumer is
-        // dead/stuck — drop the socket so it can't stall the shared download pipe.
+        // Reached only when an existing backlog would exceed the byte cap: the
+        // consumer is far behind the credit window — drop the socket (OOM guard).
         self.dl_dropped_stuck += 1;
         warn!(
-            "📥 Download: socket {} backlog cap ({}) hit — consumer dead, dropping socket to free the pipe",
-            socket_id, MAX_PENDING_FRAMES_PER_SOCKET
+            "📥 Download: socket {} backlog byte cap ({} B) hit — dropping socket to bound memory",
+            socket_id, MAX_PENDING_BYTES_PER_SOCKET
         );
         self.pending_download.remove(&socket_id);
         local_cache.remove(&socket_id);

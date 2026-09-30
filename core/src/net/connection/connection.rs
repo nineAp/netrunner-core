@@ -709,8 +709,11 @@ impl ClientHandler {
         .map_err(|e| AppError::new(ERR_INFRA_TIMEOUT, "Сбой сокета", e.to_string()))?;
         // Limit OS TCP send buffer to reduce bufferbloat on the tunnel leg.
         // Default buffers (4–8 MB) can hold seconds of data at mobile speeds.
-        let _ = socket.set_send_buffer_size(crate::net::TUNNEL_SOCKET_SNDBUF);
-        let _ = socket.set_recv_buffer_size(crate::net::TUNNEL_SOCKET_RCVBUF);
+        // Receive buffer at its ceiling BEFORE connect: the TCP window scale is fixed
+        // at the handshake, so this is what lets the adaptive tuner (connection::
+        // buftune) grow the window later. It is brought down to a small initial
+        // value right after the handshake and then follows the measured BDP.
+        let _ = socket.set_recv_buffer_size(crate::net::BUF_CAP as u32);
 
         let stream = tokio::time::timeout(FALLBACK_CONNECT_TIMEOUT, socket.connect(addr))
             .await

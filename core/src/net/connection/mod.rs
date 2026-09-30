@@ -14,6 +14,7 @@
 //! - [`bridge`] — проксирование данных между потоком туннеля и реальным TCP/UDP-сокетом цели.
 
 mod bridge;
+mod buftune;
 #[allow(clippy::module_inception)]
 mod connection;
 mod dgram_engine;
@@ -21,6 +22,7 @@ mod engine;
 mod handler;
 mod muxer;
 
+pub use buftune::BUF_CAP;
 pub use connection::{ClientHandler, Connection, ServerHandler, SessionManager, TunnelHandler};
 pub use dgram_engine::run_datagram_listener;
 pub use muxer::{Muxer, GLOBAL_MIN_RTT};

@@ -34,6 +34,8 @@ use tokio::{
 };
 use tracing::instrument;
 
+use super::buftune::{self, BufTuner, Dir as BufDir};
+
 use crate::{
     net::{
         connection::{
@@ -309,8 +311,11 @@ impl TunnelEngine {
             tokio::net::TcpSocket::new_v6()
         })
         .map_err(|e| AppError::new(ERR_INFRA_TIMEOUT, "Сокет", e.to_string()))?;
-        let _ = socket.set_send_buffer_size(crate::net::TUNNEL_SOCKET_SNDBUF);
-        let _ = socket.set_recv_buffer_size(crate::net::TUNNEL_SOCKET_RCVBUF);
+        // Receive buffer at its ceiling BEFORE connect: the TCP window scale is fixed
+        // at the handshake, so this is what lets the adaptive tuner (connection::
+        // buftune) grow the window later. It is brought down to a small initial
+        // value right after the handshake and then follows the measured BDP.
+        let _ = socket.set_recv_buffer_size(crate::net::BUF_CAP as u32);
 
         let stream = tokio::time::timeout(FALLBACK_CONNECT_TIMEOUT, socket.connect(addr))
             .await
@@ -601,6 +606,8 @@ impl TunnelEngine {
             let mut reader_handle = tokio::spawn(async move {
                 let mut read_buf = read_buf;
                 let mut inbound = inbound;
+                let mut rcv_tuner = BufTuner::new(BufDir::Recv);
+                rcv_tuner.apply_initial(inbound.as_ref());
                 loop {
                     if read_buf.len() > TUNNEL_MAX_BUFFER_SIZE {
                         error!(
@@ -631,6 +638,14 @@ impl TunnelEngine {
                             }
 
                             muxer.record_leg_rx(leg_id, n as u64);
+                            rcv_tuner.on_bytes(n);
+                            let tune_now = std::time::Instant::now();
+                            if rcv_tuner.due(tune_now) {
+                                let rtt = buftune::leg_rtt_ms(inbound.as_ref());
+                                if let Some(size) = rcv_tuner.tick(tune_now, rtt) {
+                                    rcv_tuner.apply(inbound.as_ref(), size);
+                                }
+                            }
                             let mut frames = Vec::new();
 
                             loop {
@@ -679,6 +694,8 @@ impl TunnelEngine {
                 // a time; the original mpsc channel keeps applying backpressure.
                 let fair_queue_cap = data_rx.max_capacity().max(1);
                 let mut data_closed = false;
+                let mut snd_tuner = BufTuner::new(BufDir::Send);
+                snd_tuner.apply_initial(outbound.as_ref());
                 let mut tcp_info_tick =
                     tokio::time::interval(std::time::Duration::from_millis(250));
                 tcp_info_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -714,7 +731,7 @@ impl TunnelEngine {
 
                             muxer_pong.record_ping_sent(leg_id);
                             let msg = MuxMessage { stream_id: 0, frame_type: FrameType::Heartbeat, data: Bytes::new() };
-                            if let Err(e) = Self::handle_outbound(&mut outbound, &mut tx_codec, msg, leg_id, &muxer_pong).await {
+                            if let Err(e) = Self::handle_outbound(&mut outbound, &mut tx_codec, msg, leg_id, &muxer_pong).await.map(|n| snd_tuner.on_bytes(n)) {
                                 crate::net::diagnostics::send_diag_event(
                                     crate::net::diagnostics::DiagnosticsEvent::TunnelWriteStuck {
                                         leg_id, stream_id: 0,
@@ -734,6 +751,13 @@ impl TunnelEngine {
                             if let Some(sample) = read_tcp_socket_stats(&outbound) {
                                 muxer_pong.record_tcp_socket_stats(leg_id, sample);
                             }
+                            let tune_now = std::time::Instant::now();
+                            if snd_tuner.due(tune_now) {
+                                let rtt = buftune::leg_rtt_ms(outbound.as_ref());
+                                if let Some(size) = snd_tuner.tick(tune_now, rtt) {
+                                    snd_tuner.apply(outbound.as_ref(), size);
+                                }
+                            }
                         }
 
                         msg_opt = control_rx.recv() => {
@@ -746,7 +770,7 @@ impl TunnelEngine {
                                 // still be handed to a surviving one instead of
                                 // vanishing with no signal to the peer.
                                 let retry_msg = msg.clone();
-                                if let Err(e) = Self::handle_outbound(&mut outbound, &mut tx_codec, msg, leg_id, &muxer_pong).await {
+                                if let Err(e) = Self::handle_outbound(&mut outbound, &mut tx_codec, msg, leg_id, &muxer_pong).await.map(|n| snd_tuner.on_bytes(n)) {
                                     crate::net::diagnostics::send_diag_event(
                                         crate::net::diagnostics::DiagnosticsEvent::TunnelWriteStuck {
                                             leg_id, stream_id: sid,
@@ -782,7 +806,7 @@ impl TunnelEngine {
                             // disappearing mid-stream if the write below stalls.
                             let retry_chunk = chunk_msg.clone();
 
-                            if let Err(e) = Self::handle_outbound(&mut outbound, &mut tx_codec, chunk_msg, leg_id, &muxer_pong).await {
+                            if let Err(e) = Self::handle_outbound(&mut outbound, &mut tx_codec, chunk_msg, leg_id, &muxer_pong).await.map(|n| snd_tuner.on_bytes(n)) {
                                 crate::net::diagnostics::send_diag_event(
                                     crate::net::diagnostics::DiagnosticsEvent::TunnelWriteStuck {
                                         leg_id, stream_id: chunk_sid,
@@ -1009,7 +1033,7 @@ impl TunnelEngine {
         msg: MuxMessage,
         leg_id: u32,
         muxer: &super::muxer::Muxer,
-    ) -> Result<(), AppError> {
+    ) -> Result<usize, AppError> {
         let mut data = msg.data;
         let stream_id = msg.stream_id;
         let frame_type = msg.frame_type;
@@ -1065,7 +1089,7 @@ impl TunnelEngine {
                 return Err(stuck());
             }
         }
-        Ok(())
+        Ok(wire.len())
     }
 }
 

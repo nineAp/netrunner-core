@@ -115,6 +115,25 @@ impl Network {
     }
 
     /// Запускает сервер: слушает TCP и обслуживает соединения до отмены `token`.
+    /// Like `TcpListener::bind`, but with `SO_RCVBUF` raised to the leg-buffer ceiling
+    /// before `listen` (see the call site for why).
+    async fn bind_with_big_rcvbuf(addr: &str) -> std::io::Result<TcpListener> {
+        let sock_addr = tokio::net::lookup_host(addr)
+            .await?
+            .next()
+            .ok_or_else(|| std::io::Error::other("no address to bind"))?;
+        let socket = if sock_addr.is_ipv4() {
+            tokio::net::TcpSocket::new_v4()?
+        } else {
+            tokio::net::TcpSocket::new_v6()?
+        };
+        #[cfg(unix)]
+        socket.set_reuseaddr(true)?;
+        let _ = socket.set_recv_buffer_size(netrunner_core::net::BUF_CAP as u32);
+        socket.bind(sock_addr)?;
+        socket.listen(1024)
+    }
+
     pub async fn run(&self, token: CancellationToken) {
         let addr = format!("{}:{}", self.host, self.port);
         START_TIME.get_or_init(Instant::now);
@@ -260,7 +279,18 @@ impl Network {
             }
         });
         info!("🌐 Netrunner Server: Listening on {}", addr);
-        let listener = TcpListener::bind(&addr).await.expect("Server bind failed");
+        // Receive buffer at its ceiling BEFORE listen: accepted sockets inherit it, and
+        // the TCP window scale is fixed at the handshake, so this is what lets the
+        // per-leg adaptive tuner (core `buftune`) grow the download window later. Each
+        // leg is brought down to a small initial value right after accept. Any failure
+        // here falls back to the plain bind (old behaviour).
+        let listener = match Self::bind_with_big_rcvbuf(&addr).await {
+            Ok(l) => l,
+            Err(e) => {
+                warn!(error = %e, "Tuned listener bind failed, falling back to plain bind");
+                TcpListener::bind(&addr).await.expect("Server bind failed")
+            }
+        };
 
         // Тот же адрес и порт, что и у TCP — опциональная UDP-нога (см.
         // `netrunner_core::net::run_datagram_listener`) существует ровно

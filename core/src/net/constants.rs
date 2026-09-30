@@ -280,16 +280,10 @@ pub const TUNNEL_INTERLEAVE_CHUNK: usize = crate::nrxp::MAX_FRAME_PAYLOAD;
 pub const BRIDGE_READ_CHUNK: usize = 4 * crate::nrxp::MAX_FRAME_PAYLOAD;
 
 // ── Tunnel leg TCP socket tuning ─────────────────────────────────────────────
-/// OS-level TCP send buffer for each tunnel leg.  At high RTT (>300 ms),
-/// this must accommodate BDP = bandwidth × RTT. For 300 Mbps and 350 ms,
-/// BDP ≈ 13 MB, so 1 MB per leg is a floor. Scales per-leg: 4 legs × 1 MB = 4 MB
-/// total OS buffer. Matches adaptive_batch_chunk logic (high RTT = bigger writes).
-pub const TUNNEL_SOCKET_SNDBUF: u32 = 1024 * 1024;
-/// OS-level TCP receive buffer for each tunnel leg.  Larger than the send
-/// buffer so the receiver can absorb bursts without dropping packets, but
-/// bounded to keep stale in-flight download data (for already-closed streams)
-/// small so the tunnel recovers in ~1 s after a heavy download.
-pub const TUNNEL_SOCKET_RCVBUF: u32 = 256 * 1024;
+// The OS send/receive buffers of a leg are NOT fixed: `connection::buftune`
+// keeps them near 2x the measured bandwidth-delay product (floor 256 KB, cap
+// [`BUF_CAP`]). The old fixed 1 MB / 256 KB capped a leg at `rcvbuf / RTT`
+// (~65 Mbit/s at 31 ms) while letting uploads queue seconds of data.
 /// Threshold above which Linux withholds socket write-readiness until the
 /// amount of not-yet-sent data falls again.  Keeping this close to two NRXP
 /// records limits how far a bulk stream can run ahead of the fair writer before
