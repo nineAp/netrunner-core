@@ -2031,4 +2031,154 @@ mod tests {
         // соединение просто тихо закрывается, как и было задумано.
         assert!(matches!(result.unwrap().unwrap(), Ok(())));
     }
+
+    // ---------- зомби-ноги и протухший токен (прод, 2026-09-30) ----------
+
+    /// Валидатор ноды для тестов: отклоняет всё (`reject`) или пропускает, и
+    /// считает проверки — это ровно то, что на проде видел бэкенд.
+    struct CountingValidator {
+        reject: bool,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::net::AuthValidator for CountingValidator {
+        async fn validate(&self, _token: &str) -> Result<crate::net::UserQuota, AppError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.reject {
+                return Err(AppError::new(
+                    ERR_AUTH_FAILED,
+                    "Доступ запрещен",
+                    "ExpiredSignature",
+                ));
+            }
+            Ok(crate::net::UserQuota {
+                user_id: "user".into(),
+                limit_bytes: None,
+                used_bytes: 0,
+            })
+        }
+        async fn report_usage(
+            &self,
+            _user_id: &str,
+            _delta_bytes: u64,
+        ) -> Result<crate::net::UsageReport, AppError> {
+            Ok(crate::net::UsageReport {
+                used_bytes: 0,
+                limit_bytes: None,
+                over_limit: false,
+            })
+        }
+        async fn report_node_health(
+            &self,
+            _report: crate::net::NodeHealthReport,
+        ) -> Result<(), AppError> {
+            Ok(())
+        }
+    }
+
+    /// Нода на 127.0.0.1 с заданным валидатором; возвращает адрес.
+    async fn spawn_node(validator: Arc<CountingValidator>) -> std::net::SocketAddr {
+        NetworkConfig::init_global(1500);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let sm = Arc::new(SessionManager::new());
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let handler = ServerHandler::new(
+                    Connection::new(stream),
+                    sm.clone(),
+                    Arc::from("example.com"),
+                    Some(validator.clone() as Arc<dyn crate::net::AuthValidator>),
+                    None,
+                    crate::decoy::CoverFlight::node_default().records.into(),
+                    true,
+                );
+                tokio::spawn(async move {
+                    let _ = handler.run().await;
+                });
+            }
+        });
+        addr
+    }
+
+    async fn connect_client(addr: std::net::SocketAddr) -> Arc<Muxer> {
+        let (tx_to_engine, rx_keep) = mpsc::channel(64);
+        let (tx_keep, rx_from_engine) = mpsc::channel(64);
+        // Держим противоположные концы живыми до конца теста.
+        std::mem::forget((rx_keep, tx_keep));
+        ClientHandler::connect(
+            &addr.to_string(),
+            "example.com",
+            Some("jwt".into()),
+            None,
+            rx_from_engine,
+            tx_to_engine,
+        )
+        .await
+        .unwrap()
+    }
+
+    fn calls(v: &CountingValidator) -> usize {
+        v.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Сервер отверг токен — клиент перестаёт подключаться. Раньше каждая нога
+    /// тут же переподключалась в своём внутреннем цикле (хендшейк «успешен»,
+    /// счётчик пауз обнулялся) и долбила ноду со скоростью RTT: локально
+    /// ~35 проверок/с и дальше без конца.
+    #[tokio::test]
+    async fn rejected_token_stops_all_reconnects() {
+        let validator = Arc::new(CountingValidator {
+            reject: true,
+            calls: Default::default(),
+        });
+        let addr = spawn_node(validator.clone()).await;
+        let muxer = connect_client(addr).await;
+
+        tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+        assert!(
+            muxer.is_fatal(),
+            "отказ по токену помечает сессию фатальной"
+        );
+        let settled = calls(&validator);
+        tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+        assert_eq!(
+            calls(&validator),
+            settled,
+            "после отказа ни одна нога больше не подключается"
+        );
+        assert!(
+            settled <= 2 * MAX_TUNNEL_LEGS as usize,
+            "до остановки — не больше пары попыток на ногу, было {settled}"
+        );
+    }
+
+    /// Остановленная сессия не оставляет «зомби»-ног: раньше задачи ног
+    /// переживали остановку сессии и переподключались к ноде, пока жив
+    /// процесс, — с тем токеном, с которым сессия стартовала.
+    #[tokio::test]
+    async fn shutdown_stops_legs_of_a_healthy_session() {
+        let validator = Arc::new(CountingValidator {
+            reject: false,
+            calls: Default::default(),
+        });
+        let addr = spawn_node(validator.clone()).await;
+        let muxer = connect_client(addr).await;
+
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        assert!(calls(&validator) >= 1, "ноги подключились");
+        assert!(!muxer.is_fatal());
+
+        muxer.shutdown();
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let after_shutdown = calls(&validator);
+        tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+        assert_eq!(
+            calls(&validator),
+            after_shutdown,
+            "после остановки сессии ноги не переподключаются"
+        );
+    }
 }

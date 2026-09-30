@@ -187,6 +187,11 @@ pub const RECONNECT_BACKOFF_JITTER_MS: u64 = 1000;
 /// and returns Err to the outer establish_leg loop, which re-runs DNS resolution
 /// and resets all counters.  10 × ~18 s ≈ 3 minutes max stuck-silent time.
 pub const MAX_INTERNAL_RECONNECT_ATTEMPTS: u32 = 10;
+/// Нога, умершая быстрее этого после успешного реконнекта, считается
+/// «флапающей»: следующий реконнект идёт с экспоненциальной паузой (см.
+/// `TunnelEngine::run`). Типичный случай — сервер отверг токен сразу после
+/// хендшейка.
+pub const LEG_FLAP_WINDOW: Duration = Duration::from_secs(5);
 /// Cap for exponential reconnect backoff inside the engine (milliseconds).
 ///
 /// Was 30 s: after a network dropout the legs could still be sleeping through a

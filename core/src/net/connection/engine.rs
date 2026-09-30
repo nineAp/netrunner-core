@@ -42,9 +42,10 @@ use crate::{
             handler::StreamHandler,
             muxer::{MuxMessage, TcpSocketStats},
         },
-        FALLBACK_CONNECT_TIMEOUT, HEALTH_CHECK_INTERVAL, MAX_INTERNAL_RECONNECT_ATTEMPTS,
-        MAX_RECONNECT_BACKOFF_MS, RECONNECT_BACKOFF_BASE, RECONNECT_BACKOFF_JITTER_MS,
-        TUNNEL_INTERLEAVE_CHUNK, TUNNEL_MAX_BUFFER_SIZE, TUNNEL_READ_RESERVE,
+        FALLBACK_CONNECT_TIMEOUT, HEALTH_CHECK_INTERVAL, LEG_FLAP_WINDOW,
+        MAX_INTERNAL_RECONNECT_ATTEMPTS, MAX_RECONNECT_BACKOFF_MS, RECONNECT_BACKOFF_BASE,
+        RECONNECT_BACKOFF_JITTER_MS, TUNNEL_INTERLEAVE_CHUNK, TUNNEL_MAX_BUFFER_SIZE,
+        TUNNEL_READ_RESERVE,
     },
     nrxp::{ErrorAction, FrameType, RxCodec, TxCodec, MAX_FRAME_PAYLOAD},
 };
@@ -478,6 +479,13 @@ impl TunnelEngine {
         // returns Err so the outer establish_leg loop gets control: it re-runs
         // DNS, resets its own counters, and emits proper diagnostic events.
         let mut internal_attempt: u32 = 0;
+        // Сколько раз подряд нога умерла вскоре после «успешного» реконнекта.
+        // Хендшейк на клиенте завершается ДО того, как сервер проверит токен,
+        // поэтому отвергнутый токен (или нода, закрывающая соединение сразу)
+        // выглядел как успех: счётчик выше обнулялся, и нога переподключалась
+        // снова без всякой паузы — со скоростью RTT.
+        let mut quick_deaths: u32 = 0;
+        let mut last_reconnect: Option<std::time::Instant> = None;
 
         loop {
             // Проверяем наличие всех необходимых ресурсов
@@ -496,6 +504,34 @@ impl TunnelEngine {
                     return Ok(());
                 }
 
+                // Сессия закончена (сервер отверг токен или клиент её
+                // остановил, см. `Muxer::shutdown`) — не переподключаемся.
+                if self.muxer.is_fatal() {
+                    info!("Leg {} stopping: session is over", self.leg_id);
+                    self.muxer.force_remove_leg(self.leg_id);
+                    return Ok(());
+                }
+
+                if last_reconnect.is_some_and(|t| t.elapsed() < LEG_FLAP_WINDOW) {
+                    quick_deaths += 1;
+                    let exp_ms = RECONNECT_BACKOFF_BASE.as_millis() as u64
+                        * (1u64 << quick_deaths.saturating_sub(1).min(4));
+                    let jitter = rand::random::<u64>() % RECONNECT_BACKOFF_JITTER_MS;
+                    let backoff_ms = (exp_ms + jitter).min(MAX_RECONNECT_BACKOFF_MS);
+                    warn!(
+                        "Leg {} died {} time(s) in a row right after reconnect — backing off {} ms",
+                        self.leg_id, quick_deaths, backoff_ms
+                    );
+                    tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
+                    if self.muxer.is_fatal() {
+                        info!("Leg {} stopping: session is over", self.leg_id);
+                        self.muxer.force_remove_leg(self.leg_id);
+                        return Ok(());
+                    }
+                } else {
+                    quick_deaths = 0;
+                }
+
                 self.leg_status = LegStatus::Reconnecting;
                 // Снимаем ногу с учёта на время переподключения. Регистрация
                 // в муксере означает «сюда можно писать», а писать сюда сейчас
@@ -510,6 +546,7 @@ impl TunnelEngine {
                 match self.attempt_reconnect().await {
                     Ok((new_in, new_out, new_rx, new_tx, new_tail, new_datagram_root)) => {
                         internal_attempt = 0; // successful reconnect — reset counter
+                        last_reconnect = Some(std::time::Instant::now());
 
                         let cap = crate::net::NetworkConfig::global().channel_capacity;
                         let (control_tx, control_rx) =
