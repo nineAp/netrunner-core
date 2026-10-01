@@ -110,17 +110,50 @@ jobs:
           fi
           echo "path=$NDK_PATH" >> "$GITHUB_OUTPUT"
 
-      - name: Install cargo-ndk
-        run: command -v cargo-ndk >/dev/null || cargo install cargo-ndk
+      # Кеш сборки: без него каждый пуш компилировал весь граф зависимостей с нуля
+      # под 4 ABI. По одному каталогу target на ABI (см. параллельный шаг ниже) —
+      # так ключ кеша стабилен, а ABI не мешают друг другу.
+      - name: Cache cargo (Android libs)
+        uses: actions/cache@v4
+        timeout-minutes: 3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target-android
+          key: cargo-android-libs-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-android-libs-
 
-      - name: Build Android client libs (4 ABI) + uniffi Kotlin bindings
+      # Готовый бинарь вместо `cargo install` (сборка из исходников — минуты на
+      # каждый запуск). Если загрузка не удалась — прежний путь через cargo install.
+      - name: Install cargo-ndk
+        run: |
+          command -v cargo-ndk >/dev/null && exit 0
+          V=v4.1.2
+          mkdir -p "$HOME/.cargo/bin"
+          curl -fsSL --retry 3 "https://github.com/bbqsrc/cargo-ndk/releases/download/$V/cargo-ndk-x86_64-unknown-linux-gnu-$V.tgz" \
+            | tar -xz --strip-components=1 -C "$HOME/.cargo/bin" 2>/dev/null && command -v cargo-ndk >/dev/null \
+            || cargo install cargo-ndk
+
+      # Универсального .so под все архитектуры не бывает, поэтому ускоряем иначе:
+      # все 4 ABI собираются ПАРАЛЛЕЛЬНО (раньше — по очереди), каждый в своём
+      # CARGO_TARGET_DIR, иначе cargo сериализует их блокировкой каталога сборки.
+      - name: Build Android client libs (4 ABI, parallel) + uniffi Kotlin bindings
         env:
           ANDROID_NDK_HOME: ${{ steps.ndk.outputs.path }}
         run: |
           set -e
+          pids=""
           for abi in arm64-v8a armeabi-v7a x86_64 x86; do
-            cargo ndk -t "$abi" -o ./gen build --release -p netrunner-client -p netrunner-logger --lib
+            (
+              export CARGO_TARGET_DIR="target-android/$abi"
+              cargo ndk -t "$abi" -o ./gen build --release -p netrunner-client -p netrunner-logger --lib
+            ) &
+            pids="$pids $!"
           done
+          fail=0
+          for pid in $pids; do wait "$pid" || fail=1; done
+          [ "$fail" = 0 ] || { echo "сборка одного из ABI упала" >&2; exit 1; }
           cargo run --bin bindgen-tool generate \
             --library gen/arm64-v8a/libnetrunner_client.so \
             --language kotlin --no-format --out-dir gen

@@ -337,6 +337,23 @@ pub(crate) struct TcpSocketStats {
 
 pub static GLOBAL_MIN_RTT: AtomicU32 = AtomicU32::new(INITIAL_RTT_MS);
 
+/// True at most once per `interval_ms` for the given timestamp cell (CAS, so
+/// concurrent callers agree on a single winner per interval).
+fn throttle_due(last: &AtomicU64, now_ms: u64, interval_ms: u64) -> bool {
+    let prev = last.load(Ordering::Relaxed);
+    (prev == 0 || now_ms.saturating_sub(prev) >= interval_ms)
+        && last
+            .compare_exchange(prev, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+}
+
+/// True at most once per second: gates the log line and diagnostics event for
+/// dropped control frames (see the call site for why).
+fn control_full_report_due() -> bool {
+    static LAST_MS: AtomicU64 = AtomicU64::new(0);
+    throttle_due(&LAST_MS, process_uptime_ms().max(1), 1000)
+}
+
 /// Write timeout that scales with a given RTT sample — the shared scaling
 /// rule behind [`adaptive_write_timeout`] and [`Muxer::adaptive_leg_write_timeout`].
 /// Allowing ~8 RTT of drain time (capped at 60 s) keeps a slow-but-alive path
@@ -1239,17 +1256,28 @@ impl Muxer {
                         Ok(())
                     }
                     Err(tokio::sync::mpsc::error::TrySendError::Full(ref dropped)) => {
-                        netrunner_logger::warn!(
-                            stream_id,
-                            "Control queue FULL! Dropping non-critical control frame."
-                        );
-                        DIAG_COUNTERS
+                        let drops = DIAG_COUNTERS
                             .control_full_drops
-                            .fetch_add(1, Ordering::Relaxed);
-                        diagnostics::send_diag_event(DiagnosticsEvent::ControlChannelFull {
-                            stream_id,
-                            frame_type: format!("{:?}", dropped.frame_type),
-                        });
+                            .fetch_add(1, Ordering::Relaxed)
+                            + 1;
+                        // A full control queue drops frames at thousands per second
+                        // right after an outage. One WARN and one diagnostics event per
+                        // drop turned that into a log flood plus a diagnostics backlog
+                        // the client engine then spent seconds draining in its main
+                        // loop (the engine stalls while the TUN stays up). Report at
+                        // most once a second; the counter keeps the exact total.
+                        if control_full_report_due() {
+                            netrunner_logger::warn!(
+                                stream_id,
+                                frame = ?dropped.frame_type,
+                                total_drops = drops,
+                                "Control queue FULL! Dropping non-critical control frames (reported once per second)."
+                            );
+                            diagnostics::send_diag_event(DiagnosticsEvent::ControlChannelFull {
+                                stream_id,
+                                frame_type: format!("{:?}", dropped.frame_type),
+                            });
+                        }
                         Ok(())
                     }
                     Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
@@ -2118,6 +2146,16 @@ mod scheduling_tests {
             selected.id, DATAGRAM_LEG_ID,
             "a native leg with no fresh PONG must not be selected"
         );
+    }
+
+    #[test]
+    fn throttle_reports_once_per_interval() {
+        let last = AtomicU64::new(0);
+        assert!(throttle_due(&last, 5_000, 1000), "first call reports");
+        assert!(!throttle_due(&last, 5_001, 1000));
+        assert!(!throttle_due(&last, 5_999, 1000));
+        assert!(throttle_due(&last, 6_000, 1000), "interval elapsed");
+        assert!(!throttle_due(&last, 6_500, 1000));
     }
 
     #[tokio::test]

@@ -188,7 +188,12 @@ pub const RECONNECT_BACKOFF_JITTER_MS: u64 = 1000;
 /// and resets all counters.  10 × ~18 s ≈ 3 minutes max stuck-silent time.
 pub const MAX_INTERNAL_RECONNECT_ATTEMPTS: u32 = 10;
 /// Cap for exponential reconnect backoff inside the engine (milliseconds).
-pub const MAX_RECONNECT_BACKOFF_MS: u64 = 30_000;
+///
+/// Was 30 s: after a network dropout the legs could still be sleeping through a
+/// 16-30 s backoff once the network was back, i.e. "internet stands" for up to half
+/// a minute after it returned. 10 s keeps the thundering-herd protection (the jitter
+/// in the engine grows with the step) but bounds that tail.
+pub const MAX_RECONNECT_BACKOFF_MS: u64 = 10_000;
 /// How long to wait before removing an idle session after all legs drop.
 pub const SESSION_CLEANUP_DELAY: Duration = Duration::from_secs(120);
 /// How often the network-change watcher checks the local IP address.

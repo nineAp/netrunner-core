@@ -572,7 +572,10 @@ impl TunnelEngine {
                         // The shift is capped at 4 to avoid overflow (2^4 = 16).
                         let exp_ms = RECONNECT_BACKOFF_BASE.as_millis() as u64
                             * (1u64 << internal_attempt.saturating_sub(1).min(4));
-                        let jitter = rand::random::<u64>() % RECONNECT_BACKOFF_JITTER_MS;
+                        // Jitter grows with the step (up to half of it) so a fleet that
+                        // lost the same server does not retry in lockstep.
+                        let jitter = rand::random::<u64>()
+                            % RECONNECT_BACKOFF_JITTER_MS.max(exp_ms / 2);
                         let backoff_ms = (exp_ms + jitter).min(MAX_RECONNECT_BACKOFF_MS);
                         tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
                         continue;

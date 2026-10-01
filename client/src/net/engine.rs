@@ -109,6 +109,10 @@ impl Backlog {
 /// is up to carry them, so snapshots wait here and flush once a leg recovers.
 /// Oldest is dropped past the cap — recent state matters more than ancient.
 const DIAG_OUTBOX_CAP: usize = 128;
+/// Max diagnostics events handled per engine loop iteration (each builds a snapshot).
+const DIAG_EVENTS_PER_TICK: usize = 4;
+/// Minimum spacing between snapshots of the same event kind.
+const DIAG_MIN_INTERVAL_PER_KIND: Duration = Duration::from_secs(1);
 /// Diagnostics snapshots flushed to the server per engine tick. Bounds the cold
 /// path so a large backlog can't monopolise a loop iteration after reconnect.
 const DIAG_FLUSH_PER_TICK: usize = 16;
@@ -139,6 +143,9 @@ pub struct Engine {
     /// a tunnel leg is available so reports survive the disconnect that produced
     /// them. See [`DIAG_OUTBOX_CAP`] / [`DIAG_FLUSH_PER_TICK`].
     diag_outbox: std::collections::VecDeque<Bytes>,
+    /// Last time a snapshot was built for each diagnostics event kind (coalescing).
+    diag_last_by_kind:
+        std::collections::HashMap<std::mem::Discriminant<DiagnosticsEvent>, StdInstant>,
     /// Per-socket backlog of download frames whose target channel was full.
     /// Keyed by socket_id so a single slow/dead consumer can NEVER stall the
     /// shared download pipe for other sockets — the old single global slot did
@@ -189,6 +196,7 @@ impl Engine {
             diag_rx: None,
             diag_store: Arc::new(DiagnosticsStore::new(20)),
             diag_outbox: std::collections::VecDeque::new(),
+            diag_last_by_kind: std::collections::HashMap::new(),
             pending_download: std::collections::HashMap::new(),
             dl_dispatched: 0,
             dl_dropped_stuck: 0,
@@ -490,7 +498,24 @@ impl Engine {
             // Take the receiver out (ends the borrow on self), drain events,
             // build snapshots (needs &mut self for stats), then put it back.
             if let Some(mut diag_rx) = self.diag_rx.take() {
-                while let Ok(event) = diag_rx.try_recv() {
+                // Bounded and coalesced: building a snapshot walks every socket, and
+                // this runs inside the one task that also moves all packets. An
+                // unbounded drain of a post-outage event storm (tens of thousands of
+                // events) froze the engine for seconds while the TUN stayed up.
+                let mut diag_budget = DIAG_EVENTS_PER_TICK;
+                while diag_budget > 0 {
+                    let Ok(event) = diag_rx.try_recv() else { break };
+                    diag_budget -= 1;
+                    // One snapshot per event kind per interval; the rest are dropped
+                    // (their counters live in DIAG_COUNTERS).
+                    let kind = std::mem::discriminant(&event);
+                    let now_std = StdInstant::now();
+                    if let Some(prev) = self.diag_last_by_kind.get(&kind)
+                        && now_std.duration_since(*prev) < DIAG_MIN_INTERVAL_PER_KIND
+                    {
+                        continue;
+                    }
+                    self.diag_last_by_kind.insert(kind, now_std);
                     let snap = self.build_snapshot(event);
                     // Queue a compact JSON copy for upload to the server,
                     // then keep the snapshot in the local ring buffer.
