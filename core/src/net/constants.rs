@@ -220,6 +220,16 @@ pub const NETWORK_WATCHER_INTERVAL: Duration = Duration::from_secs(1);
 /// секунд заведомо переживают штатное переподключение и смену сети, но не
 /// оставляют «подключено» на минуты.
 pub const TUNNEL_DEAD_AFTER: Duration = Duration::from_secs(30);
+/// После смены сети туннель без единой ноги не считается мёртвым так долго: новая
+/// сеть (LTE/Wi-Fi) бывает готова не сразу, а пока `remove_all_legs` снял все ноги,
+/// 30 с без ног — норма, а не смерть. Android на `CONN_FAILED` гасит VPN-интерфейс, и
+/// пользователь видел «туннель падает при смене сети». Отсчёт `TUNNEL_DEAD_AFTER`
+/// идёт заново после окончания этого окна.
+pub const NETWORK_CHANGE_DEAD_GRACE: Duration = Duration::from_secs(90);
+/// Сколько адрес может отсутствовать (Wi-Fi выключили, LTE ещё не поднялся), чтобы
+/// его возвращение считалось сменой сети даже при том же IP: сокеты за это время
+/// почти наверняка умерли.
+pub const NETWORK_GAP_IS_CHANGE: Duration = Duration::from_secs(3);
 
 // ── Logging ───────────────────────────────────────────────────────────────────
 pub const LEG_STAGGER_DELAY: Duration = Duration::from_millis(1000);

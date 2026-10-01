@@ -511,6 +511,9 @@ pub struct Muxer {
     /// (bug #2). На сервере это поле не используется (демультиплексирование там
     /// ведёт `SessionManager`).
     datagram_leg_token: Arc<Mutex<Option<[u8; 16]>>>,
+    /// Когда в последний раз сбрасывали все ноги из-за смены сети (мс от старта
+    /// процесса, 0 — ни разу). См. [`ms_since_network_change`](Self::ms_since_network_change).
+    last_network_change_ms: Arc<AtomicU64>,
 }
 
 impl Muxer {
@@ -535,6 +538,7 @@ impl Muxer {
             datagram_leg: Arc::new(ArcSwapOption::from(None)),
             pending_udp: Arc::new(DashMap::new()),
             datagram_leg_token: Arc::new(Mutex::new(None)),
+            last_network_change_ms: Arc::new(AtomicU64::new(0)),
         };
         muxer.spawn_backlog_reaper();
         muxer
@@ -562,6 +566,14 @@ impl Muxer {
     pub fn shutdown(&self) {
         self.mark_fatal();
         self.remove_all_legs();
+    }
+
+    /// Сколько миллисекунд прошло с последней смены сети; `None`, если её не было.
+    pub fn ms_since_network_change(&self) -> Option<u64> {
+        match self.last_network_change_ms.load(Ordering::Relaxed) {
+            0 => None,
+            at => Some(process_uptime_ms().saturating_sub(at)),
+        }
     }
 
     /// Токен текущей эпохи сети — от него нога порождает свой дочерний
@@ -786,6 +798,8 @@ impl Muxer {
 
     /// Сбрасывает все ноги и привязки (полная остановка туннеля).
     pub fn remove_all_legs(&self) {
+        self.last_network_change_ms
+            .store(process_uptime_ms().max(1), Ordering::Relaxed);
         for entry in self.legs.iter() {
             self.fold_removed_leg(entry.value());
         }
@@ -2159,6 +2173,14 @@ mod scheduling_tests {
             selected.id, DATAGRAM_LEG_ID,
             "a native leg with no fresh PONG must not be selected"
         );
+    }
+
+    #[tokio::test]
+    async fn network_change_is_timestamped_by_remove_all_legs() {
+        let muxer = Muxer::new(true, "t".into());
+        assert_eq!(muxer.ms_since_network_change(), None);
+        muxer.remove_all_legs();
+        assert!(muxer.ms_since_network_change().is_some_and(|ms| ms < 1_000));
     }
 
     #[test]

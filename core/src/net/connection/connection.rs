@@ -76,6 +76,19 @@ pub(crate) struct DgramSessionEntry {
     pub(crate) responded_to_initial: bool,
 }
 
+/// Смена сети по наблюдаемому локальному адресу: адрес стал другим, ИЛИ его не было
+/// дольше [`NETWORK_GAP_IS_CHANGE`](crate::net::NETWORK_GAP_IS_CHANGE) (за это время
+/// сокеты ног почти наверняка умерли, даже если интерфейс вернул тот же IP).
+fn network_changed(
+    last: Option<std::net::IpAddr>,
+    now: std::net::IpAddr,
+    gap: Option<std::time::Duration>,
+) -> bool {
+    let address_differs = last.is_some_and(|old| old != now);
+    let long_gap = gap.is_some_and(|g| g >= crate::net::NETWORK_GAP_IS_CHANGE);
+    address_differs || long_gap
+}
+
 /// Реестр активных сессий сервера: `session_id` → общий на сессию [`Muxer`].
 ///
 /// Также — демультиплексирующий реестр UDP-ног ВСЕХ сессий процесса: один
@@ -854,21 +867,34 @@ impl ClientHandler {
 
         let watcher_muxer = muxer.clone();
         tokio::spawn(async move {
-            let mut last_ip = Self::get_local_ip();
+            // Адрес, который был у нас ПОСЛЕДНИМ из реально существовавших, и
+            // момент, когда адрес пропал. Wi-Fi→LTE почти всегда идёт через
+            // «адреса нет» (Wi-Fi погас, LTE ещё не поднялся); раньше смена
+            // замечалась, только если и старый, и новый адрес были `Some`, и такой
+            // переход пропускался: ноги сидели на мёртвых сокетах до таймаутов.
+            let mut last_some = Self::get_local_ip();
+            let mut none_since: Option<std::time::Instant> = None;
             let mut interval = tokio::time::interval(NETWORK_WATCHER_INTERVAL);
             loop {
                 interval.tick().await;
                 let current_ip = Self::get_local_ip();
-                if current_ip != last_ip {
-                    if current_ip.is_some() && last_ip.is_some() {
-                        netrunner_logger::warn!(
-                            "🌐 Network Change Detected: {:?} -> {:?}",
-                            last_ip,
-                            current_ip
-                        );
-                        watcher_muxer.remove_all_legs();
+                match current_ip {
+                    None => {
+                        none_since.get_or_insert_with(std::time::Instant::now);
                     }
-                    last_ip = current_ip;
+                    Some(ip) => {
+                        let gap = none_since.take().map(|t| t.elapsed());
+                        if network_changed(last_some, ip, gap) {
+                            netrunner_logger::warn!(
+                                "🌐 Network Change Detected: {:?} -> {:?} (gap {:?})",
+                                last_some,
+                                ip,
+                                gap
+                            );
+                            watcher_muxer.remove_all_legs();
+                        }
+                        last_some = Some(ip);
+                    }
                 }
             }
         });
@@ -1741,6 +1767,42 @@ impl TunnelHandler for ServerHandler {
 
 #[cfg(test)]
 mod tests {
+    use super::network_changed;
+    use std::net::IpAddr;
+    use std::time::Duration as StdDuration;
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn network_change_is_detected_across_an_address_gap() {
+        // Direct switch.
+        assert!(network_changed(Some(ip("192.168.1.5")), ip("10.20.30.4"), None));
+        // Wi-Fi -> (no address) -> LTE: the old logic missed exactly this.
+        assert!(network_changed(
+            Some(ip("192.168.1.5")),
+            ip("10.20.30.4"),
+            Some(StdDuration::from_secs(4))
+        ));
+        // Same address back after a long gap: sockets are dead, treat as a change.
+        assert!(network_changed(
+            Some(ip("192.168.1.5")),
+            ip("192.168.1.5"),
+            Some(StdDuration::from_secs(5))
+        ));
+        // Same address, only a one-tick blip: not a change.
+        assert!(!network_changed(
+            Some(ip("192.168.1.5")),
+            ip("192.168.1.5"),
+            Some(StdDuration::from_secs(1))
+        ));
+        // Nothing changed.
+        assert!(!network_changed(Some(ip("192.168.1.5")), ip("192.168.1.5"), None));
+        // First address ever seen is not a change.
+        assert!(!network_changed(None, ip("192.168.1.5"), None));
+    }
+
     use super::*;
 
     // ---------- is_plausible_hostname ----------

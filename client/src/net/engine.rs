@@ -161,6 +161,21 @@ pub struct Engine {
     dl_recv_closed: u64,
 }
 
+/// Решение «туннель мёртв»: ни одной живой ноги дольше `TUNNEL_DEAD_AFTER`.
+/// Пока ноги есть (или идёт окно после смены сети), дедлайн отодвигается.
+fn tunnel_is_dead(
+    legs: Option<usize>,
+    now: tokio::time::Instant,
+    alive_deadline: &mut tokio::time::Instant,
+    in_network_grace: bool,
+) -> bool {
+    if legs == Some(0) && !in_network_grace {
+        return now >= *alive_deadline;
+    }
+    *alive_deadline = now + netrunner_core::net::TUNNEL_DEAD_AFTER;
+    false
+}
+
 /// Движок клиента живёт ровно столько, сколько сессия: его роняют и при
 /// штатной остановке (`Session::stop` отменяет токен), и когда он завершился
 /// сам (мёртвый туннель, отвергнутый токен). В обоих случаях ноги туннеля —
@@ -290,20 +305,28 @@ impl Engine {
             // Выходим сами: `spawn_session` увидит завершение `run()`,
             // переведёт статус в failed и уронит Session, а её Drop откатит
             // маршрутизацию и kill-switch.
-            match self.muxer.as_ref().map(|m| m.active_legs_count()) {
-                Some(0) => {
-                    if tokio::time::Instant::now() >= alive_deadline {
-                        error!(
-                            "Туннель без живых ног дольше {:?} — сессия признана мёртвой",
-                            netrunner_core::net::TUNNEL_DEAD_AFTER
-                        );
-                        return;
-                    }
-                }
-                _ => {
-                    alive_deadline =
-                        tokio::time::Instant::now() + netrunner_core::net::TUNNEL_DEAD_AFTER;
-                }
+            let legs = self.muxer.as_ref().map(|m| m.active_legs_count());
+            // Сразу после смены сети все ноги сняты и переподключаются: новая сеть
+            // бывает готова не сразу, и 30 с без ног там — норма. Android на отказе
+            // движка гасит VPN-интерфейс, поэтому в этом окне не умираем.
+            let in_network_grace = self
+                .muxer
+                .as_ref()
+                .and_then(|m| m.ms_since_network_change())
+                .is_some_and(|ms| {
+                    ms < netrunner_core::net::NETWORK_CHANGE_DEAD_GRACE.as_millis() as u64
+                });
+            if tunnel_is_dead(
+                legs,
+                tokio::time::Instant::now(),
+                &mut alive_deadline,
+                in_network_grace,
+            ) {
+                error!(
+                    "Туннель без живых ног дольше {:?} — сессия признана мёртвой",
+                    netrunner_core::net::TUNNEL_DEAD_AFTER
+                );
+                return;
             }
 
             let now = Self::current_time();
@@ -1279,5 +1302,61 @@ impl EngineBuilder {
         );
 
         Ok((engine, tun))
+    }
+}
+
+#[cfg(test)]
+mod dead_tunnel_tests {
+    use super::tunnel_is_dead;
+    use netrunner_core::net::TUNNEL_DEAD_AFTER;
+    use tokio::time::Instant;
+
+    #[test]
+    fn dies_only_after_the_deadline_with_zero_legs() {
+        let t0 = Instant::now();
+        let mut deadline = t0 + TUNNEL_DEAD_AFTER;
+        assert!(!tunnel_is_dead(
+            Some(0),
+            t0 + TUNNEL_DEAD_AFTER / 2,
+            &mut deadline,
+            false
+        ));
+        assert!(tunnel_is_dead(
+            Some(0),
+            t0 + TUNNEL_DEAD_AFTER,
+            &mut deadline,
+            false
+        ));
+    }
+
+    #[test]
+    fn a_live_leg_pushes_the_deadline_forward() {
+        let t0 = Instant::now();
+        let mut deadline = t0 + TUNNEL_DEAD_AFTER;
+        let later = t0 + TUNNEL_DEAD_AFTER * 2;
+        assert!(!tunnel_is_dead(Some(1), later, &mut deadline, false));
+        assert_eq!(deadline, later + TUNNEL_DEAD_AFTER);
+    }
+
+    #[test]
+    fn the_window_after_a_network_change_never_kills_and_restarts_the_countdown() {
+        let t0 = Instant::now();
+        let mut deadline = t0 + TUNNEL_DEAD_AFTER;
+        // Zero legs far past the deadline, but a network change just happened.
+        let now = t0 + TUNNEL_DEAD_AFTER * 3;
+        assert!(!tunnel_is_dead(Some(0), now, &mut deadline, true));
+        // The countdown restarted from now, so the grace expiring does not kill at once.
+        assert!(!tunnel_is_dead(
+            Some(0),
+            now + TUNNEL_DEAD_AFTER / 2,
+            &mut deadline,
+            false
+        ));
+        assert!(tunnel_is_dead(
+            Some(0),
+            now + TUNNEL_DEAD_AFTER,
+            &mut deadline,
+            false
+        ));
     }
 }
