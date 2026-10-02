@@ -9,9 +9,10 @@
 use async_trait::async_trait;
 use dashmap::DashMap;
 use netrunner_core::net::MeshPeer;
-use netrunner_core::net::{AuthValidator, NodeHealthReport, UsageReport, UserQuota};
+use netrunner_core::net::{AuthValidator, NodeHealthReport, UsageDelta, UsageReport, UserQuota};
 use netrunner_logger::{warn, AppError};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -133,6 +134,26 @@ struct ValidateResponse {
 struct UsageRequest<'a> {
     user_id: &'a str,
     delta_bytes: u64,
+}
+
+#[derive(Serialize)]
+struct UsageBatchRequest<'a> {
+    batch_id: &'a str,
+    entries: Vec<UsageBatchEntryRequest<'a>>,
+}
+
+#[derive(Serialize)]
+struct UsageBatchEntryRequest<'a> {
+    user_id: &'a str,
+    delta_bytes: i64,
+}
+
+#[derive(Deserialize)]
+struct UsageBatchEntryResponse {
+    user_id: String,
+    used_bytes: i64,
+    limit_bytes: Option<i64>,
+    over_limit: bool,
 }
 
 #[derive(Serialize)]
@@ -273,6 +294,90 @@ impl AuthValidator for BackendClient {
             limit_bytes: body.limit_bytes,
             over_limit: body.over_limit,
         })
+    }
+
+    async fn report_usage_batch(
+        &self,
+        batch_id: &str,
+        deltas: &[UsageDelta],
+    ) -> Result<HashMap<String, UsageReport>, AppError> {
+        const MAX_BATCH_SIZE: usize = 1000;
+        if deltas.is_empty() || deltas.len() > MAX_BATCH_SIZE {
+            return Err(AppError::new(
+                netrunner_logger::ERR_INFRA_TIMEOUT,
+                "Ошибка отчёта о трафике",
+                format!("Usage batch must contain 1..={MAX_BATCH_SIZE} users"),
+            ));
+        }
+        if self.circuit.is_open() {
+            return Err(Self::circuit_open_error());
+        }
+
+        let entries = deltas
+            .iter()
+            .map(|(user_id, delta_bytes)| {
+                Ok(UsageBatchEntryRequest {
+                    user_id,
+                    delta_bytes: i64::try_from(*delta_bytes).map_err(|_| {
+                        AppError::new(
+                            netrunner_logger::ERR_INFRA_TIMEOUT,
+                            "Ошибка отчёта о трафике",
+                            "Usage delta exceeds the backend's supported range",
+                        )
+                    })?,
+                })
+            })
+            .collect::<Result<Vec<_>, AppError>>()?;
+
+        let resp = self
+            .http
+            .post(format!("{}/api/v1/internal/usage/batch", self.base_url))
+            .header("X-Internal-Secret", &self.internal_secret)
+            .json(&UsageBatchRequest { batch_id, entries })
+            .send()
+            .await
+            .map_err(|e| {
+                self.circuit.record_failure();
+                AppError::new(
+                    netrunner_logger::ERR_INFRA_TIMEOUT,
+                    "Бэкенд недоступен",
+                    e.to_string(),
+                )
+            })?;
+
+        if resp.status().is_server_error() {
+            self.circuit.record_failure();
+        }
+        if !resp.status().is_success() {
+            return Err(AppError::new(
+                netrunner_logger::ERR_INFRA_TIMEOUT,
+                "Ошибка бэкенда",
+                format!("Usage batch rejected: HTTP {}", resp.status()),
+            ));
+        }
+
+        let body: Vec<UsageBatchEntryResponse> = resp.json().await.map_err(|e| {
+            AppError::new(
+                netrunner_logger::ERR_INFRA_TIMEOUT,
+                "Ошибка бэкенда",
+                e.to_string(),
+            )
+        })?;
+        self.circuit.record_success();
+
+        Ok(body
+            .into_iter()
+            .map(|entry| {
+                (
+                    entry.user_id,
+                    UsageReport {
+                        used_bytes: entry.used_bytes.max(0) as u64,
+                        limit_bytes: entry.limit_bytes.map(|limit| limit.max(0) as u64),
+                        over_limit: entry.over_limit,
+                    },
+                )
+            })
+            .collect())
     }
 
     /// Пушит агрегированный, полностью анонимный снимок состояния ноды на

@@ -270,6 +270,9 @@ pub const NETBIOS_PORTS: [u16; 2] = [137, 138];
 /// по IP (SNI для IP-литералов не шлётся вовсе, RFC 6066). `www.debian.org` —
 /// одиночный Apache-ориджин без CDN-роутинга, отдаёт `200` независимо от SNI/Host.
 pub const DEFAULT_DECOY_HOST: &str = "www.debian.org";
+/// Dedicated server-to-server QUIC listener. Public client ingress continues
+/// to use the existing UDP port configured by `--port`.
+pub const DEFAULT_MESH_QUIC_PORT: u16 = 8443;
 
 // ── Tunnel frame codec ───────────────────────────────────────────────────────
 /// OOM guard: drop the leg if the read buffer grows past this.

@@ -7,11 +7,13 @@
 //! спавнит `ServerHandler::run` из ядра под отдельным tracing-span клиента.
 
 use netrunner_core::net::{
-    run_datagram_listener, AuthValidator, Connection, NetworkConfig, NodeHealthReport, NodeMesh,
-    ServerHandler, SessionManager, TunnelHandler, MAX_TUNNEL_LEGS, TOPOLOGY_PRINT_INTERVAL,
+    run_datagram_listener, AuthValidator, Connection, Muxer, NetworkConfig, NodeHealthReport,
+    NodeMesh, ServerHandler, SessionManager, TunnelHandler, MAX_TUNNEL_LEGS,
+    TOPOLOGY_PRINT_INTERVAL,
 };
 use netrunner_core::Identity;
 use netrunner_logger::{debug, error, info, warn};
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -35,6 +37,12 @@ static START_TIME: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
 /// внутри него было невидимо снаружи (health-эндпоинт — отдельная задача,
 /// продолжал отвечать "ok", пока сам процесс не зависал целиком).
 static LAST_PERIODIC_TICK_UNIX_SECS: AtomicU64 = AtomicU64::new(0);
+
+struct PendingUsageBatch {
+    batch_id: String,
+    deltas: Vec<(String, u64)>,
+    sessions: Vec<(String, Vec<Arc<Muxer>>)>,
+}
 
 fn now_unix_secs() -> u64 {
     std::time::SystemTime::now()
@@ -79,6 +87,7 @@ pub struct Network {
     require_auth: bool,
     mesh_enabled: bool,
     mesh: Option<Arc<NodeMesh>>,
+    mesh_quic_port: u16,
     /// `None` — health-эндпоинт выключен (по умолчанию для обратной
     /// совместимости с уже развёрнутыми нодами без этого флага).
     health_port: Option<u16>,
@@ -103,6 +112,7 @@ impl Network {
         require_auth: bool,
         mesh_enabled: bool,
         mesh: Option<Arc<NodeMesh>>,
+        mesh_quic_port: u16,
         health_port: Option<u16>,
         identity: Option<Identity>,
         cover_flight: Arc<[usize]>,
@@ -116,6 +126,7 @@ impl Network {
             require_auth,
             mesh_enabled,
             mesh,
+            mesh_quic_port,
             health_port,
             identity,
             cover_flight,
@@ -186,6 +197,7 @@ impl Network {
         let sm_clone = session_manager.clone();
         let quota_auth = self.auth.clone();
         tokio::spawn(async move {
+            let mut pending_usage_batches = VecDeque::<PendingUsageBatch>::new();
             loop {
                 tokio::time::sleep(TOPOLOGY_PRINT_INTERVAL).await;
                 LAST_PERIODIC_TICK_UNIX_SECS.store(now_unix_secs(), Ordering::Relaxed);
@@ -230,10 +242,10 @@ impl Network {
 
                 // Динамические лимиты трафика: только сессии с проверенным
                 // владельцем (`--require-auth` включён и хендшейк прошёл
-                // валидацию токена, см. `ServerHandler::run`). Бэкенд читает
-                // текущий лимит из БД на каждый вызов — админ меняет его в
-                // любой момент, следующий тик подхватит новое значение без
-                // перезапуска прокси.
+                // валидацию токена, см. `ServerHandler::run`). Дельты
+                // агрегируются по пользователям и отправляются пакетами,
+                // поэтому объём HTTP-запросов и SQL UPDATE зависит от числа
+                // активных пользователей, а не туннельных сессий.
                 //
                 // Переиспользуем уже собранный `active_muxers` (owned Vec, см.
                 // выше), а не свежий `sm_clone.get_session().iter()` — тот
@@ -245,31 +257,93 @@ impl Network {
                 // тред (в т.ч. этот же периодический таск, который потом сам
                 // не мог провернуть следующий тик).
                 if let Some(validator) = &quota_auth {
-                    for muxer in &active_muxers {
-                        let Some(user_id) = muxer.quota_user_id() else {
-                            continue;
-                        };
-                        let delta = muxer.take_usage_delta();
-                        if delta == 0 {
-                            continue;
-                        }
-                        match validator.report_usage(&user_id, delta).await {
-                            Ok(report) if report.over_limit => {
-                                warn!(
-                                    user_id,
-                                    used = report.used_bytes,
-                                    limit = ?report.limit_bytes,
-                                    "🚫 Traffic limit exceeded, tearing down session"
-                                );
-                                muxer.remove_all_legs();
-                                sm_clone.remove(muxer.session_id());
+                    // Не меняем состав уже отправленной пачки, пока не
+                    // получим ответ: если БД успела commit, а HTTP-ответ
+                    // потерялся, повтор с тем же ID вернёт сохранённый итог.
+                    // Пока есть очередь, новые байты остаются в счётчиках muxer.
+                    if pending_usage_batches.is_empty() {
+                        let mut usage_by_user: HashMap<String, (u64, Vec<Arc<Muxer>>)> =
+                            HashMap::new();
+                        for muxer in &active_muxers {
+                            let Some(user_id) = muxer.quota_user_id() else {
+                                continue;
+                            };
+                            let delta = muxer.take_usage_delta();
+                            if delta == 0 {
+                                continue;
                             }
-                            Ok(_) => {}
-                            Err(e) => {
-                                // Бэкенд недоступен/ошибка — не терять дельту
-                                // навсегда, отчитаемся вместе со следующим тиком.
-                                muxer.rollback_usage_delta(delta);
-                                warn!(user_id, error = %e, "Usage report failed, will retry");
+                            let (total, sessions) = usage_by_user
+                                .entry(user_id)
+                                .or_insert_with(|| (0, Vec::new()));
+                            *total = total.saturating_add(delta);
+                            sessions.push(muxer.clone());
+                        }
+
+                        let mut grouped: Vec<_> = usage_by_user.into_iter().collect();
+                        grouped.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                        for chunk in grouped.chunks(1000) {
+                            let deltas = chunk
+                                .iter()
+                                .map(|(user_id, (delta, _))| (user_id.clone(), *delta))
+                                .collect();
+                            let sessions = chunk
+                                .iter()
+                                .map(|(user_id, (_, sessions))| (user_id.clone(), sessions.clone()))
+                                .collect();
+                            pending_usage_batches.push_back(PendingUsageBatch {
+                                batch_id: uuid::Uuid::new_v4().to_string(),
+                                deltas,
+                                sessions,
+                            });
+                        }
+                    }
+
+                    while let Some(batch) = pending_usage_batches.front() {
+                        let result = validator
+                            .report_usage_batch(&batch.batch_id, &batch.deltas)
+                            .await;
+                        match result {
+                            Ok(reports) => {
+                                let batch = pending_usage_batches
+                                    .pop_front()
+                                    .expect("front batch exists");
+                                let mut all_reported = true;
+                                for (user_id, sessions) in &batch.sessions {
+                                    match reports.get(user_id) {
+                                        Some(report) if report.over_limit => {
+                                            warn!(
+                                                user_id,
+                                                used = report.used_bytes,
+                                                limit = ?report.limit_bytes,
+                                                "🚫 Traffic limit exceeded, tearing down session"
+                                            );
+                                            for muxer in sessions {
+                                                muxer.remove_all_legs();
+                                                sm_clone.remove(muxer.session_id());
+                                            }
+                                        }
+                                        Some(_) => {}
+                                        None => {
+                                            all_reported = false;
+                                            warn!(
+                                                user_id,
+                                                "Usage report returned no row; will retry"
+                                            );
+                                        }
+                                    }
+                                }
+                                if !all_reported {
+                                    pending_usage_batches.push_front(batch);
+                                    break;
+                                }
+                            }
+                            Err(error) => {
+                                warn!(
+                                    batch_id = %batch.batch_id,
+                                    error = %error,
+                                    "Usage batch failed; retaining it for idempotent retry"
+                                );
+                                break;
                             }
                         }
                     }
@@ -344,6 +418,52 @@ impl Network {
             }
             Err(e) => {
                 warn!(error = %e, "UDP datagram leg listener failed to bind, continuing TCP-only");
+            }
+        }
+
+        // QUIC is reserved for authenticated node-to-node sessions. Keep it
+        // on a separate UDP port: the public ingress UDP socket above carries
+        // the existing quiceng datagram transport and cannot share Quinn's
+        // socket safely.
+        if self.mesh_enabled {
+            let quic_addr = format!("{}:{}", self.host, self.mesh_quic_port);
+            let bind_addr = tokio::net::lookup_host(&quic_addr)
+                .await
+                .ok()
+                .and_then(|mut addrs| addrs.next());
+            match bind_addr
+                .and_then(|addr| netrunner_core::net::mesh_quic_server_endpoint(addr).ok())
+            {
+                Some(endpoint) => {
+                    let listener_token = token.clone();
+                    let session_manager = session_manager.clone();
+                    let decoy_host = self.decoy_host.clone();
+                    let auth = self.auth.clone();
+                    let identity = self.identity.clone();
+                    let cover_flight = self.cover_flight.clone();
+                    let honor_requested_sni = self.honor_requested_sni;
+                    let require_auth = self.require_auth;
+                    let mesh = self.mesh.clone();
+                    tokio::spawn(async move {
+                        run_mesh_quic_listener(
+                            endpoint,
+                            session_manager,
+                            decoy_host,
+                            auth,
+                            identity,
+                            cover_flight,
+                            honor_requested_sni,
+                            require_auth,
+                            mesh,
+                            listener_token,
+                        )
+                        .await;
+                    });
+                }
+                None => warn!(
+                    port = self.mesh_quic_port,
+                    "Mesh QUIC listener failed to bind; peer links will use TCP fallback"
+                ),
             }
         }
 
@@ -448,4 +568,88 @@ impl Network {
             active_connections.load(Ordering::Relaxed)
         );
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_mesh_quic_listener(
+    endpoint: quinn::Endpoint,
+    session_manager: Arc<SessionManager>,
+    decoy_host: Arc<str>,
+    auth: Option<Arc<dyn AuthValidator>>,
+    identity: Option<Identity>,
+    cover_flight: Arc<[usize]>,
+    honor_requested_sni: bool,
+    require_auth: bool,
+    mesh: Option<Arc<NodeMesh>>,
+    token: CancellationToken,
+) {
+    info!("Authenticated mesh QUIC listener ready");
+    loop {
+        let incoming = tokio::select! {
+            _ = token.cancelled() => break,
+            incoming = endpoint.accept() => match incoming {
+                Some(incoming) => incoming,
+                None => break,
+            }
+        };
+
+        let session_manager = session_manager.clone();
+        let decoy_host = decoy_host.clone();
+        let auth = auth.clone();
+        let identity = identity.clone();
+        let cover_flight = cover_flight.clone();
+        let mesh = mesh.clone();
+        let token = token.clone();
+        tokio::spawn(async move {
+            let connection = tokio::select! {
+                _ = token.cancelled() => return,
+                connection = incoming => match connection {
+                    Ok(connection) => connection,
+                    Err(_) => {
+                        metrics::counter!("netrunner_mesh_quic_handshake_failures_total").increment(1);
+                        return;
+                    }
+                }
+            };
+
+            // One authenticated NRXP session owns a QUIC connection. Its
+            // logical streams are multiplexed by the existing MeshPeerSession.
+            let streams = tokio::time::timeout(
+                Duration::from_secs(8),
+                connection.accept_bi(),
+            )
+            .await;
+            let (send, recv) = match streams {
+                Ok(Ok(streams)) => streams,
+                _ => {
+                    connection.close(0u32.into(), b"mesh stream timeout");
+                    return;
+                }
+            };
+            metrics::counter!("netrunner_mesh_quic_sessions_accepted_total").increment(1);
+
+            let handler = ServerHandler::new(
+                Connection::new_quic(recv, send),
+                session_manager,
+                decoy_host,
+                auth,
+                identity,
+                cover_flight,
+                honor_requested_sni,
+            )
+            .with_mesh_policy(require_auth, true, mesh)
+            .with_mesh_quic_connection(connection.clone());
+            let handler = tokio::spawn(async move {
+                let _ = handler.run().await;
+            });
+
+            tokio::select! {
+                _ = token.cancelled() => connection.close(0u32.into(), b"server shutdown"),
+                _ = connection.closed() => {}
+                _ = handler => connection.close(0u32.into(), b"mesh session ended"),
+            }
+        });
+    }
+    endpoint.close(0u32.into(), b"server shutdown");
+    endpoint.wait_idle().await;
 }

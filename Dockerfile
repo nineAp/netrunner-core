@@ -40,6 +40,7 @@ COPY --chmod=0755 server/container-entrypoint.sh /app/container-entrypoint.sh
 
 EXPOSE 443/udp
 EXPOSE 443/tcp
+EXPOSE 8443/udp
 
 # Бэкенд исторически передаёт после имени образа явную команду
 # `./netrunner-proxy ...`. Entrypoint сохраняет эту форму совместимой и при

@@ -24,12 +24,11 @@ use std::{
 
 use bytes::{Bytes, BytesMut};
 use netrunner_logger::{
-    error, info, warn, AppError, ERR_INFRA_TIMEOUT, ERR_NET_TLS_TAMPER, ERR_SYS_PANIC,
+    AppError, ERR_INFRA_TIMEOUT, ERR_NET_TLS_TAMPER, ERR_SYS_PANIC, error, info, warn,
 };
 use rand::RngExt;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::tcp::{OwnedReadHalf, OwnedWriteHalf},
     sync::mpsc::Receiver,
 };
 use tracing::instrument;
@@ -38,16 +37,17 @@ use super::buftune::{self, BufTuner, Dir as BufDir};
 
 use crate::{
     net::{
-        connection::{
-            handler::StreamHandler,
-            muxer::{MuxMessage, TcpSocketStats},
-        },
         FALLBACK_CONNECT_TIMEOUT, HEALTH_CHECK_INTERVAL, LEG_FLAP_WINDOW,
         MAX_INTERNAL_RECONNECT_ATTEMPTS, MAX_RECONNECT_BACKOFF_MS, RECONNECT_BACKOFF_BASE,
         RECONNECT_BACKOFF_JITTER_MS, TUNNEL_INTERLEAVE_CHUNK, TUNNEL_MAX_BUFFER_SIZE,
         TUNNEL_READ_RESERVE,
+        connection::{
+            connection::{TunnelReadHalf, TunnelWriteHalf},
+            handler::StreamHandler,
+            muxer::{MuxMessage, TcpSocketStats},
+        },
     },
-    nrxp::{ErrorAction, FrameType, RxCodec, TxCodec, MAX_FRAME_PAYLOAD},
+    nrxp::{ErrorAction, FrameType, MAX_FRAME_PAYLOAD, RxCodec, TxCodec},
 };
 
 /// Per-leg userspace flow queue.  The mpsc channel remains the bounded ingress
@@ -149,10 +149,10 @@ impl FairDataQueue {
 }
 
 #[cfg(target_os = "linux")]
-fn read_tcp_socket_stats(outbound: &OwnedWriteHalf) -> Option<TcpSocketStats> {
+fn read_tcp_socket_stats(outbound: &TunnelWriteHalf) -> Option<TcpSocketStats> {
     use std::os::fd::AsRawFd;
 
-    let fd = outbound.as_ref().as_raw_fd();
+    let fd = outbound.tcp_owned()?.as_ref().as_raw_fd();
     let mut info = std::mem::MaybeUninit::<libc::tcp_info>::zeroed();
     let mut len = std::mem::size_of::<libc::tcp_info>() as libc::socklen_t;
     let rc = unsafe {
@@ -198,12 +198,12 @@ fn read_tcp_socket_stats(outbound: &OwnedWriteHalf) -> Option<TcpSocketStats> {
 }
 
 #[cfg(target_os = "android")]
-fn read_tcp_socket_stats(outbound: &OwnedWriteHalf) -> Option<TcpSocketStats> {
+fn read_tcp_socket_stats(outbound: &TunnelWriteHalf) -> Option<TcpSocketStats> {
     use std::os::fd::AsRawFd;
 
     // Android's libc bindings omit `tcp_info`, but the kernel still exposes the
     // not-yet-sent byte count that matters most for avoiding a queued leg.
-    let fd = outbound.as_ref().as_raw_fd();
+    let fd = outbound.tcp_owned()?.as_ref().as_raw_fd();
     let mut notsent_bytes: libc::c_int = 0;
     let rc = unsafe { libc::ioctl(fd, libc::SIOCOUTQNSD as libc::Ioctl, &mut notsent_bytes) };
     (rc == 0).then_some(TcpSocketStats {
@@ -213,7 +213,7 @@ fn read_tcp_socket_stats(outbound: &OwnedWriteHalf) -> Option<TcpSocketStats> {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
-fn read_tcp_socket_stats(_outbound: &OwnedWriteHalf) -> Option<TcpSocketStats> {
+fn read_tcp_socket_stats(_outbound: &TunnelWriteHalf) -> Option<TcpSocketStats> {
     None
 }
 
@@ -232,9 +232,9 @@ pub enum LegStatus {
 /// переиспользовать кодеки (с их счётчиками nonce) между итерациями без Arc/Mutex.
 pub(crate) struct TunnelEngine {
     /// Читающая половина TCP-сокета (выдаётся reader-задаче).
-    pub inbound: Option<OwnedReadHalf>,
+    pub inbound: Option<TunnelReadHalf>,
     /// Пишущая половина TCP-сокета (выдаётся writer-задаче).
-    pub outbound: Option<OwnedWriteHalf>,
+    pub outbound: Option<TunnelWriteHalf>,
     /// Адрес удалённой стороны; **пустой у сервера** (сервер не реконнектит).
     pub remote_addr: String,
     /// Идентификатор сессии (для логов и хендшейка реконнекта).
@@ -286,8 +286,8 @@ impl TunnelEngine {
         &mut self,
     ) -> Result<
         (
-            OwnedReadHalf,
-            OwnedWriteHalf,
+            TunnelReadHalf,
+            TunnelWriteHalf,
             RxCodec,
             TxCodec,
             BytesMut,
@@ -454,7 +454,8 @@ impl TunnelEngine {
         if lost > 0 {
             warn!(
                 leg_id = self.leg_id,
-                recovered, lost,
+                recovered,
+                lost,
                 "Leg death: some in-flight data could not be requeued — no live legs left in session"
             );
         } else {
@@ -611,8 +612,8 @@ impl TunnelEngine {
                             * (1u64 << internal_attempt.saturating_sub(1).min(4));
                         // Jitter grows with the step (up to half of it) so a fleet that
                         // lost the same server does not retry in lockstep.
-                        let jitter = rand::random::<u64>()
-                            % RECONNECT_BACKOFF_JITTER_MS.max(exp_ms / 2);
+                        let jitter =
+                            rand::random::<u64>() % RECONNECT_BACKOFF_JITTER_MS.max(exp_ms / 2);
                         let backoff_ms = (exp_ms + jitter).min(MAX_RECONNECT_BACKOFF_MS);
                         tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
                         continue;
@@ -647,7 +648,9 @@ impl TunnelEngine {
                 let mut read_buf = read_buf;
                 let mut inbound = inbound;
                 let mut rcv_tuner = BufTuner::new(BufDir::Recv);
-                rcv_tuner.apply_initial(inbound.as_ref());
+                if let Some(tcp) = inbound.tcp_stream() {
+                    rcv_tuner.apply_initial(tcp);
+                }
                 loop {
                     if read_buf.len() > TUNNEL_MAX_BUFFER_SIZE {
                         error!(
@@ -681,9 +684,11 @@ impl TunnelEngine {
                             rcv_tuner.on_bytes(n);
                             let tune_now = std::time::Instant::now();
                             if rcv_tuner.due(tune_now) {
-                                let rtt = buftune::leg_rtt_ms(inbound.as_ref());
+                                let rtt = inbound.tcp_stream().and_then(buftune::leg_rtt_ms);
                                 if let Some(size) = rcv_tuner.tick(tune_now, rtt) {
-                                    rcv_tuner.apply(inbound.as_ref(), size);
+                                    if let Some(tcp) = inbound.tcp_stream() {
+                                        rcv_tuner.apply(tcp, size);
+                                    }
                                 }
                             }
                             let mut frames = Vec::new();
@@ -735,7 +740,9 @@ impl TunnelEngine {
                 let fair_queue_cap = data_rx.max_capacity().max(1);
                 let mut data_closed = false;
                 let mut snd_tuner = BufTuner::new(BufDir::Send);
-                snd_tuner.apply_initial(outbound.as_ref());
+                if let Some(tcp) = outbound.tcp_stream() {
+                    snd_tuner.apply_initial(tcp);
+                }
                 let mut tcp_info_tick =
                     tokio::time::interval(std::time::Duration::from_millis(250));
                 tcp_info_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -793,9 +800,11 @@ impl TunnelEngine {
                             }
                             let tune_now = std::time::Instant::now();
                             if snd_tuner.due(tune_now) {
-                                let rtt = buftune::leg_rtt_ms(outbound.as_ref());
+                                let rtt = outbound.tcp_stream().and_then(buftune::leg_rtt_ms);
                                 if let Some(size) = snd_tuner.tick(tune_now, rtt) {
-                                    snd_tuner.apply(outbound.as_ref(), size);
+                                    if let Some(tcp) = outbound.tcp_stream() {
+                                        snd_tuner.apply(tcp, size);
+                                    }
                                 }
                             }
                         }
@@ -1068,7 +1077,7 @@ impl TunnelEngine {
     /// ([`Muxer::adaptive_leg_write_timeout`](super::muxer::Muxer::adaptive_leg_write_timeout))
     /// — чтобы медленная, но живая нога не убивалась по жёсткому тайм-ауту.
     async fn handle_outbound(
-        outbound: &mut OwnedWriteHalf,
+        outbound: &mut TunnelWriteHalf,
         tx_codec: &mut TxCodec,
         msg: MuxMessage,
         leg_id: u32,

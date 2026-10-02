@@ -24,5 +24,6 @@ mod muxer;
 
 pub use buftune::BUF_CAP;
 pub use connection::{ClientHandler, Connection, ServerHandler, SessionManager, TunnelHandler};
+pub(crate) use connection::{MeshPeerSession, mesh_process_uptime_ms};
 pub use dgram_engine::run_datagram_listener;
-pub use muxer::{Muxer, GLOBAL_MIN_RTT};
+pub use muxer::{GLOBAL_MIN_RTT, Muxer};

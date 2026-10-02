@@ -11,6 +11,7 @@
 use crate::net::diagnostics::ErrorCounters;
 use async_trait::async_trait;
 use netrunner_logger::AppError;
+use std::collections::HashMap;
 
 pub const MAX_MESH_HOPS: u8 = 8;
 pub const MESH_ROUTE_READY: &[u8] = b"NRXP-MESH2-READY";
@@ -225,6 +226,9 @@ pub struct UsageReport {
     pub over_limit: bool,
 }
 
+/// One user's byte delta accumulated since the previous usage report tick.
+pub type UsageDelta = (String, u64);
+
 /// Агрегированный, полностью анонимный снимок состояния ноды — ровно то, что
 /// нужно для поддержания туннеля (жива ли нода, сколько сейчас соединений,
 /// сколько трафика прошло суммарно, были ли ошибки), и НИЧЕГО о конкретных
@@ -249,6 +253,12 @@ pub trait AuthValidator: Send + Sync {
     async fn validate(&self, token: &str) -> Result<UserQuota, AppError>;
     /// Отчитывается о переданных байтах и синхронно узнаёт, не превышен ли лимит.
     async fn report_usage(&self, user_id: &str, delta_bytes: u64) -> Result<UsageReport, AppError>;
+    /// Отчитывается о нескольких пользователях одним идемпотентным пакетом.
+    async fn report_usage_batch(
+        &self,
+        batch_id: &str,
+        deltas: &[UsageDelta],
+    ) -> Result<HashMap<String, UsageReport>, AppError>;
     /// Отправляет агрегированный снимок состояния ноды на control-plane —
     /// единая точка сбора вместо локальных файлов на диске ноды.
     async fn report_node_health(&self, report: NodeHealthReport) -> Result<(), AppError>;

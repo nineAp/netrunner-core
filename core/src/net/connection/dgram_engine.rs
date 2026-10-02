@@ -35,8 +35,7 @@
 //! `Muxer::selection_load_factor` — у UDP-ноги альтернатив для сравнения
 //! нет, вопрос только "жива или нет").
 
-use std::net::SocketAddr;
-use std::sync::Arc;
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use arc_swap::ArcSwap;
 use bytes::Bytes;
@@ -144,6 +143,135 @@ async fn run_datagram_writer(
             }
         }
     }
+}
+
+/// Attaches the mesh session's UDP flow leg to QUIC DATAGRAM frames. The
+/// surrounding NRXP stream has already authenticated the peer, and QUIC
+/// protects these packet payloads on the same peer connection. If datagrams
+/// are unavailable or fail later, the Muxer falls back to its reliable stream.
+#[cfg(feature = "mesh-quic")]
+pub(crate) fn attach_mesh_quic_datagram_leg(
+    muxer: Arc<Muxer>,
+    connection: quinn::Connection,
+    handler: Arc<StreamHandler>,
+    datagram_root: [u8; 32],
+    is_client: bool,
+) {
+    let Some(max_datagram) = connection.max_datagram_size() else {
+        metrics::counter!("netrunner_mesh_quic_datagram_unavailable_total").increment(1);
+        return;
+    };
+    let max_payload = max_datagram
+        .saturating_sub(crate::rawdgram::RAW_DGRAM_OVERHEAD)
+        .min(crate::net::MAX_DATAGRAM_LEG_PAYLOAD);
+    if max_payload == 0 {
+        metrics::counter!("netrunner_mesh_quic_datagram_unavailable_total").increment(1);
+        return;
+    }
+
+    let cap = NetworkConfig::global().channel_capacity;
+    let (control_tx, mut control_rx) = mpsc::channel::<MuxMessage>(cap);
+    let (data_tx, mut data_rx) = mpsc::channel::<MuxMessage>(cap);
+    muxer.set_datagram_leg_with_max_payload(control_tx.clone(), data_tx, max_payload);
+    muxer.mark_datagram_leg_alive();
+    let (mut tx, mut rx) = build_raw_pair(datagram_root, is_client);
+
+    let token = muxer.network_epoch_token().child_token();
+    let reader_token = token.clone();
+    let writer_muxer = muxer.clone();
+    let writer_connection = connection.clone();
+    tokio::spawn(async move {
+        loop {
+            let keepalive_seconds = 15.0 + rand::random::<f64>() * 10.0;
+            let keepalive = tokio::time::sleep(Duration::from_secs_f64(keepalive_seconds));
+            tokio::pin!(keepalive);
+
+            tokio::select! {
+                _ = token.cancelled() => break,
+                _ = &mut keepalive => {
+                    let ping = match tx.seal(0, FrameType::Heartbeat, Bytes::from_static(PING)) {
+                        Ok(ping) => ping,
+                        Err(_) => {
+                            writer_muxer.clear_datagram_leg();
+                            break;
+                        }
+                    };
+                    if writer_connection.send_datagram_wait(ping).await.is_err() {
+                        writer_muxer.clear_datagram_leg();
+                        break;
+                    }
+                }
+                message = control_rx.recv() => match message {
+                    Some(message) => {
+                        let packet = match tx.seal(message.stream_id, message.frame_type, message.data) {
+                            Ok(packet) => packet,
+                            Err(_) => {
+                                writer_muxer.clear_datagram_leg();
+                                break;
+                            }
+                        };
+                        if writer_connection.send_datagram_wait(packet).await.is_err() {
+                            writer_muxer.clear_datagram_leg();
+                            break;
+                        }
+                    }
+                    None => break,
+                },
+                message = data_rx.recv() => match message {
+                    Some(message) => {
+                        let packet = match tx.seal(
+                            message.stream_id,
+                            message.frame_type,
+                            message.data.clone(),
+                        ) {
+                            Ok(packet) => packet,
+                            Err(_) => {
+                                writer_muxer.clear_datagram_leg();
+                                writer_muxer
+                                    .send_data_safe(message.stream_id, message.data, true)
+                                    .await
+                                    .ok();
+                                break;
+                            }
+                        };
+                        if writer_connection.send_datagram_wait(packet).await.is_err() {
+                            writer_muxer.clear_datagram_leg();
+                            // The QUIC datagram was not accepted. Retrying now
+                            // uses the reliable stream carried by this session.
+                            writer_muxer
+                                .send_data_safe(message.stream_id, message.data, true)
+                                .await
+                                .ok();
+                            break;
+                        }
+                    }
+                    None => break,
+                }
+            }
+        }
+        token.cancel();
+    });
+
+    let reader_muxer = muxer.clone();
+    let reader_control_tx = control_tx.clone();
+    tokio::spawn(async move {
+        loop {
+            let packet = tokio::select! {
+                _ = reader_token.cancelled() => break,
+                packet = connection.read_datagram() => match packet {
+                    Ok(packet) => packet,
+                    Err(_) => break,
+                }
+            };
+            let Ok(frame) = rx.open(&packet) else {
+                continue;
+            };
+            dispatch_open_frame(frame, &reader_control_tx, &handler).await;
+            reader_muxer.mark_datagram_leg_alive();
+        }
+        reader_muxer.clear_datagram_leg();
+        reader_token.cancel();
+    });
 }
 
 /// Решает, что делать с уже РАСШИФРОВАННЫМ кадром: `PING` — немедленно
@@ -423,6 +551,9 @@ pub(crate) async fn attempt_client_datagram_leg(
     session_id: String,
     datagram_root: [u8; 32],
 ) {
+    if muxer.is_fatal() {
+        return;
+    }
     let bind_addr: SocketAddr = if udp_addr.is_ipv4() {
         "0.0.0.0:0".parse().unwrap()
     } else {
@@ -486,7 +617,11 @@ pub(crate) async fn attempt_client_datagram_leg(
         );
         return;
     };
+    if muxer.is_fatal() {
+        return;
+    }
     info!(?session_id, "🌐 Physical UDP leg established");
+    metrics::counter!("netrunner_datagram_legs_established_total").increment(1);
 
     let cap = NetworkConfig::global().channel_capacity;
     let (control_tx, control_rx) = mpsc::channel::<MuxMessage>(cap);

@@ -21,11 +21,11 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::net::{
+    MeshRoute, NetworkConfig,
     connection::{
         bridge::{run_tcp_bridge, run_udp_bridge},
         muxer::Muxer,
     },
-    MeshRoute, NetworkConfig,
 };
 use crate::nrxp::{Frame, FrameType};
 
@@ -223,7 +223,9 @@ impl RemoteOpener {
         is_udp: bool,
         upstream_peer: bool,
     ) {
+        let route_setup_started = Instant::now();
         let Some(mut route) = mesh.route_for_flow(&route).await else {
+            metrics::counter!("netrunner_mesh_route_selection_failures_total").increment(1);
             if !token.is_cancelled() {
                 let _ = ingress_muxer
                     .send_control(ingress_stream_id, FrameType::Close, Bytes::new())
@@ -251,24 +253,19 @@ impl RemoteOpener {
                     continue;
                 };
                 let auth_token = mesh.auth_token_for_route(&next_route);
-                let result = tokio::select! {
-                    _ = token.cancelled() => break,
-                    result = Box::pin(
-                        crate::net::connection::connection::ClientHandler::connect_mesh_stream(
-                            &peer,
-                            &auth_token,
-                            &target,
-                            is_udp,
-                        ),
-                    ) => result,
-                };
+                let result = mesh
+                    .connect_peer_stream(&peer, &auth_token, &target, is_udp, Some(&token))
+                    .await;
                 match result {
-                    Ok((peer_muxer, peer_rx, engine_task)) => {
+                    Ok((peer_session, peer_stream_id, peer_rx)) => {
                         metrics::counter!("netrunner_mesh_egress_streams_total").increment(1);
-                        connected = Some((peer_muxer, peer_rx, engine_task));
+                        connected = Some((peer_session, peer_stream_id, peer_rx));
                         break;
                     }
                     Err(_) => {
+                        if token.is_cancelled() {
+                            break;
+                        }
                         // Keep failure detail local: peer addresses and destination
                         // data do not belong in normal connection logs.
                         metrics::counter!("netrunner_mesh_egress_connect_failures_total")
@@ -291,7 +288,7 @@ impl RemoteOpener {
             route = retry_route;
         }
 
-        let Some((peer_muxer, mut peer_rx, engine_task)) = connected else {
+        let Some((peer_session, peer_stream_id, mut peer_rx)) = connected else {
             if !token.is_cancelled() {
                 let _ = ingress_muxer
                     .send_control(ingress_stream_id, FrameType::Close, Bytes::new())
@@ -300,6 +297,20 @@ impl RemoteOpener {
             ingress_muxer.remove_stream(ingress_stream_id);
             return;
         };
+        let peer_muxer = peer_session.muxer.clone();
+        if token.is_cancelled() {
+            let _ = peer_muxer
+                .send_control(peer_stream_id, FrameType::Close, Bytes::new())
+                .await;
+            peer_muxer.remove_stream(peer_stream_id);
+            ingress_muxer.remove_stream(ingress_stream_id);
+            return;
+        }
+        metrics::histogram!("netrunner_mesh_route_setup_seconds")
+            .record(route_setup_started.elapsed().as_secs_f64());
+        if let Some(rtt_ms) = peer_muxer.leg_rtt_ms(0).filter(|rtt| *rtt > 0) {
+            metrics::histogram!("netrunner_mesh_peer_rtt_ms").record(f64::from(rtt_ms));
+        }
 
         // The downstream CONNECT is confirmed only after the final egress has
         // opened the destination. Propagate that acknowledgement one hop back
@@ -324,13 +335,15 @@ impl RemoteOpener {
                         Some(data) if is_udp => {
                             // UDP keeps datagram semantics; an unavailable mesh
                             // leg drops this packet instead of killing the flow.
-                            let _ = peer_muxer.send_data_safe(1, data, true).await;
+                            let _ = peer_muxer
+                                .send_data_safe(peer_stream_id, data, true)
+                                .await;
                         }
                         Some(data) => {
                             let deadline = tokio::time::Instant::now()
                                 + crate::net::STREAM_PAUSE_BUDGET;
                             let sent = loop {
-                                if peer_muxer.send_data_safe(1, data.clone(), false).await.is_ok() {
+                                if peer_muxer.send_data_safe(peer_stream_id, data.clone(), false).await.is_ok() {
                                     break true;
                                 }
                                 if token.is_cancelled()
@@ -401,11 +414,9 @@ impl RemoteOpener {
         }
 
         let _ = peer_muxer
-            .send_control(1, FrameType::Close, Bytes::new())
+            .send_control(peer_stream_id, FrameType::Close, Bytes::new())
             .await;
-        peer_muxer.remove_stream(1);
-        peer_muxer.shutdown();
-        engine_task.abort();
+        peer_muxer.remove_stream(peer_stream_id);
         if !token.is_cancelled() {
             let _ = ingress_muxer
                 .send_control(ingress_stream_id, FrameType::Close, Bytes::new())

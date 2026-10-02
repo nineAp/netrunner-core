@@ -2061,7 +2061,10 @@ dependencies = [
  "libc",
  "metrics",
  "netrunner-logger",
+ "quinn",
  "rand 0.10.0",
+ "rcgen",
+ "rustls",
  "serde",
  "serde_json",
  "sha2",
@@ -2164,12 +2167,14 @@ dependencies = [
  "metrics-exporter-prometheus",
  "netrunner-core",
  "netrunner-logger",
+ "quinn",
  "reqwest 0.13.2",
  "serde",
  "serde_json",
  "tokio",
  "tokio-util",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

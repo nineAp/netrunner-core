@@ -120,6 +120,15 @@ struct Args {
     #[arg(long, default_value_t = 2)]
     mesh_max_hops: u8,
 
+    /// UDP port for real QUIC between proxy nodes. Clients still connect to
+    /// ingress through the existing quiceng datagram transport on --port.
+    #[arg(
+        long,
+        env = "MESH_QUIC_PORT",
+        default_value_t = netrunner_core::net::DEFAULT_MESH_QUIC_PORT
+    )]
+    mesh_quic_port: u16,
+
     /// URL control-plane бэкенда для проверки токенов/отчётов о трафике.
     /// Обязателен, если включён `--require-auth` или `--mesh-enabled`.
     #[arg(long)]
@@ -192,11 +201,14 @@ fn main() {
             .as_ref()
             .expect("mesh requires PROXY_INTERNAL_SECRET")
             .clone();
-        Some(Arc::new(netrunner_core::net::NodeMesh::with_max_hops(
-            node_id,
-            node_secret,
-            args.mesh_max_hops,
-        )))
+        Some(Arc::new(
+            netrunner_core::net::NodeMesh::with_max_hops_and_quic_port(
+                node_id,
+                node_secret,
+                args.mesh_max_hops,
+                args.mesh_quic_port,
+            ),
+        ))
     } else {
         None
     };
@@ -385,6 +397,7 @@ fn main() {
         args.require_auth,
         args.mesh_enabled,
         mesh,
+        args.mesh_quic_port,
         args.health_port,
         identity,
         cover_flight,

@@ -36,6 +36,8 @@ use crate::nrxp::{
 
 const WIRE_BITS: u32 = 32;
 const PREFIX_LEN: usize = 16 + 1 + 4;
+/// Maximum per-datagram overhead: raw wire prefix + NRXP frame header + AEAD tag.
+pub(crate) const RAW_DGRAM_OVERHEAD: usize = PREFIX_LEN + 25 + 16;
 
 fn bad_packet(what: &'static str) -> TlsError {
     TlsError::new(ErrorStage::Tls(what), ErrorAction::Drop, Bytes::new())

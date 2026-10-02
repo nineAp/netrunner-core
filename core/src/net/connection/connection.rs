@@ -20,24 +20,27 @@
 
 use std::{
     future::Future,
-    net::Ipv4Addr,
+    io,
+    net::{Ipv4Addr, SocketAddr},
     pin::Pin,
     sync::Arc,
+    sync::atomic::{AtomicU64, Ordering},
+    task::{Context, Poll},
     time::{Duration, Instant},
 };
 
 use crate::{
     crypto::{ChaChaCipher, Identity, SessionKeys},
     net::{
+        DNS_LOOKUP_TIMEOUT, FALLBACK_CONNECT_TIMEOUT, HTTPS_PORT, LEG_RECONNECT_DELAY,
+        LEG_STAGGER_DELAY, MAX_TUNNEL_LEGS, NETWORK_WATCHER_INTERVAL, NetworkConfig,
+        SECURE_HANDSHAKE_TIMEOUT, SESSION_CLEANUP_DELAY, STREAM_PAUSE_BUDGET, STREAM_PAUSE_RETRY,
+        TLS_HELLO_TIMEOUT, TOPOLOGY_PRINT_INTERVAL,
         connection::{
             engine::TunnelEngine,
             handler::{RemoteOpener, StreamHandler},
             muxer::{MuxMessage, Muxer},
         },
-        NetworkConfig, DNS_LOOKUP_TIMEOUT, FALLBACK_CONNECT_TIMEOUT, HTTPS_PORT,
-        LEG_RECONNECT_DELAY, LEG_STAGGER_DELAY, MAX_TUNNEL_LEGS, NETWORK_WATCHER_INTERVAL,
-        SECURE_HANDSHAKE_TIMEOUT, SESSION_CLEANUP_DELAY, STREAM_PAUSE_BUDGET, STREAM_PAUSE_RETRY,
-        TLS_HELLO_TIMEOUT, TOPOLOGY_PRINT_INTERVAL,
     },
     nrxp::{Codec, Frame, FrameType, TlsBridge},
     rawcast::{LocalProtocol, RawCastAdapter, RawCastFrame},
@@ -46,14 +49,14 @@ use crate::{
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use netrunner_logger::{
-    debug, error, info, warn, AppError, ERR_AUTH_FAILED, ERR_INFRA_TIMEOUT, ERR_NET_TLS_TAMPER,
+    AppError, ERR_AUTH_FAILED, ERR_INFRA_TIMEOUT, ERR_NET_TLS_TAMPER, debug, error, info, warn,
 };
 use rand::{Rng, RngExt};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
     net::{
-        tcp::{OwnedReadHalf, OwnedWriteHalf},
         TcpStream,
+        tcp::{OwnedReadHalf, OwnedWriteHalf},
     },
     sync::mpsc,
 };
@@ -80,6 +83,159 @@ pub(crate) struct DgramSessionEntry {
     /// (bug #12). Только для quic-записи (Initial адресуется её DCID); шлём
     /// ровно один раз, чтобы дубликат Initial не породил повторный flight.
     pub(crate) responded_to_initial: bool,
+}
+
+/// One authenticated, persistent NRXP connection to a mesh peer. Multiple
+/// destination streams share its handshake, TCP connection, and native UDP
+/// datagram leg. The route claim is bound to the peer session; callers pool
+/// sessions by the full route claim so each flow remains pinned to its route.
+pub(crate) struct MeshPeerSession {
+    pub(crate) muxer: Arc<Muxer>,
+    engine_task: tokio::task::AbortHandle,
+    ready_payload: &'static [u8],
+    last_used_ms: AtomicU64,
+    #[cfg(feature = "mesh-quic")]
+    _quic_endpoint: Option<quinn::Endpoint>,
+    #[cfg(feature = "mesh-quic")]
+    quic_connection: Option<quinn::Connection>,
+}
+
+impl MeshPeerSession {
+    pub(crate) fn is_usable(&self) -> bool {
+        !self.muxer.is_fatal() && self.muxer.active_legs_count() > 0
+    }
+
+    pub(crate) fn is_idle(&self) -> bool {
+        self.muxer.active_streams_count() == 0
+    }
+
+    pub(crate) fn last_used_ms(&self) -> u64 {
+        self.last_used_ms.load(Ordering::Relaxed)
+    }
+
+    pub(crate) async fn open_stream(
+        &self,
+        target: &str,
+        is_udp: bool,
+        cancel: Option<&tokio_util::sync::CancellationToken>,
+    ) -> Result<(u32, mpsc::Receiver<Bytes>), AppError> {
+        if !self.is_usable() {
+            return Err(AppError::new(
+                ERR_INFRA_TIMEOUT,
+                "Mesh peer unavailable",
+                "The pooled mesh peer session has no active transport",
+            ));
+        }
+
+        let started = Instant::now();
+        let stream_id = self.muxer.next_stream_id();
+        let cap = NetworkConfig::global().channel_capacity;
+        let (stream_tx, mut stream_rx) = mpsc::channel::<Bytes>(cap);
+        self.muxer.register_stream_with_backlog_cap(
+            stream_id,
+            stream_tx,
+            crate::net::SERVER_STREAM_BACKLOG_MAX_BYTES,
+        );
+
+        let frame_type = if is_udp {
+            FrameType::UdpConnect
+        } else {
+            FrameType::Connect
+        };
+        let open_result = if let Some(cancel) = cancel {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => None,
+                result = self.muxer.send_control(
+                    stream_id,
+                    frame_type,
+                    Bytes::copy_from_slice(target.as_bytes()),
+                ) => Some(result),
+            }
+        } else {
+            Some(
+                self.muxer
+                    .send_control(
+                        stream_id,
+                        frame_type,
+                        Bytes::copy_from_slice(target.as_bytes()),
+                    )
+                    .await,
+            )
+        };
+        match open_result {
+            Some(Ok(())) => {}
+            Some(Err(error)) => {
+                self.muxer.remove_stream(stream_id);
+                return Err(error);
+            }
+            None => {
+                self.close_stream(stream_id).await;
+                return Err(AppError::new(
+                    ERR_INFRA_TIMEOUT,
+                    "Mesh stream cancelled",
+                    "The application flow closed during mesh setup",
+                ));
+            }
+        }
+
+        let response = tokio::time::timeout(Duration::from_secs(8), stream_rx.recv());
+        let response = if let Some(cancel) = cancel {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => None,
+                response = response => response.ok().flatten(),
+            }
+        } else {
+            response.await.ok().flatten()
+        };
+        match response {
+            Some(payload) if payload.as_ref() == self.ready_payload => {
+                self.last_used_ms
+                    .store(mesh_process_uptime_ms(), Ordering::Relaxed);
+                if is_udp {
+                    metrics::counter!("netrunner_mesh_udp_streams_total").increment(1);
+                }
+                metrics::histogram!("netrunner_mesh_stream_setup_seconds")
+                    .record(started.elapsed().as_secs_f64());
+                Ok((stream_id, stream_rx))
+            }
+            _ => {
+                self.close_stream(stream_id).await;
+                metrics::counter!("netrunner_mesh_stream_setup_failures_total").increment(1);
+                Err(AppError::new(
+                    ERR_INFRA_TIMEOUT,
+                    "Mesh destination unavailable",
+                    "Egress did not confirm the destination connection",
+                ))
+            }
+        }
+    }
+
+    async fn close_stream(&self, stream_id: u32) {
+        let _ = self
+            .muxer
+            .send_control(stream_id, FrameType::Close, Bytes::new())
+            .await;
+        self.muxer.remove_stream(stream_id);
+    }
+}
+
+impl Drop for MeshPeerSession {
+    fn drop(&mut self) {
+        self.muxer.remove_all_streams();
+        self.muxer.shutdown();
+        self.engine_task.abort();
+        #[cfg(feature = "mesh-quic")]
+        if let Some(connection) = &self.quic_connection {
+            connection.close(0u32.into(), b"mesh session released");
+        }
+    }
+}
+
+pub(crate) fn mesh_process_uptime_ms() -> u64 {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis() as u64
 }
 
 /// Смена сети по наблюдаемому локальному адресу: адрес стал другим, ИЛИ его не было
@@ -341,10 +497,101 @@ pub trait TunnelHandler {
     async fn run(self) -> Result<(), AppError>;
 }
 
-/// Обёртка над TCP-соединением: половинки сокета + накопительный буфер чтения.
+/// Read side of a tunnel transport. QUIC streams are only constructed for
+/// server-to-server mesh sessions; public client ingress continues to use TCP.
+pub(crate) enum TunnelReadHalf {
+    Tcp(OwnedReadHalf),
+    #[cfg(feature = "mesh-quic")]
+    Quic(quinn::RecvStream),
+}
+
+impl TunnelReadHalf {
+    pub(crate) fn tcp_stream(&self) -> Option<&TcpStream> {
+        match self {
+            Self::Tcp(stream) => Some(stream.as_ref()),
+            #[cfg(feature = "mesh-quic")]
+            Self::Quic(_) => None,
+        }
+    }
+}
+
+impl AsyncRead for TunnelReadHalf {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Tcp(stream) => Pin::new(stream).poll_read(cx, buf),
+            #[cfg(feature = "mesh-quic")]
+            Self::Quic(stream) => Pin::new(stream).poll_read(cx, buf),
+        }
+    }
+}
+
+/// Write side of a tunnel transport. QUIC streams are only constructed for
+/// server-to-server mesh sessions; public client ingress continues to use TCP.
+pub(crate) enum TunnelWriteHalf {
+    Tcp(OwnedWriteHalf),
+    #[cfg(feature = "mesh-quic")]
+    Quic(quinn::SendStream),
+}
+
+impl TunnelWriteHalf {
+    pub(crate) fn tcp_stream(&self) -> Option<&TcpStream> {
+        match self {
+            Self::Tcp(stream) => Some(stream.as_ref()),
+            #[cfg(feature = "mesh-quic")]
+            Self::Quic(_) => None,
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub(crate) fn tcp_owned(&self) -> Option<&OwnedWriteHalf> {
+        match self {
+            Self::Tcp(stream) => Some(stream),
+            #[cfg(feature = "mesh-quic")]
+            Self::Quic(_) => None,
+        }
+    }
+}
+
+impl AsyncWrite for TunnelWriteHalf {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            Self::Tcp(stream) => Pin::new(stream).poll_write(cx, buf),
+            #[cfg(feature = "mesh-quic")]
+            Self::Quic(stream) => Pin::new(stream).poll_write(cx, buf).map(|result| {
+                result.map_err(|error| io::Error::new(io::ErrorKind::BrokenPipe, error))
+            }),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Tcp(stream) => Pin::new(stream).poll_flush(cx),
+            #[cfg(feature = "mesh-quic")]
+            Self::Quic(stream) => Pin::new(stream).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Tcp(stream) => Pin::new(stream).poll_shutdown(cx),
+            #[cfg(feature = "mesh-quic")]
+            Self::Quic(stream) => Pin::new(stream).poll_shutdown(cx),
+        }
+    }
+}
+
+/// Обёртка над туннельным соединением: транспортные половинки + накопительный буфер чтения.
 pub struct Connection {
-    pub(crate) inbound: OwnedReadHalf,
-    pub(crate) outbound: OwnedWriteHalf,
+    pub(crate) inbound: TunnelReadHalf,
+    pub(crate) outbound: TunnelWriteHalf,
     pub(crate) read_buf: BytesMut,
 }
 
@@ -395,8 +642,17 @@ impl Connection {
         tune_tcp_notsent_lowat(&stream);
         let (inbound, outbound) = stream.into_split();
         Self {
-            inbound,
-            outbound,
+            inbound: TunnelReadHalf::Tcp(inbound),
+            outbound: TunnelWriteHalf::Tcp(outbound),
+            read_buf: BytesMut::with_capacity(NetworkConfig::global().connection_buf_size),
+        }
+    }
+
+    #[cfg(feature = "mesh-quic")]
+    pub fn new_quic(inbound: quinn::RecvStream, outbound: quinn::SendStream) -> Self {
+        Self {
+            inbound: TunnelReadHalf::Quic(inbound),
+            outbound: TunnelWriteHalf::Quic(outbound),
             read_buf: BytesMut::with_capacity(NetworkConfig::global().connection_buf_size),
         }
     }
@@ -468,7 +724,7 @@ async fn resolve_safe_decoy_addr(host: &str, port: u16) -> Option<std::net::Sock
 /// middlebox-совместимости TLS 1.3. Переиспользуется и клиентской, и
 /// серверной стороной хендшейка — обе ждут её одинаково.
 async fn consume_middlebox_ccs(
-    inbound: &mut OwnedReadHalf,
+    inbound: &mut TunnelReadHalf,
     read_buf: &mut BytesMut,
 ) -> Result<(), AppError> {
     loop {
@@ -556,8 +812,8 @@ impl ClientHandler {
         identity: Option<&Identity>,
     ) -> Result<
         (
-            OwnedReadHalf,
-            OwnedWriteHalf,
+            TunnelReadHalf,
+            TunnelWriteHalf,
             crate::nrxp::RxCodec,
             crate::nrxp::TxCodec,
             BytesMut,
@@ -566,7 +822,70 @@ impl ClientHandler {
         AppError,
     > {
         stream.set_nodelay(true).unwrap_or_default();
-        let mut conn = Connection::new(stream);
+        Self::perform_handshake_on_connection(
+            Connection::new(stream),
+            session_id,
+            leg_id,
+            profile,
+            decoy_sni,
+            auth_token,
+            identity,
+        )
+        .await
+    }
+
+    #[cfg(feature = "mesh-quic")]
+    pub(crate) async fn perform_mesh_quic_handshake(
+        inbound: quinn::RecvStream,
+        outbound: quinn::SendStream,
+        session_id: &str,
+        leg_id: u32,
+        profile: &BrowserProfile,
+        decoy_sni: &str,
+        auth_token: &str,
+        identity: Option<&Identity>,
+    ) -> Result<
+        (
+            TunnelReadHalf,
+            TunnelWriteHalf,
+            crate::nrxp::RxCodec,
+            crate::nrxp::TxCodec,
+            BytesMut,
+            [u8; 32],
+        ),
+        AppError,
+    > {
+        Self::perform_handshake_on_connection(
+            Connection::new_quic(inbound, outbound),
+            session_id,
+            leg_id,
+            profile,
+            decoy_sni,
+            auth_token,
+            identity,
+        )
+        .await
+    }
+
+    async fn perform_handshake_on_connection(
+        mut conn: Connection,
+        session_id: &str,
+        leg_id: u32,
+        profile: &BrowserProfile,
+        decoy_sni: &str,
+        auth_token: &str,
+        identity: Option<&Identity>,
+    ) -> Result<
+        (
+            TunnelReadHalf,
+            TunnelWriteHalf,
+            crate::nrxp::RxCodec,
+            crate::nrxp::TxCodec,
+            BytesMut,
+            [u8; 32],
+        ),
+        AppError,
+    > {
         let mut session_keys = match identity {
             Some(id) => SessionKeys::with_identity(true, id.clone()),
             None => SessionKeys::new(true),
@@ -681,61 +1000,83 @@ impl ClientHandler {
         ))
     }
 
-    /// Opens one application stream over a direct NRXP leg to a mesh egress.
-    /// The stream uses the normal NRXP CONNECT/UDP_CONNECT frames, so the
-    /// egress reuses its existing server authentication, encryption and socket
-    /// opener.
-    pub(crate) fn connect_mesh_stream<'a>(
+    /// Establish an authenticated peer session. Destination streams are opened
+    /// separately and multiplexed over this session by `MeshPeerSession`.
+    pub(crate) fn connect_mesh_session<'a>(
         peer: &'a crate::net::MeshPeer,
         auth_token: &'a str,
-        target: &'a str,
-        is_udp: bool,
-    ) -> Pin<
-        Box<
-            dyn Future<
-                    Output = Result<
-                        (
-                            Arc<Muxer>,
-                            mpsc::Receiver<Bytes>,
-                            tokio::task::JoinHandle<()>,
-                        ),
-                        AppError,
-                    >,
-                > + Send
-                + 'a,
-        >,
-    > {
+        mesh_quic_port: u16,
+    ) -> Pin<Box<dyn Future<Output = Result<MeshPeerSession, AppError>> + Send + 'a>> {
         Box::pin(async move {
+            let started = Instant::now();
             let remote_addr = peer.address();
-            let stream =
-                tokio::time::timeout(FALLBACK_CONNECT_TIMEOUT, TcpStream::connect(&remote_addr))
-                    .await
-                    .map_err(|_| {
-                        AppError::new(
-                            ERR_INFRA_TIMEOUT,
-                            "Egress timeout",
-                            "Mesh peer connect timed out",
-                        )
-                    })?
-                    .map_err(|e| {
-                        AppError::new(ERR_INFRA_TIMEOUT, "Egress unavailable", e.to_string())
-                    })?;
-
             let peer_identity =
                 crate::crypto::PeerIdentity::from_hex(&peer.nrxp_secret, &peer.nrxp_static_public)?;
             let identity = Identity::Peer(peer_identity);
             let session_id = SessionManager::generate_id();
-            let (inbound, outbound, rx_codec, tx_codec, read_buf, _datagram_root) =
-                Self::perform_handshake(
-                    stream,
+            let profile = BrowserProfile::for_session(&session_id);
+
+            #[cfg(feature = "mesh-quic")]
+            let mut quic_endpoint = None;
+            #[cfg(feature = "mesh-quic")]
+            let mut quic_connection = None;
+
+            #[cfg(feature = "mesh-quic")]
+            let quic_session = tokio::time::timeout(Duration::from_secs(3), async {
+                let (endpoint, connection, inbound, outbound) =
+                    Self::connect_mesh_quic_peer(peer, mesh_quic_port).await?;
+                let handshake = Self::perform_mesh_quic_handshake(
+                    inbound,
+                    outbound,
                     &session_id,
                     0,
-                    BrowserProfile::for_session(&session_id),
+                    profile,
                     &peer.decoy_sni,
                     auth_token,
                     Some(&identity),
                 )
                 .await?;
+                Ok::<_, AppError>((endpoint, connection, handshake))
+            })
+            .await;
+
+            #[cfg(feature = "mesh-quic")]
+            let (handshake, udp_addr, engine_remote_addr) = match quic_session {
+                Ok(Ok((endpoint, connection, handshake))) => {
+                    quic_endpoint = Some(endpoint);
+                    quic_connection = Some(connection);
+                    metrics::counter!("netrunner_mesh_quic_sessions_created_total").increment(1);
+                    (handshake, None, String::new())
+                }
+                Ok(Err(_)) | Err(_) => {
+                    metrics::counter!("netrunner_mesh_quic_fallback_total").increment(1);
+                    Self::connect_mesh_tcp_peer(
+                        peer,
+                        &remote_addr,
+                        &session_id,
+                        profile,
+                        auth_token,
+                        &identity,
+                    )
+                    .await?
+                }
+            };
+
+            #[cfg(not(feature = "mesh-quic"))]
+            let (handshake, udp_addr, engine_remote_addr) = {
+                let _ = mesh_quic_port;
+                Self::connect_mesh_tcp_peer(
+                    peer,
+                    &remote_addr,
+                    &session_id,
+                    profile,
+                    auth_token,
+                    &identity,
+                )
+                .await?
+            };
+
+            let (inbound, outbound, rx_codec, tx_codec, read_buf, datagram_root) = handshake;
 
             let muxer = Arc::new(Muxer::new(true, session_id.clone()));
             let cap = NetworkConfig::global().channel_capacity;
@@ -747,6 +1088,16 @@ impl ClientHandler {
             muxer.add_leg(0, control_tx, data_tx);
 
             let handler = Arc::new(StreamHandler::new(muxer.clone(), None));
+            #[cfg(feature = "mesh-quic")]
+            if let Some(connection) = quic_connection.as_ref() {
+                crate::net::connection::dgram_engine::attach_mesh_quic_datagram_leg(
+                    muxer.clone(),
+                    connection.clone(),
+                    handler.clone(),
+                    datagram_root,
+                    true,
+                );
+            }
             let engine = TunnelEngine {
                 leg_id: 0,
                 inbound: Some(inbound),
@@ -758,8 +1109,8 @@ impl ClientHandler {
                 data_rx: Some(data_rx),
                 handler,
                 muxer: muxer.clone(),
-                remote_addr,
-                session_id,
+                remote_addr: engine_remote_addr,
+                session_id: session_id.clone(),
                 leg_status: crate::net::connection::engine::LegStatus::Active,
                 decoy_sni: Arc::from(peer.decoy_sni.as_str()),
                 auth_token: Arc::from(auth_token),
@@ -769,15 +1120,29 @@ impl ClientHandler {
             let engine_muxer = muxer.clone();
             let engine_task = tokio::spawn(async move {
                 let _ = engine.run().await;
-                engine_muxer.remove_stream(0);
-                engine_muxer.remove_stream(1);
+                engine_muxer.remove_all_streams();
                 engine_muxer.shutdown();
             });
 
-            // The NRXP handshake proves the egress identity, but the peer still
-            // validates this node asynchronously through the control plane. A PING
-            // / PONG round trip confirms that peer authorization succeeded before
-            // the ingress starts forwarding application bytes.
+            let ready_payload =
+                if auth_token.starts_with("mesh2:") || auth_token.starts_with("mesh3:") {
+                    crate::net::MESH_ROUTE_READY
+                } else {
+                    b"PONG"
+                };
+            let session = MeshPeerSession {
+                muxer: muxer.clone(),
+                engine_task: engine_task.abort_handle(),
+                ready_payload,
+                last_used_ms: AtomicU64::new(mesh_process_uptime_ms()),
+                #[cfg(feature = "mesh-quic")]
+                _quic_endpoint: quic_endpoint,
+                #[cfg(feature = "mesh-quic")]
+                quic_connection: quic_connection.clone(),
+            };
+
+            // The peer validates this node through the control plane after the
+            // encrypted handshake. Confirm that authorization before pooling it.
             if let Err(error) = muxer
                 .send_control(0, FrameType::Heartbeat, Bytes::from_static(b"PING"))
                 .await
@@ -799,54 +1164,147 @@ impl ClientHandler {
                     ));
                 }
             }
+            muxer.remove_stream(0);
 
-            let (v_tx, mut v_rx) = mpsc::channel::<Bytes>(cap);
-            muxer.register_stream_with_backlog_cap(
-                1,
-                v_tx,
-                crate::net::SERVER_STREAM_BACKLOG_MAX_BYTES,
-            );
-
-            let frame_type = if is_udp {
-                FrameType::UdpConnect
-            } else {
-                FrameType::Connect
-            };
-            if let Err(error) = muxer
-                .send_control(1, frame_type, Bytes::copy_from_slice(target.as_bytes()))
-                .await
-            {
-                engine_task.abort();
-                muxer.shutdown();
-                return Err(error);
-            }
-
-            // The egress confirms the target only after it is opened. X-hop
-            // routes require a versioned acknowledgement so an older node
-            // cannot silently shorten the configured path to two hops.
-            let expected_ready =
-                if auth_token.starts_with("mesh2:") || auth_token.starts_with("mesh3:") {
-                    crate::net::MESH_ROUTE_READY
-                } else {
-                    b"PONG"
-                };
-            match tokio::time::timeout(Duration::from_secs(8), v_rx.recv()).await {
-                Ok(Some(payload)) if payload.as_ref() == expected_ready => {}
-                _ => {
-                    let _ = muxer.send_control(1, FrameType::Close, Bytes::new()).await;
-                    muxer.remove_stream(1);
-                    engine_task.abort();
-                    muxer.shutdown();
-                    return Err(AppError::new(
-                        ERR_INFRA_TIMEOUT,
-                        "Mesh destination unavailable",
-                        "Egress did not confirm the destination connection",
-                    ));
+            if let Some(udp_addr) = udp_addr {
+                let claim_material =
+                    crate::crypto::DatagramKeyMaterial::derive_from_root(datagram_root, true);
+                if muxer.try_claim_datagram_leg_token(claim_material.leg_token()) {
+                    let udp_muxer = muxer.clone();
+                    let decoy_sni = Arc::from(peer.decoy_sni.as_str());
+                    tokio::spawn(async move {
+                        crate::net::connection::dgram_engine::attempt_client_datagram_leg(
+                            udp_muxer,
+                            udp_addr,
+                            decoy_sni,
+                            session_id,
+                            datagram_root,
+                        )
+                        .await;
+                    });
                 }
             }
 
-            Ok((muxer, v_rx, engine_task))
+            metrics::histogram!("netrunner_mesh_peer_session_setup_seconds")
+                .record(started.elapsed().as_secs_f64());
+            metrics::counter!("netrunner_mesh_peer_sessions_created_total").increment(1);
+            Ok(session)
         })
+    }
+
+    async fn connect_mesh_tcp_peer(
+        peer: &crate::net::MeshPeer,
+        remote_addr: &str,
+        session_id: &str,
+        profile: &BrowserProfile,
+        auth_token: &str,
+        identity: &Identity,
+    ) -> Result<
+        (
+            (
+                TunnelReadHalf,
+                TunnelWriteHalf,
+                crate::nrxp::RxCodec,
+                crate::nrxp::TxCodec,
+                BytesMut,
+                [u8; 32],
+            ),
+            Option<SocketAddr>,
+            String,
+        ),
+        AppError,
+    > {
+        let stream =
+            tokio::time::timeout(FALLBACK_CONNECT_TIMEOUT, TcpStream::connect(remote_addr))
+                .await
+                .map_err(|_| {
+                    AppError::new(
+                        ERR_INFRA_TIMEOUT,
+                        "Egress timeout",
+                        "Mesh peer connect timed out",
+                    )
+                })?
+                .map_err(|e| {
+                    AppError::new(ERR_INFRA_TIMEOUT, "Egress unavailable", e.to_string())
+                })?;
+        let udp_addr = stream.peer_addr().ok();
+        let handshake = Self::perform_handshake(
+            stream,
+            session_id,
+            0,
+            profile,
+            &peer.decoy_sni,
+            auth_token,
+            Some(identity),
+        )
+        .await?;
+        Ok((handshake, udp_addr, remote_addr.to_owned()))
+    }
+
+    #[cfg(feature = "mesh-quic")]
+    async fn connect_mesh_quic_peer(
+        peer: &crate::net::MeshPeer,
+        quic_port: u16,
+    ) -> Result<
+        (
+            quinn::Endpoint,
+            quinn::Connection,
+            quinn::RecvStream,
+            quinn::SendStream,
+        ),
+        AppError,
+    > {
+        let mut addresses = tokio::net::lookup_host((peer.host.as_str(), quic_port))
+            .await
+            .map_err(|error| {
+                AppError::new(ERR_INFRA_TIMEOUT, "Mesh QUIC DNS failed", error.to_string())
+            })?;
+        let address = addresses.next().ok_or_else(|| {
+            AppError::new(
+                ERR_INFRA_TIMEOUT,
+                "Mesh QUIC address unavailable",
+                "Peer host resolved to no address",
+            )
+        })?;
+        let bind_addr = if address.is_ipv4() {
+            "0.0.0.0:0"
+        } else {
+            "[::]:0"
+        }
+        .parse()
+        .expect("valid unspecified socket address");
+        let endpoint = crate::net::mesh_quic_client_endpoint(bind_addr).map_err(|error| {
+            AppError::new(
+                ERR_INFRA_TIMEOUT,
+                "Mesh QUIC unavailable",
+                error.to_string(),
+            )
+        })?;
+        let connection = endpoint
+            .connect(address, "mesh.netrunner")
+            .map_err(|error| {
+                AppError::new(
+                    ERR_INFRA_TIMEOUT,
+                    "Mesh QUIC connect failed",
+                    error.to_string(),
+                )
+            })?
+            .await
+            .map_err(|error| {
+                AppError::new(
+                    ERR_INFRA_TIMEOUT,
+                    "Mesh QUIC handshake failed",
+                    error.to_string(),
+                )
+            })?;
+        let (outbound, inbound) = connection.open_bi().await.map_err(|error| {
+            AppError::new(
+                ERR_INFRA_TIMEOUT,
+                "Mesh QUIC stream failed",
+                error.to_string(),
+            )
+        })?;
+        Ok((endpoint, connection, inbound, outbound))
     }
 
     /// Устанавливает одну ногу и крутит её движок до остановки.
@@ -1468,6 +1926,8 @@ pub struct ServerHandler {
     /// игнорируется, поэтому открытого релея не возникает. Управляется
     /// [`crate::decoy::DecoyMode::honor_requested_sni`].
     pub(crate) honor_requested_sni: bool,
+    #[cfg(feature = "mesh-quic")]
+    mesh_quic_connection: Option<quinn::Connection>,
 }
 
 impl ServerHandler {
@@ -1492,6 +1952,8 @@ impl ServerHandler {
             identity,
             cover_flight,
             honor_requested_sni,
+            #[cfg(feature = "mesh-quic")]
+            mesh_quic_connection: None,
         }
     }
 
@@ -1506,6 +1968,12 @@ impl ServerHandler {
         self.require_auth = require_auth;
         self.mesh_enabled = mesh_enabled;
         self.mesh = mesh;
+        self
+    }
+
+    #[cfg(feature = "mesh-quic")]
+    pub fn with_mesh_quic_connection(mut self, connection: quinn::Connection) -> Self {
+        self.mesh_quic_connection = Some(connection);
         self
     }
 
@@ -1530,8 +1998,8 @@ impl ServerHandler {
     /// выглядит как обычный визит на публичный сайт — сервер не выдаёт себя
     /// сканерам и активным пробам DPI.
     async fn handle_stealth_fallback(
-        mut client_inbound: OwnedReadHalf,
-        mut client_outbound: OwnedWriteHalf,
+        mut client_inbound: TunnelReadHalf,
+        mut client_outbound: TunnelWriteHalf,
         initial_data: Bytes,
         decoy_host: &str,
         requested_sni: Option<&str>,
@@ -1613,6 +2081,10 @@ impl TunnelHandler for ServerHandler {
     async fn run(self) -> Result<(), AppError> {
         debug!("Acting as TLS Server with Stealth Fallback");
 
+        #[cfg(feature = "mesh-quic")]
+        let mesh_quic_connection = self.mesh_quic_connection;
+        #[cfg(feature = "mesh-quic")]
+        let mesh_quic_only = mesh_quic_connection.is_some();
         let decoy_host = self.decoy_host;
         let cover_flight = self.cover_flight;
         let honor_requested_sni = self.honor_requested_sni;
@@ -1656,6 +2128,14 @@ impl TunnelHandler for ServerHandler {
                             break (sh, peer_version);
                         }
                         Err(e) => {
+                            #[cfg(feature = "mesh-quic")]
+                            if mesh_quic_only {
+                                return Err(AppError::new(
+                                    ERR_AUTH_FAILED,
+                                    "Mesh QUIC auth failed",
+                                    "Invalid NRXP peer handshake on the mesh QUIC endpoint",
+                                ));
+                            }
                             warn!(
                                 "❌ Unauthorized/Invalid ClientHello. Triggering Stealth Fallback. Reason: {:?}",
                                 e.stage
@@ -1691,6 +2171,14 @@ impl TunnelHandler for ServerHandler {
                         }
                         Ok(Ok(_)) => continue,
                         _ => {
+                            #[cfg(feature = "mesh-quic")]
+                            if mesh_quic_only {
+                                return Err(AppError::new(
+                                    ERR_AUTH_FAILED,
+                                    "Mesh QUIC auth failed",
+                                    "Timed out waiting for the NRXP peer handshake",
+                                ));
+                            }
                             warn!("⏰ TLS_HELLO_TIMEOUT reached. Triggering fallback...");
                             Self::handle_stealth_fallback(
                                 inbound,
@@ -1706,6 +2194,14 @@ impl TunnelHandler for ServerHandler {
                     }
                 }
                 Err(_) => {
+                    #[cfg(feature = "mesh-quic")]
+                    if mesh_quic_only {
+                        return Err(AppError::new(
+                            ERR_AUTH_FAILED,
+                            "Mesh QUIC auth failed",
+                            "Invalid NRXP handshake on the mesh QUIC endpoint",
+                        ));
+                    }
                     warn!(
                         "❌ Handshake parse failed (Not a valid TLS probe). Triggering Stealth Fallback."
                     );
@@ -1863,9 +2359,6 @@ impl TunnelHandler for ServerHandler {
         };
 
         let muxer = self.session_manager.get_or_create(&session_id);
-        self.session_manager
-            .register_datagram_session(&muxer, leg_id, datagram_root);
-
         // Проверка личности клиента у бэкенда — только если этот инстанс
         // запущен с `--require-auth`. До этой точки соединение прошло
         // Netrunner-хендшейк (не сканер/чужой TLS-клиент), поэтому отказ здесь
@@ -1874,6 +2367,23 @@ impl TunnelHandler for ServerHandler {
         let is_mesh_peer = auth_token.starts_with("mesh:")
             || auth_token.starts_with("mesh2:")
             || auth_token.starts_with("mesh3:");
+        #[cfg(feature = "mesh-quic")]
+        if mesh_quic_connection.is_some() && !is_mesh_peer {
+            metrics::counter!("netrunner_mesh_quic_non_mesh_rejected_total").increment(1);
+            return Err(AppError::new(
+                ERR_AUTH_FAILED,
+                "Доступ запрещен",
+                "The mesh QUIC endpoint only accepts authenticated mesh peers",
+            ));
+        }
+        #[cfg(feature = "mesh-quic")]
+        if !is_mesh_peer || mesh_quic_connection.is_none() {
+            self.session_manager
+                .register_datagram_session(&muxer, leg_id, datagram_root);
+        }
+        #[cfg(not(feature = "mesh-quic"))]
+        self.session_manager
+            .register_datagram_session(&muxer, leg_id, datagram_root);
         let auth_result = if is_mesh_peer {
             match &parsed_mesh_auth {
                 Err(reason) => Err(AppError::new(
@@ -2005,6 +2515,19 @@ impl TunnelHandler for ServerHandler {
             mesh_peer: is_mesh_peer,
         });
         let handler = Arc::new(StreamHandler::new(muxer.clone(), Some(opener)));
+
+        #[cfg(feature = "mesh-quic")]
+        if is_mesh_peer {
+            if let Some(connection) = mesh_quic_connection {
+                crate::net::connection::dgram_engine::attach_mesh_quic_datagram_leg(
+                    muxer.clone(),
+                    connection,
+                    handler.clone(),
+                    datagram_root,
+                    false,
+                );
+            }
+        }
 
         let log_session_id = session_id.clone();
 
@@ -2423,6 +2946,25 @@ mod tests {
                 limit_bytes: None,
                 over_limit: false,
             })
+        }
+        async fn report_usage_batch(
+            &self,
+            _batch_id: &str,
+            deltas: &[crate::net::UsageDelta],
+        ) -> Result<std::collections::HashMap<String, crate::net::UsageReport>, AppError> {
+            Ok(deltas
+                .iter()
+                .map(|(user_id, _)| {
+                    (
+                        user_id.clone(),
+                        crate::net::UsageReport {
+                            used_bytes: 0,
+                            limit_bytes: None,
+                            over_limit: false,
+                        },
+                    )
+                })
+                .collect())
         }
         async fn report_node_health(
             &self,

@@ -50,17 +50,17 @@
 use arc_swap::{ArcSwap, ArcSwapOption};
 use bytes::Bytes;
 use dashmap::DashMap;
-use netrunner_logger::{info, instrument, trace, warn, AppError, ERR_INFRA_TIMEOUT};
+use netrunner_logger::{AppError, ERR_INFRA_TIMEOUT, info, instrument, trace, warn};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc::{error::TrySendError, Sender};
 use tokio::sync::Notify;
+use tokio::sync::mpsc::{Sender, error::TrySendError};
 use tokio_util::sync::CancellationToken;
 
-use crate::net::diagnostics::{self, DiagnosticsEvent, LegMetrics, TunnelMetrics, DIAG_COUNTERS};
 use crate::net::INITIAL_RTT_MS;
+use crate::net::diagnostics::{self, DIAG_COUNTERS, DiagnosticsEvent, LegMetrics, TunnelMetrics};
 use crate::net::{
     BACKLOG_REAPER_IDLE_TIMEOUT, BACKLOG_REAPER_INTERVAL, BACKLOG_STUCK_GRACE, BRIDGE_READ_CHUNK,
     DATAGRAM_LEG_ID, MAX_DATAGRAM_LEG_PAYLOAD, MAX_PENDING_UDP_STREAMS, MAX_TUNNEL_LEGS,
@@ -223,6 +223,9 @@ struct MuxLeg {
     control_tx: Sender<MuxMessage>,
     data_tx: Sender<MuxMessage>,
     stats: Arc<LegStats>,
+    /// Maximum plaintext payload that fits in a single native datagram.
+    /// Zero for reliable stream legs.
+    max_datagram_payload: usize,
 }
 
 impl MuxLeg {
@@ -568,6 +571,22 @@ impl Muxer {
         self.remove_all_legs();
     }
 
+    /// Number of currently registered logical streams. Mesh peer sessions use
+    /// this to retire idle pooled connections without interrupting live flows.
+    pub fn active_streams_count(&self) -> usize {
+        self.streams.len()
+    }
+
+    /// Close every logical stream after its physical peer session has ended.
+    /// Removing the slots drops their senders, waking stream owners instead of
+    /// leaving them waiting on a connection that can no longer deliver data.
+    pub fn remove_all_streams(&self) {
+        let stream_ids: Vec<_> = self.streams.iter().map(|entry| *entry.key()).collect();
+        for stream_id in stream_ids {
+            self.remove_stream(stream_id);
+        }
+    }
+
     /// Сколько миллисекунд прошло с последней смены сети; `None`, если её не было.
     pub fn ms_since_network_change(&self) -> Option<u64> {
         match self.last_network_change_ms.load(Ordering::Relaxed) {
@@ -742,6 +761,7 @@ impl Muxer {
                 control_tx,
                 data_tx,
                 stats: Arc::new(LegStats::default()),
+                max_datagram_payload: 0,
             },
         );
         self.update_legs_cache(); // Обновляем Lock-Free кэш
@@ -857,11 +877,23 @@ impl Muxer {
     /// клиенте/сервере) — до этого момента `select_udp_leg` использует
     /// исключительно TCP-переносимый фолбэк.
     pub fn set_datagram_leg(&self, control_tx: Sender<MuxMessage>, data_tx: Sender<MuxMessage>) {
+        self.set_datagram_leg_with_max_payload(control_tx, data_tx, MAX_DATAGRAM_LEG_PAYLOAD);
+    }
+
+    /// Register a native datagram leg with a transport-specific MTU ceiling.
+    /// The ceiling applies to the NRXP frame payload before framing/encryption.
+    pub fn set_datagram_leg_with_max_payload(
+        &self,
+        control_tx: Sender<MuxMessage>,
+        data_tx: Sender<MuxMessage>,
+        max_payload: usize,
+    ) {
         self.datagram_leg.store(Some(Arc::new(MuxLeg {
             id: DATAGRAM_LEG_ID,
             control_tx,
             data_tx,
             stats: Arc::new(LegStats::default()),
+            max_datagram_payload: max_payload.min(MAX_DATAGRAM_LEG_PAYLOAD),
         })));
         info!("MUXER: Physical UDP leg registered");
     }
@@ -993,7 +1025,7 @@ impl Muxer {
             // которая при DF упёрлась бы в PMTU (EMSGSIZE/чёрная дыра), а без DF
             // фрагментировалась бы (сам по себе признак для DPI). Такой кадр
             // уходит по TCP-переносимому фолбэку — правило §1.3 (bug #5).
-            if payload_len <= MAX_DATAGRAM_LEG_PAYLOAD && self.datagram_leg_is_fresh(&native) {
+            if payload_len <= native.max_datagram_payload && self.datagram_leg_is_fresh(&native) {
                 return Some((*native).clone());
             }
         }
@@ -2076,7 +2108,10 @@ mod scheduling_tests {
         let muxer2 = Muxer::new(false, "pending-bytes".into());
         let huge = Bytes::from(vec![0u8; PENDING_UDP_STREAM_MAX_BYTES + 1]);
         muxer2.dispatch_to_local_udp(1, huge);
-        assert!(muxer2.pending_udp.is_empty(), "oversized early datagram must be dropped");
+        assert!(
+            muxer2.pending_udp.is_empty(),
+            "oversized early datagram must be dropped"
+        );
     }
 
     /// TTL: свежая запись НЕ подметается, протухшая — подметается.
@@ -2094,7 +2129,11 @@ mod scheduling_tests {
             },
         );
         muxer.sweep_expired_pending_udp();
-        assert_eq!(muxer.pending_udp.len(), 1, "fresh entry must survive a sweep");
+        assert_eq!(
+            muxer.pending_udp.len(),
+            1,
+            "fresh entry must survive a sweep"
+        );
 
         // Протухшая (старше TTL) — уходит.
         let stale_since = process_uptime_ms().max(1);

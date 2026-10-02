@@ -79,6 +79,9 @@ libc = "0.2"
 # просто неиспользуемая зависимость на клиентских сборках — тот же порядок
 # цены, что и уже используемый в этом крейте `tracing`.
 metrics = "0.24.3"
+quinn = { version = "0.11.9", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
+rcgen = { version = "0.14", optional = true }
 
 # `std::time::SystemTime::now()` panics on wasm32-unknown-unknown ("time not
 # implemented on this platform" — no OS clock syscall there). web-time is an
@@ -93,6 +96,7 @@ web-time = "1.1"
 # сборки/тесты не попадает, прод-путь не трогает.
 [features]
 dev-dump = []
+mesh-quic = ["dep:quinn", "dep:rustls", "dep:rcgen"]
 
 # Пример собирается ТОЛЬКО с `--features dev-dump`, иначе `cargo build --examples`
 # не тянет его в обычных сборках.

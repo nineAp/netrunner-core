@@ -15,14 +15,14 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use netrunner_logger::{AppError, ERR_INFRA_TIMEOUT};
 use rand::RngExt;
+use sha2::Digest;
 use tokio::{
     net::TcpStream,
     sync::{Mutex, RwLock, mpsc},
-    task::JoinHandle,
     time::timeout,
 };
 
-use super::connection::{ClientHandler, Muxer};
+use super::connection::{ClientHandler, MeshPeerSession, Muxer, mesh_process_uptime_ms};
 use super::{MAX_MESH_HOPS, MeshPeer, MeshRoute, MeshRouteSelection};
 use crate::nrxp::FrameType;
 
@@ -32,6 +32,29 @@ use crate::nrxp::FrameType;
 const PEER_PROBE_TIMEOUT: Duration = Duration::from_secs(8);
 const PEER_PROBE_MAX_AGE: Duration = Duration::from_secs(90);
 const PEER_PROBE_FAILURES_TO_EVICT: u8 = 3;
+const MAX_CACHED_PEER_SESSIONS: usize = 256;
+const IDLE_PEER_SESSION_RETENTION: Duration = Duration::from_secs(300);
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct PeerSessionKey {
+    node_id: String,
+    peer_fingerprint: [u8; 32],
+    auth_fingerprint: [u8; 32],
+}
+
+struct PeerSessionSlot {
+    establish_lock: Mutex<()>,
+    session: std::sync::Mutex<Option<Arc<MeshPeerSession>>>,
+}
+
+impl PeerSessionSlot {
+    fn new() -> Self {
+        Self {
+            establish_lock: Mutex::new(()),
+            session: std::sync::Mutex::new(None),
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 struct PeerProbe {
@@ -51,9 +74,11 @@ pub struct NodeMesh {
     local_node_id: String,
     local_node_secret: String,
     max_hops: u8,
+    mesh_quic_port: u16,
     peers: RwLock<Vec<MeshPeer>>,
     rtt_ms: DashMap<String, PeerProbe>,
     egress_rotation: Mutex<EgressRotation>,
+    peer_sessions: Mutex<HashMap<PeerSessionKey, Arc<PeerSessionSlot>>>,
 }
 
 impl NodeMesh {
@@ -62,13 +87,29 @@ impl NodeMesh {
     }
 
     pub fn with_max_hops(local_node_id: String, local_node_secret: String, max_hops: u8) -> Self {
+        Self::with_max_hops_and_quic_port(
+            local_node_id,
+            local_node_secret,
+            max_hops,
+            super::DEFAULT_MESH_QUIC_PORT,
+        )
+    }
+
+    pub fn with_max_hops_and_quic_port(
+        local_node_id: String,
+        local_node_secret: String,
+        max_hops: u8,
+        mesh_quic_port: u16,
+    ) -> Self {
         Self {
             local_node_id,
             local_node_secret,
             max_hops: max_hops.clamp(1, MAX_MESH_HOPS),
+            mesh_quic_port,
             peers: RwLock::new(Vec::new()),
             rtt_ms: DashMap::new(),
             egress_rotation: Mutex::new(EgressRotation::default()),
+            peer_sessions: Mutex::new(HashMap::new()),
         }
     }
 
@@ -101,12 +142,15 @@ impl NodeMesh {
             .filter(|peer| seen_addresses.insert(peer.address().to_ascii_lowercase()))
             .collect();
 
-        let active_ids: std::collections::HashSet<_> = peers
+        let active_peer_fingerprints: std::collections::HashSet<_> = peers
             .iter()
-            .map(|peer| peer.node_id.to_ascii_lowercase())
+            .map(|peer| (peer.node_id.to_ascii_lowercase(), peer_fingerprint(peer)))
             .collect();
         self.rtt_ms
-            .retain(|node_id, _| active_ids.contains(node_id));
+            .retain(|node_id, _| active_peer_fingerprints.iter().any(|(id, _)| id == node_id));
+        self.peer_sessions.lock().await.retain(|key, _| {
+            active_peer_fingerprints.contains(&(key.node_id.clone(), key.peer_fingerprint))
+        });
         *self.peers.write().await = peers;
     }
 
@@ -212,7 +256,11 @@ impl NodeMesh {
             .cloned()
             .collect();
         if route.remaining_hops == 2 {
-            return self.two_hop_fallback(route, healthy_candidates).await;
+            let selected = self.two_hop_fallback(route, healthy_candidates).await;
+            if let Some(selected) = selected.as_ref() {
+                record_route_hops(selected);
+            }
+            return selected;
         }
 
         let max_available_hops = healthy_candidates
@@ -222,7 +270,11 @@ impl NodeMesh {
         if max_available_hops < 3 {
             // A larger hop cap is a maximum, not a minimum. Keep at least a
             // two-node route, even before this ingress has fresh RTT samples.
-            return self.two_hop_fallback(route, healthy_candidates).await;
+            let selected = self.two_hop_fallback(route, healthy_candidates).await;
+            if let Some(selected) = selected.as_ref() {
+                record_route_hops(selected);
+            }
+            return selected;
         }
 
         let mut flow_route = route.clone();
@@ -232,6 +284,7 @@ impl NodeMesh {
                 .await?
                 .node_id,
         );
+        record_route_hops(&flow_route);
         Some(flow_route)
     }
 
@@ -533,6 +586,80 @@ impl NodeMesh {
         self.peers.read().await.len()
     }
 
+    /// Open one logical flow over a pooled authenticated connection to `peer`.
+    /// The pool key fingerprints both the peer identity and encrypted route
+    /// claim, keeping each flow on its selected path while reusing handshakes.
+    pub(crate) async fn connect_peer_stream(
+        &self,
+        peer: &MeshPeer,
+        auth_token: &str,
+        target: &str,
+        is_udp: bool,
+        cancel: Option<&tokio_util::sync::CancellationToken>,
+    ) -> Result<(Arc<MeshPeerSession>, u32, mpsc::Receiver<Bytes>), AppError> {
+        let key = PeerSessionKey {
+            node_id: peer.node_id.to_ascii_lowercase(),
+            peer_fingerprint: peer_fingerprint(peer),
+            auth_fingerprint: sha256(auth_token.as_bytes()),
+        };
+        let slot = {
+            let mut sessions = self.peer_sessions.lock().await;
+            trim_peer_sessions(&mut sessions);
+            if let Some(slot) = sessions.get(&key) {
+                slot.clone()
+            } else if sessions.len() < MAX_CACHED_PEER_SESSIONS {
+                let slot = Arc::new(PeerSessionSlot::new());
+                sessions.insert(key.clone(), slot.clone());
+                slot
+            } else {
+                // Keep the cache bounded under route churn. Active streams hold
+                // this temporary slot/session until they finish; later flows
+                // can still use the normal fallback path without growing the
+                // long-lived pool.
+                Arc::new(PeerSessionSlot::new())
+            }
+        };
+
+        let _establish_guard = slot.establish_lock.lock().await;
+        let existing = slot.session.lock().unwrap().clone();
+        let (session, reused) =
+            if let Some(session) = existing.filter(|session| session.is_usable()) {
+                (session, true)
+            } else {
+                let create_session = ClientHandler::connect_mesh_session(
+                    peer,
+                    auth_token,
+                    self.mesh_quic_port,
+                );
+                let session = if let Some(cancel) = cancel {
+                    let result = tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => {
+                            return Err(AppError::new(
+                                ERR_INFRA_TIMEOUT,
+                                "Mesh session cancelled",
+                                "The application flow closed during peer setup",
+                            ));
+                        }
+                        result = create_session => result,
+                    };
+                    Arc::new(result?)
+                } else {
+                    Arc::new(create_session.await?)
+                };
+                *slot.session.lock().unwrap() = Some(session.clone());
+                (session, false)
+            };
+        drop(_establish_guard);
+
+        if reused {
+            metrics::counter!("netrunner_mesh_peer_sessions_reused_total").increment(1);
+        }
+
+        let (stream_id, receiver) = session.open_stream(target, is_udp, cancel).await?;
+        Ok((session, stream_id, receiver))
+    }
+
     /// Open a destination stream over the route configured on this node.
     /// Each hop authenticates this node through the control plane before
     /// accepting the flow.
@@ -568,17 +695,21 @@ impl NodeMesh {
                     continue;
                 };
                 let auth_token = self.auth_token_for_route(&next_route);
-                match ClientHandler::connect_mesh_stream(&peer, &auth_token, target, is_udp).await {
-                    Ok((muxer, rx, engine_task)) => {
+                match self
+                    .connect_peer_stream(&peer, &auth_token, target, is_udp, None)
+                    .await
+                {
+                    Ok((session, stream_id, rx)) => {
+                        metrics::counter!("netrunner_mesh_egress_streams_total").increment(1);
                         return Ok(MeshTunnel {
                             sender: MeshTunnelSender {
-                                muxer: muxer.clone(),
-                                stream_id: 1,
+                                muxer: session.muxer.clone(),
+                                stream_id,
                                 is_udp,
                             },
                             receiver: rx,
-                            muxer,
-                            engine_task: Some(engine_task),
+                            peer_session: session,
+                            closed: false,
                         });
                     }
                     Err(_) => {
@@ -605,6 +736,68 @@ impl NodeMesh {
             "No reachable mesh peer accepted the connection",
         ))
     }
+}
+
+fn sha256(value: &[u8]) -> [u8; 32] {
+    sha2::Sha256::digest(value).into()
+}
+
+/// Fingerprint the address and credentials without retaining or displaying the
+/// peer secret in the session-pool key.
+fn peer_fingerprint(peer: &MeshPeer) -> [u8; 32] {
+    let mut digest = sha2::Sha256::new();
+    for value in [
+        peer.node_id.as_bytes(),
+        peer.host.as_bytes(),
+        peer.decoy_sni.as_bytes(),
+        peer.nrxp_secret.as_bytes(),
+        peer.nrxp_static_public.as_bytes(),
+    ] {
+        digest.update(value);
+        digest.update([0]);
+    }
+    digest.update(peer.port.to_be_bytes());
+    digest.finalize().into()
+}
+
+fn trim_peer_sessions(sessions: &mut HashMap<PeerSessionKey, Arc<PeerSessionSlot>>) {
+    let now_ms = mesh_process_uptime_ms();
+    let idle_retention_ms = IDLE_PEER_SESSION_RETENTION.as_millis() as u64;
+    sessions.retain(|_, slot| {
+        let session = slot.session.lock().ok().and_then(|entry| entry.clone());
+        match session {
+            Some(session) => {
+                session.is_usable()
+                    && (!session.is_idle()
+                        || now_ms.saturating_sub(session.last_used_ms()) <= idle_retention_ms)
+            }
+            None => true,
+        }
+    });
+
+    while sessions.len() > MAX_CACHED_PEER_SESSIONS {
+        let oldest_idle = sessions
+            .iter()
+            .filter_map(|(key, slot)| {
+                let session = slot.session.lock().ok().and_then(|entry| entry.clone())?;
+                session
+                    .is_idle()
+                    .then(|| (key.clone(), session.last_used_ms()))
+            })
+            .min_by_key(|(_, last_used)| *last_used)
+            .map(|(key, _)| key);
+        let Some(key) = oldest_idle else {
+            break;
+        };
+        sessions.remove(&key);
+    }
+}
+
+fn record_route_hops(route: &MeshRoute) {
+    let total_hops = route
+        .remaining_hops
+        .saturating_add(route.visited.len().saturating_sub(1) as u8);
+    metrics::histogram!("netrunner_mesh_selected_route_hops").record(f64::from(total_hops));
 }
 
 /// Prefer lower-latency peers without letting a very fast peer monopolize
@@ -659,8 +852,8 @@ fn weighted_egress_order(by_address: HashMap<String, (MeshPeer, u32)>) -> Vec<(M
 pub struct MeshTunnel {
     sender: MeshTunnelSender,
     receiver: mpsc::Receiver<Bytes>,
-    muxer: Arc<Muxer>,
-    engine_task: Option<JoinHandle<()>>,
+    peer_session: Arc<MeshPeerSession>,
+    closed: bool,
 }
 
 impl MeshTunnel {
@@ -674,19 +867,26 @@ impl MeshTunnel {
 
     pub async fn close(mut self) {
         self.sender.close().await;
-        self.muxer.remove_stream(self.sender.stream_id);
-        self.muxer.shutdown();
-        if let Some(task) = self.engine_task.take() {
-            task.abort();
-        }
+        self.closed = true;
     }
 }
 
 impl Drop for MeshTunnel {
     fn drop(&mut self) {
-        self.muxer.shutdown();
-        if let Some(task) = self.engine_task.take() {
-            task.abort();
+        if self.closed {
+            return;
+        }
+        let muxer = self.peer_session.muxer.clone();
+        let stream_id = self.sender.stream_id;
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let _ = muxer
+                    .send_control(stream_id, FrameType::Close, Bytes::new())
+                    .await;
+                muxer.remove_stream(stream_id);
+            });
+        } else {
+            self.peer_session.muxer.remove_stream(stream_id);
         }
     }
 }
@@ -711,7 +911,6 @@ impl MeshTunnelSender {
             .send_control(self.stream_id, FrameType::Close, Bytes::new())
             .await;
         self.muxer.remove_stream(self.stream_id);
-        self.muxer.shutdown();
     }
 }
 

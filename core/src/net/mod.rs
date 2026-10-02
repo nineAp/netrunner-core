@@ -39,6 +39,8 @@ mod auth;
 mod config;
 #[cfg(not(target_arch = "wasm32"))]
 mod mesh;
+#[cfg(all(not(target_arch = "wasm32"), feature = "mesh-quic"))]
+mod mesh_quic;
 // `connection` — оркестровка живых TCP-ног туннеля через `tokio::net`. Этот
 // стек недоступен на `wasm32-unknown-unknown` (у tokio там нет сетевого
 // драйвера), поэтому модуль целиком выключен из wasm-сборок. Лёгкий
@@ -52,7 +54,7 @@ pub mod diagnostics;
 
 pub use auth::{
     parse_mesh_auth_token, AuthValidator, MeshAuth, MeshPeer, MeshRoute, MeshRouteSelection,
-    NodeHealthReport, UsageReport, UserQuota, MAX_MESH_HOPS, MESH_ROUTE_READY,
+    NodeHealthReport, UsageDelta, UsageReport, UserQuota, MAX_MESH_HOPS, MESH_ROUTE_READY,
 };
 pub use config::NetworkConfig;
 #[cfg(not(target_arch = "wasm32"))]
@@ -63,3 +65,7 @@ pub use connection::{
 pub use constants::*;
 #[cfg(not(target_arch = "wasm32"))]
 pub use mesh::{MeshTunnel, MeshTunnelSender, NodeMesh, SharedNodeMesh};
+#[cfg(all(not(target_arch = "wasm32"), feature = "mesh-quic"))]
+pub(crate) use mesh_quic::client_endpoint as mesh_quic_client_endpoint;
+#[cfg(all(not(target_arch = "wasm32"), feature = "mesh-quic"))]
+pub use mesh_quic::server_endpoint as mesh_quic_server_endpoint;
