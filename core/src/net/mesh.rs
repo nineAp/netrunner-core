@@ -17,13 +17,13 @@ use netrunner_logger::{AppError, ERR_INFRA_TIMEOUT};
 use rand::RngExt;
 use tokio::{
     net::TcpStream,
-    sync::{mpsc, Mutex, RwLock},
+    sync::{Mutex, RwLock, mpsc},
     task::JoinHandle,
     time::timeout,
 };
 
 use super::connection::{ClientHandler, Muxer};
-use super::{MeshPeer, MeshRoute, MeshRouteSelection, MAX_MESH_HOPS};
+use super::{MAX_MESH_HOPS, MeshPeer, MeshRoute, MeshRouteSelection};
 use crate::nrxp::FrameType;
 
 // Mesh peers may have much higher latency than an app-to-ingress leg. Give a
@@ -190,7 +190,9 @@ impl NodeMesh {
         })
     }
 
-    /// Select a healthy egress and path budget once per application flow.
+    /// Select an RTT-ranked egress and path budget once per application flow.
+    /// Freshly probed peers determine the preferred path length; if there are
+    /// too few, fall back to a two-hop route from the control-plane directory.
     /// Intermediates preserve both choices from the encrypted mesh claim.
     pub async fn route_for_flow(&self, route: &MeshRoute) -> Option<MeshRoute> {
         if route.selection != MeshRouteSelection::WeightedRandom
@@ -200,36 +202,71 @@ impl NodeMesh {
             return Some(route.clone());
         }
 
-        // Pick one healthy egress for every flow, including the ordinary
-        // two-hop route. For max_hops > 2, also cap the randomized path length
-        // to the current healthy directory so a small fleet cannot select an
-        // impossible chain.
+        // Fresh RTT samples guide the preferred path, but missing probe data
+        // must not take the entire mesh offline. Peers without a fresh sample
+        // remain available as a lower-priority fallback in peers_for_route().
         let candidates = self.peers_for_route(route).await;
+        let healthy_candidates: Vec<_> = candidates
+            .iter()
+            .filter(|peer| self.recent_rtt_ms(&peer.node_id).is_some())
+            .cloned()
+            .collect();
         if route.remaining_hops == 2 {
-            let mut flow_route = route.clone();
-            flow_route.egress_node_id = Some(
-                self.next_healthy_egress(candidates, &[])
-                    .await?
-                    .node_id,
-            );
-            return Some(flow_route);
+            return self.two_hop_fallback(route, healthy_candidates).await;
         }
 
-        let max_available_hops = candidates
+        let max_available_hops = healthy_candidates
             .len()
             .saturating_add(1)
             .min(usize::from(route.remaining_hops));
         if max_available_hops < 3 {
-            return None;
+            // A larger hop cap is a maximum, not a minimum. Keep at least a
+            // two-node route, even before this ingress has fresh RTT samples.
+            return self.two_hop_fallback(route, healthy_candidates).await;
         }
 
         let mut flow_route = route.clone();
         flow_route.remaining_hops = rand::rng().random_range(3..=max_available_hops as u8);
         flow_route.egress_node_id = Some(
-            self.next_healthy_egress(candidates, &[])
+            self.next_egress(healthy_candidates, &[], false)
                 .await?
                 .node_id,
         );
+        Some(flow_route)
+    }
+
+    async fn two_hop_fallback(
+        &self,
+        route: &MeshRoute,
+        healthy_candidates: Vec<MeshPeer>,
+    ) -> Option<MeshRoute> {
+        let (egress, selection) =
+            if let Some(egress) = self.next_egress(healthy_candidates, &[], false).await {
+                (egress, route.selection)
+            } else {
+                let fallback_peers: Vec<_> = self
+                    .peers
+                    .read()
+                    .await
+                    .iter()
+                    .filter(|peer| {
+                        !route
+                            .visited
+                            .iter()
+                            .any(|visited| visited.eq_ignore_ascii_case(&peer.node_id))
+                    })
+                    .cloned()
+                    .collect();
+                (
+                    self.next_egress(fallback_peers, &[], true).await?,
+                    MeshRouteSelection::Nearest,
+                )
+            };
+
+        let mut flow_route = route.clone();
+        flow_route.remaining_hops = 2;
+        flow_route.selection = selection;
+        flow_route.egress_node_id = Some(egress.node_id);
         Some(flow_route)
     }
 
@@ -241,7 +278,10 @@ impl NodeMesh {
         route: &MeshRoute,
         failed_egress_ids: &[String],
     ) -> Option<MeshRoute> {
-        if route.selection != MeshRouteSelection::WeightedRandom
+        let allow_unprobed_fallback = route.selection == MeshRouteSelection::Nearest
+            && route.remaining_hops == 2
+            && route.visited.len() == 1;
+        if (route.selection != MeshRouteSelection::WeightedRandom && !allow_unprobed_fallback)
             || route.visited.len() != 1
             || route.egress_node_id.is_none()
             || route.remaining_hops < 2
@@ -252,13 +292,24 @@ impl NodeMesh {
         let mut candidates_route = route.clone();
         candidates_route.egress_node_id = None;
         let candidates = self.peers_for_route(&candidates_route).await;
-        let (next_egress, shorten_chain) = match self
-            .next_healthy_egress(candidates.clone(), failed_egress_ids)
-            .await
-        {
+        let probed_candidates: Vec<_> = candidates
+            .iter()
+            .filter(|peer| self.recent_rtt_ms(&peer.node_id).is_some())
+            .cloned()
+            .collect();
+        let next_probed = self
+            .next_egress(probed_candidates, failed_egress_ids, false)
+            .await;
+        let next_fallback = if next_probed.is_none() {
+            self.next_egress(candidates.clone(), failed_egress_ids, true)
+                .await
+        } else {
+            None
+        };
+        let (next_egress, shorten_chain) = match next_probed.or(next_fallback) {
             Some(peer) => (peer, false),
             None if route.remaining_hops > 2 => {
-                (self.next_healthy_egress(candidates, &[]).await?, true)
+                (self.next_egress(candidates, &[], true).await?, true)
             }
             None => return None,
         };
@@ -270,24 +321,30 @@ impl NodeMesh {
         Some(retry_route)
     }
 
-    /// Rotate through a randomized, RTT-weighted permutation of healthy public
-    /// peer addresses. Each distinct address is used once before the bag is
-    /// reshuffled, so a fast peer cannot be selected repeatedly by chance.
-    async fn next_healthy_egress(
+    /// Rotate through a randomized, RTT-weighted permutation of distinct peer
+    /// addresses. The two-hop outage fallback may include peers without RTT
+    /// samples; each address is still used once before the bag is reshuffled.
+    async fn next_egress(
         &self,
         peers: Vec<MeshPeer>,
         excluded_node_ids: &[String],
+        allow_unprobed: bool,
     ) -> Option<MeshPeer> {
         let mut by_address = HashMap::<String, (MeshPeer, u32)>::new();
         let mut candidate_signature = Vec::with_capacity(peers.len());
         for peer in peers {
-            let Some(rtt) = self.recent_rtt_ms(&peer.node_id) else {
-                continue;
+            let rtt = match self.recent_rtt_ms(&peer.node_id) {
+                Some(rtt) => rtt,
+                None if allow_unprobed => u32::MAX,
+                None => continue,
             };
             let address_key = peer.host.trim().to_ascii_lowercase();
             candidate_signature.push(format!(
-                "{address_key}={}",
-                peer.node_id.to_ascii_lowercase()
+                "{address_key}:{}:{}:{}={}",
+                peer.port,
+                peer.node_id.to_ascii_lowercase(),
+                peer.nrxp_static_public.to_ascii_lowercase(),
+                peer.decoy_sni.to_ascii_lowercase(),
             ));
             match by_address.entry(address_key) {
                 std::collections::hash_map::Entry::Vacant(entry) => {
@@ -332,9 +389,9 @@ impl NodeMesh {
         None
     }
 
-    /// Return eligible next hops for a route. Weighted routes only use peers
-    /// that passed the latest reachability probe; every mode excludes the
-    /// originating ingress and all already visited nodes.
+    /// Return eligible next hops for a route. Freshly probed peers are ordered
+    /// first; unprobed directory peers remain as a fallback. Every mode
+    /// excludes the originating ingress and all already visited nodes.
     pub async fn peers_for_route(&self, route: &MeshRoute) -> Vec<MeshPeer> {
         let peers = self.peers.read().await.clone();
         let mut candidates: Vec<(MeshPeer, Option<u32>)> = peers
@@ -354,12 +411,9 @@ impl NodeMesh {
                     }
                 })
             })
-            .filter_map(|peer| {
+            .map(|peer| {
                 let rtt = self.recent_rtt_ms(&peer.node_id);
-                if route.selection == MeshRouteSelection::WeightedRandom && rtt.is_none() {
-                    return None;
-                }
-                Some((peer, rtt))
+                (peer, rtt)
             })
             .collect();
 
@@ -379,20 +433,22 @@ impl NodeMesh {
             }
             MeshRouteSelection::WeightedRandom => {
                 let mut rng = rand::rng();
-                let mut shuffled = Vec::with_capacity(candidates.len());
-                let fastest_rtt = candidates
+                let (mut probed, mut unprobed): (Vec<_>, Vec<_>) =
+                    candidates.into_iter().partition(|(_, rtt)| rtt.is_some());
+                let mut shuffled = Vec::with_capacity(probed.len() + unprobed.len());
+                let fastest_rtt = probed
                     .iter()
                     .filter_map(|(_, rtt)| *rtt)
                     .min()
                     .unwrap_or(1)
                     .max(1);
-                while !candidates.is_empty() {
-                    let total_weight: u64 = candidates
+                while !probed.is_empty() {
+                    let total_weight: u64 = probed
                         .iter()
                         .map(|(_, rtt)| rtt_weight(fastest_rtt, rtt.unwrap_or(fastest_rtt)))
                         .sum();
                     let mut draw = rng.random_range(0..total_weight);
-                    let index = candidates
+                    let index = probed
                         .iter()
                         .position(|(_, rtt)| {
                             let weight = rtt_weight(fastest_rtt, rtt.unwrap_or(fastest_rtt));
@@ -404,7 +460,11 @@ impl NodeMesh {
                             }
                         })
                         .unwrap_or(0);
-                    shuffled.push(candidates.remove(index));
+                    shuffled.push(probed.remove(index));
+                }
+                while !unprobed.is_empty() {
+                    let index = rng.random_range(0..unprobed.len());
+                    shuffled.push(unprobed.remove(index));
                 }
                 candidates = shuffled;
             }
@@ -484,13 +544,14 @@ impl NodeMesh {
                 "Direct output is configured for this node",
             )
         })?;
-        let mut route = self.route_for_flow(&route).await.ok_or_else(|| {
-            AppError::new(
+        let Some(mut route) = self.route_for_flow(&route).await else {
+            metrics::counter!("netrunner_mesh_route_selection_failures_total").increment(1);
+            return Err(AppError::new(
                 ERR_INFRA_TIMEOUT,
                 "Mesh egress unavailable",
                 "No eligible healthy egress path is available",
-            )
-        })?;
+            ));
+        };
         let mut failed_egress_ids = Vec::new();
         loop {
             if let Some(egress_id) = route.egress_node_id.as_ref() {
