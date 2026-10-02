@@ -4,7 +4,12 @@
 //! in-memory view and probes peers from this node. Flows select a bounded,
 //! loop-free path and carry it through the NRXP mesh legs.
 
-use std::{cmp::Ordering, collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    cmp::Ordering,
+    collections::{HashMap, VecDeque},
+    sync::Arc,
+    time::Duration,
+};
 
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -12,7 +17,7 @@ use netrunner_logger::{AppError, ERR_INFRA_TIMEOUT};
 use rand::RngExt;
 use tokio::{
     net::TcpStream,
-    sync::{mpsc, RwLock},
+    sync::{mpsc, Mutex, RwLock},
     task::JoinHandle,
     time::timeout,
 };
@@ -30,12 +35,20 @@ struct PeerProbe {
     probed_at: std::time::Instant,
 }
 
+#[derive(Default)]
+struct EgressRotation {
+    candidate_signature: Vec<String>,
+    pending: VecDeque<(MeshPeer, String)>,
+    last_address: Option<String>,
+}
+
 pub struct NodeMesh {
     local_node_id: String,
     local_node_secret: String,
     max_hops: u8,
     peers: RwLock<Vec<MeshPeer>>,
     rtt_ms: DashMap<String, PeerProbe>,
+    egress_rotation: Mutex<EgressRotation>,
 }
 
 impl NodeMesh {
@@ -50,6 +63,7 @@ impl NodeMesh {
             max_hops: max_hops.clamp(1, MAX_MESH_HOPS),
             peers: RwLock::new(Vec::new()),
             rtt_ms: DashMap::new(),
+            egress_rotation: Mutex::new(EgressRotation::default()),
         }
     }
 
@@ -180,20 +194,25 @@ impl NodeMesh {
 
         let mut flow_route = route.clone();
         flow_route.remaining_hops = rand::rng().random_range(3..=max_available_hops as u8);
-        flow_route.egress_node_id = Some(self.pick_healthy_egress(candidates)?.node_id);
+        flow_route.egress_node_id = Some(self.next_healthy_egress(candidates).await?.node_id);
         Some(flow_route)
     }
 
-    /// Pick among distinct public peer addresses so multiple node records on
-    /// one IP do not make that same website-visible egress disproportionately
-    /// likely. For each address, use its fastest healthy node as the RTT score.
-    fn pick_healthy_egress(&self, peers: Vec<MeshPeer>) -> Option<MeshPeer> {
+    /// Rotate through a randomized, RTT-weighted permutation of healthy public
+    /// peer addresses. Each distinct address is used once before the bag is
+    /// reshuffled, so a fast peer cannot be selected repeatedly by chance.
+    async fn next_healthy_egress(&self, peers: Vec<MeshPeer>) -> Option<MeshPeer> {
         let mut by_address = HashMap::<String, (MeshPeer, u32)>::new();
+        let mut candidate_signature = Vec::with_capacity(peers.len());
         for peer in peers {
             let Some(rtt) = self.recent_rtt_ms(&peer.node_id) else {
                 continue;
             };
             let address_key = peer.host.trim().to_ascii_lowercase();
+            candidate_signature.push(format!(
+                "{address_key}={}",
+                peer.node_id.to_ascii_lowercase()
+            ));
             match by_address.entry(address_key) {
                 std::collections::hash_map::Entry::Vacant(entry) => {
                     entry.insert((peer, rtt));
@@ -204,23 +223,30 @@ impl NodeMesh {
                 std::collections::hash_map::Entry::Occupied(_) => {}
             }
         }
+        candidate_signature.sort_unstable();
 
-        let candidates: Vec<_> = by_address.into_values().collect();
-        let fastest_rtt = candidates.iter().map(|(_, rtt)| *rtt).min()?.max(1);
-        let total_weight: u64 = candidates
-            .iter()
-            .map(|(_, rtt)| rtt_weight(fastest_rtt, *rtt))
-            .sum();
-        let mut draw = rand::rng().random_range(0..total_weight);
-        candidates.into_iter().find_map(|(peer, rtt)| {
-            let weight = rtt_weight(fastest_rtt, rtt);
-            if draw < weight {
-                Some(peer)
-            } else {
-                draw -= weight;
-                None
+        let mut rotation = self.egress_rotation.lock().await;
+        if rotation.candidate_signature != candidate_signature || rotation.pending.is_empty() {
+            let mut next_cycle = weighted_egress_order(by_address);
+            if next_cycle.len() > 1
+                && next_cycle
+                    .first()
+                    .is_some_and(|(_, address)| Some(address) == rotation.last_address.as_ref())
+            {
+                if let Some(next_different) = next_cycle
+                    .iter()
+                    .position(|(_, address)| Some(address) != rotation.last_address.as_ref())
+                {
+                    next_cycle.swap(0, next_different);
+                }
             }
-        })
+            rotation.candidate_signature = candidate_signature;
+            rotation.pending = next_cycle.into();
+        }
+
+        let (peer, address) = rotation.pending.pop_front()?;
+        rotation.last_address = Some(address);
+        Some(peer)
     }
 
     /// Return eligible next hops for a route. Weighted routes only use peers
@@ -422,6 +448,46 @@ impl NodeMesh {
 fn rtt_weight(fastest_rtt_ms: u32, candidate_rtt_ms: u32) -> u64 {
     let ratio = (f64::from(fastest_rtt_ms.max(1)) / f64::from(candidate_rtt_ms.max(1))).sqrt();
     (ratio * 1_000.0).round().clamp(250.0, 1_000.0) as u64
+}
+
+/// Build a weighted random permutation of unique egress IPs. The queue drains
+/// completely before another permutation is made, preserving RTT preference
+/// while guaranteeing that a stable healthy pool rotates through each IP.
+fn weighted_egress_order(by_address: HashMap<String, (MeshPeer, u32)>) -> Vec<(MeshPeer, String)> {
+    let mut candidates: Vec<_> = by_address
+        .into_iter()
+        .map(|(address, (peer, rtt))| (peer, rtt, address))
+        .collect();
+    let Some(fastest_rtt) = candidates.iter().map(|(_, rtt, _)| *rtt).min() else {
+        return Vec::new();
+    };
+    let fastest_rtt = fastest_rtt.max(1);
+    let mut order = Vec::with_capacity(candidates.len());
+    let mut rng = rand::rng();
+
+    while !candidates.is_empty() {
+        let total_weight: u64 = candidates
+            .iter()
+            .map(|(_, rtt, _)| rtt_weight(fastest_rtt, *rtt))
+            .sum();
+        let mut draw = rng.random_range(0..total_weight);
+        let index = candidates
+            .iter()
+            .position(|(_, rtt, _)| {
+                let weight = rtt_weight(fastest_rtt, *rtt);
+                if draw < weight {
+                    true
+                } else {
+                    draw -= weight;
+                    false
+                }
+            })
+            .unwrap_or(0);
+        let (peer, _, address) = candidates.remove(index);
+        order.push((peer, address));
+    }
+
+    order
 }
 
 /// One logical TCP or UDP flow carried by a direct NRXP leg to a mesh egress.
