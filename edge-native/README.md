@@ -210,7 +210,7 @@ workflow**. Workflow запускается только вручную; он б
 | Variable | Обязательна | Значение |
 |----------|------------|----------|
 | `DEPLOY_TARGET` | да | SSH-цель `user@host`, например `root@edge.example.com` |
-| `DEPLOY_KNOWN_HOSTS` | да | Публичная host key строка VDS, например вывод `ssh-keyscan -p 22 edge.example.com` |
+| `DEPLOY_KNOWN_HOSTS` | да | Все строки ключей хоста из `ssh-keyscan -H -t ed25519 -p 22 <DEPLOY_TARGET host>`; без строк-комментариев `# ...` |
 | `PUBLIC_DOMAIN` | да | Домен edge, на который настроен DNS |
 | `VPN_NODE_ADDR` | да | Адрес VPN-ноды в формате `host:port` |
 | `LANDING_ADDR` | да | Адрес сайта-витрины в формате `host:port` |
@@ -224,10 +224,13 @@ workflow**. Workflow запускается только вручную; он б
 | `DEPLOY_SSH_KEY` | да | Приватный SSH-ключ; соответствующий публичный ключ должен быть в `authorized_keys` пользователя на VDS |
 | `AUTH_TOKEN` | только для `--require-auth` | Edge-токен из Owner-эндпоинта backend; если нода не требует авторизацию, secret можно не создавать |
 
-VDS должна принимать SSH с runner'а Gitea Actions, иметь установленный Docker
-Compose plugin, а указанный пользователь должен запускать `docker compose` без
-интерактивного ввода пароля. Деплой использует порт SSH `22` и каталог
-`~/netrunner-proxy`. `DEPLOY_KNOWN_HOSTS` закрепляет ключ сервера,
+VDS должна принимать SSH с runner'а Gitea Actions и работать на Ubuntu/Debian с
+`apt-get` и `systemd`. Если Docker или Compose plugin отсутствует, workflow
+установит `docker.io` и `docker-compose-v2` при первом запуске; для такой
+установки `DEPLOY_TARGET` должен подключаться как `root`. После установки можно
+использовать пользователя с доступом к Docker без интерактивного `sudo`.
+Деплой использует порт SSH `22` и каталог `~/netrunner-proxy`.
+`DEPLOY_KNOWN_HOSTS` закрепляет ключ сервера,
 поэтому workflow не доверяет результату `ssh-keyscan`, полученному во время
 самого деплоя. `.env` на VDS устанавливается с правами `0600`.
 
