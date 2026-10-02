@@ -8,6 +8,9 @@ services:
     image: caddy:2
     container_name: netrunner-edge-caddy
     restart: always
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
     ports:
       - "80:80"
       - "443:443"
@@ -29,6 +32,9 @@ services:
     image: ${IMAGE:-netrunner-edge:latest}
     container_name: netrunner-edge
     restart: always
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
     # Порт НЕ публикуется на хост — только Caddy достаёт его по имени
     # сервиса внутри docker-сети (см. reverse_proxy в Caddyfile.example).
     expose:
