@@ -1,0 +1,61 @@
+name: Build OpenWrt Client (manual)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-openwrt-client:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl,aarch64-unknown-linux-musl,armv7-unknown-linux-musleabihf
+
+      - name: Install Zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.14.1
+
+      - name: Install native build tools
+        run: sudo apt-get update -qq && sudo apt-get install -y cmake ninja-build perl
+
+      - name: Install cargo-zigbuild
+        run: command -v cargo-zigbuild >/dev/null || cargo install --locked cargo-zigbuild --version 0.23.3
+
+      - name: Build and package OpenWrt clients
+        env:
+          CARGO_TARGET_DIR: target/openwrt
+        run: |
+          set -eu
+          mkdir -p dist-openwrt
+          while read -r target arch; do
+            cargo zigbuild --locked --release -p netrunner-client --features cli --bin netrunner-client --target "$target"
+            binary="$CARGO_TARGET_DIR/$target/release/netrunner-client"
+            if readelf -l "$binary" | grep -q 'Requesting program interpreter'; then
+              echo "$target получился динамическим, такой бинарник не подходит OpenWrt" >&2
+              exit 1
+            fi
+            sh scripts/package-openwrt-client.sh "$binary" "$arch" dist-openwrt
+          done <<'TARGETS'
+          x86_64-unknown-linux-musl x86_64
+          aarch64-unknown-linux-musl aarch64
+          armv7-unknown-linux-musleabihf armv7
+          TARGETS
+          sha256sum dist-openwrt/*.tar.gz > dist-openwrt/SHA256SUMS
+
+      - name: Keep OpenWrt artifacts in Actions
+        uses: actions/upload-artifact@v3
+        with:
+          name: netrunner-client-openwrt
+          path: dist-openwrt/
+
+      - name: Publish OpenWrt clients to Gitea package registry
+        env:
+          GITEA_TOKEN: ${{ secrets.GT_REGISTRY_TOKEN }}
+          GITEA_SERVER_URL: https://gitea.netrunner-vpn.com
+          GITEA_OWNER: nineap
+        run: node scripts/publish-openwrt-client.mjs dist-openwrt

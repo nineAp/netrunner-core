@@ -138,6 +138,10 @@ curl -X POST https://<backend>/api/v1/admin/staff/owner/edge-tokens \
 `token` — тот самый `AUTH_TOKEN`. Он показывается ровно один раз в этом
 ответе (репозиторий хранит только его SHA256); потерялся — выпускайте новый
 и отзывайте старый (`POST /api/v1/admin/staff/owner/edge-tokens/{id}/revoke`).
+Существующие строки `edge_tokens` содержат только хэш и метаданные: по ним
+нельзя восстановить значение токена. Если старого значения нет, выпустите
+новый токен, обновите secret `AUTH_TOKEN` и перезапустите edge; старую запись
+можно отозвать по её `id` после проверки нового токена.
 `limit_bytes` в теле запроса — необязательное ограничение трафика для этого
 токена, по умолчанию безлимит (осознанно, соответствует "открытый прокси без
 контроля" — включайте лимит явно, если он всё же нужен).
@@ -200,26 +204,30 @@ workflow**. Workflow запускается только вручную; он б
 `Caddyfile` из `Caddyfile.example` и выполняет `docker compose up -d --build`.
 Образ собирается на самой VDS и в Container Registry не публикуется.
 
-Перед первым запуском добавьте в настройках репозитория **Actions secrets**:
+Перед первым запуском добавьте настройки в репозитории → **Settings → Actions**.
+Переменные ниже публичны и лежат в **Variables**:
 
-| Secret | Обязателен | Значение |
-|--------|------------|----------|
-| `EDGE_DEPLOY_HOST` | да | IP или DNS-имя VDS |
-| `EDGE_DEPLOY_USER` | да | SSH-пользователь с доступом к Docker и правом записи в каталог деплоя |
-| `EDGE_DEPLOY_SSH_KEY` | да | Приватный SSH-ключ; публичный ключ должен быть в `authorized_keys` пользователя на VDS |
-| `EDGE_DEPLOY_KNOWN_HOSTS` | да | Закреплённая SSH host key строка VDS, например вывод `ssh-keyscan -p 22 edge.example.com` |
-| `EDGE_DEPLOY_PATH` | да | Абсолютный путь каталога исходников на VDS, например `/root/netrunner-proxy` |
-| `EDGE_DOMAIN` | да | Домен edge, на который настроен DNS |
+| Variable | Обязательна | Значение |
+|----------|------------|----------|
+| `DEPLOY_TARGET` | да | SSH-цель `user@host`, например `root@edge.example.com` |
+| `DEPLOY_KNOWN_HOSTS` | да | Публичная host key строка VDS, например вывод `ssh-keyscan -p 22 edge.example.com` |
+| `PUBLIC_DOMAIN` | да | Домен edge, на который настроен DNS |
 | `VPN_NODE_ADDR` | да | Адрес VPN-ноды в формате `host:port` |
 | `LANDING_ADDR` | да | Адрес сайта-витрины в формате `host:port` |
 | `BACKEND_ADDR` | да | Адрес backend в формате `host:port` |
-| `EDGE_DEPLOY_PORT` | нет | SSH-порт, по умолчанию `22` |
 | `DECOY_SNI` | нет | Домен-декой исходящего NRXP, по умолчанию `www.debian.org` |
-| `AUTH_TOKEN` | только для `--require-auth` | Edge-токен, выпущенный Owner-эндпоинтом backend; пустое значение отключает авторизацию на ноде |
+
+В **Secrets** нужны только:
+
+| Secret | Обязателен | Значение |
+|--------|------------|----------|
+| `DEPLOY_SSH_KEY` | да | Приватный SSH-ключ; соответствующий публичный ключ должен быть в `authorized_keys` пользователя на VDS |
+| `AUTH_TOKEN` | только для `--require-auth` | Edge-токен из Owner-эндпоинта backend; если нода не требует авторизацию, secret можно не создавать |
 
 VDS должна принимать SSH с runner'а Gitea Actions, иметь установленный Docker
 Compose plugin, а указанный пользователь должен запускать `docker compose` без
-интерактивного ввода пароля. `EDGE_DEPLOY_KNOWN_HOSTS` закрепляет ключ сервера,
+интерактивного ввода пароля. Деплой использует порт SSH `22` и каталог
+`~/netrunner-proxy`. `DEPLOY_KNOWN_HOSTS` закрепляет ключ сервера,
 поэтому workflow не доверяет результату `ssh-keyscan`, полученному во время
 самого деплоя. `.env` на VDS устанавливается с правами `0600`.
 
