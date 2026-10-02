@@ -16,6 +16,7 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use h3::{ext::Protocol, quic::StreamId, server::RequestStream};
 use h3_datagram::datagram_handler::HandleDatagramsExt;
 use http::{Method, Request, Response, StatusCode};
+use netrunner_core::net::{MeshPeer, MeshTunnel, MeshTunnelSender, NodeMesh};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpStream, UdpSocket},
@@ -31,7 +32,8 @@ use crate::{
 type Sessions = Arc<RwLock<HashMap<StreamId, Arc<UdpSession>>>>;
 
 struct UdpSession {
-    socket: UdpSocket,
+    socket: Option<UdpSocket>,
+    mesh_sender: Option<MeshTunnelSender>,
     unreported_bytes: AtomicU64,
 }
 
@@ -65,9 +67,35 @@ pub struct Config {
     pub auth: BearerAuth,
     pub allow_private_targets: bool,
     pub max_connections: usize,
+    pub mesh: Option<MeshConfig>,
+}
+
+pub struct MeshConfig {
+    pub node_id: String,
+    pub backend_url: String,
+    pub internal_secret: String,
 }
 
 pub async fn run(config: Config) -> Result<()> {
+    let mesh = config.mesh.map(|mesh_config| {
+        let mesh = Arc::new(NodeMesh::new(
+            mesh_config.node_id.clone(),
+            mesh_config.internal_secret.clone(),
+        ));
+        let refresh_mesh = mesh.clone();
+        tokio::spawn(async move {
+            let client = reqwest::Client::new();
+            let mut interval = tokio::time::interval(Duration::from_secs(20));
+            loop {
+                match refresh_mesh_peers(&client, &mesh_config, &refresh_mesh).await {
+                    Ok(()) => refresh_mesh.probe_peers().await,
+                    Err(error) => warn!(%error, "MASQUE mesh directory refresh failed"),
+                }
+                interval.tick().await;
+            }
+        });
+        mesh
+    });
     let server_config = build_server_config(&config.cert, &config.key)?;
     let endpoint = quinn::Endpoint::server(server_config, config.bind)
         .with_context(|| format!("failed to bind HTTP/3 endpoint at {}", config.bind))?;
@@ -91,13 +119,14 @@ pub async fn run(config: Config) -> Result<()> {
         };
         let auth = config.auth.clone();
         let allow_private_targets = config.allow_private_targets;
+        let mesh = mesh.clone();
         tokio::spawn(async move {
             let _connection_slot = connection_slot;
             match incoming.await {
                 Ok(connection) => {
                     let remote = connection.remote_address();
                     if let Err(error) =
-                        handle_connection(connection, auth, allow_private_targets).await
+                        handle_connection(connection, auth, allow_private_targets, mesh).await
                     {
                         warn!(%remote, %error, "HTTP/3 connection failed");
                     }
@@ -106,6 +135,26 @@ pub async fn run(config: Config) -> Result<()> {
             }
         });
     }
+    Ok(())
+}
+
+async fn refresh_mesh_peers(
+    client: &reqwest::Client,
+    config: &MeshConfig,
+    mesh: &NodeMesh,
+) -> Result<()> {
+    let peers = client
+        .get(format!(
+            "{}/api/v1/internal/mesh/peers",
+            config.backend_url.trim_end_matches('/')
+        ))
+        .header("X-Internal-Secret", &config.internal_secret)
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Vec<MeshPeer>>()
+        .await?;
+    mesh.update_peers(peers).await;
     Ok(())
 }
 
@@ -150,6 +199,7 @@ async fn handle_connection(
     connection: quinn::Connection,
     auth: BearerAuth,
     allow_private_targets: bool,
+    mesh: Option<Arc<NodeMesh>>,
 ) -> Result<()> {
     let remote = connection.remote_address();
     let quinn_connection = h3_quinn::Connection::new(connection);
@@ -163,7 +213,7 @@ async fn handle_connection(
     let sessions: Sessions = Arc::new(RwLock::new(HashMap::new()));
     let mut datagram_reader = h3.get_datagram_reader();
     let uplink_sessions = Arc::clone(&sessions);
-    let datagram_task = tokio::spawn(async move {
+    let mut datagram_task = tokio::spawn(async move {
         loop {
             let datagram = datagram_reader
                 .read_datagram()
@@ -180,11 +230,17 @@ async fn handle_connection(
             };
             let session = uplink_sessions.read().await.get(&stream_id).cloned();
             if let Some(session) = session {
-                session
-                    .socket
-                    .send(&payload)
-                    .await
-                    .context("failed to forward CONNECT-UDP datagram")?;
+                if let Some(sender) = &session.mesh_sender {
+                    sender
+                        .send(payload.clone())
+                        .await
+                        .context("failed to forward CONNECT-UDP datagram through mesh")?;
+                } else if let Some(socket) = &session.socket {
+                    socket
+                        .send(&payload)
+                        .await
+                        .context("failed to forward CONNECT-UDP datagram")?;
+                }
                 session
                     .unreported_bytes
                     .fetch_add(payload.len() as u64, Ordering::Relaxed);
@@ -200,11 +256,29 @@ async fn handle_connection(
     });
 
     info!(%remote, "HTTP/3 connection established");
-    while let Some(resolver) = h3
-        .accept()
-        .await
-        .context("failed to accept HTTP/3 request")?
-    {
+    let mut request_tasks = tokio::task::JoinSet::new();
+    let connection_result = loop {
+        let accepted = tokio::select! {
+            result = h3.accept() => result,
+            joined = request_tasks.join_next(), if !request_tasks.is_empty() => {
+                if let Some(Err(error)) = joined {
+                    warn!(%remote, %error, "MASQUE request task panicked");
+                }
+                continue;
+            }
+            datagram_result = &mut datagram_task => {
+                break match datagram_result {
+                    Ok(Ok(())) => Err(anyhow::anyhow!("HTTP/3 datagram reader stopped unexpectedly")),
+                    Ok(Err(error)) => Err(error),
+                    Err(error) => Err(error.into()),
+                };
+            }
+        };
+        let resolver = match accepted {
+            Ok(Some(resolver)) => resolver,
+            Ok(None) => break Ok(()),
+            Err(error) => break Err(error).context("failed to accept HTTP/3 request"),
+        };
         let (request, stream) = match resolver.resolve_request().await {
             Ok(request) => request,
             Err(error) => {
@@ -215,7 +289,8 @@ async fn handle_connection(
         let datagram_sender = h3.get_datagram_sender(stream.id());
         let request_auth = auth.clone();
         let request_sessions = Arc::clone(&sessions);
-        tokio::spawn(async move {
+        let request_mesh = mesh.clone();
+        request_tasks.spawn(async move {
             let stream_id = stream.id();
             if let Err(error) = handle_request(
                 request,
@@ -224,16 +299,20 @@ async fn handle_connection(
                 request_sessions,
                 request_auth,
                 allow_private_targets,
+                request_mesh,
             )
             .await
             {
                 warn!(?stream_id, %error, "MASQUE request failed");
             }
+            Ok::<(), anyhow::Error>(())
         });
-    }
+    };
 
+    request_tasks.abort_all();
+    while request_tasks.join_next().await.is_some() {}
     datagram_task.abort();
-    Ok(())
+    connection_result
 }
 
 async fn handle_request(
@@ -246,10 +325,18 @@ async fn handle_request(
     sessions: Sessions,
     auth: BearerAuth,
     allow_private_targets: bool,
+    mesh: Option<Arc<NodeMesh>>,
 ) -> Result<()> {
-    let Some(grant) = auth.authorize(&request).await else {
-        send_status(&mut stream, StatusCode::UNAUTHORIZED).await?;
-        return Ok(());
+    let grant = match auth.authorize(&request).await {
+        Ok(Some(grant)) => grant,
+        Ok(None) => {
+            send_status(&mut stream, StatusCode::UNAUTHORIZED).await?;
+            return Ok(());
+        }
+        Err(()) => {
+            send_status(&mut stream, StatusCode::SERVICE_UNAVAILABLE).await?;
+            return Ok(());
+        }
     };
     if request.method() != Method::CONNECT {
         send_status(&mut stream, StatusCode::METHOD_NOT_ALLOWED).await?;
@@ -266,6 +353,7 @@ async fn handle_request(
                 auth,
                 grant,
                 allow_private_targets,
+                mesh,
             )
             .await
         }
@@ -273,7 +361,7 @@ async fn handle_request(
             warn!(?protocol, "unsupported extended CONNECT protocol");
             send_status(&mut stream, StatusCode::NOT_IMPLEMENTED).await
         }
-        None => handle_connect_tcp(request, stream, auth, grant, allow_private_targets).await,
+        None => handle_connect_tcp(request, stream, auth, grant, allow_private_targets, mesh).await,
     }
 }
 
@@ -283,6 +371,7 @@ async fn handle_connect_tcp(
     auth: BearerAuth,
     grant: AuthGrant,
     allow_private_targets: bool,
+    mesh: Option<Arc<NodeMesh>>,
 ) -> Result<()> {
     let authority = request
         .uri()
@@ -290,6 +379,10 @@ async fn handle_connect_tcp(
         .context("TCP CONNECT request has no :authority")?;
     let target = target::from_authority(authority.as_str())?;
     let resolved = target.resolve(allow_private_targets).await?;
+    if let Some(mesh) = mesh {
+        let tunnel = mesh.connect_stream(&resolved.to_string(), false).await?;
+        return handle_mesh_connect_tcp(stream, tunnel, auth, grant, target).await;
+    }
     let tcp = TcpStream::connect(resolved)
         .await
         .with_context(|| format!("TCP connect to {} failed", target))?;
@@ -363,6 +456,75 @@ async fn handle_connect_tcp(
     result
 }
 
+async fn handle_mesh_connect_tcp(
+    mut stream: RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    mut tunnel: MeshTunnel,
+    auth: BearerAuth,
+    grant: AuthGrant,
+    target: target::Target,
+) -> Result<()> {
+    stream
+        .send_response(Response::builder().status(StatusCode::OK).body(())?)
+        .await
+        .context("failed to accept TCP CONNECT")?;
+    info!(%target, "TCP CONNECT established through mesh");
+
+    let (mut h3_send, mut h3_recv) = stream.split();
+    let tunnel_sender = tunnel.sender();
+    let unreported_bytes = Arc::new(AtomicU64::new(0));
+    let upload_bytes = Arc::clone(&unreported_bytes);
+    let download_bytes = Arc::clone(&unreported_bytes);
+
+    let upload = async {
+        while let Some(mut data) = h3_recv.recv_data().await? {
+            while data.has_remaining() {
+                let chunk = data.chunk();
+                let len = chunk.len();
+                tunnel_sender.send(Bytes::copy_from_slice(chunk)).await?;
+                upload_bytes.fetch_add(len as u64, Ordering::Relaxed);
+                data.advance(len);
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    };
+
+    let download = async {
+        while let Some(data) = tunnel.recv().await {
+            download_bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
+            h3_send.send_data(data).await?;
+        }
+        h3_send.finish().await?;
+        Ok::<(), anyhow::Error>(())
+    };
+
+    let transfer = async {
+        tokio::try_join!(upload, download)?;
+        Ok::<(), anyhow::Error>(())
+    };
+    let reporter = async {
+        let mut interval = tokio::time::interval(Duration::from_secs(10));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            let delta = unreported_bytes.swap(0, Ordering::Relaxed);
+            if auth.report_usage(grant, delta).await {
+                bail!("traffic limit reached");
+            }
+        }
+    };
+    let result = tokio::select! {
+        result = transfer => result,
+        result = reporter => result,
+    };
+    let remaining = unreported_bytes.swap(0, Ordering::Relaxed);
+    if auth.report_usage(grant, remaining).await {
+        tunnel.close().await;
+        bail!("traffic limit reached");
+    }
+    tunnel.close().await;
+    result
+}
+
 async fn handle_connect_udp(
     request: Request<()>,
     mut stream: RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
@@ -374,18 +536,29 @@ async fn handle_connect_udp(
     auth: BearerAuth,
     grant: AuthGrant,
     allow_private_targets: bool,
+    mesh: Option<Arc<NodeMesh>>,
 ) -> Result<()> {
     let target = target::from_connect_udp_path(request.uri().path())?;
     let resolved = target.resolve(allow_private_targets).await?;
-    let bind = match resolved.ip() {
-        IpAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
-        IpAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
+    let mut mesh_tunnel = if let Some(mesh) = mesh {
+        Some(mesh.connect_stream(&resolved.to_string(), true).await?)
+    } else {
+        None
     };
-    let socket = UdpSocket::bind(bind).await?;
-    socket
-        .connect(resolved)
-        .await
-        .with_context(|| format!("UDP connect to {} failed", target))?;
+    let socket = if mesh_tunnel.is_none() {
+        let bind = match resolved.ip() {
+            IpAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+            IpAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
+        };
+        let socket = UdpSocket::bind(bind).await?;
+        socket
+            .connect(resolved)
+            .await
+            .with_context(|| format!("UDP connect to {} failed", target))?;
+        Some(socket)
+    } else {
+        None
+    };
 
     let response = Response::builder()
         .status(StatusCode::OK)
@@ -399,6 +572,7 @@ async fn handle_connect_udp(
     let stream_id = stream.id();
     let session = Arc::new(UdpSession {
         socket,
+        mesh_sender: mesh_tunnel.as_ref().map(MeshTunnel::sender),
         unreported_bytes: AtomicU64::new(0),
     });
     sessions
@@ -413,13 +587,13 @@ async fn handle_connect_udp(
         usage_interval.tick().await;
         loop {
             tokio::select! {
-                received = session.socket.recv(&mut buffer) => {
-                    let received = received?;
-                    session.unreported_bytes.fetch_add(received as u64, Ordering::Relaxed);
-                    let mut payload = BytesMut::with_capacity(received + 1);
-                    payload.put_u8(0); // RFC 9298 context ID 0.
-                    payload.put_slice(&buffer[..received]);
-                    if let Err(error) = datagram_sender.send_datagram(payload.freeze()) {
+                received = recv_udp_payload(&mut mesh_tunnel, session.socket.as_ref(), &mut buffer) => {
+                    let Some(payload) = received? else { break; };
+                    session.unreported_bytes.fetch_add(payload.len() as u64, Ordering::Relaxed);
+                    let mut datagram = BytesMut::with_capacity(payload.len() + 1);
+                    datagram.put_u8(0); // RFC 9298 context ID 0.
+                    datagram.put_slice(&payload);
+                    if let Err(error) = datagram_sender.send_datagram(datagram.freeze()) {
                         warn!(?stream_id, %error, "dropping UDP response datagram");
                     }
                 }
@@ -441,6 +615,9 @@ async fn handle_connect_udp(
     }
     .await;
 
+    if let Some(tunnel) = mesh_tunnel {
+        tunnel.close().await;
+    }
     sessions.write().await.remove(&stream_id);
     let remaining = session.unreported_bytes.swap(0, Ordering::Relaxed);
     let over_limit = auth.report_usage(grant, remaining).await;
@@ -449,6 +626,19 @@ async fn handle_connect_udp(
         bail!("traffic limit reached");
     }
     result
+}
+
+async fn recv_udp_payload(
+    mesh_tunnel: &mut Option<MeshTunnel>,
+    socket: Option<&UdpSocket>,
+    buffer: &mut [u8],
+) -> Result<Option<Bytes>> {
+    if let Some(tunnel) = mesh_tunnel {
+        return Ok(tunnel.recv().await);
+    }
+    let socket = socket.context("UDP egress is not configured")?;
+    let received = socket.recv(buffer).await?;
+    Ok(Some(Bytes::copy_from_slice(&buffer[..received])))
 }
 
 async fn send_status(
@@ -520,6 +710,7 @@ mod tests {
             auth: BearerAuth::new(Some("test-token".into())),
             allow_private_targets: true,
             max_connections: 32,
+            mesh: None,
         }));
         tokio::time::sleep(Duration::from_millis(30)).await;
 

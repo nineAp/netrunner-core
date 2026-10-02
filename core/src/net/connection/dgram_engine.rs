@@ -836,6 +836,8 @@ async fn process_datagram(
         let peer_addr = Arc::new(ArcSwap::from(Arc::new(peer)));
         let opener = Arc::new(RemoteOpener {
             muxer: entry.muxer.clone(),
+            mesh: None,
+            mesh_peer: false,
         });
         let handler = Arc::new(StreamHandler::new(entry.muxer.clone(), Some(opener)));
 
@@ -1374,7 +1376,11 @@ mod tests {
     #[tokio::test]
     async fn datagram_dispatch_filters_out_non_udp_frame_types() {
         let muxer = Arc::new(Muxer::new(false, "filter-test".into()));
-        let opener = Arc::new(RemoteOpener { muxer: muxer.clone() });
+        let opener = Arc::new(RemoteOpener {
+            muxer: muxer.clone(),
+            mesh: None,
+            mesh_peer: false,
+        });
         let handler = StreamHandler::new(muxer.clone(), Some(opener));
 
         let (stream_tx, mut stream_rx) = mpsc::channel::<Bytes>(4);

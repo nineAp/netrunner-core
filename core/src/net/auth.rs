@@ -12,6 +12,42 @@ use crate::net::diagnostics::ErrorCounters;
 use async_trait::async_trait;
 use netrunner_logger::AppError;
 
+/// Public connection data for one node in the mesh. The control plane returns
+/// only nodes that are eligible to receive an egress hop; node-to-node data
+/// still travels directly between the peers.
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+pub struct MeshPeer {
+    pub node_id: String,
+    pub host: String,
+    pub port: u16,
+    pub decoy_sni: String,
+    pub nrxp_secret: String,
+    pub nrxp_static_public: String,
+}
+
+impl std::fmt::Debug for MeshPeer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MeshPeer")
+            .field("node_id", &self.node_id)
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("decoy_sni", &self.decoy_sni)
+            .field("nrxp_secret", &"[REDACTED]")
+            .field("nrxp_static_public", &self.nrxp_static_public)
+            .finish()
+    }
+}
+
+impl MeshPeer {
+    pub fn address(&self) -> String {
+        if self.host.contains(':') && !self.host.starts_with('[') {
+            format!("[{}]:{}", self.host, self.port)
+        } else {
+            format!("{}:{}", self.host, self.port)
+        }
+    }
+}
+
 /// Результат успешной проверки токена клиента.
 #[derive(Debug, Clone)]
 pub struct UserQuota {
@@ -56,4 +92,25 @@ pub trait AuthValidator: Send + Sync {
     /// Отправляет агрегированный снимок состояния ноды на control-plane —
     /// единая точка сбора вместо локальных файлов на диске ноды.
     async fn report_node_health(&self, report: NodeHealthReport) -> Result<(), AppError>;
+
+    /// Returns the current online mesh peers for this node. Older validators
+    /// can omit mesh support; the server then leaves mesh routing disabled.
+    async fn list_mesh_peers(&self) -> Result<Vec<MeshPeer>, AppError> {
+        Err(AppError::new(
+            netrunner_logger::ERR_AUTH_FAILED,
+            "Mesh unavailable",
+            "Mesh peer discovery is not configured",
+        ))
+    }
+
+    /// Confirms that `peer_id` is an active node allowed to use this node as
+    /// an egress. The node secret is sent only inside the authenticated NRXP
+    /// tunnel, then verified by the control plane over its internal API.
+    async fn validate_mesh_peer(&self, _peer_id: &str, _peer_secret: &str) -> Result<(), AppError> {
+        Err(AppError::new(
+            netrunner_logger::ERR_AUTH_FAILED,
+            "Mesh peer rejected",
+            "Mesh peer validation is not configured",
+        ))
+    }
 }

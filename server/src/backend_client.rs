@@ -8,6 +8,7 @@
 
 use async_trait::async_trait;
 use dashmap::DashMap;
+use netrunner_core::net::MeshPeer;
 use netrunner_core::net::{AuthValidator, NodeHealthReport, UsageReport, UserQuota};
 use netrunner_logger::{warn, AppError};
 use serde::{Deserialize, Serialize};
@@ -15,6 +16,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 const VALIDATE_CACHE_TTL: Duration = Duration::from_secs(60);
+const MESH_PEER_CACHE_TTL: Duration = Duration::from_secs(30);
 
 /// Таймаут одного HTTP-запроса к бэкенду. Без него `reqwest::Client` ждёт
 /// ответ неограниченно долго на зависшем (не упавшем — именно зависшем)
@@ -87,6 +89,7 @@ pub struct BackendClient {
     base_url: String,
     internal_secret: String,
     validate_cache: DashMap<String, (UserQuota, Instant)>,
+    mesh_peer_cache: DashMap<(String, String), Instant>,
     circuit: Circuit,
 }
 
@@ -100,6 +103,7 @@ impl BackendClient {
             base_url: base_url.trim_end_matches('/').to_string(),
             internal_secret,
             validate_cache: DashMap::new(),
+            mesh_peer_cache: DashMap::new(),
             circuit: Circuit::new(),
         }
     }
@@ -129,6 +133,12 @@ struct ValidateResponse {
 struct UsageRequest<'a> {
     user_id: &'a str,
     delta_bytes: u64,
+}
+
+#[derive(Serialize)]
+struct MeshPeerValidationRequest<'a> {
+    peer_id: &'a str,
+    peer_secret: &'a str,
 }
 
 #[derive(Deserialize)]
@@ -294,6 +304,96 @@ impl AuthValidator for BackendClient {
                 format!("Node health report rejected: HTTP {}", resp.status()),
             ));
         }
+        Ok(())
+    }
+
+    async fn list_mesh_peers(&self) -> Result<Vec<MeshPeer>, AppError> {
+        if self.circuit.is_open() {
+            return Err(Self::circuit_open_error());
+        }
+
+        let response = self
+            .http
+            .get(format!("{}/api/v1/internal/mesh/peers", self.base_url))
+            .header("X-Internal-Secret", &self.internal_secret)
+            .send()
+            .await
+            .map_err(|e| {
+                self.circuit.record_failure();
+                AppError::new(
+                    netrunner_logger::ERR_INFRA_TIMEOUT,
+                    "Mesh directory unavailable",
+                    e.to_string(),
+                )
+            })?;
+
+        if response.status().is_server_error() {
+            self.circuit.record_failure();
+        }
+        if !response.status().is_success() {
+            return Err(AppError::new(
+                netrunner_logger::ERR_INFRA_TIMEOUT,
+                "Mesh directory rejected request",
+                format!("HTTP {}", response.status()),
+            ));
+        }
+
+        let peers = response.json::<Vec<MeshPeer>>().await.map_err(|e| {
+            AppError::new(
+                netrunner_logger::ERR_INFRA_TIMEOUT,
+                "Invalid mesh directory response",
+                e.to_string(),
+            )
+        })?;
+        self.circuit.record_success();
+        Ok(peers)
+    }
+
+    async fn validate_mesh_peer(&self, peer_id: &str, peer_secret: &str) -> Result<(), AppError> {
+        let cache_key = (peer_id.to_string(), peer_secret.to_string());
+        if self
+            .mesh_peer_cache
+            .get(&cache_key)
+            .is_some_and(|verified_at| verified_at.elapsed() < MESH_PEER_CACHE_TTL)
+        {
+            return Ok(());
+        }
+        if self.circuit.is_open() {
+            return Err(Self::circuit_open_error());
+        }
+
+        let response = self
+            .http
+            .post(format!("{}/api/v1/internal/mesh/validate", self.base_url))
+            .header("X-Internal-Secret", &self.internal_secret)
+            .json(&MeshPeerValidationRequest {
+                peer_id,
+                peer_secret,
+            })
+            .send()
+            .await
+            .map_err(|e| {
+                self.circuit.record_failure();
+                AppError::new(
+                    netrunner_logger::ERR_INFRA_TIMEOUT,
+                    "Mesh peer validation unavailable",
+                    e.to_string(),
+                )
+            })?;
+
+        if response.status().is_server_error() {
+            self.circuit.record_failure();
+        }
+        if !response.status().is_success() {
+            return Err(AppError::new(
+                netrunner_logger::ERR_AUTH_FAILED,
+                "Mesh peer rejected",
+                format!("HTTP {}", response.status()),
+            ));
+        }
+
+        self.circuit.record_success();
+        self.mesh_peer_cache.insert(cache_key, Instant::now());
         Ok(())
     }
 }

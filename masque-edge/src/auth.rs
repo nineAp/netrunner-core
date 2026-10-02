@@ -104,16 +104,19 @@ impl BearerAuth {
         })
     }
 
-    pub async fn authorize(&self, request: &Request<()>) -> Option<AuthGrant> {
+    pub async fn authorize(&self, request: &Request<()>) -> Result<Option<AuthGrant>, ()> {
         let Some(actual) = bearer_token(request) else {
-            return matches!(self.mode, AuthMode::Anonymous)
-                .then_some(AuthGrant { subject_id: None });
+            return Ok(
+                matches!(self.mode, AuthMode::Anonymous).then_some(AuthGrant { subject_id: None })
+            );
         };
 
         match &self.mode {
-            AuthMode::Anonymous => Some(AuthGrant { subject_id: None }),
-            AuthMode::Static(expected) => constant_time_eq(actual.as_bytes(), expected.as_bytes())
-                .then_some(AuthGrant { subject_id: None }),
+            AuthMode::Anonymous => Ok(Some(AuthGrant { subject_id: None })),
+            AuthMode::Static(expected) => {
+                Ok(constant_time_eq(actual.as_bytes(), expected.as_bytes())
+                    .then_some(AuthGrant { subject_id: None }))
+            }
             AuthMode::Remote(remote) => remote.authorize(actual).await,
         }
     }
@@ -131,53 +134,20 @@ impl BearerAuth {
 }
 
 impl RemoteAuth {
-    async fn authorize(&self, token: &str) -> Option<AuthGrant> {
+    async fn authorize(&self, token: &str) -> Result<Option<AuthGrant>, ()> {
         let fingerprint: [u8; 32] = Sha256::digest(token.as_bytes()).into();
         let now = Instant::now();
         if let Some(entry) = self.cache.read().await.get(&fingerprint).copied() {
             if entry.expires_at > now {
-                return entry.allowed.then_some(AuthGrant {
+                return Ok(entry.allowed.then_some(AuthGrant {
                     subject_id: entry.subject_id,
-                });
+                }));
             }
         }
 
-        let grant = match self
-            .client
-            .post(&self.url)
-            .header("X-Internal-Secret", &self.internal_secret)
-            .json(&ValidateRequest { token })
-            .send()
-            .await
-        {
-            Ok(response) if response.status().is_success() => {
-                match response.json::<ValidateResponse>().await {
-                    Ok(response)
-                        if !response
-                            .limit_bytes
-                            .is_some_and(|limit| response.used_bytes >= limit) =>
-                    {
-                        Some(AuthGrant {
-                            subject_id: Some(response.user_id),
-                        })
-                    }
-                    Ok(_) => None,
-                    Err(error) => {
-                        warn!(%error, "MASQUE auth response has invalid JSON");
-                        None
-                    }
-                }
-            }
-            Ok(_) => None,
-            Err(error) => {
-                warn!(
-                    token_fingerprint = %hex::encode(&fingerprint[..6]),
-                    %error,
-                    "MASQUE remote authorization failed closed"
-                );
-                None
-            }
-        };
+        // A short backend/network interruption must not be cached as a bad
+        // profile token. Validate is idempotent, so retry one transient failure.
+        let grant = self.validate(token, &fingerprint).await?;
 
         let ttl = if grant.is_some() {
             self.allow_ttl
@@ -196,7 +166,69 @@ impl RemoteAuth {
         if cache.len() > 4096 {
             cache.retain(|_, entry| entry.expires_at > now);
         }
-        grant
+        Ok(grant)
+    }
+
+    async fn validate(&self, token: &str, fingerprint: &[u8; 32]) -> Result<Option<AuthGrant>, ()> {
+        const ATTEMPTS: usize = 2;
+
+        for attempt in 0..ATTEMPTS {
+            let response = self
+                .client
+                .post(&self.url)
+                .header("X-Internal-Secret", &self.internal_secret)
+                .json(&ValidateRequest { token })
+                .send()
+                .await;
+
+            let response = match response {
+                Ok(response) => response,
+                Err(error) => {
+                    warn!(
+                        token_fingerprint = %hex::encode(&fingerprint[..6]),
+                        attempt = attempt + 1,
+                        %error,
+                        "MASQUE remote authorization request failed"
+                    );
+                    if attempt + 1 < ATTEMPTS {
+                        tokio::time::sleep(Duration::from_millis(150)).await;
+                        continue;
+                    }
+                    return Err(());
+                }
+            };
+
+            let status = response.status();
+            if status.is_success() {
+                match response.json::<ValidateResponse>().await {
+                    Ok(response)
+                        if !response
+                            .limit_bytes
+                            .is_some_and(|limit| response.used_bytes >= limit) =>
+                    {
+                        return Ok(Some(AuthGrant {
+                            subject_id: Some(response.user_id),
+                        }));
+                    }
+                    Ok(_) => return Ok(None),
+                    Err(error) => {
+                        warn!(%error, "MASQUE auth response has invalid JSON");
+                    }
+                }
+            } else if status == http::StatusCode::UNAUTHORIZED
+                || status == http::StatusCode::FORBIDDEN
+            {
+                return Ok(None);
+            } else {
+                warn!(%status, "MASQUE auth backend returned a transient failure");
+            }
+
+            if attempt + 1 < ATTEMPTS {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            }
+        }
+
+        Err(())
     }
 
     async fn report_usage(&self, subject_id: Uuid, delta_bytes: u64) -> bool {
@@ -286,6 +318,6 @@ mod tests {
             .build()
             .unwrap()
             .block_on(auth.authorize(request))
-            .is_some()
+            .is_ok_and(|grant| grant.is_some())
     }
 }

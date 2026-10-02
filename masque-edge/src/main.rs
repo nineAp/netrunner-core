@@ -136,6 +136,25 @@ async fn main() -> Result<()> {
                 .usage_url
                 .or_else(|| std::env::var("MASQUE_USAGE_URL").ok())
                 .filter(|value| !value.trim().is_empty());
+            let mesh_enabled = std::env::var("MESH_ENABLED")
+                .map(|value| value.eq_ignore_ascii_case("true") || value == "1")
+                .unwrap_or(false);
+            let mesh = if mesh_enabled {
+                let node_id = std::env::var("PROXY_NODE_ID")
+                    .context("MESH_ENABLED requires PROXY_NODE_ID")?;
+                let backend_url =
+                    std::env::var("BACKEND_URL").context("MESH_ENABLED requires BACKEND_URL")?;
+                let internal_secret = std::env::var("PROXY_INTERNAL_SECRET")
+                    .or_else(|_| std::env::var("MASQUE_AUTH_SECRET"))
+                    .context("MESH_ENABLED requires PROXY_INTERNAL_SECRET")?;
+                Some(server::MeshConfig {
+                    node_id,
+                    backend_url,
+                    internal_secret,
+                })
+            } else {
+                None
+            };
             let max_connections = args
                 .max_connections
                 .or_else(|| {
@@ -177,6 +196,7 @@ async fn main() -> Result<()> {
                 auth,
                 allow_private_targets: args.allow_private_targets,
                 max_connections,
+                mesh,
             })
             .await
         }

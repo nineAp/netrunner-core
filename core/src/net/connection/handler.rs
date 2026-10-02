@@ -35,6 +35,13 @@ use crate::nrxp::{Frame, FrameType};
 /// запускает соответствующий мост, прокачивающий данные между туннелем и целью.
 pub struct RemoteOpener {
     pub muxer: Arc<Muxer>,
+    /// Present on a user/client session when this ingress must forward every
+    /// destination through another mesh node. Mesh-peer sessions deliberately
+    /// receive `None`, making this node the egress for that hop.
+    pub mesh: Option<Arc<crate::net::NodeMesh>>,
+    /// Mesh egress sessions confirm destination CONNECTs over the control
+    /// stream before their ingress acknowledges the client request.
+    pub mesh_peer: bool,
 }
 
 impl RemoteOpener {
@@ -52,7 +59,14 @@ impl RemoteOpener {
         token: CancellationToken,
     ) {
         let muxer = self.muxer.clone();
+        let mesh = self.mesh.clone();
+        let mesh_peer = self.mesh_peer;
         tokio::spawn(async move {
+            if let Some(mesh) = mesh {
+                Self::open_via_mesh(muxer, mesh, stream_id, target, v_rx, token, false).await;
+                return;
+            }
+
             // Приватность: НЕ логируем `target` (хост, к которому идёт пользователь)
             // — это ровно та информация о его активности, которую прокси не должен
             // хранить нигде. `stream_id` достаточно для локальной корреляции.
@@ -67,6 +81,15 @@ impl RemoteOpener {
                 connect_res = tokio::time::timeout(Duration::from_secs(7), TcpStream::connect(&target)) => {
                     match connect_res {
                         Ok(Ok(stream)) => {
+                            if mesh_peer {
+                                let _ = muxer
+                                    .send_control(
+                                        stream_id,
+                                        FrameType::Heartbeat,
+                                        Bytes::from_static(b"PONG"),
+                                    )
+                                    .await;
+                            }
                             debug!(stream_id, elapsed_ms = start.elapsed().as_millis() as u64, "✅ [Remote] Connected");
                             let (r, w) = stream.into_split();
 
@@ -116,21 +139,207 @@ impl RemoteOpener {
         token: CancellationToken,
     ) {
         let muxer = self.muxer.clone();
+        let mesh = self.mesh.clone();
+        let mesh_peer = self.mesh_peer;
         tokio::spawn(async move {
+            if let Some(mesh) = mesh {
+                Self::open_via_mesh(muxer, mesh, stream_id, target, v_rx, token, true).await;
+                return;
+            }
+
             debug!(stream_id, "🚀 [Remote] Binding UDP");
             tokio::select! {
                 _ = token.cancelled() => { return; }
                 _ = async {
-                    let socket = UdpSocket::bind("0.0.0.0:0").await.ok();
-                    if let Some(s) = socket {
-                        if s.connect(&target).await.is_ok() {
-                            run_udp_bridge(stream_id, s, muxer.clone(), v_rx).await;
+                    let resolved = tokio::time::timeout(
+                        Duration::from_secs(5),
+                        tokio::net::lookup_host(&target),
+                    )
+                    .await
+                    .ok()
+                    .and_then(|result| result.ok())
+                    .and_then(|mut addresses| addresses.next());
+                    if let Some(address) = resolved {
+                        let bind = if address.is_ipv4() {
+                            "0.0.0.0:0"
+                        } else {
+                            "[::]:0"
+                        };
+                        if let Ok(socket) = UdpSocket::bind(bind).await {
+                            if socket.connect(address).await.is_ok() {
+                                if mesh_peer {
+                                    let _ = muxer
+                                        .send_control(
+                                            stream_id,
+                                            FrameType::Heartbeat,
+                                            Bytes::from_static(b"PONG"),
+                                        )
+                                        .await;
+                                }
+                                run_udp_bridge(stream_id, socket, muxer.clone(), v_rx).await;
+                            }
                         }
                     }
                 } => {}
             }
             muxer.remove_stream(stream_id);
         });
+    }
+
+    /// Selects the closest reachable egress and opens the destination through
+    /// an ordinary NRXP client leg. There is intentionally no direct-egress
+    /// fallback when the mesh is enabled: silently doing so would expose the
+    /// ingress address and turn a configured two-hop route back into one hop.
+    async fn open_via_mesh(
+        ingress_muxer: Arc<Muxer>,
+        mesh: Arc<crate::net::NodeMesh>,
+        ingress_stream_id: u32,
+        target: String,
+        mut ingress_rx: mpsc::Receiver<Bytes>,
+        token: CancellationToken,
+        is_udp: bool,
+    ) {
+        let auth_token = mesh.auth_token();
+        let peers = mesh.ordered_peers().await;
+        let mut connected = None;
+
+        for peer in peers {
+            if token.is_cancelled() {
+                break;
+            }
+            let result = tokio::select! {
+                _ = token.cancelled() => break,
+                result = Box::pin(
+                    crate::net::connection::connection::ClientHandler::connect_mesh_stream(
+                        &peer,
+                        &auth_token,
+                        &target,
+                        is_udp,
+                    ),
+                ) => result,
+            };
+            match result {
+                Ok((peer_muxer, peer_rx, engine_task)) => {
+                    metrics::counter!("netrunner_mesh_egress_streams_total").increment(1);
+                    connected = Some((peer_muxer, peer_rx, engine_task));
+                    break;
+                }
+                Err(_) => {
+                    // Keep failure detail local: peer addresses and destination
+                    // data do not belong in normal connection logs.
+                    metrics::counter!("netrunner_mesh_egress_connect_failures_total").increment(1);
+                }
+            }
+        }
+
+        let Some((peer_muxer, mut peer_rx, engine_task)) = connected else {
+            if !token.is_cancelled() {
+                let _ = ingress_muxer
+                    .send_control(ingress_stream_id, FrameType::Close, Bytes::new())
+                    .await;
+            }
+            ingress_muxer.remove_stream(ingress_stream_id);
+            return;
+        };
+
+        let upload = async {
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = token.cancelled() => break,
+                    item = ingress_rx.recv() => match item {
+                        None => break,
+                        Some(data) if is_udp => {
+                            // UDP keeps datagram semantics; an unavailable mesh
+                            // leg drops this packet instead of killing the flow.
+                            let _ = peer_muxer.send_data_safe(1, data, true).await;
+                        }
+                        Some(data) => {
+                            let deadline = tokio::time::Instant::now()
+                                + crate::net::STREAM_PAUSE_BUDGET;
+                            let sent = loop {
+                                if peer_muxer.send_data_safe(1, data.clone(), false).await.is_ok() {
+                                    break true;
+                                }
+                                if token.is_cancelled()
+                                    || tokio::time::Instant::now() >= deadline
+                                {
+                                    break false;
+                                }
+                                tokio::select! {
+                                    _ = token.cancelled() => break false,
+                                    _ = tokio::time::sleep(crate::net::STREAM_PAUSE_RETRY) => {}
+                                }
+                            };
+                            if !sent {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        };
+
+        let download = async {
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = token.cancelled() => break,
+                    item = peer_rx.recv() => match item {
+                        None => break,
+                        Some(data) if is_udp => {
+                            let _ = ingress_muxer
+                                .send_data_safe(ingress_stream_id, data, true)
+                                .await;
+                        }
+                        Some(data) => {
+                            let deadline = tokio::time::Instant::now()
+                                + crate::net::STREAM_PAUSE_BUDGET;
+                            let sent = loop {
+                                if ingress_muxer
+                                    .send_data_safe(ingress_stream_id, data.clone(), false)
+                                    .await
+                                    .is_ok()
+                                {
+                                    break true;
+                                }
+                                if token.is_cancelled()
+                                    || tokio::time::Instant::now() >= deadline
+                                {
+                                    break false;
+                                }
+                                tokio::select! {
+                                    _ = token.cancelled() => break false,
+                                    _ = tokio::time::sleep(crate::net::STREAM_PAUSE_RETRY) => {}
+                                }
+                            };
+                            if !sent {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        };
+
+        tokio::select! {
+            _ = token.cancelled() => {},
+            _ = upload => {},
+            _ = download => {},
+        }
+
+        let _ = peer_muxer
+            .send_control(1, FrameType::Close, Bytes::new())
+            .await;
+        peer_muxer.remove_stream(1);
+        peer_muxer.shutdown();
+        engine_task.abort();
+        if !token.is_cancelled() {
+            let _ = ingress_muxer
+                .send_control(ingress_stream_id, FrameType::Close, Bytes::new())
+                .await;
+        }
+        ingress_muxer.remove_stream(ingress_stream_id);
     }
 }
 

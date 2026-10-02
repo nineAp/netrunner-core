@@ -7,7 +7,7 @@
 //! спавнит `ServerHandler::run` из ядра под отдельным tracing-span клиента.
 
 use netrunner_core::net::{
-    run_datagram_listener, AuthValidator, Connection, NetworkConfig, NodeHealthReport,
+    run_datagram_listener, AuthValidator, Connection, NetworkConfig, NodeHealthReport, NodeMesh,
     ServerHandler, SessionManager, TunnelHandler, MAX_TUNNEL_LEGS, TOPOLOGY_PRINT_INTERVAL,
 };
 use netrunner_core::Identity;
@@ -76,6 +76,9 @@ pub struct Network {
     /// `None` — `--require-auth` не передан, авторизация и лимиты трафика
     /// выключены на этом инстансе целиком (поведение как до этой фичи).
     auth: Option<Arc<dyn AuthValidator>>,
+    require_auth: bool,
+    mesh_enabled: bool,
+    mesh: Option<Arc<NodeMesh>>,
     /// `None` — health-эндпоинт выключен (по умолчанию для обратной
     /// совместимости с уже развёрнутыми нодами без этого флага).
     health_port: Option<u16>,
@@ -97,6 +100,9 @@ impl Network {
         port: u16,
         decoy_host: impl Into<Arc<str>>,
         auth: Option<Arc<dyn AuthValidator>>,
+        require_auth: bool,
+        mesh_enabled: bool,
+        mesh: Option<Arc<NodeMesh>>,
         health_port: Option<u16>,
         identity: Option<Identity>,
         cover_flight: Arc<[usize]>,
@@ -107,6 +113,9 @@ impl Network {
             port,
             decoy_host: decoy_host.into(),
             auth,
+            require_auth,
+            mesh_enabled,
+            mesh,
             health_port,
             identity,
             cover_flight,
@@ -142,6 +151,28 @@ impl Network {
 
         // 🔥 CRITICAL FIX: Create ONE global session manager for multiplexing
         let session_manager = Arc::new(SessionManager::new());
+
+        // The control plane supplies peer metadata; each node probes from its
+        // own location and sends application data directly to the selected
+        // egress over NRXP.
+        if let (Some(mesh), Some(validator)) = (self.mesh.clone(), self.auth.clone()) {
+            tokio::spawn(async move {
+                loop {
+                    match validator.list_mesh_peers().await {
+                        Ok(peers) => {
+                            mesh.update_peers(peers).await;
+                            mesh.probe_peers().await;
+                            metrics::gauge!("netrunner_mesh_peers_available")
+                                .set(mesh.peer_count().await as f64);
+                        }
+                        Err(error) => {
+                            warn!(error = %error.internal_msg, "Mesh peer directory refresh failed");
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_secs(20)).await;
+                }
+            });
+        }
 
         // Диагностика — только ограниченный in-memory store, без файлов на
         // диске ноды (см. diagnostics.rs). Делит SessionManager, чтобы снапшоты
@@ -363,6 +394,11 @@ impl Network {
                             self.identity.clone(),
                             cover_flight,
                             self.honor_requested_sni,
+                        )
+                        .with_mesh_policy(
+                            self.require_auth,
+                            self.mesh_enabled,
+                            self.mesh.clone(),
                         );
 
                         let active_now = active_connections.fetch_add(1, Ordering::Relaxed) + 1;

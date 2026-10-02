@@ -109,8 +109,13 @@ struct Args {
     #[arg(long, default_value_t = false)]
     require_auth: bool,
 
+    /// Make this node both an ingress and an egress in the node mesh. Ordinary
+    /// client streams enter here, then leave through the nearest online peer.
+    #[arg(long, default_value_t = false)]
+    mesh_enabled: bool,
+
     /// URL control-plane бэкенда для проверки токенов/отчётов о трафике.
-    /// Обязателен, только если передан `--require-auth`.
+    /// Обязателен, если включён `--require-auth` или `--mesh-enabled`.
     #[arg(long)]
     backend_url: Option<String>,
 
@@ -138,13 +143,44 @@ fn main() {
     Logger::global().set_level("info");
     let args = Args::parse();
 
-    let auth: Option<Arc<dyn AuthValidator>> = if args.require_auth {
-        let backend_url = args
-            .backend_url
-            .expect("--require-auth требует --backend-url");
-        let internal_secret = std::env::var("PROXY_INTERNAL_SECRET")
-            .expect("--require-auth требует переменную окружения PROXY_INTERNAL_SECRET");
-        Some(Arc::new(BackendClient::new(backend_url, internal_secret)))
+    let auth_required_by_node = args.require_auth || args.mesh_enabled;
+    let backend_url = if auth_required_by_node {
+        Some(args.backend_url.clone().expect(
+            "--require-auth/--mesh-enabled требуют --backend-url",
+        ))
+    } else {
+        None
+    };
+    let internal_secret = if auth_required_by_node {
+        Some(
+            std::env::var("PROXY_INTERNAL_SECRET")
+                .expect("--require-auth/--mesh-enabled требуют PROXY_INTERNAL_SECRET"),
+        )
+    } else {
+        None
+    };
+    let auth: Option<Arc<dyn AuthValidator>> = if auth_required_by_node {
+        let backend_url = backend_url.expect("backend URL checked above");
+        let internal_secret = internal_secret.as_ref().expect("secret checked above");
+        Some(Arc::new(BackendClient::new(
+            backend_url,
+            internal_secret.clone(),
+        )))
+    } else {
+        None
+    };
+
+    let mesh = if args.mesh_enabled {
+        let node_id = std::env::var("PROXY_NODE_ID")
+            .expect("--mesh-enabled requires PROXY_NODE_ID from netrunner-backend");
+        let node_secret = internal_secret
+            .as_ref()
+            .expect("mesh requires PROXY_INTERNAL_SECRET")
+            .clone();
+        Some(Arc::new(netrunner_core::net::NodeMesh::new(
+            node_id,
+            node_secret,
+        )))
     } else {
         None
     };
@@ -206,6 +242,10 @@ fn main() {
              нода с половиной учётных данных не сможет аутентифицировать себя клиентам"
         ),
     };
+
+    if args.mesh_enabled && identity.is_none() {
+        panic!("--mesh-enabled requires PROXY_NRXP_SECRET and PROXY_NRXP_PRIVATE_KEY");
+    }
 
     // Регистрируется один раз, до первого metrics::counter!/gauge!/histogram! —
     // если --metrics-port не задан, вызовы макросов молча уходят в
@@ -322,6 +362,9 @@ fn main() {
         args.port,
         fallback_host,
         auth,
+        args.require_auth,
+        args.mesh_enabled,
+        mesh,
         args.health_port,
         identity,
         cover_flight,

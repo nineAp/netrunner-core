@@ -27,6 +27,7 @@ tokio = { version = "1.49", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4", "serde"] }
+netrunner-core = { path = "../core" }
 
 [dev-dependencies]
 rcgen = "0.14"

@@ -53,6 +53,30 @@ pub(crate) type PooledSender = hyper::client::conn::http1::SendRequest<Full<Byte
 /// предполагаются — см. ограничения в README.md.
 const MAX_PROXIED_BODY_BYTES: usize = 16 * 1024 * 1024;
 
+#[cfg(test)]
+fn looks_like_asset(path: &str) -> bool {
+    let Some(ext) = path.rsplit('/').next().and_then(|f| f.rsplit_once('.')) else {
+        return false;
+    };
+    matches!(
+        ext.1.to_ascii_lowercase().as_str(),
+        "js" | "mjs"
+            | "css"
+            | "map"
+            | "woff"
+            | "woff2"
+            | "ttf"
+            | "eot"
+            | "png"
+            | "jpg"
+            | "jpeg"
+            | "gif"
+            | "webp"
+            | "svg"
+            | "ico"
+    )
+}
+
 /// По RFC 7230 §6.1 эти заголовки осмысленны только для ОДНОГО хопа
 /// TCP-соединения и не должны слепо копироваться на другую сторону
 /// reverse-proxy. `Content-Length`/`Transfer-Encoding` — отдельная и более
@@ -90,65 +114,21 @@ static TLS_CONFIG: LazyLock<Arc<rustls::ClientConfig>> = LazyLock::new(|| {
     )
 });
 
-/// Точка входа из `main.rs::handle` — ошибки не всплывают наружу как
-/// HTTP-5xx (подозрительно, не то, что показал бы обычный сайт при сбое),
-/// а превращаются в ту же decoy-страницу, что и раньше отдавалась на любой
-/// не-WS запрос: недоступность бэкенда/ноды снаружи должна выглядеть как
-/// "тут просто дефолтная страница веб-сервера", а не как явная ошибка прокси.
-///
-/// ИСКЛЮЧЕНИЕ — статические ассеты (см. `looks_like_asset`): им на неудаче
-/// отдаём настоящий 502, а не decoy-200. Живой инцидент: `blue-pixel-studio.online`
-/// стоит за Cloudflare, а у неё дефолтное поведение — кэшировать ответы на
-/// `*.js`/`*.css` и т.п. по расширению пути НЕЗАВИСИМО от `Cache-Control`
-/// источника. Один-единственный неудачный (но временный — см. известную
-/// нестабильность свежих коннектов до ноды) запрос к иммутабельному
-/// хеш-именованному чанку, отданный как decoy-200, Cloudflare кэширует
-/// НАВСЕГДА (ну или до ручной чистки) — и уже ВСЕ посетители получают
-/// сломанный чанк вместо честной редкой осечки. 502 никакой CDN по
-/// умолчанию не кэширует, так что следующий реальный запрос получит новую,
-/// скорее всего удачную, попытку — вместо забетонированной в кэше старой.
+/// Точка входа из `main.rs::handle`. Если upstream недоступен, возвращает
+/// некэшируемый 502. Заглушка nginx маскировала сбой и иногда сама попадала
+/// в кэш зеркала вместо реального ответа сайта.
 pub async fn proxy(cfg: Arc<EdgeConfig>, req: axum::extract::Request) -> Response {
-    let is_asset = looks_like_asset(req.uri().path());
     match try_proxy(&cfg, req).await {
         Ok(resp) => resp,
         Err(e) => {
             error!("[netrunner-edge] http proxy failed: {e}");
-            if is_asset {
-                (StatusCode::BAD_GATEWAY, "upstream unavailable").into_response()
-            } else {
-                crate::decoy_response()
-            }
+            Response::builder()
+                .status(StatusCode::BAD_GATEWAY)
+                .header(header::CACHE_CONTROL, "no-store")
+                .body(Body::from("upstream unavailable"))
+                .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
         }
     }
-}
-
-/// Эвристика "это статический ассет странице, не сама страница/API" — по
-/// расширению в последнем сегменте пути. Не претендует на полноту (список
-/// расширений открытый), достаточно покрыть то, что реально генерирует Vite
-/// (`.js`/`.css`/шрифты/картинки/`.map`) — именно эти URL идут
-/// хеш-именованными и попадают под агрессивное CDN-кэширование, см. doc на
-/// `proxy`.
-fn looks_like_asset(path: &str) -> bool {
-    let Some(ext) = path.rsplit('/').next().and_then(|f| f.rsplit_once('.')) else {
-        return false;
-    };
-    matches!(
-        ext.1.to_ascii_lowercase().as_str(),
-        "js" | "mjs"
-            | "css"
-            | "map"
-            | "woff"
-            | "woff2"
-            | "ttf"
-            | "eot"
-            | "png"
-            | "jpg"
-            | "jpeg"
-            | "gif"
-            | "webp"
-            | "svg"
-            | "ico"
-    )
 }
 
 /// Разбирает путь запроса и решает, куда его вести. Два независимых сигнала,
@@ -291,10 +271,8 @@ async fn try_proxy(cfg: &EdgeConfig, req: axum::extract::Request) -> Result<Resp
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
 
-    // Собирается заново на каждую попытку (а не один раз) — `hyper::Request`
-    // не `Clone`, а попытки может быть две (пул + фоллбэк на свежее
-    // соединение ниже); сама сборка дешёвая (`body_bytes` — `Bytes`, клон по
-    // счётчику ссылок, не копия).
+    // Собирается заново на каждую попытку (`hyper::Request` не `Clone`); сама
+    // сборка дешёвая: `body_bytes` клонируется по счётчику ссылок.
     let build_request = || -> Result<hyper::Request<Full<Bytes>>, String> {
         let mut builder = hyper::Request::builder()
             .method(parts.method.clone())
@@ -332,47 +310,54 @@ async fn try_proxy(cfg: &EdgeConfig, req: axum::extract::Request) -> Result<Resp
             .map_err(|e| format!("building proxied request: {e}"))
     };
 
-    // Сначала пробуем уже поднятое keep-alive соединение из пула, привязанного
-    // к ЭТОМУ конкретному апстриму (`route_for` выше) — см. doc на
-    // `EdgeConfig::landing_pool`/`backend_pool` за тем, почему это не просто
-    // оптимизация. Протухшее соединение (нода/бэкенд закрыли простаивавший
-    // канал) — не ошибка, просто открываем новое ниже, как и раньше.
-    let mut sender = pop_pooled(pool).await;
-    let mut resp = None;
-    if let Some(sr) = sender.as_mut() {
-        match sr.send_request(build_request()?).await {
-            Ok(r) => resp = Some(r),
-            Err(_) => sender = None,
+    // Reuse keep-alive connections where possible. A connection can look
+    // ready immediately before the upstream closes it, or reset while its
+    // response body is being read. Retry safe browser reads on a fresh tunnel
+    // so transient stale-pool failures do not turn the mirror into a decoy.
+    let retryable = parts.method == hyper::Method::GET || parts.method == hyper::Method::HEAD;
+    let mut pooled_error = None;
+    if let Some(mut pooled) = pop_pooled(pool).await {
+        match send_and_collect(&mut pooled, build_request()?).await {
+            Ok(response) => {
+                push_pooled(pool, pooled).await;
+                let (parts, body_bytes) = response;
+                return build_response(parts, body_bytes);
+            }
+            Err(error) if error.is_request_send() || retryable => {
+                pooled_error = Some(error.to_string());
+            }
+            Err(error) => return Err(error.to_string()),
         }
     }
 
-    let resp = match resp {
-        Some(r) => r,
-        None => {
-            let mut sr = connect_backend(cfg, target_addr, target_host).await?;
-            let r = sr
-                .send_request(build_request()?)
+    let first_fresh = fresh_attempt(cfg, target_addr, target_host, &build_request).await;
+    let (response_parts, response_bytes, fresh_sender) = match first_fresh {
+        Ok(result) => result,
+        Err(first_error) if retryable => {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            fresh_attempt(cfg, target_addr, target_host, &build_request)
                 .await
-                .map_err(|e| format!("sending proxied request: {e}"))?;
-            sender = Some(sr);
-            r
+                .map_err(|retry_error| {
+                    format!(
+                        "upstream retry failed: {retry_error}; first attempt failed: {first_error}"
+                    )
+                })?
         }
+        Err(error) => return Err(error),
     };
+    push_pooled(pool, fresh_sender).await;
 
-    let (parts, body) = resp.into_parts();
-    let body_bytes: Bytes = body
-        .collect()
-        .await
-        .map_err(|e| format!("reading backend response body: {e}"))?
-        .to_bytes();
-
-    // Тело полностью вычитано — соединение снова простаивает и готово к
-    // следующему запросу, кладём обратно в пул вместо того, чтобы дать ему
-    // молча упасть вместе с этой функцией.
-    if let Some(sr) = sender {
-        push_pooled(pool, sr).await;
+    if let Some(pooled_error) = pooled_error {
+        warn!("[netrunner-edge] discarded stale upstream connection: {pooled_error}");
     }
 
+    build_response(response_parts, response_bytes)
+}
+
+fn build_response(
+    parts: hyper::http::response::Parts,
+    body_bytes: Bytes,
+) -> Result<Response, String> {
     let mut builder = Response::builder().status(parts.status);
     if let Some(headers) = builder.headers_mut() {
         // `.iter()`, не `.into_iter()`: он отдаёт по одной полноценной
@@ -399,6 +384,62 @@ async fn try_proxy(cfg: &EdgeConfig, req: axum::extract::Request) -> Result<Resp
 /// пачку суб-ресурсов одной страницы, не открывая для каждого из них свежий
 /// NRXP-хендшейк одновременно (см. doc на `EdgeConfig::conn_pool`).
 const MAX_POOLED_CONNS: usize = 8;
+
+struct AttemptFailure {
+    phase: &'static str,
+    detail: String,
+}
+
+impl AttemptFailure {
+    fn is_request_send(&self) -> bool {
+        self.phase == "sending proxied request"
+    }
+}
+
+impl std::fmt::Display for AttemptFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: {}", self.phase, self.detail)
+    }
+}
+
+async fn send_and_collect(
+    sender: &mut PooledSender,
+    request: hyper::Request<Full<Bytes>>,
+) -> Result<(hyper::http::response::Parts, Bytes), AttemptFailure> {
+    let response = sender
+        .send_request(request)
+        .await
+        .map_err(|error| AttemptFailure {
+            phase: "sending proxied request",
+            detail: error.to_string(),
+        })?;
+    let (parts, body) = response.into_parts();
+    let body_bytes = body
+        .collect()
+        .await
+        .map_err(|error| AttemptFailure {
+            phase: "reading backend response body",
+            detail: error.to_string(),
+        })?
+        .to_bytes();
+    Ok((parts, body_bytes))
+}
+
+async fn fresh_attempt<F>(
+    cfg: &EdgeConfig,
+    target_addr: &str,
+    target_host: &str,
+    build_request: &F,
+) -> Result<(hyper::http::response::Parts, Bytes, PooledSender), String>
+where
+    F: Fn() -> Result<hyper::Request<Full<Bytes>>, String>,
+{
+    let mut sender = connect_backend(cfg, target_addr, target_host).await?;
+    let (parts, body) = send_and_collect(&mut sender, build_request()?)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok((parts, body, sender))
+}
 
 /// Сколько НОВЫХ NRXP-хендшейков до ноды можно поднимать одновременно. Пул
 /// сам по себе не спасает первый холодный всплеск запросов (первая загрузка

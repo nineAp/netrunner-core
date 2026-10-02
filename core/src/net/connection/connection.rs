@@ -18,7 +18,13 @@
 //! Обе роли сходятся на [`TunnelEngine`]: клиент задаёт `remote_addr`
 //! (реконнектит), сервер оставляет его пустым (нога просто завершается).
 
-use std::{net::Ipv4Addr, sync::Arc, time::Instant};
+use std::{
+    future::Future,
+    net::Ipv4Addr,
+    pin::Pin,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use crate::{
     crypto::{ChaChaCipher, Identity, SessionKeys},
@@ -675,6 +681,169 @@ impl ClientHandler {
         ))
     }
 
+    /// Opens one application stream over a direct NRXP leg to a mesh egress.
+    /// The stream uses the normal NRXP CONNECT/UDP_CONNECT frames, so the
+    /// egress reuses its existing server authentication, encryption and socket
+    /// opener.
+    pub(crate) fn connect_mesh_stream<'a>(
+        peer: &'a crate::net::MeshPeer,
+        auth_token: &'a str,
+        target: &'a str,
+        is_udp: bool,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        (
+                            Arc<Muxer>,
+                            mpsc::Receiver<Bytes>,
+                            tokio::task::JoinHandle<()>,
+                        ),
+                        AppError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let remote_addr = peer.address();
+            let stream =
+                tokio::time::timeout(FALLBACK_CONNECT_TIMEOUT, TcpStream::connect(&remote_addr))
+                    .await
+                    .map_err(|_| {
+                        AppError::new(
+                            ERR_INFRA_TIMEOUT,
+                            "Egress timeout",
+                            "Mesh peer connect timed out",
+                        )
+                    })?
+                    .map_err(|e| {
+                        AppError::new(ERR_INFRA_TIMEOUT, "Egress unavailable", e.to_string())
+                    })?;
+
+            let peer_identity =
+                crate::crypto::PeerIdentity::from_hex(&peer.nrxp_secret, &peer.nrxp_static_public)?;
+            let identity = Identity::Peer(peer_identity);
+            let session_id = SessionManager::generate_id();
+            let (inbound, outbound, rx_codec, tx_codec, read_buf, _datagram_root) =
+                Self::perform_handshake(
+                    stream,
+                    &session_id,
+                    0,
+                    BrowserProfile::for_session(&session_id),
+                    &peer.decoy_sni,
+                    auth_token,
+                    Some(&identity),
+                )
+                .await?;
+
+            let muxer = Arc::new(Muxer::new(true, session_id.clone()));
+            let cap = NetworkConfig::global().channel_capacity;
+            let (probe_tx, mut probe_rx) = mpsc::channel::<Bytes>(1);
+            muxer.register_stream(0, probe_tx);
+
+            let (control_tx, control_rx) = mpsc::channel::<MuxMessage>(cap);
+            let (data_tx, data_rx) = mpsc::channel::<MuxMessage>(cap);
+            muxer.add_leg(0, control_tx, data_tx);
+
+            let handler = Arc::new(StreamHandler::new(muxer.clone(), None));
+            let engine = TunnelEngine {
+                leg_id: 0,
+                inbound: Some(inbound),
+                outbound: Some(outbound),
+                rx_codec: Some(rx_codec),
+                tx_codec: Some(tx_codec),
+                read_buf,
+                control_rx: Some(control_rx),
+                data_rx: Some(data_rx),
+                handler,
+                muxer: muxer.clone(),
+                remote_addr,
+                session_id,
+                leg_status: crate::net::connection::engine::LegStatus::Active,
+                decoy_sni: Arc::from(peer.decoy_sni.as_str()),
+                auth_token: Arc::from(auth_token),
+                identity: Some(identity),
+            };
+
+            let engine_muxer = muxer.clone();
+            let engine_task = tokio::spawn(async move {
+                let _ = engine.run().await;
+                engine_muxer.remove_stream(0);
+                engine_muxer.remove_stream(1);
+                engine_muxer.shutdown();
+            });
+
+            // The NRXP handshake proves the egress identity, but the peer still
+            // validates this node asynchronously through the control plane. A PING
+            // / PONG round trip confirms that peer authorization succeeded before
+            // the ingress starts forwarding application bytes.
+            if let Err(error) = muxer
+                .send_control(0, FrameType::Heartbeat, Bytes::from_static(b"PING"))
+                .await
+            {
+                engine_task.abort();
+                muxer.shutdown();
+                return Err(error);
+            }
+            let pong = tokio::time::timeout(Duration::from_secs(8), probe_rx.recv()).await;
+            match pong {
+                Ok(Some(payload)) if payload.as_ref() == b"PONG" => {}
+                _ => {
+                    engine_task.abort();
+                    muxer.shutdown();
+                    return Err(AppError::new(
+                        ERR_AUTH_FAILED,
+                        "Mesh peer rejected",
+                        "Mesh peer did not confirm the NRXP tunnel",
+                    ));
+                }
+            }
+
+            let (v_tx, mut v_rx) = mpsc::channel::<Bytes>(cap);
+            muxer.register_stream_with_backlog_cap(
+                1,
+                v_tx,
+                crate::net::SERVER_STREAM_BACKLOG_MAX_BYTES,
+            );
+
+            let frame_type = if is_udp {
+                FrameType::UdpConnect
+            } else {
+                FrameType::Connect
+            };
+            if let Err(error) = muxer
+                .send_control(1, frame_type, Bytes::copy_from_slice(target.as_bytes()))
+                .await
+            {
+                engine_task.abort();
+                muxer.shutdown();
+                return Err(error);
+            }
+
+            // The egress sends this stream-scoped PONG only after the target
+            // TCP socket or UDP association has been opened. It travels before
+            // destination data, so the ingress can consume it safely here and
+            // fail over before reporting CONNECT success to its own client.
+            match tokio::time::timeout(Duration::from_secs(8), v_rx.recv()).await {
+                Ok(Some(payload)) if payload.as_ref() == b"PONG" => {}
+                _ => {
+                    let _ = muxer.send_control(1, FrameType::Close, Bytes::new()).await;
+                    muxer.remove_stream(1);
+                    engine_task.abort();
+                    muxer.shutdown();
+                    return Err(AppError::new(
+                        ERR_INFRA_TIMEOUT,
+                        "Mesh destination unavailable",
+                        "Egress did not confirm the destination connection",
+                    ));
+                }
+            }
+
+            Ok((muxer, v_rx, engine_task))
+        })
+    }
+
     /// Устанавливает одну ногу и крутит её движок до остановки.
     ///
     /// Резолвит адрес (с тайм-аутом), создаёт TCP-сокет с анти-bufferbloat
@@ -1266,6 +1435,11 @@ pub struct ServerHandler {
     /// передан), поведение как до этой фичи. `Some` — токен клиента
     /// обязателен и проверяется бэкендом при установке первой ноги сессии.
     pub(crate) auth: Option<Arc<dyn crate::net::AuthValidator>>,
+    /// User auth and mesh peer auth are separate policies: a mesh-only node
+    /// can accept peer hops without requiring a user JWT at ingress.
+    pub(crate) require_auth: bool,
+    pub(crate) mesh_enabled: bool,
+    pub(crate) mesh: Option<Arc<crate::net::NodeMesh>>,
     /// Долговременные учётные данные этой ноды (см. [`crate::crypto::identity`]),
     /// заведённые в админке бэкенда и приехавшие сюда провижинингом. `None` —
     /// нода их не настроила и работает по старой анонимной схеме: хендшейк без
@@ -1301,15 +1475,33 @@ impl ServerHandler {
         cover_flight: Arc<[usize]>,
         honor_requested_sni: bool,
     ) -> Self {
+        let require_auth = auth.is_some();
         Self {
             conn: connection,
             session_manager,
             decoy_host,
             auth,
+            require_auth,
+            mesh_enabled: false,
+            mesh: None,
             identity,
             cover_flight,
             honor_requested_sni,
         }
+    }
+
+    /// Installs node routing policy while preserving the legacy constructor
+    /// used by embedders.
+    pub fn with_mesh_policy(
+        mut self,
+        require_auth: bool,
+        mesh_enabled: bool,
+        mesh: Option<Arc<crate::net::NodeMesh>>,
+    ) -> Self {
+        self.require_auth = require_auth;
+        self.mesh_enabled = mesh_enabled;
+        self.mesh = mesh;
+        self
     }
 
     /// Stealth-fallback: прозрачно проксирует соединение на безобидный хост,
@@ -1419,6 +1611,10 @@ impl TunnelHandler for ServerHandler {
         let decoy_host = self.decoy_host;
         let cover_flight = self.cover_flight;
         let honor_requested_sni = self.honor_requested_sni;
+        let require_auth = self.require_auth;
+        let mesh_enabled = self.mesh_enabled;
+        let mesh = self.mesh;
+        let auth = self.auth;
         let Connection {
             mut inbound,
             mut outbound,
@@ -1669,37 +1865,76 @@ impl TunnelHandler for ServerHandler {
         // запущен с `--require-auth`. До этой точки соединение прошло
         // Netrunner-хендшейк (не сканер/чужой TLS-клиент), поэтому отказ здесь
         // — обычный разрыв, а не stealth-fallback (светить уже нечего).
-        if let Some(validator) = &self.auth {
-            match validator.validate(&auth_token).await {
-                Ok(quota) => muxer.set_quota_user(quota.user_id),
-                Err(e) => {
-                    // Не дублируем счётчик — `BackendClient::validate` (см.
-                    // server/src/backend_client.rs) уже инкрементит тот же
-                    // `netrunner_auth_failures_total` сам, на обеих своих
-                    // ветках отказа (пустой токен / бэкенд отклонил).
-                    warn!("❌ Backend rejected client token: {}", e.internal_msg);
-                    // Раньше клиент видел только голый TCP EOF на отказ — неотличимо
-                    // от сбоя сети/недоступной цели (см. client-edge: "vpn node
-                    // closed the tunnel leg" без единой подсказки, почему). Шлём
-                    // явный сигнал ДО закрытия: Close-кадр на служебном stream_id=0
-                    // (0 уже зарезервирован под heartbeat/diag — см. muxer.rs,
-                    // ни один реальный Connect-поток туда никогда не попадает), с
-                    // текстовой причиной. Crypto-хендшейк уже завершён, поэтому
-                    // кадр кодируется тем же codec'ом, что и всё остальное — клиент
-                    // (edge и толстый) видит его как обычный кадр в своём цикле чтения.
-                    if let Ok(reject_frame) = tx_codec.encode_frame(
-                        0,
-                        FrameType::Close,
-                        Bytes::from(format!("auth_rejected: {}", e.internal_msg)),
-                    ) {
-                        let _ = outbound.write_all(&reject_frame).await;
-                    }
-                    return Err(AppError::new(
+        let is_mesh_peer = auth_token.starts_with("mesh:");
+        let auth_result = if let Some(mesh_claim) = auth_token.strip_prefix("mesh:") {
+            if !mesh_enabled {
+                Err(AppError::new(
+                    ERR_AUTH_FAILED,
+                    "Доступ запрещен",
+                    "Mesh peer received while mesh support is disabled",
+                ))
+            } else if let Some((peer_id, peer_secret)) = mesh_claim.split_once(':') {
+                match &auth {
+                    Some(validator) => validator
+                        .validate_mesh_peer(peer_id, peer_secret)
+                        .await
+                        .map(|()| None),
+                    None => Err(AppError::new(
                         ERR_AUTH_FAILED,
                         "Доступ запрещен",
-                        e.internal_msg,
-                    ));
+                        "Mesh peer validation service is unavailable",
+                    )),
                 }
+            } else {
+                Err(AppError::new(
+                    ERR_AUTH_FAILED,
+                    "Доступ запрещен",
+                    "Malformed mesh peer credential",
+                ))
+            }
+        } else if require_auth {
+            match &auth {
+                Some(validator) => validator.validate(&auth_token).await.map(Some),
+                None => Err(AppError::new(
+                    ERR_AUTH_FAILED,
+                    "Доступ запрещен",
+                    "User authentication service is unavailable",
+                )),
+            }
+        } else {
+            Ok(None)
+        };
+
+        match auth_result {
+            Ok(Some(quota)) => muxer.set_quota_user(quota.user_id),
+            Ok(None) => {}
+            Err(e) => {
+                // Не дублируем счётчик — `BackendClient::validate` (см.
+                // server/src/backend_client.rs) уже инкрементит тот же
+                // `netrunner_auth_failures_total` сам, на обеих своих
+                // ветках отказа (пустой токен / бэкенд отклонил).
+                warn!("❌ Backend rejected client token: {}", e.internal_msg);
+                // Раньше клиент видел только голый TCP EOF на отказ — неотличимо
+                // от сбоя сети/недоступной цели (см. client-edge: "vpn node
+                // closed the tunnel leg" без единой подсказки, почему). Шлём
+                // явный сигнал ДО закрытия: Close-кадр на служебном stream_id=0
+                // (0 уже зарезервирован под heartbeat/diag — см. muxer.rs,
+                // ни один реальный Connect-поток туда никогда не попадает), с
+                // текстовой причиной. Crypto-хендшейк уже завершён, поэтому
+                // кадр кодируется тем же codec'ом, что и всё остальное — клиент
+                // (edge и толстый) видит его как обычный кадр в своём цикле чтения.
+                if let Ok(reject_frame) = tx_codec.encode_frame(
+                    0,
+                    FrameType::Close,
+                    Bytes::from(format!("auth_rejected: {}", e.internal_msg)),
+                ) {
+                    let _ = outbound.write_all(&reject_frame).await;
+                }
+                return Err(AppError::new(
+                    ERR_AUTH_FAILED,
+                    "Доступ запрещен",
+                    e.internal_msg,
+                ));
             }
         }
 
@@ -1718,6 +1953,10 @@ impl TunnelHandler for ServerHandler {
 
         let opener = Arc::new(RemoteOpener {
             muxer: muxer.clone(),
+            // A peer-authenticated connection is this node's egress hop. Only
+            // external/user ingress sessions receive the mesh router.
+            mesh: if is_mesh_peer { None } else { mesh },
+            mesh_peer: is_mesh_peer,
         });
         let handler = Arc::new(StreamHandler::new(muxer.clone(), Some(opener)));
 
@@ -1778,7 +2017,11 @@ mod tests {
     #[test]
     fn network_change_is_detected_across_an_address_gap() {
         // Direct switch.
-        assert!(network_changed(Some(ip("192.168.1.5")), ip("10.20.30.4"), None));
+        assert!(network_changed(
+            Some(ip("192.168.1.5")),
+            ip("10.20.30.4"),
+            None
+        ));
         // Wi-Fi -> (no address) -> LTE: the old logic missed exactly this.
         assert!(network_changed(
             Some(ip("192.168.1.5")),
@@ -1798,7 +2041,11 @@ mod tests {
             Some(StdDuration::from_secs(1))
         ));
         // Nothing changed.
-        assert!(!network_changed(Some(ip("192.168.1.5")), ip("192.168.1.5"), None));
+        assert!(!network_changed(
+            Some(ip("192.168.1.5")),
+            ip("192.168.1.5"),
+            None
+        ));
         // First address ever seen is not a change.
         assert!(!network_changed(None, ip("192.168.1.5"), None));
     }
