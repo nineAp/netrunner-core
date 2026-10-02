@@ -27,7 +27,20 @@ jobs:
           DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
           AUTH_TOKEN: ${{ secrets.AUTH_TOKEN }}
         run: |
+          # Never let shell tracing print deployment credentials. Add each
+          # line to the runner's mask list as defense in depth for multiline
+          # SSH private keys as well as the edge auth token.
+          set +x
           set -euo pipefail
+
+          mask_secret() {
+            local secret="$1"
+            while IFS= read -r line; do
+              [ -z "$line" ] || printf '::add-mask::%s\n' "$line"
+            done <<< "$secret"
+          }
+          mask_secret "${DEPLOY_SSH_KEY:-}"
+          mask_secret "${AUTH_TOKEN:-}"
 
           for name in DEPLOY_TARGET DEPLOY_KNOWN_HOSTS PUBLIC_DOMAIN VPN_NODE_ADDR LANDING_ADDR BACKEND_ADDR DEPLOY_SSH_KEY; do
             if [ -z "${!name}" ]; then
