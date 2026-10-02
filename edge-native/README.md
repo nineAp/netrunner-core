@@ -189,10 +189,39 @@ AUTH_TOKEN=your-nrxp-bearer-token
 
 Обновление на уже развёрнутой VDS — `git pull && docker compose build &&
 docker compose up -d` (см. "Сборка для прода" ниже за тем, почему не `docker
-compose pull`). Тот же принцип "код обновился → нужен новый образ", что и у обычных нод,
-но без автоматики: там образ приезжает сам (watchtower на ноде), а здесь
-это не заведено — каждая edge-VDS по определению одноразовая/недолгоживущая
-точка входа, а не часть постоянного парка в `vpn_nodes`.
+compose pull`). Для ручного запуска этого же обновления из Gitea Actions см.
+следующий раздел.
+
+### Ручной деплой через Gitea Actions
+
+В репозитории `netrunner-proxy` откройте **Actions → Deploy Edge Native → Run
+workflow**. Workflow запускается только вручную; он берёт выбранную в Actions
+ревизию, передаёт её исходники на VDS, записывает `.env`, генерирует
+`Caddyfile` из `Caddyfile.example` и выполняет `docker compose up -d --build`.
+Образ собирается на самой VDS и в Container Registry не публикуется.
+
+Перед первым запуском добавьте в настройках репозитория **Actions secrets**:
+
+| Secret | Обязателен | Значение |
+|--------|------------|----------|
+| `EDGE_DEPLOY_HOST` | да | IP или DNS-имя VDS |
+| `EDGE_DEPLOY_USER` | да | SSH-пользователь с доступом к Docker и правом записи в каталог деплоя |
+| `EDGE_DEPLOY_SSH_KEY` | да | Приватный SSH-ключ; публичный ключ должен быть в `authorized_keys` пользователя на VDS |
+| `EDGE_DEPLOY_KNOWN_HOSTS` | да | Закреплённая SSH host key строка VDS, например вывод `ssh-keyscan -p 22 edge.example.com` |
+| `EDGE_DEPLOY_PATH` | да | Абсолютный путь каталога исходников на VDS, например `/root/netrunner-proxy` |
+| `EDGE_DOMAIN` | да | Домен edge, на который настроен DNS |
+| `VPN_NODE_ADDR` | да | Адрес VPN-ноды в формате `host:port` |
+| `LANDING_ADDR` | да | Адрес сайта-витрины в формате `host:port` |
+| `BACKEND_ADDR` | да | Адрес backend в формате `host:port` |
+| `EDGE_DEPLOY_PORT` | нет | SSH-порт, по умолчанию `22` |
+| `DECOY_SNI` | нет | Домен-декой исходящего NRXP, по умолчанию `www.debian.org` |
+| `AUTH_TOKEN` | только для `--require-auth` | Edge-токен, выпущенный Owner-эндпоинтом backend; пустое значение отключает авторизацию на ноде |
+
+VDS должна принимать SSH с runner'а Gitea Actions, иметь установленный Docker
+Compose plugin, а указанный пользователь должен запускать `docker compose` без
+интерактивного ввода пароля. `EDGE_DEPLOY_KNOWN_HOSTS` закрепляет ключ сервера,
+поэтому workflow не доверяет результату `ssh-keyscan`, полученному во время
+самого деплоя. `.env` на VDS устанавливается с правами `0600`.
 
 ## Сборка для прода
 
@@ -215,15 +244,11 @@ docker build -f edge-native/Dockerfile -t netrunner-edge:latest .
 приём, что и у корневого `Dockerfile`, т.к. `cargo chef`/workspace видит все
 крейты только из корня).
 
-**Обновление образа на уже развёрнутой VDS.** Ни один `.gitea/workflows/*`
-не публикует этот образ ни в какой registry (в отличие от обычных нод —
-там `build.yml` пушит образ, а watchtower на ноде его подтягивает) —
-осознанно, та же причина, что и всегда: каждая edge-VDS
-одноразовая/недолгоживущая, не часть постоянного парка в `vpn_nodes`, так
-что заводить под неё отдельный CI-пайплайн незачем. Отсюда следствие:
-`docker compose pull` здесь ничего не найдёт (нет такого тега в registry,
-только локально собранный). Обновляйте так — подтяните исходники и
-пересоберите на самой VDS:
+**Обновление образа на уже развёрнутой VDS.** Edge-образ не публикуется в
+registry: workflow `Deploy Edge Native` передаёт исходники и собирает его на
+VDS. Поэтому `docker compose pull` здесь ничего не найдёт (нет такого тега в
+registry, только локально собранный). Запасной путь без Actions — подтянуть
+исходники и пересобрать на самой VDS:
 
 ```bash
 cd /root/netrunner-proxy/edge-native

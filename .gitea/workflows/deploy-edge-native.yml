@@ -1,0 +1,125 @@
+name: Deploy Edge Native
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-edge-native
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out selected revision
+        uses: actions/checkout@v4
+
+      - name: Prepare deployment bundle and SSH
+        env:
+          EDGE_DEPLOY_HOST: ${{ secrets.EDGE_DEPLOY_HOST }}
+          EDGE_DEPLOY_USER: ${{ secrets.EDGE_DEPLOY_USER }}
+          EDGE_DEPLOY_PORT: ${{ secrets.EDGE_DEPLOY_PORT }}
+          EDGE_DEPLOY_PATH: ${{ secrets.EDGE_DEPLOY_PATH }}
+          EDGE_DEPLOY_SSH_KEY: ${{ secrets.EDGE_DEPLOY_SSH_KEY }}
+          EDGE_DEPLOY_KNOWN_HOSTS: ${{ secrets.EDGE_DEPLOY_KNOWN_HOSTS }}
+          EDGE_DOMAIN: ${{ secrets.EDGE_DOMAIN }}
+          VPN_NODE_ADDR: ${{ secrets.VPN_NODE_ADDR }}
+          LANDING_ADDR: ${{ secrets.LANDING_ADDR }}
+          BACKEND_ADDR: ${{ secrets.BACKEND_ADDR }}
+          DECOY_SNI: ${{ secrets.DECOY_SNI }}
+          AUTH_TOKEN: ${{ secrets.AUTH_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          for name in EDGE_DEPLOY_HOST EDGE_DEPLOY_USER EDGE_DEPLOY_PATH EDGE_DEPLOY_SSH_KEY EDGE_DEPLOY_KNOWN_HOSTS EDGE_DOMAIN VPN_NODE_ADDR LANDING_ADDR BACKEND_ADDR; do
+            if [ -z "${!name}" ]; then
+              echo "Missing repository Actions secret: $name" >&2
+              exit 1
+            fi
+          done
+
+          if [[ ! "$EDGE_DEPLOY_HOST" =~ ^[A-Za-z0-9.-]+$ ]]; then
+            echo "EDGE_DEPLOY_HOST must be a hostname or IPv4 address" >&2
+            exit 1
+          fi
+          if [[ ! "$EDGE_DEPLOY_USER" =~ ^[A-Za-z_][A-Za-z0-9_-]*$ ]]; then
+            echo "EDGE_DEPLOY_USER has unsupported characters" >&2
+            exit 1
+          fi
+          if [[ ! "$EDGE_DEPLOY_PATH" =~ ^/[A-Za-z0-9._/-]+$ || "$EDGE_DEPLOY_PATH" == *..* ]]; then
+            echo "EDGE_DEPLOY_PATH must be an absolute path without '..'" >&2
+            exit 1
+          fi
+
+          EDGE_DEPLOY_PORT="${EDGE_DEPLOY_PORT:-22}"
+          if [[ ! "$EDGE_DEPLOY_PORT" =~ ^[0-9]{1,5}$ ]] || (( EDGE_DEPLOY_PORT < 1 || EDGE_DEPLOY_PORT > 65535 )); then
+            echo "EDGE_DEPLOY_PORT must be between 1 and 65535" >&2
+            exit 1
+          fi
+          DECOY_SNI="${DECOY_SNI:-www.debian.org}"
+          AUTH_TOKEN="${AUTH_TOKEN:-}"
+
+          for value in "$EDGE_DOMAIN" "$VPN_NODE_ADDR" "$LANDING_ADDR" "$BACKEND_ADDR" "$DECOY_SNI" "$AUTH_TOKEN"; do
+            if [[ "$value" == *$'\n'* || "$value" == *$'\r'* ]]; then
+              echo "Edge configuration values must not contain newlines" >&2
+              exit 1
+            fi
+          done
+
+          umask 077
+          mkdir -p "$RUNNER_TEMP/edge-native-ssh"
+          printf '%s\n' "$EDGE_DEPLOY_SSH_KEY" > "$RUNNER_TEMP/edge-native-ssh/id_ed25519"
+          printf '%s\n' "$EDGE_DEPLOY_KNOWN_HOSTS" > "$RUNNER_TEMP/edge-native-ssh/known_hosts"
+          chmod 600 "$RUNNER_TEMP/edge-native-ssh/id_ed25519" "$RUNNER_TEMP/edge-native-ssh/known_hosts"
+
+          {
+            printf 'EDGE_DOMAIN=%s\n' "$EDGE_DOMAIN"
+            printf 'VPN_NODE_ADDR=%s\n' "$VPN_NODE_ADDR"
+            printf 'LANDING_ADDR=%s\n' "$LANDING_ADDR"
+            printf 'BACKEND_ADDR=%s\n' "$BACKEND_ADDR"
+            printf 'DECOY_SNI=%s\n' "$DECOY_SNI"
+            printf 'AUTH_TOKEN=%s\n' "$AUTH_TOKEN"
+          } > "$RUNNER_TEMP/edge-native.env"
+
+          git archive --format=tar HEAD | gzip -1 > "$RUNNER_TEMP/netrunner-proxy.tar.gz"
+          echo "EDGE_DEPLOY_PORT=$EDGE_DEPLOY_PORT" >> "$GITHUB_ENV"
+        shell: bash
+
+      - name: Copy source and configuration to edge VPS
+        env:
+          EDGE_DEPLOY_HOST: ${{ secrets.EDGE_DEPLOY_HOST }}
+          EDGE_DEPLOY_USER: ${{ secrets.EDGE_DEPLOY_USER }}
+          EDGE_DEPLOY_PATH: ${{ secrets.EDGE_DEPLOY_PATH }}
+        run: |
+          set -euo pipefail
+          ssh_opts=(-i "$RUNNER_TEMP/edge-native-ssh/id_ed25519" -p "$EDGE_DEPLOY_PORT" -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$RUNNER_TEMP/edge-native-ssh/known_hosts")
+          destination="$EDGE_DEPLOY_USER@$EDGE_DEPLOY_HOST"
+          stage="/tmp/netrunner-edge-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+          ssh "${ssh_opts[@]}" "$destination" "umask 077 && mkdir -p '$stage' '$EDGE_DEPLOY_PATH'"
+          scp -i "$RUNNER_TEMP/edge-native-ssh/id_ed25519" -P "$EDGE_DEPLOY_PORT" -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$RUNNER_TEMP/edge-native-ssh/known_hosts" \
+            "$RUNNER_TEMP/netrunner-proxy.tar.gz" "$RUNNER_TEMP/edge-native.env" "$destination:$stage/"
+        shell: bash
+
+      - name: Build and restart Edge Native
+        env:
+          EDGE_DEPLOY_HOST: ${{ secrets.EDGE_DEPLOY_HOST }}
+          EDGE_DEPLOY_USER: ${{ secrets.EDGE_DEPLOY_USER }}
+          EDGE_DEPLOY_PATH: ${{ secrets.EDGE_DEPLOY_PATH }}
+        run: |
+          set -euo pipefail
+          ssh_opts=(-i "$RUNNER_TEMP/edge-native-ssh/id_ed25519" -p "$EDGE_DEPLOY_PORT" -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$RUNNER_TEMP/edge-native-ssh/known_hosts")
+          destination="$EDGE_DEPLOY_USER@$EDGE_DEPLOY_HOST"
+          stage="/tmp/netrunner-edge-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+          ssh "${ssh_opts[@]}" "$destination" "set -eu
+            trap \"rm -f '$stage/netrunner-proxy.tar.gz' '$stage/edge-native.env'; rmdir '$stage'\" EXIT
+            tar -xzf '$stage/netrunner-proxy.tar.gz' -C '$EDGE_DEPLOY_PATH'
+            install -m 600 '$stage/edge-native.env' '$EDGE_DEPLOY_PATH/edge-native/.env'
+            cp '$EDGE_DEPLOY_PATH/edge-native/Caddyfile.example' '$EDGE_DEPLOY_PATH/edge-native/Caddyfile'
+            cd '$EDGE_DEPLOY_PATH/edge-native'
+            docker compose up -d --build --remove-orphans
+            docker compose ps
+          "
+        shell: bash
