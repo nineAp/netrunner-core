@@ -24,12 +24,14 @@ jobs:
           LANDING_ADDR: ${{ vars.LANDING_ADDR }}
           BACKEND_ADDR: ${{ vars.BACKEND_ADDR }}
           DECOY_SNI: ${{ vars.DECOY_SNI }}
+          NRXP_PUBLIC_KEY: ${{ vars.NRXP_PUBLIC_KEY }}
           DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
           AUTH_TOKEN: ${{ secrets.AUTH_TOKEN }}
+          NRXP_SECRET: ${{ secrets.NRXP_SECRET }}
         run: |
           # Never let shell tracing print deployment credentials. Add each
           # line to the runner's mask list as defense in depth for multiline
-          # SSH private keys as well as the edge auth token.
+          # SSH private keys and edge/node credentials.
           set +x
           set -euo pipefail
 
@@ -41,13 +43,19 @@ jobs:
           }
           mask_secret "${DEPLOY_SSH_KEY:-}"
           mask_secret "${AUTH_TOKEN:-}"
+          mask_secret "${NRXP_SECRET:-}"
 
-          for name in DEPLOY_TARGET DEPLOY_KNOWN_HOSTS PUBLIC_DOMAIN VPN_NODE_ADDR LANDING_ADDR BACKEND_ADDR DEPLOY_SSH_KEY; do
+          for name in DEPLOY_TARGET DEPLOY_KNOWN_HOSTS PUBLIC_DOMAIN VPN_NODE_ADDR LANDING_ADDR BACKEND_ADDR DEPLOY_SSH_KEY NRXP_SECRET NRXP_PUBLIC_KEY; do
             if [ -z "${!name}" ]; then
               echo "Missing repository Actions variable/secret: $name" >&2
               exit 1
             fi
           done
+
+          if [[ ! "$NRXP_SECRET" =~ ^[0-9A-Fa-f]{64}$ || ! "$NRXP_PUBLIC_KEY" =~ ^[0-9A-Fa-f]{64}$ ]]; then
+            echo "NRXP_SECRET and NRXP_PUBLIC_KEY must each be 64 hexadecimal characters" >&2
+            exit 1
+          fi
 
           if [[ ! "$DEPLOY_TARGET" =~ ^[A-Za-z_][A-Za-z0-9_-]*@[A-Za-z0-9.-]+$ ]]; then
             echo "DEPLOY_TARGET must have the form user@hostname-or-ipv4" >&2
@@ -57,7 +65,7 @@ jobs:
           DECOY_SNI="${DECOY_SNI:-www.debian.org}"
           AUTH_TOKEN="${AUTH_TOKEN:-}"
 
-          for value in "$PUBLIC_DOMAIN" "$VPN_NODE_ADDR" "$LANDING_ADDR" "$BACKEND_ADDR" "$DECOY_SNI" "$AUTH_TOKEN"; do
+          for value in "$PUBLIC_DOMAIN" "$VPN_NODE_ADDR" "$LANDING_ADDR" "$BACKEND_ADDR" "$DECOY_SNI" "$AUTH_TOKEN" "$NRXP_SECRET" "$NRXP_PUBLIC_KEY"; do
             if [[ "$value" == *$'\n'* || "$value" == *$'\r'* ]]; then
               echo "Edge configuration values must not contain newlines" >&2
               exit 1
@@ -77,6 +85,8 @@ jobs:
             printf 'BACKEND_ADDR=%s\n' "$BACKEND_ADDR"
             printf 'DECOY_SNI=%s\n' "$DECOY_SNI"
             printf 'AUTH_TOKEN=%s\n' "$AUTH_TOKEN"
+            printf 'NRXP_SECRET=%s\n' "$NRXP_SECRET"
+            printf 'NRXP_PUBLIC_KEY=%s\n' "$NRXP_PUBLIC_KEY"
           } > "$RUNNER_TEMP/edge-native.env"
 
           git archive --format=tar HEAD | gzip -1 > "$RUNNER_TEMP/netrunner-proxy.tar.gz"

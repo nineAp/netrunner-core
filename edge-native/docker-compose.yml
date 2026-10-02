@@ -45,6 +45,8 @@ services:
       - BACKEND_ADDR=${BACKEND_ADDR}
       - DECOY_SNI=${DECOY_SNI:-www.debian.org}
       - AUTH_TOKEN=${AUTH_TOKEN:-}
+      - NRXP_SECRET=${NRXP_SECRET:?NRXP_SECRET must be set to authenticate with the VPN node}
+      - NRXP_PUBLIC_KEY=${NRXP_PUBLIC_KEY:?NRXP_PUBLIC_KEY must be set to authenticate with the VPN node}
     networks:
       - netrunner_edge
 

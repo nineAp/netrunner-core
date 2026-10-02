@@ -69,6 +69,13 @@ IP-репутацию домена `*.workers.dev`/своего домена —
 | `BACKEND_ADDR`  | да          | `host:port` бэкенда — сюда идёт путь, содержащий `/api/` ИЛИ `/account` |
 | `DECOY_SNI`     | нет (`www.debian.org`) | Домен-декой для поддельного `ClientHello` исходящей ноги      |
 | `AUTH_TOKEN`    | нет (пусто) | Bearer-токен, только если нода поднята с `--require-auth`            |
+| `NRXP_SECRET`   | да          | `nrxp_secret` выбранной VPN-ноды из backend; хранить как секрет       |
+| `NRXP_PUBLIC_KEY` | да        | `nrxp_static_public` той же VPN-ноды из backend; 64 hex символа       |
+
+`NRXP_SECRET` и `NRXP_PUBLIC_KEY` задаются парой и должны относиться к адресу
+`VPN_NODE_ADDR`. В deploy workflow передавайте `NRXP_SECRET` как Actions secret,
+а `NRXP_PUBLIC_KEY` как Actions variable. Это ключи аутентификации NRXP и они
+не связаны с `AUTH_TOKEN`, который проверяется уже после NRXP-рукопожатия.
 
 `--host`/`--port` (CLI, не env) — где слушает сам процесс. По умолчанию
 `127.0.0.1:8082`: предполагается, что перед ним стоит reverse-proxy (Caddy),
