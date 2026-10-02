@@ -55,6 +55,11 @@ const MAX_PROXIED_BODY_BYTES: usize = 16 * 1024 * 1024;
 /// Search is deliberately pinned to one upstream. This endpoint cannot be
 /// used as an arbitrary URL fetcher or an open forward proxy.
 const SEARCH_UPSTREAM_ADDR: &str = "html.duckduckgo.com:443";
+/// Locales supported by the landing site's Next.js middleware. Requests can
+/// arrive here as `/en/search` after that middleware has prefixed the URL.
+const SEARCH_LOCALES: &[&str] = &[
+    "en", "ru", "zh-CN", "fa", "ar", "tr", "uk", "be", "vi", "uz", "th",
+];
 
 #[cfg(test)]
 fn looks_like_asset(path: &str) -> bool {
@@ -153,12 +158,7 @@ fn route_for<'a>(
     cfg: &'a EdgeConfig,
     path: &str,
 ) -> (&'a str, &'a tokio::sync::Mutex<Vec<PooledSender>>) {
-    let pathname = path.split_once('?').map_or(path, |(pathname, _)| pathname);
-    if pathname == "/search"
-        || pathname == "/html"
-        || pathname.starts_with("/html/")
-        || pathname.starts_with("/l/")
-    {
+    if search_upstream_path(path).is_some() {
         return (SEARCH_UPSTREAM_ADDR, &cfg.search_pool);
     }
     if path.contains("/api/") || path.contains("/account") {
@@ -166,6 +166,46 @@ fn route_for<'a>(
     } else {
         (&cfg.landing_addr, &cfg.landing_pool)
     }
+}
+
+/// Maps the search endpoint and DuckDuckGo's follow-up paths to the fixed
+/// search upstream. A locale prefix is optional because the site's Next.js
+/// middleware may turn `/search` into `/en/search` before the request reaches
+/// this relay. The locale is removed before forwarding so DuckDuckGo receives
+/// its expected paths (`/html/`, `/html/...`, or `/l/...`).
+fn search_upstream_path(path_and_query: &str) -> Option<std::borrow::Cow<'_, str>> {
+    let (pathname, query) = path_and_query
+        .split_once('?')
+        .map_or((path_and_query, None), |(pathname, query)| {
+            (pathname, Some(query))
+        });
+
+    let normalized_path = pathname
+        .strip_prefix('/')
+        .and_then(|rest| rest.split_once('/'))
+        .filter(|(locale, _)| SEARCH_LOCALES.contains(locale))
+        .map(|(_, suffix)| format!("/{suffix}"));
+    let upstream_path = normalized_path.as_deref().unwrap_or(pathname);
+
+    if upstream_path == "/search" || upstream_path == "/search/" {
+        return Some(match query {
+            Some(query) => std::borrow::Cow::Owned(format!("/html/?{query}")),
+            None => std::borrow::Cow::Borrowed("/html/"),
+        });
+    }
+
+    let is_search_follow_up = upstream_path == "/html"
+        || upstream_path.starts_with("/html/")
+        || upstream_path.starts_with("/l/");
+    if !is_search_follow_up {
+        return None;
+    }
+
+    Some(match (normalized_path, query) {
+        (Some(path), Some(query)) => std::borrow::Cow::Owned(format!("{path}?{query}")),
+        (Some(path), None) => std::borrow::Cow::Owned(path),
+        (None, _) => std::borrow::Cow::Borrowed(path_and_query),
+    })
 }
 
 /// Бэкенд ничего не знает про префикс "/account" — он смонтирован на
@@ -273,17 +313,14 @@ async fn try_proxy(cfg: &EdgeConfig, req: axum::extract::Request) -> Result<Resp
     // Только у BACKEND_ADDR путь может нести префикс "/account", который
     // сам бэкенд не понимает (см. doc на `strip_account_prefix`) — у
     // LANDING_ADDR путь пересылается как есть, ничего резать не нужно.
-    let forwarded_path =
-        if target_addr == SEARCH_UPSTREAM_ADDR && path_and_query.starts_with("/search") {
-            match path_and_query.split_once('?') {
-                Some((_, query)) => std::borrow::Cow::Owned(format!("/html/?{query}")),
-                None => std::borrow::Cow::Borrowed("/html/"),
-            }
-        } else if target_addr == cfg.backend_addr {
-            strip_account_prefix(&path_and_query)
-        } else {
-            std::borrow::Cow::Borrowed(path_and_query.as_str())
-        };
+    let forwarded_path = if target_addr == SEARCH_UPSTREAM_ADDR {
+        search_upstream_path(&path_and_query)
+            .unwrap_or_else(|| std::borrow::Cow::Borrowed(path_and_query.as_str()))
+    } else if target_addr == cfg.backend_addr {
+        strip_account_prefix(&path_and_query)
+    } else {
+        std::borrow::Cow::Borrowed(path_and_query.as_str())
+    };
 
     let body_bytes = axum::body::to_bytes(body, MAX_PROXIED_BODY_BYTES)
         .await
@@ -600,6 +637,7 @@ mod tests {
             identity: None,
             landing_pool: tokio::sync::Mutex::new(Vec::new()),
             backend_pool: tokio::sync::Mutex::new(Vec::new()),
+            search_pool: tokio::sync::Mutex::new(Vec::new()),
         }
     }
 
