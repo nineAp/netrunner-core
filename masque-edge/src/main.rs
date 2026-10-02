@@ -139,7 +139,20 @@ async fn main() -> Result<()> {
             let mesh_enabled = std::env::var("MESH_ENABLED")
                 .map(|value| value.eq_ignore_ascii_case("true") || value == "1")
                 .unwrap_or(false);
-            let mesh = if mesh_enabled {
+            let mesh_max_hops = match std::env::var("PROXY_MESH_MAX_HOPS") {
+                Ok(value) => value
+                    .parse::<u8>()
+                    .context("PROXY_MESH_MAX_HOPS must be a number between 1 and 8")?,
+                Err(std::env::VarError::NotPresent) => 2,
+                Err(error) => return Err(error.into()),
+            };
+            if !(1..=netrunner_core::net::MAX_MESH_HOPS).contains(&mesh_max_hops) {
+                bail!(
+                    "PROXY_MESH_MAX_HOPS must be between 1 and {}",
+                    netrunner_core::net::MAX_MESH_HOPS
+                );
+            }
+            let mesh = if mesh_enabled && mesh_max_hops > 1 {
                 let node_id = std::env::var("PROXY_NODE_ID")
                     .context("MESH_ENABLED requires PROXY_NODE_ID")?;
                 let backend_url =
@@ -151,6 +164,7 @@ async fn main() -> Result<()> {
                     node_id,
                     backend_url,
                     internal_secret,
+                    max_hops: mesh_max_hops,
                 })
             } else {
                 None

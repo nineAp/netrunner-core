@@ -50,7 +50,10 @@ mod connection;
 mod constants;
 pub mod diagnostics;
 
-pub use auth::{AuthValidator, MeshPeer, NodeHealthReport, UsageReport, UserQuota};
+pub use auth::{
+    parse_mesh_auth_token, AuthValidator, MeshAuth, MeshPeer, MeshRoute, MeshRouteSelection,
+    NodeHealthReport, UsageReport, UserQuota, MAX_MESH_HOPS, MESH_ROUTE_READY,
+};
 pub use config::NetworkConfig;
 #[cfg(not(target_arch = "wasm32"))]
 pub use connection::{

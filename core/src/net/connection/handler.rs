@@ -25,7 +25,7 @@ use crate::net::{
         bridge::{run_tcp_bridge, run_udp_bridge},
         muxer::Muxer,
     },
-    NetworkConfig,
+    MeshRoute, NetworkConfig,
 };
 use crate::nrxp::{Frame, FrameType};
 
@@ -36,9 +36,12 @@ use crate::nrxp::{Frame, FrameType};
 pub struct RemoteOpener {
     pub muxer: Arc<Muxer>,
     /// Present on a user/client session when this ingress must forward every
-    /// destination through another mesh node. Mesh-peer sessions deliberately
-    /// receive `None`, making this node the egress for that hop.
+    /// destination through the configured mesh route. Mesh-peer sessions only
+    /// receive a router when their authenticated route has hops remaining.
     pub mesh: Option<Arc<crate::net::NodeMesh>>,
+    /// Per-flow route budget and visited-node set. This is fixed at CONNECT and
+    /// carried unchanged for the lifetime of the flow.
+    pub mesh_route: Option<MeshRoute>,
     /// Mesh egress sessions confirm destination CONNECTs over the control
     /// stream before their ingress acknowledges the client request.
     pub mesh_peer: bool,
@@ -60,10 +63,15 @@ impl RemoteOpener {
     ) {
         let muxer = self.muxer.clone();
         let mesh = self.mesh.clone();
+        let mesh_route = self.mesh_route.clone();
         let mesh_peer = self.mesh_peer;
+        let mesh2_peer = mesh_route.is_some();
         tokio::spawn(async move {
-            if let Some(mesh) = mesh {
-                Self::open_via_mesh(muxer, mesh, stream_id, target, v_rx, token, false).await;
+            if let (Some(mesh), Some(route)) = (mesh, mesh_route) {
+                Self::open_via_mesh(
+                    muxer, mesh, route, stream_id, target, v_rx, token, false, mesh_peer,
+                )
+                .await;
                 return;
             }
 
@@ -82,11 +90,16 @@ impl RemoteOpener {
                     match connect_res {
                         Ok(Ok(stream)) => {
                             if mesh_peer {
+                                let ready = if mesh2_peer {
+                                    crate::net::MESH_ROUTE_READY
+                                } else {
+                                    b"PONG"
+                                };
                                 let _ = muxer
                                     .send_control(
                                         stream_id,
                                         FrameType::Heartbeat,
-                                        Bytes::from_static(b"PONG"),
+                                        Bytes::from_static(ready),
                                     )
                                     .await;
                             }
@@ -140,10 +153,15 @@ impl RemoteOpener {
     ) {
         let muxer = self.muxer.clone();
         let mesh = self.mesh.clone();
+        let mesh_route = self.mesh_route.clone();
         let mesh_peer = self.mesh_peer;
+        let mesh2_peer = mesh_route.is_some();
         tokio::spawn(async move {
-            if let Some(mesh) = mesh {
-                Self::open_via_mesh(muxer, mesh, stream_id, target, v_rx, token, true).await;
+            if let (Some(mesh), Some(route)) = (mesh, mesh_route) {
+                Self::open_via_mesh(
+                    muxer, mesh, route, stream_id, target, v_rx, token, true, mesh_peer,
+                )
+                .await;
                 return;
             }
 
@@ -168,11 +186,16 @@ impl RemoteOpener {
                         if let Ok(socket) = UdpSocket::bind(bind).await {
                             if socket.connect(address).await.is_ok() {
                                 if mesh_peer {
+                                    let ready = if mesh2_peer {
+                                        crate::net::MESH_ROUTE_READY
+                                    } else {
+                                        b"PONG"
+                                    };
                                     let _ = muxer
                                         .send_control(
                                             stream_id,
                                             FrameType::Heartbeat,
-                                            Bytes::from_static(b"PONG"),
+                                            Bytes::from_static(ready),
                                         )
                                         .await;
                                 }
@@ -186,27 +209,31 @@ impl RemoteOpener {
         });
     }
 
-    /// Selects the closest reachable egress and opens the destination through
-    /// an ordinary NRXP client leg. There is intentionally no direct-egress
-    /// fallback when the mesh is enabled: silently doing so would expose the
-    /// ingress address and turn a configured two-hop route back into one hop.
+    /// Forwards this stream to the next route node over an ordinary NRXP leg.
+    /// There is intentionally no direct-egress fallback when a route is active:
+    /// that would silently shorten the configured path and expose this node.
     async fn open_via_mesh(
         ingress_muxer: Arc<Muxer>,
         mesh: Arc<crate::net::NodeMesh>,
+        route: MeshRoute,
         ingress_stream_id: u32,
         target: String,
         mut ingress_rx: mpsc::Receiver<Bytes>,
         token: CancellationToken,
         is_udp: bool,
+        upstream_peer: bool,
     ) {
-        let auth_token = mesh.auth_token();
-        let peers = mesh.ordered_peers().await;
+        let peers = mesh.peers_for_route(&route).await;
         let mut connected = None;
 
         for peer in peers {
             if token.is_cancelled() {
                 break;
             }
+            let Some(next_route) = mesh.route_via_peer(&route, &peer.node_id) else {
+                continue;
+            };
+            let auth_token = mesh.auth_token_for_route(&next_route);
             let result = tokio::select! {
                 _ = token.cancelled() => break,
                 result = Box::pin(
@@ -241,6 +268,19 @@ impl RemoteOpener {
             ingress_muxer.remove_stream(ingress_stream_id);
             return;
         };
+
+        // The downstream CONNECT is confirmed only after the final egress has
+        // opened the destination. Propagate that acknowledgement one hop back
+        // so each ingress can finish CONNECT setup before data starts flowing.
+        if upstream_peer {
+            let _ = ingress_muxer
+                .send_control(
+                    ingress_stream_id,
+                    FrameType::Heartbeat,
+                    Bytes::from_static(crate::net::MESH_ROUTE_READY),
+                )
+                .await;
+        }
 
         let upload = async {
             loop {
@@ -373,7 +413,7 @@ impl StreamHandler {
                             .send_control(stream_id, FrameType::Heartbeat, Bytes::from("PONG"))
                             .await;
                     });
-                } else if payload == b"PONG" {
+                } else if payload == b"PONG" || payload == crate::net::MESH_ROUTE_READY {
                     trace!(stream_id, "🤝 [Tunnel] PONG received");
                     self.muxer.dispatch_to_local(stream_id, frame.payload);
                 } else {

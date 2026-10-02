@@ -1,14 +1,15 @@
-//! Peer directory and latency ordering for two-hop node routing.
+//! Peer directory and latency-aware routing across the node mesh.
 //!
 //! The control plane supplies peer metadata. This module keeps a short-lived
-//! in-memory view and orders peers by direct TCP reachability from this node;
-//! application traffic is opened directly to the selected egress.
+//! in-memory view and probes peers from this node. Flows select a bounded,
+//! loop-free path and carry it through the NRXP mesh legs.
 
 use std::{cmp::Ordering, sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use dashmap::DashMap;
 use netrunner_logger::{AppError, ERR_INFRA_TIMEOUT};
+use rand::RngExt;
 use tokio::{
     net::TcpStream,
     sync::{mpsc, RwLock},
@@ -17,23 +18,36 @@ use tokio::{
 };
 
 use super::connection::{ClientHandler, Muxer};
-use super::MeshPeer;
+use super::{MeshPeer, MeshRoute, MeshRouteSelection, MAX_MESH_HOPS};
 use crate::nrxp::FrameType;
 
 const PEER_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+const PEER_PROBE_MAX_AGE: Duration = Duration::from_secs(45);
+
+#[derive(Clone, Copy)]
+struct PeerProbe {
+    rtt_ms: u32,
+    probed_at: std::time::Instant,
+}
 
 pub struct NodeMesh {
     local_node_id: String,
     local_node_secret: String,
+    max_hops: u8,
     peers: RwLock<Vec<MeshPeer>>,
-    rtt_ms: DashMap<String, u32>,
+    rtt_ms: DashMap<String, PeerProbe>,
 }
 
 impl NodeMesh {
     pub fn new(local_node_id: String, local_node_secret: String) -> Self {
+        Self::with_max_hops(local_node_id, local_node_secret, 2)
+    }
+
+    pub fn with_max_hops(local_node_id: String, local_node_secret: String, max_hops: u8) -> Self {
         Self {
             local_node_id,
             local_node_secret,
+            max_hops: max_hops.clamp(1, MAX_MESH_HOPS),
             peers: RwLock::new(Vec::new()),
             rtt_ms: DashMap::new(),
         }
@@ -50,21 +64,30 @@ impl NodeMesh {
     }
 
     pub async fn update_peers(&self, peers: Vec<MeshPeer>) {
+        let mut seen_ids = std::collections::HashSet::new();
+        let mut seen_addresses = std::collections::HashSet::new();
         let peers: Vec<_> = peers
             .into_iter()
-            .filter(|peer| peer.node_id != self.local_node_id)
+            // Node ids are UUIDs but may arrive with different casing from
+            // provisioning and the backend. Canonicalize comparisons here so
+            // this ingress can never select itself as its own egress.
+            .filter(|peer| !peer.node_id.eq_ignore_ascii_case(&self.local_node_id))
+            .filter(|peer| seen_ids.insert(peer.node_id.to_ascii_lowercase()))
             .filter(|peer| {
                 !peer.host.trim().is_empty()
                     && peer.port != 0
                     && !peer.nrxp_secret.is_empty()
                     && !peer.nrxp_static_public.is_empty()
             })
+            .filter(|peer| seen_addresses.insert(peer.address().to_ascii_lowercase()))
             .collect();
 
-        let active_ids: std::collections::HashSet<_> =
-            peers.iter().map(|peer| peer.node_id.as_str()).collect();
+        let active_ids: std::collections::HashSet<_> = peers
+            .iter()
+            .map(|peer| peer.node_id.to_ascii_lowercase())
+            .collect();
         self.rtt_ms
-            .retain(|node_id, _| active_ids.contains(node_id.as_str()));
+            .retain(|node_id, _| active_ids.contains(node_id));
         *self.peers.write().await = peers;
     }
 
@@ -84,11 +107,14 @@ impl NodeMesh {
                     .is_ok_and(|result| result.is_ok());
                 if reachable {
                     rtt_ms.insert(
-                        peer.node_id,
-                        start.elapsed().as_millis().clamp(1, u32::MAX as u128) as u32,
+                        peer.node_id.to_ascii_lowercase(),
+                        PeerProbe {
+                            rtt_ms: start.elapsed().as_millis().clamp(1, u32::MAX as u128) as u32,
+                            probed_at: std::time::Instant::now(),
+                        },
                     );
                 } else {
-                    rtt_ms.remove(&peer.node_id);
+                    rtt_ms.remove(&peer.node_id.to_ascii_lowercase());
                 }
             });
         }
@@ -97,13 +123,13 @@ impl NodeMesh {
     }
 
     /// Lowest measured RTT first. Unprobed peers are retained after measured
-    /// peers so a fresh node can still join the mesh before its first probe.
+    /// peers so the legacy nearest-egress mode can start before its first probe.
     pub async fn ordered_peers(&self) -> Vec<MeshPeer> {
         let mut peers = self.peers.read().await.clone();
         peers.sort_by(|left, right| {
             match (
-                self.rtt_ms.get(&left.node_id),
-                self.rtt_ms.get(&right.node_id),
+                self.recent_rtt_ms(&left.node_id),
+                self.recent_rtt_ms(&right.node_id),
             ) {
                 (Some(left_rtt), Some(right_rtt)) => left_rtt.cmp(&right_rtt),
                 (Some(_), None) => Ordering::Less,
@@ -114,17 +140,154 @@ impl NodeMesh {
         peers
     }
 
+    /// A max-hop value of one means direct output. Two preserves the existing
+    /// nearest reachable egress behavior. Longer paths use weighted random
+    /// selection among peers with a successful recent probe.
+    pub fn initial_route(&self) -> Option<MeshRoute> {
+        (self.max_hops > 1).then(|| MeshRoute {
+            remaining_hops: self.max_hops,
+            selection: if self.max_hops == 2 {
+                MeshRouteSelection::Nearest
+            } else {
+                MeshRouteSelection::WeightedRandom
+            },
+            visited: vec![self.local_node_id.clone()],
+        })
+    }
+
+    /// Return eligible next hops for a route. Weighted routes only use peers
+    /// that passed the latest reachability probe; every mode excludes the
+    /// originating ingress and all already visited nodes.
+    pub async fn peers_for_route(&self, route: &MeshRoute) -> Vec<MeshPeer> {
+        let peers = self.peers.read().await.clone();
+        let mut candidates: Vec<(MeshPeer, Option<u32>)> = peers
+            .into_iter()
+            .filter(|peer| {
+                !route
+                    .visited
+                    .iter()
+                    .any(|visited| visited.eq_ignore_ascii_case(&peer.node_id))
+            })
+            .filter_map(|peer| {
+                let rtt = self.recent_rtt_ms(&peer.node_id);
+                if route.selection == MeshRouteSelection::WeightedRandom && rtt.is_none() {
+                    return None;
+                }
+                Some((peer, rtt))
+            })
+            .collect();
+
+        match route.selection {
+            MeshRouteSelection::Nearest => {
+                candidates.sort_by(|(left, left_rtt), (right, right_rtt)| {
+                    match (left_rtt, right_rtt) {
+                        (Some(left), Some(right)) => left.cmp(right),
+                        (Some(_), None) => Ordering::Less,
+                        (None, Some(_)) => Ordering::Greater,
+                        (None, None) => left
+                            .node_id
+                            .to_ascii_lowercase()
+                            .cmp(&right.node_id.to_ascii_lowercase()),
+                    }
+                });
+            }
+            MeshRouteSelection::WeightedRandom => {
+                let mut rng = rand::rng();
+                let mut shuffled = Vec::with_capacity(candidates.len());
+                while !candidates.is_empty() {
+                    let total_weight: u64 = candidates
+                        .iter()
+                        .map(|(_, rtt)| 1_000_000_u64 / u64::from(rtt.unwrap_or(1).max(1)))
+                        .map(|weight| weight.max(1))
+                        .sum();
+                    let mut draw = rng.random_range(0..total_weight);
+                    let index = candidates
+                        .iter()
+                        .position(|(_, rtt)| {
+                            let weight =
+                                (1_000_000_u64 / u64::from(rtt.unwrap_or(1).max(1))).max(1);
+                            if draw < weight {
+                                true
+                            } else {
+                                draw -= weight;
+                                false
+                            }
+                        })
+                        .unwrap_or(0);
+                    shuffled.push(candidates.remove(index));
+                }
+                candidates = shuffled;
+            }
+        }
+
+        candidates.into_iter().map(|(peer, _)| peer).collect()
+    }
+
+    fn recent_rtt_ms(&self, node_id: &str) -> Option<u32> {
+        self.rtt_ms
+            .get(&node_id.to_ascii_lowercase())
+            .filter(|probe| probe.probed_at.elapsed() <= PEER_PROBE_MAX_AGE)
+            .map(|probe| probe.rtt_ms)
+    }
+
+    /// Consume one hop from the current route and add the selected node. This
+    /// both keeps the hop limit fixed per flow and prevents route loops.
+    pub fn route_via_peer(&self, route: &MeshRoute, peer_id: &str) -> Option<MeshRoute> {
+        if route.remaining_hops <= 1
+            || route.remaining_hops > MAX_MESH_HOPS
+            || route.visited.len() >= MAX_MESH_HOPS as usize
+            || route
+                .visited
+                .iter()
+                .any(|visited| visited.eq_ignore_ascii_case(peer_id))
+        {
+            return None;
+        }
+
+        let mut next = route.clone();
+        next.remaining_hops -= 1;
+        next.visited.push(peer_id.to_owned());
+        Some(next)
+    }
+
+    pub fn auth_token_for_route(&self, route: &MeshRoute) -> String {
+        let route_size = route.remaining_hops as usize + route.visited.len().saturating_sub(1);
+        if route_size == 2 && route.selection == MeshRouteSelection::Nearest {
+            // Preserve the original 2-hop auth shape so existing nodes can
+            // keep acting as direct egresses during a rolling deployment.
+            return self.auth_token();
+        }
+        format!(
+            "mesh2:{}:{}:{}:{}:{}",
+            self.local_node_id,
+            self.local_node_secret,
+            route.remaining_hops,
+            route.selection.as_wire_value(),
+            route.visited.join(",")
+        )
+    }
+
     pub async fn peer_count(&self) -> usize {
         self.peers.read().await.len()
     }
 
-    /// Open a destination stream through the lowest-latency reachable peer.
-    /// Each peer receives the same user-independent node credential; the
-    /// egress validates it with the control plane before accepting the flow.
+    /// Open a destination stream over the route configured on this node.
+    /// Each hop authenticates this node through the control plane before
+    /// accepting the flow.
     pub async fn connect_stream(&self, target: &str, is_udp: bool) -> Result<MeshTunnel, AppError> {
-        let auth_token = self.auth_token();
-        let peers = self.ordered_peers().await;
+        let route = self.initial_route().ok_or_else(|| {
+            AppError::new(
+                ERR_INFRA_TIMEOUT,
+                "Mesh routing disabled",
+                "Direct output is configured for this node",
+            )
+        })?;
+        let peers = self.peers_for_route(&route).await;
         for peer in peers {
+            let Some(next_route) = self.route_via_peer(&route, &peer.node_id) else {
+                continue;
+            };
+            let auth_token = self.auth_token_for_route(&next_route);
             match ClientHandler::connect_mesh_stream(&peer, &auth_token, target, is_udp).await {
                 Ok((muxer, rx, engine_task)) => {
                     return Ok(MeshTunnel {

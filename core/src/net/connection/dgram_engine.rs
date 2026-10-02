@@ -209,8 +209,10 @@ fn build_mimicry_pair(
     match kind {
         DgramEngineKind::Quic => {
             let ctx = DgramKdfContext::new(DgramEngineLabel::Quic, ATTEMPT);
-            let tx_material = DatagramKeyMaterial::derive_from_root_ctx(datagram_root, is_client, ctx);
-            let rx_material = DatagramKeyMaterial::derive_from_root_ctx(datagram_root, is_client, ctx);
+            let tx_material =
+                DatagramKeyMaterial::derive_from_root_ctx(datagram_root, is_client, ctx);
+            let rx_material =
+                DatagramKeyMaterial::derive_from_root_ctx(datagram_root, is_client, ctx);
             let leg_token = tx_material.leg_token();
             let hp_tx = tx_material.hp_key_tx();
             let hp_rx = rx_material.hp_key_rx();
@@ -233,8 +235,10 @@ fn build_mimicry_pair(
         }
         DgramEngineKind::WebRtc => {
             let ctx = DgramKdfContext::new(DgramEngineLabel::WebRtc, ATTEMPT);
-            let tx_material = DatagramKeyMaterial::derive_from_root_ctx(datagram_root, is_client, ctx);
-            let rx_material = DatagramKeyMaterial::derive_from_root_ctx(datagram_root, is_client, ctx);
+            let tx_material =
+                DatagramKeyMaterial::derive_from_root_ctx(datagram_root, is_client, ctx);
+            let rx_material =
+                DatagramKeyMaterial::derive_from_root_ctx(datagram_root, is_client, ctx);
             let leg_token = tx_material.leg_token();
             let ssrc_out = if is_client {
                 dgram_leg::webrtc_ssrc_client(&leg_token)
@@ -467,7 +471,10 @@ pub(crate) async fn attempt_client_datagram_leg(
     }
 
     if established.is_none() {
-        debug!(?session_id, "Datagram leg: both mimicry engines failed, trying raw UDP");
+        debug!(
+            ?session_id,
+            "Datagram leg: both mimicry engines failed, trying raw UDP"
+        );
         let (raw_tx, raw_rx) = build_raw_pair(datagram_root, true);
         established = try_establish(raw_tx, raw_rx, &socket, None).await;
     }
@@ -837,6 +844,7 @@ async fn process_datagram(
         let opener = Arc::new(RemoteOpener {
             muxer: entry.muxer.clone(),
             mesh: None,
+            mesh_route: None,
             mesh_peer: false,
         });
         let handler = Arc::new(StreamHandler::new(entry.muxer.clone(), Some(opener)));
@@ -1379,6 +1387,7 @@ mod tests {
         let opener = Arc::new(RemoteOpener {
             muxer: muxer.clone(),
             mesh: None,
+            mesh_route: None,
             mesh_peer: false,
         });
         let handler = StreamHandler::new(muxer.clone(), Some(opener));
@@ -1501,7 +1510,8 @@ mod tests {
         // Клиентский Initial ДЛЯ этой сессии: DCID = quic_dcid_client(leg_token).
         let leg_token = DatagramKeyMaterial::derive_from_root(datagram_root, false).leg_token();
         let dcid = dgram_leg::quic_dcid_client(&leg_token);
-        let initial = quiceng::build_client_initial(&quiceng::QuicProfile::CHROME, "example.com", &dcid, &[]);
+        let initial =
+            quiceng::build_client_initial(&quiceng::QuicProfile::CHROME, "example.com", &dcid, &[]);
 
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         client.connect(listen_addr).await.unwrap();
@@ -1515,7 +1525,11 @@ mod tests {
             "server must answer a client Initial for a registered session (bug #12)"
         );
         // Ответ — long-header пакет (Initial или Handshake).
-        assert_eq!(buf[0] & 0xC0, 0xC0, "server reply must be a QUIC long-header packet");
+        assert_eq!(
+            buf[0] & 0xC0,
+            0xC0,
+            "server reply must be a QUIC long-header packet"
+        );
 
         // Повторный тот же Initial НЕ должен породить второй flight (дедуп).
         client.send(&initial).await.unwrap();
@@ -1526,12 +1540,17 @@ mod tests {
 
         // Initial для НЕизвестной сессии (случайный DCID) — сервер молчит.
         let unknown_dcid = [0x00u8; 8];
-        let unknown_initial =
-            quiceng::build_client_initial(&quiceng::QuicProfile::CHROME, "example.com", &unknown_dcid, &[]);
+        let unknown_initial = quiceng::build_client_initial(
+            &quiceng::QuicProfile::CHROME,
+            "example.com",
+            &unknown_dcid,
+            &[],
+        );
         let client2 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         client2.connect(listen_addr).await.unwrap();
         client2.send(&unknown_initial).await.unwrap();
-        let silence = tokio::time::timeout(Duration::from_millis(400), client2.recv(&mut buf)).await;
+        let silence =
+            tokio::time::timeout(Duration::from_millis(400), client2.recv(&mut buf)).await;
         assert!(
             silence.is_err(),
             "server must NOT answer an Initial for an unknown session (amplification gate)"

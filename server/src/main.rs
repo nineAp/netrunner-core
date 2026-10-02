@@ -109,10 +109,15 @@ struct Args {
     #[arg(long, default_value_t = false)]
     require_auth: bool,
 
-    /// Make this node both an ingress and an egress in the node mesh. Ordinary
-    /// client streams enter here, then leave through the nearest online peer.
+    /// Enable authenticated peer routing. This node can accept mesh traffic
+    /// and route local client streams according to --mesh-max-hops.
     #[arg(long, default_value_t = false)]
     mesh_enabled: bool,
+
+    /// Number of proxy nodes in a route: 1 = direct, 2 = nearest egress,
+    /// 3..=8 = weighted-random chain using recently reachable peers.
+    #[arg(long, default_value_t = 2)]
+    mesh_max_hops: u8,
 
     /// URL control-plane бэкенда для проверки токенов/отчётов о трафике.
     /// Обязателен, если включён `--require-auth` или `--mesh-enabled`.
@@ -143,11 +148,20 @@ fn main() {
     Logger::global().set_level("info");
     let args = Args::parse();
 
+    if !(1..=netrunner_core::net::MAX_MESH_HOPS).contains(&args.mesh_max_hops) {
+        panic!(
+            "--mesh-max-hops must be between 1 and {}",
+            netrunner_core::net::MAX_MESH_HOPS
+        );
+    }
+
     let auth_required_by_node = args.require_auth || args.mesh_enabled;
     let backend_url = if auth_required_by_node {
-        Some(args.backend_url.clone().expect(
-            "--require-auth/--mesh-enabled требуют --backend-url",
-        ))
+        Some(
+            args.backend_url
+                .clone()
+                .expect("--require-auth/--mesh-enabled требуют --backend-url"),
+        )
     } else {
         None
     };
@@ -177,9 +191,10 @@ fn main() {
             .as_ref()
             .expect("mesh requires PROXY_INTERNAL_SECRET")
             .clone();
-        Some(Arc::new(netrunner_core::net::NodeMesh::new(
+        Some(Arc::new(netrunner_core::net::NodeMesh::with_max_hops(
             node_id,
             node_secret,
+            args.mesh_max_hops,
         )))
     } else {
         None
@@ -301,7 +316,9 @@ fn main() {
             // SelfHosted требует пресет витрины и владение его SNI: собрать и
             // проверить здесь, на старте, иначе узел не поднимется.
             let preset_name = args.decoy_preset.as_deref().unwrap_or_else(|| {
-                panic!("--decoy-mode self-hosted требует --decoy-preset (какую витрину обслуживать)")
+                panic!(
+                    "--decoy-mode self-hosted требует --decoy-preset (какую витрину обслуживать)"
+                )
             });
             let preset = decoy_site::preset::Preset::load(preset_name)
                 .unwrap_or_else(|e| panic!("не удалось загрузить пресет '{preset_name}': {e}"));
@@ -344,18 +361,20 @@ fn main() {
                 ),
             }
             // Fallback — на локальный сайт узла; запрошенный SNI игнорируется.
-            (args.decoy_local_site.clone(), decoy_mode.honor_requested_sni())
+            (
+                args.decoy_local_site.clone(),
+                decoy_mode.honor_requested_sni(),
+            )
         }
     };
 
     // Cover-flight — один на весь узел, детерминированный (см. ServerHandler).
     // Пока считается из типовой цепочки; правильный следующий шаг — измерить
     // настоящую цепочку своего домена (см. CoverFlight::node_default).
-    let cover_flight: std::sync::Arc<[usize]> =
-        netrunner_core::decoy::CoverFlight::node_default()
-            .as_records()
-            .to_vec()
-            .into();
+    let cover_flight: std::sync::Arc<[usize]> = netrunner_core::decoy::CoverFlight::node_default()
+        .as_records()
+        .to_vec()
+        .into();
 
     let net = Network::new(
         args.host.clone(),

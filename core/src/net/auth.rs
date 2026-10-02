@@ -12,6 +12,129 @@ use crate::net::diagnostics::ErrorCounters;
 use async_trait::async_trait;
 use netrunner_logger::AppError;
 
+pub const MAX_MESH_HOPS: u8 = 8;
+pub const MESH_ROUTE_READY: &[u8] = b"NRXP-MESH2-READY";
+
+/// How the next peer is selected for a stream route.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MeshRouteSelection {
+    Nearest,
+    WeightedRandom,
+}
+
+impl MeshRouteSelection {
+    pub(crate) fn as_wire_value(self) -> &'static str {
+        match self {
+            Self::Nearest => "nearest",
+            Self::WeightedRandom => "weighted-random",
+        }
+    }
+
+    fn from_wire_value(value: &str) -> Option<Self> {
+        match value {
+            "nearest" => Some(Self::Nearest),
+            "weighted-random" => Some(Self::WeightedRandom),
+            _ => None,
+        }
+    }
+}
+
+/// Stream-scoped routing budget. `remaining_hops` includes the node that
+/// receives this route; `visited` includes the originating ingress and every
+/// node selected so far.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MeshRoute {
+    pub remaining_hops: u8,
+    pub selection: MeshRouteSelection,
+    pub visited: Vec<String>,
+}
+
+#[derive(Debug)]
+pub struct MeshAuth {
+    pub peer_id: String,
+    pub peer_secret: String,
+    pub route: Option<MeshRoute>,
+}
+
+/// Parse peer authentication carried inside an encrypted NRXP session.
+/// `mesh:` remains supported for old nodes and means a direct egress. New
+/// routes use `mesh2:` to carry a hop budget and loop-prevention path.
+pub fn parse_mesh_auth_token(token: &str) -> Result<Option<MeshAuth>, &'static str> {
+    if let Some(claim) = token.strip_prefix("mesh2:") {
+        let mut fields = claim.splitn(5, ':');
+        let peer_id = fields.next().unwrap_or_default();
+        let peer_secret = fields.next().unwrap_or_default();
+        let remaining_hops = fields
+            .next()
+            .and_then(|value| value.parse::<u8>().ok())
+            .ok_or("invalid mesh hop budget")?;
+        let selection = fields
+            .next()
+            .and_then(MeshRouteSelection::from_wire_value)
+            .ok_or("invalid mesh route selection")?;
+        let visited = fields
+            .next()
+            .ok_or("missing mesh route path")?
+            .split(',')
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+
+        if peer_id.is_empty() || peer_secret.is_empty() || visited.is_empty() {
+            return Err("incomplete mesh peer credentials or route");
+        }
+        if remaining_hops == 0 || remaining_hops > MAX_MESH_HOPS {
+            return Err("mesh hop budget is outside the allowed range");
+        }
+        let route_size = remaining_hops as usize + visited.len().saturating_sub(1);
+        if route_size > MAX_MESH_HOPS as usize || visited.len() > MAX_MESH_HOPS as usize {
+            return Err("mesh route exceeds the maximum hop count");
+        }
+        if visited.iter().any(|node_id| {
+            node_id.is_empty()
+                || node_id.len() > 64
+                || !node_id
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || character == '-')
+        }) {
+            return Err("mesh route contains an invalid node id");
+        }
+        for (index, node_id) in visited.iter().enumerate() {
+            if visited[..index]
+                .iter()
+                .any(|previous| previous.eq_ignore_ascii_case(node_id))
+            {
+                return Err("mesh route contains a loop");
+            }
+        }
+
+        return Ok(Some(MeshAuth {
+            peer_id: peer_id.to_owned(),
+            peer_secret: peer_secret.to_owned(),
+            route: Some(MeshRoute {
+                remaining_hops,
+                selection,
+                visited,
+            }),
+        }));
+    }
+
+    if let Some(claim) = token.strip_prefix("mesh:") {
+        let (peer_id, peer_secret) = claim
+            .split_once(':')
+            .ok_or("malformed mesh peer credentials")?;
+        if peer_id.is_empty() || peer_secret.is_empty() {
+            return Err("incomplete mesh peer credentials");
+        }
+        return Ok(Some(MeshAuth {
+            peer_id: peer_id.to_owned(),
+            peer_secret: peer_secret.to_owned(),
+            route: None,
+        }));
+    }
+
+    Ok(None)
+}
+
 /// Public connection data for one node in the mesh. The control plane returns
 /// only nodes that are eligible to receive an egress hop; node-to-node data
 /// still travels directly between the peers.

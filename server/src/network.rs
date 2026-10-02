@@ -153,8 +153,7 @@ impl Network {
         let session_manager = Arc::new(SessionManager::new());
 
         // The control plane supplies peer metadata; each node probes from its
-        // own location and sends application data directly to the selected
-        // egress over NRXP.
+        // own location and forwards each stream over authenticated NRXP legs.
         if let (Some(mesh), Some(validator)) = (self.mesh.clone(), self.auth.clone()) {
             tokio::spawn(async move {
                 loop {

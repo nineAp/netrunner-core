@@ -821,12 +821,16 @@ impl ClientHandler {
                 return Err(error);
             }
 
-            // The egress sends this stream-scoped PONG only after the target
-            // TCP socket or UDP association has been opened. It travels before
-            // destination data, so the ingress can consume it safely here and
-            // fail over before reporting CONNECT success to its own client.
+            // The egress confirms the target only after it is opened. X-hop
+            // routes require a versioned acknowledgement so an older node
+            // cannot silently shorten the configured path to two hops.
+            let expected_ready = if auth_token.starts_with("mesh2:") {
+                crate::net::MESH_ROUTE_READY
+            } else {
+                b"PONG"
+            };
             match tokio::time::timeout(Duration::from_secs(8), v_rx.recv()).await {
-                Ok(Some(payload)) if payload.as_ref() == b"PONG" => {}
+                Ok(Some(payload)) if payload.as_ref() == expected_ready => {}
                 _ => {
                     let _ = muxer.send_control(1, FrameType::Close, Bytes::new()).await;
                     muxer.remove_stream(1);
@@ -1865,32 +1869,57 @@ impl TunnelHandler for ServerHandler {
         // запущен с `--require-auth`. До этой точки соединение прошло
         // Netrunner-хендшейк (не сканер/чужой TLS-клиент), поэтому отказ здесь
         // — обычный разрыв, а не stealth-fallback (светить уже нечего).
-        let is_mesh_peer = auth_token.starts_with("mesh:");
-        let auth_result = if let Some(mesh_claim) = auth_token.strip_prefix("mesh:") {
-            if !mesh_enabled {
-                Err(AppError::new(
+        let parsed_mesh_auth = crate::net::parse_mesh_auth_token(&auth_token);
+        let is_mesh_peer = auth_token.starts_with("mesh:") || auth_token.starts_with("mesh2:");
+        let auth_result = if is_mesh_peer {
+            match &parsed_mesh_auth {
+                Err(reason) => Err(AppError::new(
                     ERR_AUTH_FAILED,
                     "Доступ запрещен",
-                    "Mesh peer received while mesh support is disabled",
-                ))
-            } else if let Some((peer_id, peer_secret)) = mesh_claim.split_once(':') {
-                match &auth {
-                    Some(validator) => validator
-                        .validate_mesh_peer(peer_id, peer_secret)
-                        .await
-                        .map(|()| None),
-                    None => Err(AppError::new(
-                        ERR_AUTH_FAILED,
-                        "Доступ запрещен",
-                        "Mesh peer validation service is unavailable",
-                    )),
-                }
-            } else {
-                Err(AppError::new(
+                    format!("Malformed mesh peer credential: {reason}"),
+                )),
+                Ok(None) => Err(AppError::new(
                     ERR_AUTH_FAILED,
                     "Доступ запрещен",
                     "Malformed mesh peer credential",
-                ))
+                )),
+                Ok(Some(_)) if !mesh_enabled => Err(AppError::new(
+                    ERR_AUTH_FAILED,
+                    "Доступ запрещен",
+                    "Mesh peer received while mesh support is disabled",
+                )),
+                Ok(Some(claim)) => {
+                    let valid_route = claim.route.as_ref().map_or(true, |route| {
+                        let local_id = mesh.as_ref().map(|mesh| mesh.local_node_id());
+                        route.visited.len() >= 2
+                            && route
+                                .visited
+                                .last()
+                                .zip(local_id)
+                                .is_some_and(|(last, local)| last.eq_ignore_ascii_case(local))
+                            && route.visited[route.visited.len() - 2]
+                                .eq_ignore_ascii_case(&claim.peer_id)
+                    });
+                    if !valid_route {
+                        Err(AppError::new(
+                            ERR_AUTH_FAILED,
+                            "Доступ запрещен",
+                            "Mesh route does not match the authenticated peer path",
+                        ))
+                    } else {
+                        match &auth {
+                            Some(validator) => validator
+                                .validate_mesh_peer(&claim.peer_id, &claim.peer_secret)
+                                .await
+                                .map(|()| None),
+                            None => Err(AppError::new(
+                                ERR_AUTH_FAILED,
+                                "Доступ запрещен",
+                                "Mesh peer validation service is unavailable",
+                            )),
+                        }
+                    }
+                }
             }
         } else if require_auth {
             match &auth {
@@ -1951,11 +1980,25 @@ impl TunnelHandler for ServerHandler {
         // тем, как выглядят остальные две категории.
         metrics::counter!("netrunner_vpn_established_total").increment(1);
 
+        let peer_route = parsed_mesh_auth
+            .ok()
+            .flatten()
+            .and_then(|claim| claim.route);
+        let mesh_route = if is_mesh_peer {
+            peer_route
+        } else {
+            mesh.as_ref().and_then(|mesh| mesh.initial_route())
+        };
+        let route_has_more_hops = mesh_route
+            .as_ref()
+            .is_some_and(|route| route.remaining_hops > 1);
         let opener = Arc::new(RemoteOpener {
             muxer: muxer.clone(),
-            // A peer-authenticated connection is this node's egress hop. Only
-            // external/user ingress sessions receive the mesh router.
-            mesh: if is_mesh_peer { None } else { mesh },
+            // A peer route keeps moving until its hop budget reaches the final
+            // egress. Local direct mode creates no initial route, but the node
+            // can still forward authenticated routes from another ingress.
+            mesh: if route_has_more_hops { mesh } else { None },
+            mesh_route,
             mesh_peer: is_mesh_peer,
         });
         let handler = Arc::new(StreamHandler::new(muxer.clone(), Some(opener)));

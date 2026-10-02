@@ -74,13 +74,15 @@ pub struct MeshConfig {
     pub node_id: String,
     pub backend_url: String,
     pub internal_secret: String,
+    pub max_hops: u8,
 }
 
 pub async fn run(config: Config) -> Result<()> {
     let mesh = config.mesh.map(|mesh_config| {
-        let mesh = Arc::new(NodeMesh::new(
+        let mesh = Arc::new(NodeMesh::with_max_hops(
             mesh_config.node_id.clone(),
             mesh_config.internal_secret.clone(),
+            mesh_config.max_hops,
         ));
         let refresh_mesh = mesh.clone();
         tokio::spawn(async move {
