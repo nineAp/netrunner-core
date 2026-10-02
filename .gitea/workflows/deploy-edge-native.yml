@@ -112,11 +112,11 @@ jobs:
             cd \"\$DEPLOY_PATH/edge-native\"
             if ! command -v docker >/dev/null 2>&1; then
               if ! command -v apt-get >/dev/null 2>&1; then
-                echo "Docker is missing and automatic installation requires Ubuntu/Debian apt" >&2
+                echo \"Docker is missing and automatic installation requires Ubuntu/Debian apt\" >&2
                 exit 1
               fi
-              if [ "\$(id -u)" -ne 0 ]; then
-                echo "First-time Docker installation requires DEPLOY_TARGET to use root" >&2
+              if [ \"\$(id -u)\" -ne 0 ]; then
+                echo \"First-time Docker installation requires DEPLOY_TARGET to use root\" >&2
                 exit 1
               fi
               export DEBIAN_FRONTEND=noninteractive
@@ -124,21 +124,21 @@ jobs:
               apt-get install -y docker.io docker-compose-v2
             elif ! docker compose version >/dev/null 2>&1; then
               if ! command -v apt-get >/dev/null 2>&1; then
-                echo "Docker Compose plugin is missing and automatic installation requires apt" >&2
+                echo \"Docker Compose plugin is missing and automatic installation requires apt\" >&2
                 exit 1
               fi
-              if [ "\$(id -u)" -ne 0 ]; then
-                echo "First-time Docker Compose installation requires DEPLOY_TARGET to use root" >&2
+              if [ \"\$(id -u)\" -ne 0 ]; then
+                echo \"First-time Docker Compose installation requires DEPLOY_TARGET to use root\" >&2
                 exit 1
               fi
               export DEBIAN_FRONTEND=noninteractive
               apt-get update
               apt-get install -y docker-compose-v2
             fi
-            if [ "\$(id -u)" -eq 0 ]; then
+            if [ \"\$(id -u)\" -eq 0 ]; then
               systemctl enable --now docker
             elif ! docker info >/dev/null 2>&1; then
-              echo "Docker is unavailable to DEPLOY_TARGET; grant it Docker access" >&2
+              echo \"Docker is unavailable to DEPLOY_TARGET; grant it Docker access\" >&2
               exit 1
             fi
             docker compose up -d --build --remove-orphans
