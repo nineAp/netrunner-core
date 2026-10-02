@@ -101,13 +101,13 @@ make build-server      # собирает netrunner-server + netrunner-masque-ed
 make deploy-server     # rsync обоих бинарников + двух systemd unit
 make deploy-dev        # то же, но на DEV_IP / *.dev.service
 make logs              # основной TCP-сервер
-make logs-masque       # HTTP/3 relay на UDP/443
+make logs-masque       # HTTP/3 relay на UDP/8444
 make ssh               # быстрый ssh на прод-ноду
 ```
 
-Основной сервер и MASQUE могут жить на одном IP и одном номере порта без
-конфликта: `netrunner-server` занимает `0.0.0.0:443/tcp`, а
-`netrunner-masque-edge` — `0.0.0.0:443/udp`. Ручной systemd-деплой всегда
+Основной сервер, его нативная UDP-нога и MASQUE используют отдельные сокеты:
+`netrunner-server` занимает `0.0.0.0:443/tcp` и `0.0.0.0:443/udp`, а
+`netrunner-masque-edge` — `0.0.0.0:8444/udp`. Ручной systemd-деплой всегда
 кладёт оба бинарника и оба юнита, но MASQUE-юнит имеет
 `ConditionPathExists=/etc/netrunner/masque-edge.env`: без конфигурации он
 пропускается и не влияет на работающий NRXP. Шаблон —
@@ -119,8 +119,10 @@ make ssh               # быстрый ssh на прод-ноду
 `MASQUE_CERT_FILE` и `MASQUE_KEY_FILE`.
 Старый вызов бэкенда `IMAGE ./netrunner-proxy ...` поддерживается. Для
 включения на Docker-ноде сертификат и ключ нужно смонтировать в контейнер, а
-в firewall открыть именно `443/udp`; существующее правило `443/tcp` этого не
-делает. Сертификат должен быть публично доверенным и совпадать с relay hostname
+в firewall открыть `443/udp` для core datagram-нóги и `8444/udp` для MASQUE.
+Новые iOS-профили используют relay URL с портом `8444`. После переноса старые
+установленные профили нужно заменить профилем, повторно скачанным из админки.
+Сертификат должен быть публично доверенным и совпадать с relay hostname
 из iOS-профиля.
 
 В production задаются `MASQUE_AUTH_URL` и per-node

@@ -8,8 +8,8 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /src/target/release/netrunner-masque-edge /usr/local/bin/netrunner-masque-edge
-EXPOSE 443/udp
-# The common Let's Encrypt private-key path is root-readable and the default
-# listener is a privileged port. Harden with a dedicated uid/capability after
-# certificate delivery is moved away from the host's live directory.
+EXPOSE 8444/udp
+# The common Let's Encrypt private-key path is root-readable. Harden with a
+# dedicated uid after certificate delivery is moved away from the host's live
+# directory.
 ENTRYPOINT ["netrunner-masque-edge"]

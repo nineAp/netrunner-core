@@ -43,13 +43,13 @@ docker build -f masque-edge/Dockerfile -t netrunner-masque-edge .
 
 ## Deploy next to the ordinary server
 
-The root workspace image and `make deploy-server` now ship both server
-binaries. They intentionally use different transports on the same numeric
-port, so there is no socket collision:
+The root workspace image and `make deploy-server` ship both server binaries.
+The core proxy keeps UDP/443 for its datagram leg; MASQUE uses UDP/8444:
 
 ```text
 0.0.0.0:443/tcp  netrunner-proxy
-0.0.0.0:443/udp  netrunner-masque-edge
+0.0.0.0:443/udp  netrunner-proxy datagram leg
+0.0.0.0:8444/udp netrunner-masque-edge
 ```
 
 For the root Docker image, mount the certificate files read-only and pass the
@@ -79,7 +79,7 @@ skipped, while the ordinary TCP server still starts.
 
 ```bash
 cargo run -p netrunner-masque-edge -- profile \
-  --http3-url 'https://relay.example.com/.well-known/masque/udp/{target_host}/{target_port}/' \
+  --http3-url 'https://relay.example.com:8444/.well-known/masque/udp/{target_host}/{target_port}/' \
   --token 'replace-with-a-random-secret' \
   --output netrunner-relay.mobileconfig
 ```

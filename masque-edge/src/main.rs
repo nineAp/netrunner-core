@@ -30,7 +30,7 @@ enum Command {
 #[derive(Debug, Args)]
 struct ServeArgs {
     /// UDP socket used by HTTP/3 / QUIC.
-    #[arg(long, default_value = "0.0.0.0:443")]
+    #[arg(long, default_value = "0.0.0.0:8444")]
     bind: SocketAddr,
 
     /// PEM certificate chain for the relay hostname.
@@ -77,7 +77,7 @@ struct ServeArgs {
 #[derive(Debug, Args)]
 struct ProfileArgs {
     /// Relay URL or RFC 9298 URI template, for example
-    /// https://relay.example.com/.well-known/masque/udp/{target_host}/{target_port}/
+    /// https://relay.example.com:8444/.well-known/masque/udp/{target_host}/{target_port}/
     #[arg(long)]
     http3_url: String,
 

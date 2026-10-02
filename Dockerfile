@@ -37,13 +37,15 @@ RUN apt-get update && apt-get install -y ca-certificates libssl3 tini wget && rm
 COPY --from=builder /app/target/release/netrunner-server /app/netrunner-proxy
 COPY --from=builder /app/target/release/netrunner-masque-edge /app/netrunner-masque-edge
 COPY --chmod=0755 server/container-entrypoint.sh /app/container-entrypoint.sh
+COPY --chmod=0644 server/masque-bind.sh /app/masque-bind.sh
 
 EXPOSE 443/udp
 EXPOSE 443/tcp
 EXPOSE 8443/udp
+EXPOSE 8444/udp
 
 # Бэкенд исторически передаёт после имени образа явную команду
 # `./netrunner-proxy ...`. Entrypoint сохраняет эту форму совместимой и при
-# наличии MASQUE_* запускает рядом HTTP/3 relay на UDP того же номера порта.
+# наличии MASQUE_* запускает рядом HTTP/3 relay на отдельном UDP-порту 8444.
 ENTRYPOINT ["/usr/bin/tini", "--", "/app/container-entrypoint.sh"]
 CMD ["./netrunner-proxy"]

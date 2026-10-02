@@ -2,7 +2,8 @@
 
 # Один контейнер, два независимых сокета:
 #   netrunner-proxy       -> TCP/--port (обычно 443)
-#   netrunner-masque-edge -> UDP/${MASQUE_BIND:-0.0.0.0:443}
+#   netrunner-proxy       -> UDP/--port (native datagram leg)
+#   netrunner-masque-edge -> UDP/${MASQUE_BIND:-0.0.0.0:8444}
 #
 # MASQUE включается явно (MASQUE_ENABLED=true) либо автоматически, когда
 # одновременно переданы авторизация, сертификат и ключ. Поэтому обновление образа
@@ -91,20 +92,54 @@ if [ "$masque_start" = true ]; then
         exit 66
     fi
 
+    # Old node containers have MASQUE_BIND=...:443 baked into their Docker
+    # config. Watchtower replaces the image but preserves that environment, so
+    # move only a colliding legacy bind before starting MASQUE. The proxy's
+    # native datagram listener must retain the same UDP port as its TCP ingress.
+    proxy_udp_port=8080
+    mesh_udp_port="${MESH_QUIC_PORT:-8443}"
+    expect_proxy_port=false
+    expect_mesh_port=false
+    for arg in "$@"; do
+        if [ "$expect_proxy_port" = true ]; then
+            proxy_udp_port="$arg"
+            expect_proxy_port=false
+            continue
+        fi
+        if [ "$expect_mesh_port" = true ]; then
+            mesh_udp_port="$arg"
+            expect_mesh_port=false
+            continue
+        fi
+        case "$arg" in
+            --port) expect_proxy_port=true ;;
+            --port=*) proxy_udp_port="${arg#*=}" ;;
+            --mesh-quic-port) expect_mesh_port=true ;;
+            --mesh-quic-port=*) mesh_udp_port="${arg#*=}" ;;
+        esac
+    done
+
+    requested_masque_bind="${MASQUE_BIND:-0.0.0.0:8444}"
+    . /app/masque-bind.sh
+    masque_bind="$(resolve_masque_bind "$requested_masque_bind" "$proxy_udp_port" "$mesh_udp_port")"
+    if [ "$masque_bind" != "$requested_masque_bind" ]; then
+        echo "MASQUE_BIND overlaps a proxy UDP port; moved the relay listener to $masque_bind" >&2
+    fi
+
     if [ "${MASQUE_ALLOW_PRIVATE_TARGETS:-false}" = true ]; then
         /app/netrunner-masque-edge serve \
-            --bind "${MASQUE_BIND:-0.0.0.0:443}" \
+            --bind "$masque_bind" \
             --cert "$MASQUE_CERT_FILE" \
             --key "$MASQUE_KEY_FILE" \
             --allow-private-targets &
     else
         /app/netrunner-masque-edge serve \
-            --bind "${MASQUE_BIND:-0.0.0.0:443}" \
+            --bind "$masque_bind" \
             --cert "$MASQUE_CERT_FILE" \
             --key "$MASQUE_KEY_FILE" &
     fi
     masque_pid=$!
-    echo "started netrunner-masque-edge as pid $masque_pid on ${MASQUE_BIND:-0.0.0.0:443}" >&2
+    echo "started netrunner-masque-edge as pid $masque_pid on $masque_bind" >&2
 fi
 
 /app/netrunner-proxy "$@" &
