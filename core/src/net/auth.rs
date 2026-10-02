@@ -39,13 +39,16 @@ impl MeshRouteSelection {
     }
 }
 
-/// Stream-scoped routing budget. `remaining_hops` includes the node that
-/// receives this route; `visited` includes the originating ingress and every
-/// node selected so far.
+/// Stream-scoped route. `remaining_hops` includes the node that receives this
+/// route; `visited` includes the originating ingress and every node selected so
+/// far. New mesh3 routes also carry the egress selected by the ingress.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MeshRoute {
     pub remaining_hops: u8,
     pub selection: MeshRouteSelection,
+    /// Exit selected by the ingress for this flow. `None` is retained for
+    /// legacy mesh2 routes and the nearest 2-node mode.
+    pub egress_node_id: Option<String>,
     pub visited: Vec<String>,
 }
 
@@ -57,11 +60,16 @@ pub struct MeshAuth {
 }
 
 /// Parse peer authentication carried inside an encrypted NRXP session.
-/// `mesh:` remains supported for old nodes and means a direct egress. New
-/// routes use `mesh2:` to carry a hop budget and loop-prevention path.
+/// `mesh:` remains supported for old nodes and means a direct egress. `mesh2:`
+/// carries a hop budget and loop-prevention path. `mesh3:` additionally pins
+/// the selected egress for one flow.
 pub fn parse_mesh_auth_token(token: &str) -> Result<Option<MeshAuth>, &'static str> {
-    if let Some(claim) = token.strip_prefix("mesh2:") {
-        let mut fields = claim.splitn(5, ':');
+    let versioned_claim = token
+        .strip_prefix("mesh3:")
+        .map(|claim| (claim, true))
+        .or_else(|| token.strip_prefix("mesh2:").map(|claim| (claim, false)));
+    if let Some((claim, has_pinned_egress)) = versioned_claim {
+        let mut fields = claim.splitn(if has_pinned_egress { 6 } else { 5 }, ':');
         let peer_id = fields.next().unwrap_or_default();
         let peer_secret = fields.next().unwrap_or_default();
         let remaining_hops = fields
@@ -72,6 +80,20 @@ pub fn parse_mesh_auth_token(token: &str) -> Result<Option<MeshAuth>, &'static s
             .next()
             .and_then(MeshRouteSelection::from_wire_value)
             .ok_or("invalid mesh route selection")?;
+        let egress_node_id = if has_pinned_egress {
+            let value = fields.next().unwrap_or_default();
+            if value.is_empty()
+                || value.len() > 64
+                || !value
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || character == '-')
+            {
+                return Err("mesh route contains an invalid egress node id");
+            }
+            Some(value.to_owned())
+        } else {
+            None
+        };
         let visited = fields
             .next()
             .ok_or("missing mesh route path")?
@@ -106,6 +128,20 @@ pub fn parse_mesh_auth_token(token: &str) -> Result<Option<MeshAuth>, &'static s
                 return Err("mesh route contains a loop");
             }
         }
+        if let Some(egress) = egress_node_id.as_ref() {
+            let egress_is_last = visited
+                .last()
+                .is_some_and(|visited_node| visited_node.eq_ignore_ascii_case(egress));
+            let egress_was_visited_early = visited[..visited.len().saturating_sub(1)]
+                .iter()
+                .any(|visited_node| visited_node.eq_ignore_ascii_case(egress));
+            if egress_was_visited_early
+                || (remaining_hops == 1 && !egress_is_last)
+                || (remaining_hops > 1 && egress_is_last)
+            {
+                return Err("mesh route egress does not match the path");
+            }
+        }
 
         return Ok(Some(MeshAuth {
             peer_id: peer_id.to_owned(),
@@ -113,6 +149,7 @@ pub fn parse_mesh_auth_token(token: &str) -> Result<Option<MeshAuth>, &'static s
             route: Some(MeshRoute {
                 remaining_hops,
                 selection,
+                egress_node_id,
                 visited,
             }),
         }));

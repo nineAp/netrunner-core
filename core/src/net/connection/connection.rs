@@ -824,11 +824,12 @@ impl ClientHandler {
             // The egress confirms the target only after it is opened. X-hop
             // routes require a versioned acknowledgement so an older node
             // cannot silently shorten the configured path to two hops.
-            let expected_ready = if auth_token.starts_with("mesh2:") {
-                crate::net::MESH_ROUTE_READY
-            } else {
-                b"PONG"
-            };
+            let expected_ready =
+                if auth_token.starts_with("mesh2:") || auth_token.starts_with("mesh3:") {
+                    crate::net::MESH_ROUTE_READY
+                } else {
+                    b"PONG"
+                };
             match tokio::time::timeout(Duration::from_secs(8), v_rx.recv()).await {
                 Ok(Some(payload)) if payload.as_ref() == expected_ready => {}
                 _ => {
@@ -1870,7 +1871,9 @@ impl TunnelHandler for ServerHandler {
         // Netrunner-хендшейк (не сканер/чужой TLS-клиент), поэтому отказ здесь
         // — обычный разрыв, а не stealth-fallback (светить уже нечего).
         let parsed_mesh_auth = crate::net::parse_mesh_auth_token(&auth_token);
-        let is_mesh_peer = auth_token.starts_with("mesh:") || auth_token.starts_with("mesh2:");
+        let is_mesh_peer = auth_token.starts_with("mesh:")
+            || auth_token.starts_with("mesh2:")
+            || auth_token.starts_with("mesh3:");
         let auth_result = if is_mesh_peer {
             match &parsed_mesh_auth {
                 Err(reason) => Err(AppError::new(

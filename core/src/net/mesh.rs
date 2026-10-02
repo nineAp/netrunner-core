@@ -4,7 +4,7 @@
 //! in-memory view and probes peers from this node. Flows select a bounded,
 //! loop-free path and carry it through the NRXP mesh legs.
 
-use std::{cmp::Ordering, sync::Arc, time::Duration};
+use std::{cmp::Ordering, collections::HashMap, sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -141,9 +141,8 @@ impl NodeMesh {
     }
 
     /// A max-hop value of one means direct output. Two preserves the existing
-    /// nearest reachable egress behavior. For a larger limit, each flow chooses
-    /// a random path length from three through the configured maximum, then
-    /// uses RTT-weighted random peers with a successful recent probe.
+    /// nearest reachable egress behavior. For a larger limit, each flow picks
+    /// a random path length and pins a healthy RTT-weighted egress for the path.
     pub fn initial_route(&self) -> Option<MeshRoute> {
         (self.max_hops > 1).then(|| MeshRoute {
             remaining_hops: self.max_hops,
@@ -152,24 +151,76 @@ impl NodeMesh {
             } else {
                 MeshRouteSelection::WeightedRandom
             },
+            egress_node_id: None,
             visited: vec![self.local_node_id.clone()],
         })
     }
 
-    /// Turn a session's maximum route into the budget for one application
-    /// flow. Intermediates must retain the ingress-selected budget, so only the
-    /// originating node (the sole visited id) may shorten it.
-    pub fn route_for_flow(&self, route: &MeshRoute) -> MeshRoute {
+    /// Select a healthy egress and path budget once per application flow.
+    /// Intermediates preserve both choices from the encrypted mesh claim.
+    pub async fn route_for_flow(&self, route: &MeshRoute) -> Option<MeshRoute> {
         if route.selection != MeshRouteSelection::WeightedRandom
             || route.visited.len() != 1
-            || route.remaining_hops <= 3
+            || route.egress_node_id.is_some()
         {
-            return route.clone();
+            return Some(route.clone());
+        }
+
+        // A chain of N nodes needs N-1 distinct healthy peers from the
+        // ingress. Cap the random budget to the current healthy directory so
+        // a small fleet does not randomly choose an impossible path length.
+        let candidates = self.peers_for_route(route).await;
+        let max_available_hops = candidates
+            .len()
+            .saturating_add(1)
+            .min(usize::from(route.remaining_hops));
+        if max_available_hops < 3 {
+            return None;
         }
 
         let mut flow_route = route.clone();
-        flow_route.remaining_hops = rand::rng().random_range(3..=route.remaining_hops);
-        flow_route
+        flow_route.remaining_hops = rand::rng().random_range(3..=max_available_hops as u8);
+        flow_route.egress_node_id = Some(self.pick_healthy_egress(candidates)?.node_id);
+        Some(flow_route)
+    }
+
+    /// Pick among distinct public peer addresses so multiple node records on
+    /// one IP do not make that same website-visible egress disproportionately
+    /// likely. For each address, use its fastest healthy node as the RTT score.
+    fn pick_healthy_egress(&self, peers: Vec<MeshPeer>) -> Option<MeshPeer> {
+        let mut by_address = HashMap::<String, (MeshPeer, u32)>::new();
+        for peer in peers {
+            let Some(rtt) = self.recent_rtt_ms(&peer.node_id) else {
+                continue;
+            };
+            let address_key = peer.host.trim().to_ascii_lowercase();
+            match by_address.entry(address_key) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert((peer, rtt));
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry) if rtt < entry.get().1 => {
+                    entry.insert((peer, rtt));
+                }
+                std::collections::hash_map::Entry::Occupied(_) => {}
+            }
+        }
+
+        let candidates: Vec<_> = by_address.into_values().collect();
+        let fastest_rtt = candidates.iter().map(|(_, rtt)| *rtt).min()?.max(1);
+        let total_weight: u64 = candidates
+            .iter()
+            .map(|(_, rtt)| rtt_weight(fastest_rtt, *rtt))
+            .sum();
+        let mut draw = rand::rng().random_range(0..total_weight);
+        candidates.into_iter().find_map(|(peer, rtt)| {
+            let weight = rtt_weight(fastest_rtt, rtt);
+            if draw < weight {
+                Some(peer)
+            } else {
+                draw -= weight;
+                None
+            }
+        })
     }
 
     /// Return eligible next hops for a route. Weighted routes only use peers
@@ -184,6 +235,15 @@ impl NodeMesh {
                     .visited
                     .iter()
                     .any(|visited| visited.eq_ignore_ascii_case(&peer.node_id))
+            })
+            .filter(|peer| {
+                route.egress_node_id.as_ref().is_none_or(|egress| {
+                    if route.remaining_hops == 2 {
+                        peer.node_id.eq_ignore_ascii_case(egress)
+                    } else {
+                        !peer.node_id.eq_ignore_ascii_case(egress)
+                    }
+                })
             })
             .filter_map(|peer| {
                 let rtt = self.recent_rtt_ms(&peer.node_id);
@@ -278,6 +338,17 @@ impl NodeMesh {
             // keep acting as direct egresses during a rolling deployment.
             return self.auth_token();
         }
+        if let Some(egress_node_id) = &route.egress_node_id {
+            return format!(
+                "mesh3:{}:{}:{}:{}:{}:{}",
+                self.local_node_id,
+                self.local_node_secret,
+                route.remaining_hops,
+                route.selection.as_wire_value(),
+                egress_node_id,
+                route.visited.join(",")
+            );
+        }
         format!(
             "mesh2:{}:{}:{}:{}:{}",
             self.local_node_id,
@@ -303,7 +374,13 @@ impl NodeMesh {
                 "Direct output is configured for this node",
             )
         })?;
-        let route = self.route_for_flow(&route);
+        let route = self.route_for_flow(&route).await.ok_or_else(|| {
+            AppError::new(
+                ERR_INFRA_TIMEOUT,
+                "Mesh egress unavailable",
+                "At least two healthy peers are required for a pinned X-hop route",
+            )
+        })?;
         let peers = self.peers_for_route(&route).await;
         for peer in peers {
             let Some(next_route) = self.route_via_peer(&route, &peer.node_id) else {

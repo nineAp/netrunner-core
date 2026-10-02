@@ -223,7 +223,15 @@ impl RemoteOpener {
         is_udp: bool,
         upstream_peer: bool,
     ) {
-        let route = mesh.route_for_flow(&route);
+        let Some(route) = mesh.route_for_flow(&route).await else {
+            if !token.is_cancelled() {
+                let _ = ingress_muxer
+                    .send_control(ingress_stream_id, FrameType::Close, Bytes::new())
+                    .await;
+            }
+            ingress_muxer.remove_stream(ingress_stream_id);
+            return;
+        };
         let peers = mesh.peers_for_route(&route).await;
         let mut connected = None;
 
