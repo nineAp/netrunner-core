@@ -26,13 +26,18 @@ use super::connection::{ClientHandler, Muxer};
 use super::{MeshPeer, MeshRoute, MeshRouteSelection, MAX_MESH_HOPS};
 use crate::nrxp::FrameType;
 
-const PEER_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
-const PEER_PROBE_MAX_AGE: Duration = Duration::from_secs(45);
+// Mesh peers may have much higher latency than an app-to-ingress leg. Give a
+// TCP reachability probe enough time to cross a slow inter-node path instead
+// of misclassifying a working node as unhealthy.
+const PEER_PROBE_TIMEOUT: Duration = Duration::from_secs(8);
+const PEER_PROBE_MAX_AGE: Duration = Duration::from_secs(90);
+const PEER_PROBE_FAILURES_TO_EVICT: u8 = 3;
 
 #[derive(Clone, Copy)]
 struct PeerProbe {
     rtt_ms: u32,
     probed_at: std::time::Instant,
+    consecutive_failures: u8,
 }
 
 #[derive(Default)]
@@ -125,10 +130,26 @@ impl NodeMesh {
                         PeerProbe {
                             rtt_ms: start.elapsed().as_millis().clamp(1, u32::MAX as u128) as u32,
                             probed_at: std::time::Instant::now(),
+                            consecutive_failures: 0,
                         },
                     );
                 } else {
-                    rtt_ms.remove(&peer.node_id.to_ascii_lowercase());
+                    // A few lost probes are not enough to declare a node
+                    // unhealthy. Keep the last sample through transient misses;
+                    // evict only after the configured number of consecutive
+                    // failures. recent_rtt_ms() independently expires old
+                    // successful samples.
+                    let node_id = peer.node_id.to_ascii_lowercase();
+                    let evict = if let Some(mut previous) = rtt_ms.get_mut(&node_id) {
+                        previous.consecutive_failures =
+                            previous.consecutive_failures.saturating_add(1);
+                        previous.consecutive_failures >= PEER_PROBE_FAILURES_TO_EVICT
+                    } else {
+                        false
+                    };
+                    if evict {
+                        rtt_ms.remove(&node_id);
+                    }
                 }
             });
         }
