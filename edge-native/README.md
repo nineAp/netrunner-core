@@ -169,6 +169,7 @@ cargo run -p netrunner-edge-native -- --host 127.0.0.1 --port 8082
 VPN_NODE_ADDR=1.2.3.4:443 \
 LANDING_ADDR=netrunner-vpn.com:443 \
 BACKEND_ADDR=account.netrunner-vpn.com:443 \
+EDGE_DOMAIN=your-fresh-domain.example \
 DECOY_SNI=www.debian.org \
 AUTH_TOKEN=your-nrxp-bearer-token \
 cargo run -p netrunner-edge-native
@@ -203,6 +204,17 @@ BACKEND_ADDR=account.netrunner-vpn.com:443
 DECOY_SNI=www.debian.org
 AUTH_TOKEN=your-nrxp-bearer-token
 ```
+
+Для браузерного поиска и переходов по сайтам добавьте DNS-запись
+`browse.your-fresh-domain.example` на тот же relay (A/AAAA или CNAME на основной
+домен). Caddy сам выпустит для неё HTTPS-сертификат. В Actions отдельную
+переменную добавлять не нужно: `PUBLIC_DOMAIN` передаётся в `EDGE_DOMAIN`.
+Шлюз проксирует публичные HTTP(S)-адреса на портах 80 и 443, переписывает
+ссылки, редиректы и CSS-ресурсы. Он не передаёт cookies сайтов и не поддерживает
+WebSocket, поэтому вход в чужие аккаунты и сайты, которым нужны WebSocket или
+нестандартные порты, через него не заработают.
+Запросы и ответы буферизуются с пределом 16 MiB; загрузка больших файлов этим
+шлюзом не поддерживается.
 
 Обновление на уже развёрнутой VDS — `git pull && docker compose build &&
 docker compose up -d` (см. "Сборка для прода" ниже за тем, почему не `docker

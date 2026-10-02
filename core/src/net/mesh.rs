@@ -186,7 +186,11 @@ impl NodeMesh {
         let candidates = self.peers_for_route(route).await;
         if route.remaining_hops == 2 {
             let mut flow_route = route.clone();
-            flow_route.egress_node_id = Some(self.next_healthy_egress(candidates).await?.node_id);
+            flow_route.egress_node_id = Some(
+                self.next_healthy_egress(candidates, &[])
+                    .await?
+                    .node_id,
+            );
             return Some(flow_route);
         }
 
@@ -200,14 +204,59 @@ impl NodeMesh {
 
         let mut flow_route = route.clone();
         flow_route.remaining_hops = rand::rng().random_range(3..=max_available_hops as u8);
-        flow_route.egress_node_id = Some(self.next_healthy_egress(candidates).await?.node_id);
+        flow_route.egress_node_id = Some(
+            self.next_healthy_egress(candidates, &[])
+                .await?
+                .node_id,
+        );
         Some(flow_route)
+    }
+
+    /// Retry route setup before a flow is established: first try another
+    /// egress, then shorten an impossible X-hop chain. A live flow keeps its
+    /// selected route pinned for its full lifetime.
+    pub async fn retry_with_next_egress(
+        &self,
+        route: &MeshRoute,
+        failed_egress_ids: &[String],
+    ) -> Option<MeshRoute> {
+        if route.selection != MeshRouteSelection::WeightedRandom
+            || route.visited.len() != 1
+            || route.egress_node_id.is_none()
+            || route.remaining_hops < 2
+        {
+            return None;
+        }
+
+        let mut candidates_route = route.clone();
+        candidates_route.egress_node_id = None;
+        let candidates = self.peers_for_route(&candidates_route).await;
+        let (next_egress, shorten_chain) = match self
+            .next_healthy_egress(candidates.clone(), failed_egress_ids)
+            .await
+        {
+            Some(peer) => (peer, false),
+            None if route.remaining_hops > 2 => {
+                (self.next_healthy_egress(candidates, &[]).await?, true)
+            }
+            None => return None,
+        };
+        let mut retry_route = route.clone();
+        if shorten_chain {
+            retry_route.remaining_hops -= 1;
+        }
+        retry_route.egress_node_id = Some(next_egress.node_id);
+        Some(retry_route)
     }
 
     /// Rotate through a randomized, RTT-weighted permutation of healthy public
     /// peer addresses. Each distinct address is used once before the bag is
     /// reshuffled, so a fast peer cannot be selected repeatedly by chance.
-    async fn next_healthy_egress(&self, peers: Vec<MeshPeer>) -> Option<MeshPeer> {
+    async fn next_healthy_egress(
+        &self,
+        peers: Vec<MeshPeer>,
+        excluded_node_ids: &[String],
+    ) -> Option<MeshPeer> {
         let mut by_address = HashMap::<String, (MeshPeer, u32)>::new();
         let mut candidate_signature = Vec::with_capacity(peers.len());
         for peer in peers {
@@ -250,9 +299,16 @@ impl NodeMesh {
             rotation.pending = next_cycle.into();
         }
 
-        let (peer, address) = rotation.pending.pop_front()?;
-        rotation.last_address = Some(address);
-        Some(peer)
+        while let Some((peer, address)) = rotation.pending.pop_front() {
+            rotation.last_address = Some(address);
+            if !excluded_node_ids
+                .iter()
+                .any(|excluded| excluded.eq_ignore_ascii_case(&peer.node_id))
+            {
+                return Some(peer);
+            }
+        }
+        None
     }
 
     /// Return eligible next hops for a route. Weighted routes only use peers
@@ -365,9 +421,10 @@ impl NodeMesh {
 
     pub fn auth_token_for_route(&self, route: &MeshRoute) -> String {
         let route_size = route.remaining_hops as usize + route.visited.len().saturating_sub(1);
-        if route_size == 2 && route.selection == MeshRouteSelection::Nearest {
-            // Preserve the original 2-hop auth shape so existing nodes can
-            // keep acting as direct egresses during a rolling deployment.
+        if route_size == 2 {
+            // The ingress has already connected directly to the chosen egress,
+            // so no route claim is needed on this final hop. Keep the original
+            // auth shape for compatibility with nodes that predate mesh2/mesh3.
             return self.auth_token();
         }
         if let Some(egress_node_id) = &route.egress_node_id {
@@ -406,38 +463,58 @@ impl NodeMesh {
                 "Direct output is configured for this node",
             )
         })?;
-        let route = self.route_for_flow(&route).await.ok_or_else(|| {
+        let mut route = self.route_for_flow(&route).await.ok_or_else(|| {
             AppError::new(
                 ERR_INFRA_TIMEOUT,
                 "Mesh egress unavailable",
                 "No eligible healthy egress path is available",
             )
         })?;
-        let peers = self.peers_for_route(&route).await;
-        for peer in peers {
-            let Some(next_route) = self.route_via_peer(&route, &peer.node_id) else {
-                continue;
-            };
-            let auth_token = self.auth_token_for_route(&next_route);
-            match ClientHandler::connect_mesh_stream(&peer, &auth_token, target, is_udp).await {
-                Ok((muxer, rx, engine_task)) => {
-                    return Ok(MeshTunnel {
-                        sender: MeshTunnelSender {
-                            muxer: muxer.clone(),
-                            stream_id: 1,
-                            is_udp,
-                        },
-                        receiver: rx,
-                        muxer,
-                        engine_task: Some(engine_task),
-                    });
-                }
-                Err(_) => {
-                    // A failed peer must not expose the user's destination.
-                    // Try another peer, then fail closed if none is reachable.
-                    metrics::counter!("netrunner_mesh_egress_connect_failures_total").increment(1);
+        let mut failed_egress_ids = Vec::new();
+        loop {
+            if let Some(egress_id) = route.egress_node_id.as_ref() {
+                if !failed_egress_ids
+                    .iter()
+                    .any(|failed: &String| failed.eq_ignore_ascii_case(egress_id))
+                {
+                    failed_egress_ids.push(egress_id.clone());
                 }
             }
+            let peers = self.peers_for_route(&route).await;
+            for peer in peers {
+                let Some(next_route) = self.route_via_peer(&route, &peer.node_id) else {
+                    continue;
+                };
+                let auth_token = self.auth_token_for_route(&next_route);
+                match ClientHandler::connect_mesh_stream(&peer, &auth_token, target, is_udp).await {
+                    Ok((muxer, rx, engine_task)) => {
+                        return Ok(MeshTunnel {
+                            sender: MeshTunnelSender {
+                                muxer: muxer.clone(),
+                                stream_id: 1,
+                                is_udp,
+                            },
+                            receiver: rx,
+                            muxer,
+                            engine_task: Some(engine_task),
+                        });
+                    }
+                    Err(_) => {
+                        metrics::counter!("netrunner_mesh_egress_connect_failures_total")
+                            .increment(1);
+                    }
+                }
+            }
+            let Some(retry_route) = self
+                .retry_with_next_egress(&route, &failed_egress_ids)
+                .await
+            else {
+                break;
+            };
+            if retry_route.remaining_hops != route.remaining_hops {
+                failed_egress_ids.clear();
+            }
+            route = retry_route;
         }
 
         Err(AppError::new(

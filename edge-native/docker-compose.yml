@@ -43,6 +43,7 @@ services:
       - VPN_NODE_ADDR=${VPN_NODE_ADDR}
       - LANDING_ADDR=${LANDING_ADDR}
       - BACKEND_ADDR=${BACKEND_ADDR}
+      - EDGE_DOMAIN=${EDGE_DOMAIN}
       - DECOY_SNI=${DECOY_SNI:-www.debian.org}
       - AUTH_TOKEN=${AUTH_TOKEN:-}
       - NRXP_SECRET=${NRXP_SECRET:?NRXP_SECRET must be set to authenticate with the VPN node}

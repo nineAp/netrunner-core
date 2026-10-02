@@ -223,7 +223,7 @@ impl RemoteOpener {
         is_udp: bool,
         upstream_peer: bool,
     ) {
-        let Some(route) = mesh.route_for_flow(&route).await else {
+        let Some(mut route) = mesh.route_for_flow(&route).await else {
             if !token.is_cancelled() {
                 let _ = ingress_muxer
                     .send_control(ingress_stream_id, FrameType::Close, Bytes::new())
@@ -232,40 +232,63 @@ impl RemoteOpener {
             ingress_muxer.remove_stream(ingress_stream_id);
             return;
         };
-        let peers = mesh.peers_for_route(&route).await;
+        let mut failed_egress_ids: Vec<String> = Vec::new();
         let mut connected = None;
-
-        for peer in peers {
-            if token.is_cancelled() {
-                break;
+        loop {
+            if let Some(egress_id) = route.egress_node_id.as_ref() {
+                if !failed_egress_ids
+                    .iter()
+                    .any(|failed| failed.eq_ignore_ascii_case(egress_id))
+                {
+                    failed_egress_ids.push(egress_id.clone());
+                }
             }
-            let Some(next_route) = mesh.route_via_peer(&route, &peer.node_id) else {
-                continue;
-            };
-            let auth_token = mesh.auth_token_for_route(&next_route);
-            let result = tokio::select! {
-                _ = token.cancelled() => break,
-                result = Box::pin(
-                    crate::net::connection::connection::ClientHandler::connect_mesh_stream(
-                        &peer,
-                        &auth_token,
-                        &target,
-                        is_udp,
-                    ),
-                ) => result,
-            };
-            match result {
-                Ok((peer_muxer, peer_rx, engine_task)) => {
-                    metrics::counter!("netrunner_mesh_egress_streams_total").increment(1);
-                    connected = Some((peer_muxer, peer_rx, engine_task));
+            for peer in mesh.peers_for_route(&route).await {
+                if token.is_cancelled() {
                     break;
                 }
-                Err(_) => {
-                    // Keep failure detail local: peer addresses and destination
-                    // data do not belong in normal connection logs.
-                    metrics::counter!("netrunner_mesh_egress_connect_failures_total").increment(1);
+                let Some(next_route) = mesh.route_via_peer(&route, &peer.node_id) else {
+                    continue;
+                };
+                let auth_token = mesh.auth_token_for_route(&next_route);
+                let result = tokio::select! {
+                    _ = token.cancelled() => break,
+                    result = Box::pin(
+                        crate::net::connection::connection::ClientHandler::connect_mesh_stream(
+                            &peer,
+                            &auth_token,
+                            &target,
+                            is_udp,
+                        ),
+                    ) => result,
+                };
+                match result {
+                    Ok((peer_muxer, peer_rx, engine_task)) => {
+                        metrics::counter!("netrunner_mesh_egress_streams_total").increment(1);
+                        connected = Some((peer_muxer, peer_rx, engine_task));
+                        break;
+                    }
+                    Err(_) => {
+                        // Keep failure detail local: peer addresses and destination
+                        // data do not belong in normal connection logs.
+                        metrics::counter!("netrunner_mesh_egress_connect_failures_total")
+                            .increment(1);
+                    }
                 }
             }
+            if connected.is_some() || token.is_cancelled() {
+                break;
+            }
+            let Some(retry_route) = mesh
+                .retry_with_next_egress(&route, &failed_egress_ids)
+                .await
+            else {
+                break;
+            };
+            if retry_route.remaining_hops != route.remaining_hops {
+                failed_egress_ids.clear();
+            }
+            route = retry_route;
         }
 
         let Some((peer_muxer, mut peer_rx, engine_task)) = connected else {

@@ -24,11 +24,12 @@
 //! `TcpStream::connect` здесь `TunnelStream::connect`.
 
 use crate::tunnel_stream::TunnelStream;
+use crate::browser_proxy::{self, Target as BrowserTarget};
 use crate::EdgeConfig;
 use axum::body::Body;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use http_body_util::{BodyExt, Full};
 use hyper::header;
 use hyper_util::rt::TokioIo;
@@ -38,6 +39,7 @@ use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tokio_rustls::rustls;
 use tokio_rustls::TlsConnector;
+use tokio::io::{AsyncRead, AsyncWrite};
 
 /// Один keep-alive HTTP/1.1-отправитель поверх уже установленного
 /// NRXP-туннеля + внутреннего TLS до бэкенда — то, чем реально владеет пул в
@@ -258,7 +260,63 @@ async fn try_proxy(cfg: &EdgeConfig, req: axum::extract::Request) -> Result<Resp
         .map(|pq| pq.as_str())
         .unwrap_or("/")
         .to_string();
-    if route_for(cfg, &path_and_query).0 == SEARCH_UPSTREAM_ADDR
+    let request_host = parts
+        .headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    let is_browser_gateway = host_without_port(request_host)
+        .eq_ignore_ascii_case(&cfg.browser_proxy_domain);
+
+    if !is_browser_gateway {
+        if let Some(search_path) = search_upstream_path(&path_and_query) {
+            if let Some((search_route, search_query)) = search_path.split_once('?') {
+                if search_route.starts_with("/l/") {
+                    if let Some(target) = browser_proxy::search_redirect(search_query) {
+                        let location = browser_proxy::gateway_url(
+                            &target,
+                            &cfg.browser_proxy_domain,
+                        );
+                        return Response::builder()
+                            .status(StatusCode::FOUND)
+                            .header(header::LOCATION, location)
+                            .header(header::CACHE_CONTROL, "no-store")
+                            .body(Body::empty())
+                            .map_err(|error| format!("building search redirect: {error}"));
+                    }
+                }
+            }
+        }
+    }
+
+    let browser_target = if is_browser_gateway {
+        let parsed = if path_and_query.starts_with("/browse/") {
+            browser_proxy::parse_target(&path_and_query).await
+        } else if let Some(referer) = parts.headers.get(header::REFERER).and_then(|v| v.to_str().ok()) {
+            browser_proxy::parse_referer_target(
+                referer,
+                &path_and_query,
+                &cfg.browser_proxy_domain,
+            )
+            .await
+        } else {
+            Err("browse URL is missing".to_string())
+        };
+        match parsed {
+            Ok(target) => Some(target),
+            Err(error) => {
+                return Ok(Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .header(header::CACHE_CONTROL, "no-store")
+                    .body(Body::from(error))
+                    .unwrap_or_else(|_| StatusCode::BAD_REQUEST.into_response()));
+            }
+        }
+    } else {
+        None
+    };
+    if browser_target.is_none()
+        && route_for(cfg, &path_and_query).0 == SEARCH_UPSTREAM_ADDR
         && parts.method != hyper::Method::GET
         && parts.method != hyper::Method::HEAD
     {
@@ -305,21 +363,55 @@ async fn try_proxy(cfg: &EdgeConfig, req: axum::extract::Request) -> Result<Resp
             .map_err(|e| format!("building account-redirect response: {e}"));
     }
 
-    let (target_addr, pool) = route_for(cfg, &path_and_query);
-    let (target_host, _) = target_addr
-        .rsplit_once(':')
-        .ok_or_else(|| format!("upstream addr must be host:port, got {target_addr:?}"))?;
+    let static_route = if browser_target.is_none() {
+        Some(route_for(cfg, &path_and_query))
+    } else {
+        None
+    };
+    let dynamic_pool = if let Some(target) = &browser_target {
+        Some(browser_pool(cfg, &target.pool_key).await)
+    } else {
+        None
+    };
+    let (target_addr, target_host, target_authority, pool, use_tls) =
+        if let Some(target) = &browser_target {
+            (
+                target.connect_addr.clone(),
+                target.url.host_str().unwrap_or_default().to_string(),
+                target.host_header.clone(),
+                dynamic_pool.as_deref().expect("dynamic browser pool"),
+                target.tls,
+            )
+        } else {
+            let (target_addr, pool) = static_route.expect("static route");
+            let (target_host, _) = target_addr
+                .rsplit_once(':')
+                .ok_or_else(|| format!("upstream addr must be host:port, got {target_addr:?}"))?;
+            (
+                target_addr.to_string(),
+                target_host.to_string(),
+                target_host.to_string(),
+                pool,
+                true,
+            )
+        };
 
     // Только у BACKEND_ADDR путь может нести префикс "/account", который
     // сам бэкенд не понимает (см. doc на `strip_account_prefix`) — у
     // LANDING_ADDR путь пересылается как есть, ничего резать не нужно.
-    let forwarded_path = if target_addr == SEARCH_UPSTREAM_ADDR {
-        search_upstream_path(&path_and_query)
-            .unwrap_or_else(|| std::borrow::Cow::Borrowed(path_and_query.as_str()))
-    } else if target_addr == cfg.backend_addr {
-        strip_account_prefix(&path_and_query)
+    let forwarded_path = if let Some(target) = &browser_target {
+        target_path_and_query(&target.url)
     } else {
-        std::borrow::Cow::Borrowed(path_and_query.as_str())
+        if target_addr == SEARCH_UPSTREAM_ADDR && path_and_query.starts_with("/search") {
+            match path_and_query.split_once('?') {
+                Some((_, query)) => std::borrow::Cow::Owned(format!("/html/?{query}")),
+                None => std::borrow::Cow::Borrowed("/html/"),
+            }
+        } else if target_addr == cfg.backend_addr {
+            strip_account_prefix(&path_and_query)
+        } else {
+            std::borrow::Cow::Borrowed(path_and_query.as_str())
+        }
     };
 
     let body_bytes = axum::body::to_bytes(body, MAX_PROXIED_BODY_BYTES)
@@ -347,13 +439,35 @@ async fn try_proxy(cfg: &EdgeConfig, req: axum::extract::Request) -> Result<Resp
             // домен ЭТОЙ VDS и не поймёт, какой виртуальный хост отдавать (то
             // же самое сделал бы любой обычный reverse-proxy). Hop-by-hop —
             // см. doc `is_hop_by_hop`.
+            let browser_credential = browser_target.is_some()
+                && (name == header::COOKIE
+                    || name == header::AUTHORIZATION
+                    || name == header::ACCEPT_ENCODING
+                    || name == header::ORIGIN
+                    || name == header::REFERER);
             let search_credential = target_addr == SEARCH_UPSTREAM_ADDR
-                && (name == header::COOKIE || name == header::AUTHORIZATION);
-            if name != header::HOST && !is_hop_by_hop(name) && !search_credential {
+                && (name == header::COOKIE
+                    || name == header::AUTHORIZATION
+                    || name == header::ACCEPT_ENCODING);
+            if name != header::HOST
+                && !is_hop_by_hop(name)
+                && !search_credential
+                && !browser_credential
+            {
                 builder = builder.header(name, value);
             }
         }
-        builder = builder.header(header::HOST, target_host);
+        builder = builder.header(header::HOST, target_authority.as_str());
+        if let Some(target) = &browser_target {
+            builder = builder
+                .header(header::ACCEPT_ENCODING, "identity")
+                .header(header::ORIGIN, target.url.origin().ascii_serialization())
+                .header(header::REFERER, target.url.as_str());
+        } else if target_addr == SEARCH_UPSTREAM_ADDR {
+            // The search-result HTML must remain uncompressed until links are
+            // rewritten to the browse gateway.
+            builder = builder.header(header::ACCEPT_ENCODING, "identity");
+        }
         // Живой баг: бэкенд определяет по Host, безопасно ли ставить
         // `Set-Cookie: ...; Domain=.netrunner-vpn.com` (см.
         // cookie_domain_attr в netrunner-backend/src/modules/auth/controller.rs)
@@ -369,8 +483,10 @@ async fn try_proxy(cfg: &EdgeConfig, req: axum::extract::Request) -> Result<Resp
         // реально видел браузер; без него у бэкенда просто нет способа
         // отличить "настоящий account.netrunner-vpn.com" от "зеркало,
         // прикидывающееся им ради маршрутизации".
-        if let Some(ref host) = original_host {
+        if browser_target.is_none() {
+            if let Some(ref host) = original_host {
             builder = builder.header("x-forwarded-host", host.as_str());
+            }
         }
         builder
             .body(Full::new(body_bytes.clone()))
@@ -387,7 +503,14 @@ async fn try_proxy(cfg: &EdgeConfig, req: axum::extract::Request) -> Result<Resp
         match send_and_collect(&mut pooled, build_request()?).await {
             Ok(response) => {
                 push_pooled(pool, pooled).await;
-                let (parts, body_bytes) = response;
+                let (mut parts, mut body_bytes) = response;
+                rewrite_response(
+                    &mut parts,
+                    &mut body_bytes,
+                    browser_target.as_ref(),
+                    cfg,
+                    target_addr == SEARCH_UPSTREAM_ADDR,
+                )?;
                 return build_response(parts, body_bytes);
             }
             Err(error) if error.is_request_send() || retryable => {
@@ -397,12 +520,25 @@ async fn try_proxy(cfg: &EdgeConfig, req: axum::extract::Request) -> Result<Resp
         }
     }
 
-    let first_fresh = fresh_attempt(cfg, target_addr, target_host, &build_request).await;
+    let first_fresh = fresh_attempt(
+        cfg,
+        &target_addr,
+        &target_host,
+        use_tls,
+        &build_request,
+    )
+    .await;
     let (response_parts, response_bytes, fresh_sender) = match first_fresh {
         Ok(result) => result,
         Err(first_error) if retryable => {
             tokio::time::sleep(Duration::from_millis(100)).await;
-            fresh_attempt(cfg, target_addr, target_host, &build_request)
+            fresh_attempt(
+                cfg,
+                &target_addr,
+                &target_host,
+                use_tls,
+                &build_request,
+            )
                 .await
                 .map_err(|retry_error| {
                     format!(
@@ -418,7 +554,118 @@ async fn try_proxy(cfg: &EdgeConfig, req: axum::extract::Request) -> Result<Resp
         warn!("[netrunner-edge] discarded stale upstream connection: {pooled_error}");
     }
 
+    let mut response_parts = response_parts;
+    let mut response_bytes = response_bytes;
+    rewrite_response(
+        &mut response_parts,
+        &mut response_bytes,
+        browser_target.as_ref(),
+        cfg,
+        target_addr == SEARCH_UPSTREAM_ADDR,
+    )?;
     build_response(response_parts, response_bytes)
+}
+
+fn host_without_port(authority: &str) -> &str {
+    if authority.starts_with('[') {
+        authority.split_once(']').map_or(authority, |(host, _)| host)
+    } else {
+        authority.split(':').next().unwrap_or(authority)
+    }
+}
+
+fn target_path_and_query(url: &url::Url) -> std::borrow::Cow<'static, str> {
+    let path = url.path();
+    match url.query() {
+        Some(query) => std::borrow::Cow::Owned(format!("{path}?{query}")),
+        None => std::borrow::Cow::Owned(path.to_string()),
+    }
+}
+
+async fn browser_pool(
+    cfg: &EdgeConfig,
+    key: &str,
+) -> std::sync::Arc<tokio::sync::Mutex<Vec<PooledSender>>> {
+    let mut pools = cfg.browser_pools.lock().await;
+    if let Some(pool) = pools.get(key) {
+        return pool.clone();
+    }
+    // The public-site gateway can see arbitrary destination hosts. Keep the
+    // origin cache bounded so unique one-off hostnames cannot grow it forever.
+    if pools.len() >= 64 {
+        return std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    }
+    pools
+        .entry(key.to_string())
+        .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new())))
+        .clone()
+}
+
+fn rewrite_response(
+    parts: &mut hyper::http::response::Parts,
+    body: &mut Bytes,
+    target: Option<&BrowserTarget>,
+    cfg: &EdgeConfig,
+    is_search: bool,
+) -> Result<(), String> {
+    if let Some(target) = target {
+        if let Some(location) = parts.headers.get(header::LOCATION).and_then(|v| v.to_str().ok()) {
+            if let Ok(url) = target.url.join(location) {
+                if matches!(url.scheme(), "http" | "https") {
+                    let proxied = browser_proxy::gateway_url(&url, &cfg.browser_proxy_domain);
+                    parts.headers.insert(
+                        header::LOCATION,
+                        hyper::header::HeaderValue::from_str(&proxied)
+                            .map_err(|error| format!("rewriting redirect: {error}"))?,
+                    );
+                }
+            }
+        }
+        parts.headers.remove(header::SET_COOKIE);
+        parts.headers.remove("content-security-policy");
+        parts.headers.remove("content-security-policy-report-only");
+        rewrite_document_body(parts, body, &target.url, cfg)?;
+    } else if is_search {
+        let base = url::Url::parse("https://html.duckduckgo.com/html/")
+            .expect("static search URL is valid");
+        rewrite_document_body(parts, body, &base, cfg)?;
+    }
+    Ok(())
+}
+
+fn rewrite_document_body(
+    parts: &hyper::http::response::Parts,
+    body: &mut Bytes,
+    base_url: &url::Url,
+    cfg: &EdgeConfig,
+) -> Result<(), String> {
+    let Some(content_type) = parts.headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()) else {
+        return Ok(());
+    };
+    let content_type = content_type.to_ascii_lowercase();
+    if content_type.contains("text/css") {
+        if let Some(rewritten) = browser_proxy::rewrite_css(body, base_url, &cfg.browser_proxy_domain) {
+            *body = Bytes::from(rewritten);
+        }
+        return Ok(());
+    }
+    if !content_type.contains("text/html") && !content_type.contains("application/xhtml+xml") {
+        return Ok(());
+    }
+    if std::str::from_utf8(body).is_err() {
+        return Ok(());
+    }
+    let relay_domain = cfg
+        .browser_proxy_domain
+        .strip_prefix("browse.")
+        .unwrap_or(&cfg.browser_proxy_domain);
+    *body = Bytes::from(browser_proxy::rewrite_html(
+        body,
+        base_url,
+        &cfg.browser_proxy_domain,
+        relay_domain,
+    )?);
+    Ok(())
 }
 
 fn build_response(
@@ -481,27 +728,37 @@ async fn send_and_collect(
             detail: error.to_string(),
         })?;
     let (parts, body) = response.into_parts();
-    let body_bytes = body
-        .collect()
-        .await
-        .map_err(|error| AttemptFailure {
+    let mut body = body;
+    let mut body_bytes = BytesMut::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|error| AttemptFailure {
             phase: "reading backend response body",
             detail: error.to_string(),
-        })?
-        .to_bytes();
-    Ok((parts, body_bytes))
+        })?;
+        if let Ok(data) = frame.into_data() {
+            if data.len() > MAX_PROXIED_BODY_BYTES.saturating_sub(body_bytes.len()) {
+                return Err(AttemptFailure {
+                    phase: "reading backend response body",
+                    detail: format!("response exceeds {MAX_PROXIED_BODY_BYTES} byte buffer limit"),
+                });
+            }
+            body_bytes.extend_from_slice(&data);
+        }
+    }
+    Ok((parts, body_bytes.freeze()))
 }
 
 async fn fresh_attempt<F>(
     cfg: &EdgeConfig,
     target_addr: &str,
     target_host: &str,
+    use_tls: bool,
     build_request: &F,
 ) -> Result<(hyper::http::response::Parts, Bytes, PooledSender), String>
 where
     F: Fn() -> Result<hyper::Request<Full<Bytes>>, String>,
 {
-    let mut sender = connect_backend(cfg, target_addr, target_host).await?;
+    let mut sender = connect_backend(cfg, target_addr, target_host, use_tls).await?;
     let (parts, body) = send_and_collect(&mut sender, build_request()?)
         .await
         .map_err(|error| error.to_string())?;
@@ -544,6 +801,7 @@ async fn connect_backend(
     cfg: &EdgeConfig,
     target_addr: &str,
     target_host: &str,
+    use_tls: bool,
 ) -> Result<PooledSender, String> {
     let _permit = CONNECT_LIMIT
         .acquire()
@@ -552,7 +810,7 @@ async fn connect_backend(
 
     tokio::time::timeout(
         BACKEND_CONNECT_TIMEOUT,
-        connect_backend_inner(cfg, target_addr, target_host),
+        connect_backend_inner(cfg, target_addr, target_host, use_tls),
     )
     .await
     .map_err(|_| {
@@ -567,19 +825,30 @@ async fn connect_backend_inner(
     cfg: &EdgeConfig,
     target_addr: &str,
     target_host: &str,
+    use_tls: bool,
 ) -> Result<PooledSender, String> {
     let tunnel_stream = TunnelStream::connect(cfg, target_addr).await?;
 
-    let connector = TlsConnector::from(TLS_CONFIG.clone());
-    let server_name = ServerName::try_from(target_host.to_string())
-        .map_err(|e| format!("invalid upstream hostname {target_host:?}: {e}"))?;
-    let tls_stream = connector
-        .connect(server_name, tunnel_stream)
-        .await
-        .map_err(|e| format!("TLS handshake with backend failed: {e}"))?;
+    if use_tls {
+        let connector = TlsConnector::from(TLS_CONFIG.clone());
+        let server_name = ServerName::try_from(target_host.to_string())
+            .map_err(|e| format!("invalid upstream hostname {target_host:?}: {e}"))?;
+        let tls_stream = connector
+            .connect(server_name, tunnel_stream)
+            .await
+            .map_err(|e| format!("TLS handshake with backend failed: {e}"))?;
+        finish_http_handshake(tls_stream).await
+    } else {
+        finish_http_handshake(tunnel_stream).await
+    }
+}
 
+async fn finish_http_handshake<S>(stream: S) -> Result<PooledSender, String>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let (send_request, connection) =
-        hyper::client::conn::http1::handshake(TokioIo::new(tls_stream))
+        hyper::client::conn::http1::handshake(TokioIo::new(stream))
             .await
             .map_err(|e| format!("HTTP/1 handshake with backend failed: {e}"))?;
 
@@ -630,6 +899,7 @@ mod tests {
             vpn_node_addr: "1.2.3.4:443".to_string(),
             landing_addr: "netrunner-vpn.com:443".to_string(),
             backend_addr: "account.netrunner-vpn.com:443".to_string(),
+            browser_proxy_domain: "browse.mirror.example".to_string(),
             decoy_sni: "cloudflare.com".to_string(),
             auth_token: String::new(),
             // Маршрутизация HTTP не зависит от учётных данных ноды — они нужны
@@ -638,6 +908,7 @@ mod tests {
             landing_pool: tokio::sync::Mutex::new(Vec::new()),
             backend_pool: tokio::sync::Mutex::new(Vec::new()),
             search_pool: tokio::sync::Mutex::new(Vec::new()),
+            browser_pools: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 

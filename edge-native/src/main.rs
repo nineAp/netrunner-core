@@ -62,6 +62,7 @@
 //! секрет (`AUTH_TOKEN`) в их числе — ничего не зашито в бинарь.
 
 mod bridge;
+mod browser_proxy;
 mod proxy_http;
 mod tunnel_stream;
 
@@ -134,6 +135,8 @@ pub struct EdgeConfig {
     /// лендингом, тихо ловили 404 — сайт зеркалировал лендинг, но не мог
     /// дотянуться до его же бэкенда.
     pub(crate) backend_addr: String,
+    /// Separate origin for proxied public websites.
+    pub(crate) browser_proxy_domain: String,
     /// Домен-декой для поддельного `ClientHello` — должен резолвиться и
     /// отвечать 200, чтобы отпечаток держался правдоподобно (см.
     /// `core::net::DEFAULT_DECOY_HOST` и ARCH.md в основном репозитории).
@@ -176,6 +179,8 @@ pub struct EdgeConfig {
     /// Keep search-engine connections separate from the site pools: they have
     /// a different upstream Host and TLS identity.
     pub(crate) search_pool: tokio::sync::Mutex<Vec<proxy_http::PooledSender>>,
+    /// Dynamic keep-alive pools keyed by scheme, hostname, and port.
+    pub(crate) browser_pools: tokio::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<Vec<proxy_http::PooledSender>>>>>,
 }
 
 impl EdgeConfig {
@@ -193,6 +198,8 @@ impl EdgeConfig {
             .expect("LANDING_ADDR обязателен — host:port витрины/лендинга за нодой");
         let backend_addr = std::env::var("BACKEND_ADDR")
             .expect("BACKEND_ADDR обязателен — host:port бэкенда (API) за нодой");
+        let edge_domain = std::env::var("EDGE_DOMAIN")
+            .expect("EDGE_DOMAIN обязателен — домен edge из Caddyfile");
         let decoy_sni = std::env::var("DECOY_SNI").unwrap_or_else(|_| "www.debian.org".to_string());
         let auth_token = std::env::var("AUTH_TOKEN").unwrap_or_default();
         validate_host_port("VPN_NODE_ADDR", &vpn_node_addr);
@@ -217,12 +224,14 @@ impl EdgeConfig {
             vpn_node_addr,
             landing_addr,
             backend_addr,
+            browser_proxy_domain: format!("browse.{}", edge_domain.trim_end_matches('.')),
             decoy_sni,
             auth_token,
             identity,
             landing_pool: tokio::sync::Mutex::new(Vec::new()),
             backend_pool: tokio::sync::Mutex::new(Vec::new()),
             search_pool: tokio::sync::Mutex::new(Vec::new()),
+            browser_pools: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 }

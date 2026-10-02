@@ -9,3 +9,7 @@
 {$EDGE_DOMAIN} {
 	reverse_proxy edge:8082
 }
+
+browse.{$EDGE_DOMAIN} {
+	reverse_proxy edge:8082
+}
