@@ -114,9 +114,9 @@ struct Args {
     #[arg(long, default_value_t = false)]
     mesh_enabled: bool,
 
-    /// Maximum proxy-node count in a route: 1 = direct, 2 = nearest egress,
-    /// 3..=8 = per-flow random length up to the limit and a pinned healthy
-    /// egress, selected with a capped RTT preference.
+    /// Maximum proxy-node count in a route: 1 = direct, 2 = RTT-weighted
+    /// rotating healthy egress, 3..=8 = per-flow random length up to the limit
+    /// with a pinned healthy egress.
     #[arg(long, default_value_t = 2)]
     mesh_max_hops: u8,
 

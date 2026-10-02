@@ -154,17 +154,16 @@ impl NodeMesh {
         peers
     }
 
-    /// A max-hop value of one means direct output. Two preserves the existing
-    /// nearest reachable egress behavior. For a larger limit, each flow picks
-    /// a random path length and pins a healthy RTT-weighted egress for the path.
+    /// A max-hop value of one means direct output. Two keeps the normal
+    /// two-node route and selects a healthy RTT-weighted egress per flow. For
+    /// a larger limit, each flow also picks a random path length up to the cap.
     pub fn initial_route(&self) -> Option<MeshRoute> {
         (self.max_hops > 1).then(|| MeshRoute {
             remaining_hops: self.max_hops,
-            selection: if self.max_hops == 2 {
-                MeshRouteSelection::Nearest
-            } else {
-                MeshRouteSelection::WeightedRandom
-            },
+            // Even the normal two-hop mode must rotate healthy egress IPs.
+            // `WeightedRandom` selects the egress in route_for_flow; path
+            // length is randomized there only when the configured cap is > 2.
+            selection: MeshRouteSelection::WeightedRandom,
             egress_node_id: None,
             visited: vec![self.local_node_id.clone()],
         })
@@ -180,10 +179,17 @@ impl NodeMesh {
             return Some(route.clone());
         }
 
-        // A chain of N nodes needs N-1 distinct healthy peers from the
-        // ingress. Cap the random budget to the current healthy directory so
-        // a small fleet does not randomly choose an impossible path length.
+        // Pick one healthy egress for every flow, including the ordinary
+        // two-hop route. For max_hops > 2, also cap the randomized path length
+        // to the current healthy directory so a small fleet cannot select an
+        // impossible chain.
         let candidates = self.peers_for_route(route).await;
+        if route.remaining_hops == 2 {
+            let mut flow_route = route.clone();
+            flow_route.egress_node_id = Some(self.next_healthy_egress(candidates).await?.node_id);
+            return Some(flow_route);
+        }
+
         let max_available_hops = candidates
             .len()
             .saturating_add(1)
@@ -404,7 +410,7 @@ impl NodeMesh {
             AppError::new(
                 ERR_INFRA_TIMEOUT,
                 "Mesh egress unavailable",
-                "At least two healthy peers are required for a pinned X-hop route",
+                "No eligible healthy egress path is available",
             )
         })?;
         let peers = self.peers_for_route(&route).await;

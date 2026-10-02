@@ -47,7 +47,7 @@ pub struct MeshRoute {
     pub remaining_hops: u8,
     pub selection: MeshRouteSelection,
     /// Exit selected by the ingress for this flow. `None` is retained for
-    /// legacy mesh2 routes and the nearest 2-node mode.
+    /// legacy mesh2 routes and older nearest-egress routes.
     pub egress_node_id: Option<String>,
     pub visited: Vec<String>,
 }
