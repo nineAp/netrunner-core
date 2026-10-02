@@ -65,6 +65,13 @@ pub struct MeshAuth {
 /// carries a hop budget and loop-prevention path. `mesh3:` additionally pins
 /// the selected egress for one flow.
 pub fn parse_mesh_auth_token(token: &str) -> Result<Option<MeshAuth>, &'static str> {
+    if token.len() > 1024
+        && (token.starts_with("mesh:")
+            || token.starts_with("mesh2:")
+            || token.starts_with("mesh3:"))
+    {
+        return Err("mesh credential exceeds the maximum size");
+    }
     let versioned_claim = token
         .strip_prefix("mesh3:")
         .map(|claim| (claim, true))
@@ -102,7 +109,10 @@ pub fn parse_mesh_auth_token(token: &str) -> Result<Option<MeshAuth>, &'static s
             .map(str::to_owned)
             .collect::<Vec<_>>();
 
-        if peer_id.is_empty() || peer_secret.is_empty() || visited.is_empty() {
+        if !valid_mesh_node_id(peer_id)
+            || !valid_mesh_peer_secret(peer_secret)
+            || visited.is_empty()
+        {
             return Err("incomplete mesh peer credentials or route");
         }
         if remaining_hops == 0 || remaining_hops > MAX_MESH_HOPS {
@@ -112,13 +122,7 @@ pub fn parse_mesh_auth_token(token: &str) -> Result<Option<MeshAuth>, &'static s
         if route_size > MAX_MESH_HOPS as usize || visited.len() > MAX_MESH_HOPS as usize {
             return Err("mesh route exceeds the maximum hop count");
         }
-        if visited.iter().any(|node_id| {
-            node_id.is_empty()
-                || node_id.len() > 64
-                || !node_id
-                    .chars()
-                    .all(|character| character.is_ascii_alphanumeric() || character == '-')
-        }) {
+        if visited.iter().any(|node_id| !valid_mesh_node_id(node_id)) {
             return Err("mesh route contains an invalid node id");
         }
         for (index, node_id) in visited.iter().enumerate() {
@@ -160,7 +164,7 @@ pub fn parse_mesh_auth_token(token: &str) -> Result<Option<MeshAuth>, &'static s
         let (peer_id, peer_secret) = claim
             .split_once(':')
             .ok_or("malformed mesh peer credentials")?;
-        if peer_id.is_empty() || peer_secret.is_empty() {
+        if !valid_mesh_node_id(peer_id) || !valid_mesh_peer_secret(peer_secret) {
             return Err("incomplete mesh peer credentials");
         }
         return Ok(Some(MeshAuth {
@@ -171,6 +175,18 @@ pub fn parse_mesh_auth_token(token: &str) -> Result<Option<MeshAuth>, &'static s
     }
 
     Ok(None)
+}
+
+fn valid_mesh_node_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '-')
+}
+
+fn valid_mesh_peer_secret(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 128 && !value.chars().any(char::is_control)
 }
 
 /// Public connection data for one node in the mesh. The control plane returns
@@ -282,5 +298,73 @@ pub trait AuthValidator: Send + Sync {
             "Mesh peer rejected",
             "Mesh peer validation is not configured",
         ))
+    }
+}
+
+#[cfg(test)]
+mod mesh_auth_token_tests {
+    use super::{parse_mesh_auth_token, MeshRouteSelection};
+
+    #[test]
+    fn accepts_legacy_and_versioned_mesh_claims() {
+        let legacy = parse_mesh_auth_token("mesh:node-a:secret")
+            .unwrap()
+            .unwrap();
+        assert_eq!(legacy.peer_id, "node-a");
+        assert!(legacy.route.is_none());
+
+        let mesh2 = parse_mesh_auth_token("mesh2:node-a:secret:2:weighted-random:node-a")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            mesh2.route.unwrap().selection,
+            MeshRouteSelection::WeightedRandom
+        );
+
+        let mesh3 =
+            parse_mesh_auth_token("mesh3:node-b:secret:2:weighted-random:node-c:node-a,node-b")
+                .unwrap()
+                .unwrap();
+        let route = mesh3.route.unwrap();
+        assert_eq!(route.egress_node_id.as_deref(), Some("node-c"));
+        assert_eq!(route.visited, ["node-a", "node-b"]);
+
+        let final_hop = parse_mesh_auth_token(
+            "mesh3:node-b:secret:1:weighted-random:node-c:node-a,node-b,node-c",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(final_hop.route.unwrap().remaining_hops, 1);
+        assert!(parse_mesh_auth_token("a.valid.client.token")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn rejects_loops_invalid_egress_and_out_of_range_claims() {
+        for claim in [
+            "mesh2:node-a:secret:2:nearest:node-a,Node-A",
+            "mesh3:node-a:secret:2:nearest:node-a:node-a,node-b",
+            "mesh3:node-a:secret:2:nearest:node-c:node-a,node-c",
+            "mesh3:node-a:secret:1:nearest:node-c:node-a,node-b",
+            "mesh2:node-a:secret:0:nearest:node-a",
+            "mesh2:node-a:secret:9:nearest:node-a",
+            "mesh2:node-a:secret:2:unknown:node-a",
+            "mesh2:node/a:secret:2:nearest:node-a",
+        ] {
+            assert!(parse_mesh_auth_token(claim).is_err(), "accepted {claim}");
+        }
+    }
+
+    #[test]
+    fn rejects_unbounded_peer_credentials_and_claims() {
+        let long_secret = "s".repeat(129);
+        let long_node_id = "n".repeat(65);
+        assert!(parse_mesh_auth_token(&format!("mesh:node:{long_secret}")).is_err());
+        assert!(parse_mesh_auth_token(&format!("mesh:{long_node_id}:secret")).is_err());
+        assert!(parse_mesh_auth_token(&format!("mesh:{}", "x".repeat(1025))).is_err());
+        assert!(parse_mesh_auth_token(&"opaque-client-token".repeat(100))
+            .unwrap()
+            .is_none());
     }
 }

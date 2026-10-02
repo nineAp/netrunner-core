@@ -18,12 +18,12 @@ use rand::RngExt;
 use sha2::Digest;
 use tokio::{
     net::TcpStream,
-    sync::{Mutex, RwLock, mpsc},
+    sync::{mpsc, Mutex, RwLock},
     time::timeout,
 };
 
-use super::connection::{ClientHandler, MeshPeerSession, Muxer, mesh_process_uptime_ms};
-use super::{MAX_MESH_HOPS, MeshPeer, MeshRoute, MeshRouteSelection};
+use super::connection::{mesh_process_uptime_ms, ClientHandler, MeshPeerSession, Muxer};
+use super::{MeshPeer, MeshRoute, MeshRouteSelection, MAX_MESH_HOPS};
 use crate::nrxp::FrameType;
 
 // Mesh peers may have much higher latency than an app-to-ingress leg. Give a
@@ -626,11 +626,8 @@ impl NodeMesh {
             if let Some(session) = existing.filter(|session| session.is_usable()) {
                 (session, true)
             } else {
-                let create_session = ClientHandler::connect_mesh_session(
-                    peer,
-                    auth_token,
-                    self.mesh_quic_port,
-                );
+                let create_session =
+                    ClientHandler::connect_mesh_session(peer, auth_token, self.mesh_quic_port);
                 let session = if let Some(cancel) = cancel {
                     let result = tokio::select! {
                         biased;
@@ -924,3 +921,179 @@ impl std::fmt::Debug for NodeMesh {
 }
 
 pub type SharedNodeMesh = Arc<NodeMesh>;
+
+#[cfg(test)]
+mod tests {
+    use super::{MeshPeer, MeshRoute, MeshRouteSelection, NodeMesh, PeerProbe, PEER_PROBE_MAX_AGE};
+    use std::{
+        collections::HashSet,
+        time::{Duration, Instant},
+    };
+
+    fn peer(node_id: &str, host: &str, port: u16) -> MeshPeer {
+        MeshPeer {
+            node_id: node_id.into(),
+            host: host.into(),
+            port,
+            decoy_sni: "www.debian.org".into(),
+            nrxp_secret: format!("secret-{node_id}"),
+            nrxp_static_public: format!("public-{node_id}"),
+        }
+    }
+
+    async fn mesh_with_healthy_peers(max_hops: u8, peers: Vec<MeshPeer>) -> NodeMesh {
+        let mesh = NodeMesh::with_max_hops("ingress".into(), "node-secret".into(), max_hops);
+        mesh.update_peers(peers).await;
+        for peer in mesh.peers.read().await.iter() {
+            mesh.rtt_ms.insert(
+                peer.node_id.to_ascii_lowercase(),
+                PeerProbe {
+                    rtt_ms: 30,
+                    probed_at: Instant::now(),
+                    consecutive_failures: 0,
+                },
+            );
+        }
+        mesh
+    }
+
+    #[tokio::test]
+    async fn peer_directory_excludes_self_invalid_entries_and_duplicates() {
+        let mesh = NodeMesh::new("ingress".into(), "node-secret".into());
+        mesh.update_peers(vec![
+            peer("INGRESS", "192.0.2.1", 443),
+            peer("peer-a", "192.0.2.2", 443),
+            peer("peer-a", "192.0.2.3", 443),
+            peer("peer-b", "192.0.2.2", 443),
+            peer("peer-c", "   ", 443),
+            peer("peer-d", "192.0.2.4", 0),
+        ])
+        .await;
+
+        let peers = mesh.ordered_peers().await;
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].node_id, "peer-a");
+        assert_ne!(peers[0].node_id, mesh.local_node_id());
+    }
+
+    #[tokio::test]
+    async fn two_hop_routes_rotate_over_unique_healthy_egress_ips() {
+        let mesh = mesh_with_healthy_peers(
+            2,
+            vec![
+                peer("peer-a", "192.0.2.1", 443),
+                peer("peer-a-alt", "192.0.2.1", 8443),
+                peer("peer-b", "192.0.2.2", 443),
+                peer("peer-c", "192.0.2.3", 443),
+            ],
+        )
+        .await;
+        let initial = mesh.initial_route().unwrap();
+        let mut selected_ips = Vec::new();
+
+        for _ in 0..3 {
+            let flow = mesh.route_for_flow(&initial).await.unwrap();
+            assert_eq!(flow.remaining_hops, 2);
+            assert_eq!(flow.selection, MeshRouteSelection::WeightedRandom);
+            assert!(!flow
+                .egress_node_id
+                .as_deref()
+                .unwrap()
+                .eq_ignore_ascii_case("ingress"));
+            let peer = mesh
+                .peers_for_route(&flow)
+                .await
+                .into_iter()
+                .find(|peer| Some(peer.node_id.as_str()) == flow.egress_node_id.as_deref())
+                .unwrap();
+            selected_ips.push(peer.host);
+        }
+
+        assert_eq!(selected_ips.iter().collect::<HashSet<_>>().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn x_hop_route_pins_a_healthy_egress_and_preserves_the_path_claim() {
+        let peers = vec![
+            peer("peer-a", "192.0.2.1", 443),
+            peer("peer-b", "192.0.2.2", 443),
+            peer("peer-c", "192.0.2.3", 443),
+            peer("peer-d", "192.0.2.4", 443),
+        ];
+        let mesh = mesh_with_healthy_peers(5, peers.clone()).await;
+        let initial = mesh.initial_route().unwrap();
+        let flow = mesh.route_for_flow(&initial).await.unwrap();
+        assert!((3..=5).contains(&flow.remaining_hops));
+        let egress = flow.egress_node_id.as_deref().unwrap();
+        assert!(peers.iter().any(|peer| peer.node_id == egress));
+
+        let relay = peers.iter().find(|peer| peer.node_id != egress).unwrap();
+        let next = mesh.route_via_peer(&flow, &relay.node_id).unwrap();
+        assert_eq!(next.remaining_hops, flow.remaining_hops - 1);
+        assert_eq!(
+            next.visited,
+            vec!["ingress".to_owned(), relay.node_id.clone()]
+        );
+        assert_eq!(next.egress_node_id.as_deref(), Some(egress));
+
+        let token = mesh.auth_token_for_route(&next);
+        let parsed = crate::net::parse_mesh_auth_token(&token).unwrap().unwrap();
+        let parsed_route = parsed.route.unwrap();
+        assert_eq!(parsed_route.egress_node_id.as_deref(), Some(egress));
+        assert_eq!(parsed_route.visited, next.visited);
+    }
+
+    #[tokio::test]
+    async fn stale_rtt_samples_fall_back_to_a_two_hop_route() {
+        let mesh = mesh_with_healthy_peers(2, vec![peer("peer-a", "192.0.2.1", 443)]).await;
+        mesh.rtt_ms.insert(
+            "peer-a".into(),
+            PeerProbe {
+                rtt_ms: 30,
+                probed_at: Instant::now() - PEER_PROBE_MAX_AGE - Duration::from_secs(1),
+                consecutive_failures: 0,
+            },
+        );
+
+        let route = mesh
+            .route_for_flow(&mesh.initial_route().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(route.remaining_hops, 2);
+        assert_eq!(route.selection, MeshRouteSelection::Nearest);
+        assert!(route.egress_node_id.is_some());
+    }
+
+    #[tokio::test]
+    async fn retry_selects_a_different_egress_and_route_extension_rejects_loops() {
+        let mesh = mesh_with_healthy_peers(
+            3,
+            vec![
+                peer("peer-a", "192.0.2.1", 443),
+                peer("peer-b", "192.0.2.2", 443),
+            ],
+        )
+        .await;
+        let route = mesh
+            .route_for_flow(&mesh.initial_route().unwrap())
+            .await
+            .unwrap();
+        let failed = route.egress_node_id.clone().unwrap();
+        let retry = mesh
+            .retry_with_next_egress(&route, std::slice::from_ref(&failed))
+            .await
+            .unwrap();
+        assert_ne!(retry.egress_node_id.as_deref(), Some(failed.as_str()));
+
+        let direct = MeshRoute {
+            remaining_hops: 2,
+            selection: MeshRouteSelection::WeightedRandom,
+            egress_node_id: Some("peer-a".into()),
+            visited: vec!["ingress".into()],
+        };
+        let next = mesh.route_via_peer(&direct, "peer-a").unwrap();
+        assert_eq!(next.remaining_hops, 1);
+        assert!(mesh.route_via_peer(&next, "peer-a").is_none());
+        assert!(mesh.route_via_peer(&next, "ingress").is_none());
+    }
+}

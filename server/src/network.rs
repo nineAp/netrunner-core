@@ -14,10 +14,12 @@ use netrunner_core::net::{
 use netrunner_core::Identity;
 use netrunner_logger::{debug, error, info, warn};
 use std::collections::{HashMap, VecDeque};
+use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, UdpSocket};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
@@ -73,6 +75,9 @@ use crate::health;
 /// прежде чем отпустить рантайм (который при Drop абортит все задачи разом,
 /// без предупреждения клиентам).
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+/// The QUIC mesh port is reachable before NRXP authentication. Bound the
+/// number of handshakes and active peer sessions that can reserve resources.
+const MAX_MESH_QUIC_CONNECTIONS: usize = 512;
 
 /// Параметры прослушивания сервера.
 pub struct Network {
@@ -584,6 +589,7 @@ async fn run_mesh_quic_listener(
     token: CancellationToken,
 ) {
     info!("Authenticated mesh QUIC listener ready");
+    let connection_slots = Arc::new(Semaphore::new(MAX_MESH_QUIC_CONNECTIONS));
     loop {
         let incoming = tokio::select! {
             _ = token.cancelled() => break,
@@ -591,6 +597,12 @@ async fn run_mesh_quic_listener(
                 Some(incoming) => incoming,
                 None => break,
             }
+        };
+
+        let Some(connection_permit) = try_acquire_mesh_quic_slot(&connection_slots) else {
+            incoming.refuse();
+            metrics::counter!("netrunner_mesh_quic_admission_rejected_total").increment(1);
+            continue;
         };
 
         let session_manager = session_manager.clone();
@@ -601,6 +613,9 @@ async fn run_mesh_quic_listener(
         let mesh = mesh.clone();
         let token = token.clone();
         tokio::spawn(async move {
+            // Keep the slot until the transport and its NRXP session are
+            // closed, including while the initial handshake is in progress.
+            let _connection_permit = connection_permit;
             let connection = tokio::select! {
                 _ = token.cancelled() => return,
                 connection = incoming => match connection {
@@ -614,11 +629,8 @@ async fn run_mesh_quic_listener(
 
             // One authenticated NRXP session owns a QUIC connection. Its
             // logical streams are multiplexed by the existing MeshPeerSession.
-            let streams = tokio::time::timeout(
-                Duration::from_secs(8),
-                connection.accept_bi(),
-            )
-            .await;
+            let streams =
+                tokio::time::timeout(Duration::from_secs(8), connection.accept_bi()).await;
             let (send, recv) = match streams {
                 Ok(Ok(streams)) => streams,
                 _ => {
@@ -639,17 +651,123 @@ async fn run_mesh_quic_listener(
             )
             .with_mesh_policy(require_auth, true, mesh)
             .with_mesh_quic_connection(connection.clone());
-            let handler = tokio::spawn(async move {
-                let _ = handler.run().await;
-            });
-
-            tokio::select! {
-                _ = token.cancelled() => connection.close(0u32.into(), b"server shutdown"),
-                _ = connection.closed() => {}
-                _ = handler => connection.close(0u32.into(), b"mesh session ended"),
+            let exit = supervise_mesh_quic_handler(
+                async move {
+                    let _ = handler.run().await;
+                },
+                connection.closed(),
+                token.cancelled(),
+            )
+            .await;
+            match exit {
+                MeshHandlerExit::Shutdown => connection.close(0u32.into(), b"server shutdown"),
+                MeshHandlerExit::ConnectionClosed => {}
+                MeshHandlerExit::HandlerFinished => {
+                    connection.close(0u32.into(), b"mesh session ended")
+                }
             }
         });
     }
     endpoint.close(0u32.into(), b"server shutdown");
     endpoint.wait_idle().await;
+}
+
+fn try_acquire_mesh_quic_slot(slots: &Arc<Semaphore>) -> Option<OwnedSemaphorePermit> {
+    slots.clone().try_acquire_owned().ok()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MeshHandlerExit {
+    Shutdown,
+    ConnectionClosed,
+    HandlerFinished,
+}
+
+async fn supervise_mesh_quic_handler<H, C, S>(
+    handler: H,
+    connection_closed: C,
+    shutdown: S,
+) -> MeshHandlerExit
+where
+    H: Future<Output = ()>,
+    C: Future,
+    S: Future,
+{
+    tokio::pin!(handler);
+    tokio::select! {
+        _ = shutdown => MeshHandlerExit::Shutdown,
+        _ = connection_closed => MeshHandlerExit::ConnectionClosed,
+        _ = &mut handler => MeshHandlerExit::HandlerFinished,
+    }
+}
+
+#[cfg(test)]
+mod mesh_quic_admission_tests {
+    use super::{
+        supervise_mesh_quic_handler, try_acquire_mesh_quic_slot, MeshHandlerExit, Semaphore,
+    };
+    use std::{
+        future::pending,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
+    };
+    use tokio::task::yield_now;
+
+    #[test]
+    fn mesh_quic_admission_is_bounded_and_releases_slots() {
+        let slots = Arc::new(Semaphore::new(2));
+        let first = try_acquire_mesh_quic_slot(&slots).unwrap();
+        let second = try_acquire_mesh_quic_slot(&slots).unwrap();
+        assert!(try_acquire_mesh_quic_slot(&slots).is_none());
+
+        drop(first);
+        assert!(try_acquire_mesh_quic_slot(&slots).is_some());
+        drop(second);
+    }
+
+    #[tokio::test]
+    async fn quic_handler_is_dropped_when_transport_closes_or_server_stops() {
+        struct DropMarker(Arc<AtomicBool>);
+        impl Drop for DropMarker {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        for shutdown in [false, true] {
+            let dropped = Arc::new(AtomicBool::new(false));
+            let marker = DropMarker(dropped.clone());
+            let handler = async move {
+                let _marker = marker;
+                pending::<()>().await;
+            };
+            let close = async {
+                if !shutdown {
+                    yield_now().await;
+                } else {
+                    pending::<()>().await;
+                }
+            };
+            let stop = async {
+                if shutdown {
+                    yield_now().await;
+                } else {
+                    pending::<()>().await;
+                }
+            };
+
+            let result = supervise_mesh_quic_handler(handler, close, stop).await;
+            assert_eq!(
+                result,
+                if shutdown {
+                    MeshHandlerExit::Shutdown
+                } else {
+                    MeshHandlerExit::ConnectionClosed
+                }
+            );
+            assert!(dropped.load(Ordering::SeqCst));
+        }
+    }
 }

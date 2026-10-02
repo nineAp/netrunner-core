@@ -12,7 +12,9 @@ use quinn::{ClientConfig, Endpoint, ServerConfig, TransportConfig, VarInt};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 
 const ALPN: &[u8] = b"nrxp-mesh/1";
-const QUIC_DATAGRAM_BUFFER: usize = 1024 * 1024;
+// A bounded per-connection queue limits memory consumed by unauthenticated
+// peers before the inner NRXP identity handshake completes.
+const QUIC_DATAGRAM_BUFFER: usize = 256 * 1024;
 
 pub(crate) fn client_endpoint(bind_addr: SocketAddr) -> io::Result<Endpoint> {
     let mut endpoint = Endpoint::client(bind_addr)?;
@@ -112,5 +114,51 @@ impl rustls::client::danger::ServerCertVerifier for SkipCertificateVerification 
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
         self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{client_endpoint, server_endpoint};
+    use bytes::Bytes;
+    use tokio::sync::oneshot;
+
+    #[tokio::test]
+    async fn mesh_quic_negotiates_streams_and_datagrams_with_ephemeral_tls() {
+        let server = server_endpoint("127.0.0.1:0".parse().unwrap()).unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let client = client_endpoint("127.0.0.1:0".parse().unwrap()).unwrap();
+        let (received_tx, received_rx) = oneshot::channel();
+
+        let server_task = tokio::spawn(async move {
+            let incoming = server.accept().await.expect("incoming QUIC connection");
+            let connection = incoming.await.expect("QUIC handshake");
+            let (mut send, mut recv) = connection.accept_bi().await.unwrap();
+            let mut request = [0; 4];
+            recv.read_exact(&mut request).await.unwrap();
+            assert_eq!(&request, b"ping");
+            send.write_all(b"pong").await.unwrap();
+            connection
+                .send_datagram(Bytes::from_static(b"datagram-ok"))
+                .unwrap();
+            received_rx.await.unwrap();
+        });
+
+        let connection = client
+            .connect(server_addr, "mesh.netrunner")
+            .unwrap()
+            .await
+            .unwrap();
+        let (mut send, mut recv) = connection.open_bi().await.unwrap();
+        send.write_all(b"ping").await.unwrap();
+        let mut response = [0; 4];
+        recv.read_exact(&mut response).await.unwrap();
+        assert_eq!(&response, b"pong");
+        assert_eq!(
+            connection.read_datagram().await.unwrap().as_ref(),
+            b"datagram-ok"
+        );
+        received_tx.send(()).unwrap();
+        server_task.await.unwrap();
     }
 }
