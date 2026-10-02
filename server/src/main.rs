@@ -26,6 +26,13 @@ use tokio_util::sync::CancellationToken;
 use crate::backend_client::BackendClient;
 use crate::network::Network;
 
+/// reqwest enables AWS-LC while Quinn enables Ring in this binary. Rustls
+/// therefore cannot infer which process-wide provider to use from features.
+/// Select Ring before any tokio task can build a TLS or QUIC config.
+fn install_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 /// Ждёт SIGTERM (docker stop/systemctl stop) или SIGINT (Ctrl+C) и отменяет
 /// токен — раньше этой функции не было вообще: сервер получал сигнал прямо
 /// от ОС мимо CancellationToken'а, и вся drain-логика в `Network::run` была
@@ -149,6 +156,8 @@ struct Args {
 }
 
 fn main() {
+    install_crypto_provider();
+
     // Приватность/стабильность: НЕ пишем JSON-лог на диск ноды — раньше это
     // (`Some("./logs")`) дважды забивало диск и вешало прокси (см. историю
     // инцидентов на proxy-fr1). JSON уходит в stdout — виден через
@@ -433,4 +442,18 @@ fn main() {
             error!(error = ?e, "Задача сервера завершилась с паникой при остановке");
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::install_crypto_provider;
+
+    #[test]
+    fn rustls_builder_works_with_both_ring_and_aws_lc_enabled() {
+        install_crypto_provider();
+
+        let _client_config = rustls::ClientConfig::builder()
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth();
+    }
 }
