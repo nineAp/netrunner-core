@@ -52,6 +52,9 @@ pub(crate) type PooledSender = hyper::client::conn::http1::SendRequest<Full<Byte
 /// размера) этого достаточно. Большие файлы/апдейты через этот путь не
 /// предполагаются — см. ограничения в README.md.
 const MAX_PROXIED_BODY_BYTES: usize = 16 * 1024 * 1024;
+/// Search is deliberately pinned to one upstream. This endpoint cannot be
+/// used as an arbitrary URL fetcher or an open forward proxy.
+const SEARCH_UPSTREAM_ADDR: &str = "html.duckduckgo.com:443";
 
 #[cfg(test)]
 fn looks_like_asset(path: &str) -> bool {
@@ -150,6 +153,14 @@ fn route_for<'a>(
     cfg: &'a EdgeConfig,
     path: &str,
 ) -> (&'a str, &'a tokio::sync::Mutex<Vec<PooledSender>>) {
+    let pathname = path.split_once('?').map_or(path, |(pathname, _)| pathname);
+    if pathname == "/search"
+        || pathname == "/html"
+        || pathname.starts_with("/html/")
+        || pathname.starts_with("/l/")
+    {
+        return (SEARCH_UPSTREAM_ADDR, &cfg.search_pool);
+    }
     if path.contains("/api/") || path.contains("/account") {
         (&cfg.backend_addr, &cfg.backend_pool)
     } else {
@@ -207,6 +218,17 @@ async fn try_proxy(cfg: &EdgeConfig, req: axum::extract::Request) -> Result<Resp
         .map(|pq| pq.as_str())
         .unwrap_or("/")
         .to_string();
+    if route_for(cfg, &path_and_query).0 == SEARCH_UPSTREAM_ADDR
+        && parts.method != hyper::Method::GET
+        && parts.method != hyper::Method::HEAD
+    {
+        return Ok(Response::builder()
+            .status(StatusCode::METHOD_NOT_ALLOWED)
+            .header(header::ALLOW, "GET, HEAD")
+            .header(header::CACHE_CONTROL, "no-store")
+            .body(Body::empty())
+            .unwrap_or_else(|_| StatusCode::METHOD_NOT_ALLOWED.into_response()));
+    }
 
     // Оригинал при переходе в раздел "аккаунт" делает полный переход на
     // ОТДЕЛЬНЫЙ домен (account.netrunner-vpn.com/profile — БЕЗ языкового
@@ -251,11 +273,17 @@ async fn try_proxy(cfg: &EdgeConfig, req: axum::extract::Request) -> Result<Resp
     // Только у BACKEND_ADDR путь может нести префикс "/account", который
     // сам бэкенд не понимает (см. doc на `strip_account_prefix`) — у
     // LANDING_ADDR путь пересылается как есть, ничего резать не нужно.
-    let forwarded_path = if target_addr == cfg.backend_addr {
-        strip_account_prefix(&path_and_query)
-    } else {
-        std::borrow::Cow::Borrowed(path_and_query.as_str())
-    };
+    let forwarded_path =
+        if target_addr == SEARCH_UPSTREAM_ADDR && path_and_query.starts_with("/search") {
+            match path_and_query.split_once('?') {
+                Some((_, query)) => std::borrow::Cow::Owned(format!("/html/?{query}")),
+                None => std::borrow::Cow::Borrowed("/html/"),
+            }
+        } else if target_addr == cfg.backend_addr {
+            strip_account_prefix(&path_and_query)
+        } else {
+            std::borrow::Cow::Borrowed(path_and_query.as_str())
+        };
 
     let body_bytes = axum::body::to_bytes(body, MAX_PROXIED_BODY_BYTES)
         .await
@@ -282,7 +310,9 @@ async fn try_proxy(cfg: &EdgeConfig, req: axum::extract::Request) -> Result<Resp
             // домен ЭТОЙ VDS и не поймёт, какой виртуальный хост отдавать (то
             // же самое сделал бы любой обычный reverse-proxy). Hop-by-hop —
             // см. doc `is_hop_by_hop`.
-            if name != header::HOST && !is_hop_by_hop(name) {
+            let search_credential = target_addr == SEARCH_UPSTREAM_ADDR
+                && (name == header::COOKIE || name == header::AUTHORIZATION);
+            if name != header::HOST && !is_hop_by_hop(name) && !search_credential {
                 builder = builder.header(name, value);
             }
         }

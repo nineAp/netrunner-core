@@ -223,6 +223,7 @@ impl RemoteOpener {
         is_udp: bool,
         upstream_peer: bool,
     ) {
+        let route = mesh.route_for_flow(&route);
         let peers = mesh.peers_for_route(&route).await;
         let mut connected = None;
 

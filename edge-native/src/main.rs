@@ -173,6 +173,9 @@ pub struct EdgeConfig {
     /// переиспользовать соединение к лендингу для запроса к бэкенду (или
     /// наоборот) — не переиспользование, а поломанный запрос не туда.
     pub(crate) backend_pool: tokio::sync::Mutex<Vec<proxy_http::PooledSender>>,
+    /// Keep search-engine connections separate from the site pools: they have
+    /// a different upstream Host and TLS identity.
+    pub(crate) search_pool: tokio::sync::Mutex<Vec<proxy_http::PooledSender>>,
 }
 
 impl EdgeConfig {
@@ -219,6 +222,7 @@ impl EdgeConfig {
             identity,
             landing_pool: tokio::sync::Mutex::new(Vec::new()),
             backend_pool: tokio::sync::Mutex::new(Vec::new()),
+            search_pool: tokio::sync::Mutex::new(Vec::new()),
         }
     }
 }

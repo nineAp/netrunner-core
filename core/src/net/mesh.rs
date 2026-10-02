@@ -141,8 +141,9 @@ impl NodeMesh {
     }
 
     /// A max-hop value of one means direct output. Two preserves the existing
-    /// nearest reachable egress behavior. Longer paths use weighted random
-    /// selection among peers with a successful recent probe.
+    /// nearest reachable egress behavior. For a larger limit, each flow chooses
+    /// a random path length from three through the configured maximum, then
+    /// uses RTT-weighted random peers with a successful recent probe.
     pub fn initial_route(&self) -> Option<MeshRoute> {
         (self.max_hops > 1).then(|| MeshRoute {
             remaining_hops: self.max_hops,
@@ -153,6 +154,22 @@ impl NodeMesh {
             },
             visited: vec![self.local_node_id.clone()],
         })
+    }
+
+    /// Turn a session's maximum route into the budget for one application
+    /// flow. Intermediates must retain the ingress-selected budget, so only the
+    /// originating node (the sole visited id) may shorten it.
+    pub fn route_for_flow(&self, route: &MeshRoute) -> MeshRoute {
+        if route.selection != MeshRouteSelection::WeightedRandom
+            || route.visited.len() != 1
+            || route.remaining_hops <= 3
+        {
+            return route.clone();
+        }
+
+        let mut flow_route = route.clone();
+        flow_route.remaining_hops = rand::rng().random_range(3..=route.remaining_hops);
+        flow_route
     }
 
     /// Return eligible next hops for a route. Weighted routes only use peers
@@ -194,18 +211,22 @@ impl NodeMesh {
             MeshRouteSelection::WeightedRandom => {
                 let mut rng = rand::rng();
                 let mut shuffled = Vec::with_capacity(candidates.len());
+                let fastest_rtt = candidates
+                    .iter()
+                    .filter_map(|(_, rtt)| *rtt)
+                    .min()
+                    .unwrap_or(1)
+                    .max(1);
                 while !candidates.is_empty() {
                     let total_weight: u64 = candidates
                         .iter()
-                        .map(|(_, rtt)| 1_000_000_u64 / u64::from(rtt.unwrap_or(1).max(1)))
-                        .map(|weight| weight.max(1))
+                        .map(|(_, rtt)| rtt_weight(fastest_rtt, rtt.unwrap_or(fastest_rtt)))
                         .sum();
                     let mut draw = rng.random_range(0..total_weight);
                     let index = candidates
                         .iter()
                         .position(|(_, rtt)| {
-                            let weight =
-                                (1_000_000_u64 / u64::from(rtt.unwrap_or(1).max(1))).max(1);
+                            let weight = rtt_weight(fastest_rtt, rtt.unwrap_or(fastest_rtt));
                             if draw < weight {
                                 true
                             } else {
@@ -282,6 +303,7 @@ impl NodeMesh {
                 "Direct output is configured for this node",
             )
         })?;
+        let route = self.route_for_flow(&route);
         let peers = self.peers_for_route(&route).await;
         for peer in peers {
             let Some(next_route) = self.route_via_peer(&route, &peer.node_id) else {
@@ -315,6 +337,14 @@ impl NodeMesh {
             "No reachable mesh peer accepted the connection",
         ))
     }
+}
+
+/// Prefer lower-latency peers without letting a very fast peer monopolize
+/// route selection. The square-root score and 4:1 cap make RTT a preference,
+/// not a near-deterministic selector as inverse-RTT weights were.
+fn rtt_weight(fastest_rtt_ms: u32, candidate_rtt_ms: u32) -> u64 {
+    let ratio = (f64::from(fastest_rtt_ms.max(1)) / f64::from(candidate_rtt_ms.max(1))).sqrt();
+    (ratio * 1_000.0).round().clamp(250.0, 1_000.0) as u64
 }
 
 /// One logical TCP or UDP flow carried by a direct NRXP leg to a mesh egress.
