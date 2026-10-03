@@ -1051,7 +1051,10 @@ impl ClientHandler {
         // функция (AEAD-ключи), поэтому дополнительных мер защиты в передаче
         // не требует.
         let datagram_root = session_keys.datagram_root();
-        let mut cipher = ChaChaCipher::with_suite(session_keys.aead_suite());
+        let mut cipher = ChaChaCipher::with_suite_and_legacy_chacha_aad(
+            session_keys.aead_suite(),
+            session_keys.uses_legacy_chacha_aad(),
+        );
         cipher.set_keys(tx_key, tx_iv, rx_key, rx_iv);
         let codec = Codec::new(cipher, session_keys.get_auth_key());
         let (rx_codec, mut tx_codec) = codec.split();
@@ -2436,7 +2439,10 @@ impl TunnelHandler for ServerHandler {
         // выводит свой материал из её корня позже.
         let datagram_root = session_keys.datagram_root();
         let mesh_route_preference = session_keys.mesh_route_preference();
-        let mut cipher = ChaChaCipher::with_suite(session_keys.aead_suite());
+        let mut cipher = ChaChaCipher::with_suite_and_legacy_chacha_aad(
+            session_keys.aead_suite(),
+            session_keys.uses_legacy_chacha_aad(),
+        );
         cipher.set_keys(tx_key, tx_iv, rx_key, rx_iv);
 
         let codec = Codec::new(cipher, session_keys.get_auth_key());

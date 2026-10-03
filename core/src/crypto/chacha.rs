@@ -85,20 +85,31 @@ pub struct AeadStream {
     cipher: AeadCipher,
     state: NonceState,
     suite: AeadSuite,
+    legacy_chacha_aad: bool,
     ratchet: Zeroizing<[u8; 32]>,
     records_in_epoch: u64,
 }
 
 impl AeadStream {
     pub fn new(key: &[u8; 32], iv: [u8; 12]) -> Self {
-        Self::with_suite(AeadSuite::ChaCha20Poly1305, key, iv)
+        Self::with_suite_and_legacy_chacha_aad(AeadSuite::ChaCha20Poly1305, key, iv, true)
     }
 
     pub fn with_suite(suite: AeadSuite, key: &[u8; 32], iv: [u8; 12]) -> Self {
+        Self::with_suite_and_legacy_chacha_aad(suite, key, iv, false)
+    }
+
+    pub fn with_suite_and_legacy_chacha_aad(
+        suite: AeadSuite,
+        key: &[u8; 32],
+        iv: [u8; 12],
+        legacy_chacha_aad: bool,
+    ) -> Self {
         Self {
             cipher: AeadCipher::new(suite, key).expect("fixed-size AEAD key is valid"),
             state: NonceState::new(iv),
             suite,
+            legacy_chacha_aad: legacy_chacha_aad && suite == AeadSuite::ChaCha20Poly1305,
             ratchet: Zeroizing::new(*key),
             records_in_epoch: 0,
         }
@@ -142,7 +153,8 @@ impl AeadPacker for AeadStream {
         // Убеждаемся, что в BytesMut есть место для тега, чтобы избежать аллокации
         data.reserve(16);
 
-        match self.cipher.seal(nonce, &[], data) {
+        let aad: &[u8] = if self.legacy_chacha_aad { &nonce } else { &[] };
+        match self.cipher.seal(nonce, aad, data) {
             Ok(_) => {
                 netrunner_logger::trace!(
                     counter = current_counter,
@@ -174,7 +186,8 @@ impl AeadPacker for AeadStream {
         let nonce = self.state.next_nonce()?;
         let data_len = data.len();
 
-        match self.cipher.open(nonce, &[], data) {
+        let aad: &[u8] = if self.legacy_chacha_aad { &nonce } else { &[] };
+        match self.cipher.open(nonce, aad, data) {
             Ok(_) => {
                 netrunner_logger::trace!(
                     counter = saved_counter,
@@ -223,19 +236,35 @@ pub struct SessionCipher {
     /// Входящее направление (расшифровка того, что приняли).
     pub rx: AeadStream,
     suite: AeadSuite,
+    legacy_chacha_aad: bool,
 }
 
 impl SessionCipher {
     /// Создаёт шифр с нулевыми ключами-заглушками (до хендшейка).
     pub fn new() -> Self {
-        Self::with_suite(AeadSuite::ChaCha20Poly1305)
+        Self::with_suite_and_legacy_chacha_aad(AeadSuite::ChaCha20Poly1305, true)
     }
 
     pub fn with_suite(suite: AeadSuite) -> Self {
+        Self::with_suite_and_legacy_chacha_aad(suite, false)
+    }
+
+    pub fn with_suite_and_legacy_chacha_aad(suite: AeadSuite, legacy_chacha_aad: bool) -> Self {
         Self {
-            tx: AeadStream::with_suite(suite, &[0u8; 32], [0u8; 12]),
-            rx: AeadStream::with_suite(suite, &[0u8; 32], [0u8; 12]),
+            tx: AeadStream::with_suite_and_legacy_chacha_aad(
+                suite,
+                &[0u8; 32],
+                [0u8; 12],
+                legacy_chacha_aad,
+            ),
+            rx: AeadStream::with_suite_and_legacy_chacha_aad(
+                suite,
+                &[0u8; 32],
+                [0u8; 12],
+                legacy_chacha_aad,
+            ),
             suite,
+            legacy_chacha_aad: legacy_chacha_aad && suite == AeadSuite::ChaCha20Poly1305,
         }
     }
 
@@ -248,8 +277,18 @@ impl SessionCipher {
         mut r_key: [u8; 32],
         r_iv: [u8; 12],
     ) {
-        self.tx = AeadStream::with_suite(self.suite, &w_key, w_iv);
-        self.rx = AeadStream::with_suite(self.suite, &r_key, r_iv);
+        self.tx = AeadStream::with_suite_and_legacy_chacha_aad(
+            self.suite,
+            &w_key,
+            w_iv,
+            self.legacy_chacha_aad,
+        );
+        self.rx = AeadStream::with_suite_and_legacy_chacha_aad(
+            self.suite,
+            &r_key,
+            r_iv,
+            self.legacy_chacha_aad,
+        );
         // Ключи пришли по значению — это копии на стеке поверх тех, что уже
         // легли внутрь шифра. Свои копии затираем сразу: дальше они не нужны,
         // а `[u8; 32]` при выходе из области видимости не затирается сам.

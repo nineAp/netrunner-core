@@ -219,6 +219,13 @@ impl SessionKeys {
         self.data_cipher_preference.wire_code()
     }
 
+    /// Versions before v4 used the record nonce as ChaCha's additional data.
+    /// Keep that wire format for legacy peers; v4+ uses the new empty-AAD
+    /// format introduced alongside selectable data ciphers.
+    pub(crate) fn uses_legacy_chacha_aad(&self) -> bool {
+        self.peer_version < crate::MIN_VERSION_FOR_RING_AEAD
+    }
+
     pub(crate) fn set_mesh_route_preference(&mut self, preference: MeshRoutePreference) {
         let (mode, hops) = preference.wire_codes();
         let preference = MeshRoutePreference::from_wire_codes(mode, hops)

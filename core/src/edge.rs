@@ -203,7 +203,10 @@ impl EdgeHandshake {
         }
 
         let (tx_key, tx_iv, rx_key, rx_iv) = self.session_keys.get_aead_parameters();
-        let mut cipher = ChaChaCipher::with_suite(self.session_keys.aead_suite());
+        let mut cipher = ChaChaCipher::with_suite_and_legacy_chacha_aad(
+            self.session_keys.aead_suite(),
+            self.session_keys.uses_legacy_chacha_aad(),
+        );
         cipher.set_keys(tx_key, tx_iv, rx_key, rx_iv);
         let codec = Codec::new(cipher, self.session_keys.get_auth_key());
         let (rx_codec, tx_codec) = codec.split();
