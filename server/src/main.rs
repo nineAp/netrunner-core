@@ -283,6 +283,9 @@ fn main() {
     if args.mesh_enabled && identity.is_none() {
         panic!("--mesh-enabled requires PROXY_NRXP_SECRET and PROXY_NRXP_PRIVATE_KEY");
     }
+    if let (Some(mesh), Some(Identity::Local(local))) = (mesh.as_ref(), identity.as_ref()) {
+        mesh.set_onion_identity(local.clone());
+    }
 
     // Регистрируется один раз, до первого metrics::counter!/gauge!/histogram! —
     // если --metrics-port не задан, вызовы макросов молча уходят в

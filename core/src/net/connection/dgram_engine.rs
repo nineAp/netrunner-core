@@ -35,7 +35,10 @@
 //! `Muxer::selection_load_factor` — у UDP-ноги альтернатив для сравнения
 //! нет, вопрос только "жива или нет").
 
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{net::SocketAddr, sync::Arc};
+
+#[cfg(feature = "mesh-quic")]
+use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use bytes::Bytes;
@@ -997,6 +1000,7 @@ async fn process_datagram(
             mesh: None,
             mesh_route: None,
             mesh_peer: false,
+            mesh_onion_peer: false,
         });
         let handler = Arc::new(StreamHandler::new(entry.muxer.clone(), Some(opener)));
 
@@ -1540,6 +1544,7 @@ mod tests {
             mesh: None,
             mesh_route: None,
             mesh_peer: false,
+            mesh_onion_peer: false,
         });
         let handler = StreamHandler::new(muxer.clone(), Some(opener));
 

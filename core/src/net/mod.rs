@@ -39,6 +39,8 @@ mod auth;
 mod config;
 #[cfg(not(target_arch = "wasm32"))]
 mod mesh;
+#[cfg(not(target_arch = "wasm32"))]
+mod mesh_onion;
 #[cfg(all(not(target_arch = "wasm32"), feature = "mesh-quic"))]
 mod mesh_quic;
 // `connection` — оркестровка живых TCP-ног туннеля через `tokio::net`. Этот
@@ -54,7 +56,8 @@ pub mod diagnostics;
 
 pub use auth::{
     parse_mesh_auth_token, AuthValidator, MeshAuth, MeshPeer, MeshRoute, MeshRouteSelection,
-    NodeHealthReport, UsageDelta, UsageReport, UserQuota, MAX_MESH_HOPS, MESH_ROUTE_READY,
+    NodeHealthReport, UsageDelta, UsageReport, UserQuota, MAX_MESH_HOPS, MESH_ONION_READY,
+    MESH_ROUTE_READY,
 };
 pub use config::NetworkConfig;
 #[cfg(not(target_arch = "wasm32"))]

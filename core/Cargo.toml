@@ -6,6 +6,7 @@ edition = "2021"
 
 [dependencies]
 chacha20poly1305 = "0.10.1"
+hpke = { version = "0.14", default-features = false, features = ["alloc", "getrandom", "chacha", "x25519"] }
 # Raw ChaCha20 keystream (no Poly1305), already in the tree transitively via
 # chacha20poly1305 0.10 — pinned as a direct dependency for `quiceng`'s QUIC-style
 # header protection (RFC 9001 §5.4.4 defines the mask as a raw ChaCha20 block,

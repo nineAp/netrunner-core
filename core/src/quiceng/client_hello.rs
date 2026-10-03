@@ -195,7 +195,11 @@ mod tests {
         // legacy_version(2) + random(32) → session_id length byte at offset 4+34.
         assert_eq!(ch[4], 0x03);
         assert_eq!(ch[5], 0x03);
-        assert_eq!(ch[4 + 2 + 32], 0x00, "legacy_session_id must be empty in QUIC");
+        assert_eq!(
+            ch[4 + 2 + 32],
+            0x00,
+            "legacy_session_id must be empty in QUIC"
+        );
     }
 
     #[test]

@@ -46,14 +46,38 @@ pub struct Block {
 /// Все известные блоки. Добавить блок = положить `blocks/<имя>.html` и одну
 /// строку сюда; больше нигде регистрировать не нужно.
 pub const BLOCKS: &[Block] = &[
-    Block { name: "header", template: include_str!("blocks/header.html") },
-    Block { name: "hero", template: include_str!("blocks/hero.html") },
-    Block { name: "logos", template: include_str!("blocks/logos.html") },
-    Block { name: "features", template: include_str!("blocks/features.html") },
-    Block { name: "stats", template: include_str!("blocks/stats.html") },
-    Block { name: "pricing", template: include_str!("blocks/pricing.html") },
-    Block { name: "cta", template: include_str!("blocks/cta.html") },
-    Block { name: "footer", template: include_str!("blocks/footer.html") },
+    Block {
+        name: "header",
+        template: include_str!("blocks/header.html"),
+    },
+    Block {
+        name: "hero",
+        template: include_str!("blocks/hero.html"),
+    },
+    Block {
+        name: "logos",
+        template: include_str!("blocks/logos.html"),
+    },
+    Block {
+        name: "features",
+        template: include_str!("blocks/features.html"),
+    },
+    Block {
+        name: "stats",
+        template: include_str!("blocks/stats.html"),
+    },
+    Block {
+        name: "pricing",
+        template: include_str!("blocks/pricing.html"),
+    },
+    Block {
+        name: "cta",
+        template: include_str!("blocks/cta.html"),
+    },
+    Block {
+        name: "footer",
+        template: include_str!("blocks/footer.html"),
+    },
 ];
 
 /// Почему витрину не удалось собрать.
@@ -204,7 +228,10 @@ mod tests {
 
     #[test]
     fn unknown_block_is_an_error_not_a_silent_skip() {
-        let content = SiteContent { page: HashMap::new(), blocks: HashMap::new() };
+        let content = SiteContent {
+            page: HashMap::new(),
+            blocks: HashMap::new(),
+        };
         let err = assemble(&["nope".to_string()], &content).unwrap_err();
         assert_eq!(err, SiteError::UnknownBlock("nope".to_string()));
     }

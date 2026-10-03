@@ -27,7 +27,10 @@ pub(crate) fn gateway_url(url: &Url, proxy_domain: &str) -> String {
         authority.push_str(&port.to_string());
     }
     let host: String = url::form_urlencoded::byte_serialize(authority.as_bytes()).collect();
-    let query = url.query().map(|query| format!("?{query}")).unwrap_or_default();
+    let query = url
+        .query()
+        .map(|query| format!("?{query}"))
+        .unwrap_or_default();
     let fragment = url
         .fragment()
         .map(|fragment| format!("#{fragment}"))
@@ -109,7 +112,10 @@ async fn resolve_target(url: Url) -> Result<Target, String> {
         return Err("only ports 80 and 443 are allowed".into());
     }
 
-    let host = match url.host().ok_or_else(|| "URL has no hostname".to_string())? {
+    let host = match url
+        .host()
+        .ok_or_else(|| "URL has no hostname".to_string())?
+    {
         Host::Domain(domain) => domain.to_ascii_lowercase(),
         Host::Ipv4(address) => address.to_string(),
         Host::Ipv6(address) => format!("[{address}]"),
@@ -154,7 +160,10 @@ pub(crate) fn rewrite_html(
     relay_domain: &str,
 ) -> Result<Vec<u8>, String> {
     let mut output = Vec::with_capacity(html.len());
-    let bootstrap = BROWSER_FETCH_BOOTSTRAP.replace("__BROWSER_PROXY_ORIGIN__", &format!("https://{proxy_domain}"));
+    let bootstrap = BROWSER_FETCH_BOOTSTRAP.replace(
+        "__BROWSER_PROXY_ORIGIN__",
+        &format!("https://{proxy_domain}"),
+    );
     let mut rewriter = HtmlRewriter::new(
         Settings {
             element_content_handlers: vec![
@@ -252,7 +261,12 @@ fn rewrite_attr(
     Ok(())
 }
 
-fn rewrite_url(value: &str, base_url: &Url, proxy_domain: &str, relay_domain: &str) -> Option<String> {
+fn rewrite_url(
+    value: &str,
+    base_url: &Url,
+    proxy_domain: &str,
+    relay_domain: &str,
+) -> Option<String> {
     let value = value.trim();
     if value.is_empty()
         || value.starts_with('#')
@@ -287,7 +301,9 @@ fn rewrite_srcset(value: &str, base_url: &Url, proxy_domain: &str, relay_domain:
         .split(',')
         .map(|candidate| {
             let candidate = candidate.trim();
-            let split = candidate.find(char::is_whitespace).unwrap_or(candidate.len());
+            let split = candidate
+                .find(char::is_whitespace)
+                .unwrap_or(candidate.len());
             let (url, descriptor) = candidate.split_at(split);
             match rewrite_url(url, base_url, proxy_domain, relay_domain) {
                 Some(url) if descriptor.is_empty() => url,

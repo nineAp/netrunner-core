@@ -313,7 +313,12 @@ mod tests {
 
     #[test]
     fn client_initial_meets_the_amplification_floor() {
-        let pkt = build_client_initial(&super::super::QuicProfile::CHROME, "example.com", DCID, SCID);
+        let pkt = build_client_initial(
+            &super::super::QuicProfile::CHROME,
+            "example.com",
+            DCID,
+            SCID,
+        );
         assert!(
             pkt.len() >= MIN_INITIAL_DATAGRAM_LEN,
             "client Initial datagram must be >= {MIN_INITIAL_DATAGRAM_LEN} bytes, got {}",
@@ -323,7 +328,12 @@ mod tests {
 
     #[test]
     fn client_initial_starts_with_a_long_header_initial_first_byte() {
-        let pkt = build_client_initial(&super::super::QuicProfile::CHROME, "example.com", DCID, SCID);
+        let pkt = build_client_initial(
+            &super::super::QuicProfile::CHROME,
+            "example.com",
+            DCID,
+            SCID,
+        );
         // Header protection масками только 4 младших бита long header —
         // верхние 4 бита (form=1, fixed=1, type=00) видны как есть на проводе.
         assert_eq!(
@@ -363,7 +373,12 @@ mod tests {
     /// сборки, а разбирая байты на проводе с нуля.
     #[test]
     fn our_initial_decrypts_and_parses_as_a_real_quic_client_hello() {
-        let pkt = build_client_initial(&super::super::QuicProfile::CHROME, "sni.example", DCID, SCID);
+        let pkt = build_client_initial(
+            &super::super::QuicProfile::CHROME,
+            "sni.example",
+            DCID,
+            SCID,
+        );
         let mut wire = pkt.to_vec();
 
         // Разбор long header: first(1) | version(4) | dcid_len(1) | dcid |
@@ -429,7 +444,11 @@ mod tests {
         // Валидный QUIC ClientHello: тип 0x01, пустой session_id, ALPN h3,
         // quic_transport_parameters (bug #10).
         assert_eq!(ch[0], 0x01, "CRYPTO must carry a ClientHello");
-        assert_eq!(ch[4 + 2 + 32], 0x00, "legacy_session_id must be empty (QUIC)");
+        assert_eq!(
+            ch[4 + 2 + 32],
+            0x00,
+            "legacy_session_id must be empty (QUIC)"
+        );
         assert!(
             ch.windows(2).any(|w| w == [b'h', b'3']),
             "ALPN must advertise h3, not h2"
@@ -449,11 +468,19 @@ mod tests {
         assert_eq!(flight.len(), 2, "Initial + Handshake");
 
         // Пакет 1 — long-header Handshake (тип 10 в битах 4..5 → 0xE0 сверху).
-        assert_eq!(flight[1][0] & 0xF0, 0xE0, "second packet must be a Handshake long header");
+        assert_eq!(
+            flight[1][0] & 0xF0,
+            0xE0,
+            "second packet must be a Handshake long header"
+        );
 
         // Пакет 0 — Initial: разбираем и расшифровываем как независимый получатель.
         let mut wire = flight[0].to_vec();
-        assert_eq!(wire[0] & 0xF0, 0xC0, "first packet must be an Initial long header");
+        assert_eq!(
+            wire[0] & 0xF0,
+            0xC0,
+            "first packet must be an Initial long header"
+        );
         let mut off = 1 + 4; // first + version
         let dcid_len = wire[off] as usize;
         off += 1;

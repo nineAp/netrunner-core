@@ -16,16 +16,19 @@ use bytes::Bytes;
 use netrunner_logger::{debug, trace, warn};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::mpsc;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpStream, UdpSocket},
+};
 use tokio_util::sync::CancellationToken;
 
 use crate::net::{
-    MeshRoute, NetworkConfig,
     connection::{
         bridge::{run_tcp_bridge, run_udp_bridge},
         muxer::Muxer,
     },
+    MeshRoute, NetworkConfig,
 };
 use crate::nrxp::{Frame, FrameType};
 
@@ -45,9 +48,91 @@ pub struct RemoteOpener {
     /// Mesh egress sessions confirm destination CONNECTs over the control
     /// stream before their ingress acknowledges the client request.
     pub mesh_peer: bool,
+    /// The authenticated peer used the mesh4 onion-capable handshake.
+    pub mesh_onion_peer: bool,
 }
 
 impl RemoteOpener {
+    pub async fn open_tcp_with_privacy(
+        &self,
+        stream_id: u32,
+        target: String,
+        v_rx: mpsc::Receiver<Bytes>,
+        token: CancellationToken,
+        strong_privacy: bool,
+    ) {
+        if !self.mesh_peer
+            && self
+                .mesh_route
+                .as_ref()
+                .is_some_and(|route| route.remaining_hops > 1)
+        {
+            if let Some(mesh) = self.mesh.clone() {
+                tokio::spawn(Self::open_via_onion(
+                    self.muxer.clone(),
+                    mesh,
+                    stream_id,
+                    target,
+                    v_rx,
+                    token,
+                    false,
+                    strong_privacy,
+                ));
+                return;
+            }
+        }
+        if strong_privacy {
+            self.reject_stream(stream_id, token).await;
+            return;
+        }
+        self.open_tcp(stream_id, target, v_rx, token).await;
+    }
+
+    pub async fn open_udp_with_privacy(
+        &self,
+        stream_id: u32,
+        target: String,
+        v_rx: mpsc::Receiver<Bytes>,
+        token: CancellationToken,
+        strong_privacy: bool,
+    ) {
+        if !self.mesh_peer
+            && self
+                .mesh_route
+                .as_ref()
+                .is_some_and(|route| route.remaining_hops > 1)
+        {
+            if let Some(mesh) = self.mesh.clone() {
+                tokio::spawn(Self::open_via_onion(
+                    self.muxer.clone(),
+                    mesh,
+                    stream_id,
+                    target,
+                    v_rx,
+                    token,
+                    true,
+                    strong_privacy,
+                ));
+                return;
+            }
+        }
+        if strong_privacy {
+            self.reject_stream(stream_id, token).await;
+            return;
+        }
+        self.open_udp(stream_id, target, v_rx, token).await;
+    }
+
+    async fn reject_stream(&self, stream_id: u32, token: CancellationToken) {
+        if !token.is_cancelled() {
+            let _ = self
+                .muxer
+                .send_control(stream_id, FrameType::Close, Bytes::new())
+                .await;
+        }
+        self.muxer.remove_stream(stream_id);
+    }
+
     /// Открывает TCP-соединение к `target` и запускает TCP-мост.
     ///
     /// Всё происходит в отдельной задаче. Установка соединения (тайм-аут 7 с) и
@@ -65,6 +150,7 @@ impl RemoteOpener {
         let mesh = self.mesh.clone();
         let mesh_route = self.mesh_route.clone();
         let mesh_peer = self.mesh_peer;
+        let self_mesh_onion_peer = self.mesh_onion_peer;
         let mesh2_peer = mesh_route.is_some();
         tokio::spawn(async move {
             if let (Some(mesh), Some(route)) = (mesh, mesh_route) {
@@ -90,7 +176,7 @@ impl RemoteOpener {
                     match connect_res {
                         Ok(Ok(stream)) => {
                             if mesh_peer {
-                                let ready = if mesh2_peer {
+                                let ready = if mesh2_peer || self_mesh_onion_peer {
                                     crate::net::MESH_ROUTE_READY
                                 } else {
                                     b"PONG"
@@ -155,6 +241,7 @@ impl RemoteOpener {
         let mesh = self.mesh.clone();
         let mesh_route = self.mesh_route.clone();
         let mesh_peer = self.mesh_peer;
+        let self_mesh_onion_peer = self.mesh_onion_peer;
         let mesh2_peer = mesh_route.is_some();
         tokio::spawn(async move {
             if let (Some(mesh), Some(route)) = (mesh, mesh_route) {
@@ -186,7 +273,7 @@ impl RemoteOpener {
                         if let Ok(socket) = UdpSocket::bind(bind).await {
                             if socket.connect(address).await.is_ok() {
                                 if mesh_peer {
-                                    let ready = if mesh2_peer {
+                                    let ready = if mesh2_peer || self_mesh_onion_peer {
                                         crate::net::MESH_ROUTE_READY
                                     } else {
                                         b"PONG"
@@ -206,6 +293,182 @@ impl RemoteOpener {
                 } => {}
             }
             muxer.remove_stream(stream_id);
+        });
+    }
+
+    async fn open_via_onion(
+        ingress_muxer: Arc<Muxer>,
+        mesh: Arc<crate::net::NodeMesh>,
+        ingress_stream_id: u32,
+        target: String,
+        ingress_rx: mpsc::Receiver<Bytes>,
+        token: CancellationToken,
+        is_udp: bool,
+        strong_privacy: bool,
+    ) {
+        let started = Instant::now();
+        let mut excluded_first_hops = Vec::new();
+        let mut connected = None;
+        let max_attempts = mesh
+            .peer_count()
+            .await
+            .clamp(1, usize::from(crate::net::MAX_MESH_HOPS));
+        for _ in 0..max_attempts {
+            if token.is_cancelled() {
+                break;
+            }
+            let Some((peer, capsule)) = mesh
+                .build_onion_route(&target, is_udp, strong_privacy, &excluded_first_hops)
+                .await
+            else {
+                break;
+            };
+            match mesh
+                .connect_onion_stream(
+                    &peer,
+                    &capsule,
+                    is_udp,
+                    Some(&token),
+                    Some(ingress_stream_id),
+                )
+                .await
+            {
+                Ok((peer_session, peer_stream_id, peer_rx)) => {
+                    connected = Some((peer_session, peer_stream_id, peer_rx));
+                    break;
+                }
+                Err(_) => {
+                    excluded_first_hops.push(peer.node_id);
+                    metrics::counter!("netrunner_mesh_onion_route_failures_total").increment(1);
+                }
+            }
+        }
+
+        let Some((peer_session, peer_stream_id, peer_rx)) = connected else {
+            if !token.is_cancelled() {
+                let _ = ingress_muxer
+                    .send_control(ingress_stream_id, FrameType::Close, Bytes::new())
+                    .await;
+            }
+            ingress_muxer.remove_stream(ingress_stream_id);
+            return;
+        };
+        metrics::counter!("netrunner_mesh_onion_streams_total").increment(1);
+        metrics::histogram!("netrunner_mesh_onion_setup_seconds")
+            .record(started.elapsed().as_secs_f64());
+        let peer_muxer = peer_session.muxer.clone();
+        run_mesh_onion_bridge(
+            mesh,
+            ingress_muxer,
+            ingress_stream_id,
+            ingress_rx,
+            peer_muxer,
+            peer_stream_id,
+            peer_rx,
+            peer_session,
+            token,
+            is_udp,
+            strong_privacy,
+        )
+        .await;
+    }
+
+    pub async fn open_mesh_onion(
+        &self,
+        stream_id: u32,
+        capsule: Bytes,
+        v_rx: mpsc::Receiver<Bytes>,
+        token: CancellationToken,
+        is_udp: bool,
+    ) {
+        let muxer = self.muxer.clone();
+        let mesh = self.mesh.clone();
+        let mesh_onion_peer = self.mesh_onion_peer;
+        tokio::spawn(async move {
+            let Some(mesh) = mesh.filter(|_| mesh_onion_peer) else {
+                close_mesh_stream(muxer, stream_id, token).await;
+                return;
+            };
+            let opened = match mesh.open_onion_capsule(&capsule).await {
+                Ok(opened) => opened,
+                Err(_) => {
+                    metrics::counter!("netrunner_mesh_onion_capsule_rejections_total").increment(1);
+                    close_mesh_stream(muxer, stream_id, token).await;
+                    return;
+                }
+            };
+            let strong_privacy = opened.strong_privacy;
+            if opened.is_udp != is_udp {
+                metrics::counter!("netrunner_mesh_onion_protocol_rejections_total").increment(1);
+                close_mesh_stream(muxer, stream_id, token).await;
+                return;
+            }
+            match opened.instruction {
+                crate::net::mesh_onion::OnionInstruction::Forward {
+                    next_peer,
+                    next_capsule,
+                } => {
+                    if next_peer.node_id.eq_ignore_ascii_case(mesh.local_node_id()) {
+                        metrics::counter!("netrunner_mesh_onion_loop_rejections_total")
+                            .increment(1);
+                        close_mesh_stream(muxer, stream_id, token).await;
+                        return;
+                    }
+                    let (peer_session, peer_stream_id, peer_rx) = match mesh
+                        .connect_onion_stream(
+                            &next_peer,
+                            &next_capsule,
+                            is_udp,
+                            Some(&token),
+                            Some(stream_id),
+                        )
+                        .await
+                    {
+                        Ok(stream) => stream,
+                        Err(_) => {
+                            metrics::counter!("netrunner_mesh_onion_forward_failures_total")
+                                .increment(1);
+                            close_mesh_stream(muxer, stream_id, token).await;
+                            return;
+                        }
+                    };
+                    let peer_muxer = peer_session.muxer.clone();
+                    let _ = muxer
+                        .send_control(
+                            stream_id,
+                            FrameType::Heartbeat,
+                            Bytes::from_static(crate::net::MESH_ROUTE_READY),
+                        )
+                        .await;
+                    run_mesh_onion_bridge(
+                        mesh,
+                        muxer,
+                        stream_id,
+                        v_rx,
+                        peer_muxer,
+                        peer_stream_id,
+                        peer_rx,
+                        peer_session,
+                        token,
+                        is_udp,
+                        strong_privacy,
+                    )
+                    .await;
+                }
+                crate::net::mesh_onion::OnionInstruction::Exit { target } => {
+                    run_mesh_onion_exit(
+                        mesh,
+                        muxer,
+                        stream_id,
+                        target,
+                        v_rx,
+                        token,
+                        is_udp,
+                        strong_privacy,
+                    )
+                    .await;
+                }
+            }
         });
     }
 
@@ -426,6 +689,404 @@ impl RemoteOpener {
     }
 }
 
+async fn close_mesh_stream(muxer: Arc<Muxer>, stream_id: u32, token: CancellationToken) {
+    if !token.is_cancelled() {
+        let _ = muxer
+            .send_control(stream_id, FrameType::Close, Bytes::new())
+            .await;
+    }
+    muxer.remove_stream(stream_id);
+}
+
+async fn send_mesh_payload(
+    mesh: &Arc<crate::net::NodeMesh>,
+    muxer: Arc<Muxer>,
+    stream_id: u32,
+    payload: Bytes,
+    is_udp: bool,
+    strong_privacy: bool,
+    token: &CancellationToken,
+) -> bool {
+    if token.is_cancelled() {
+        return false;
+    }
+    if strong_privacy {
+        return tokio::select! {
+            _ = token.cancelled() => false,
+            result = mesh.send_mixed(muxer, stream_id, payload, is_udp, token.clone()) => result.is_ok(),
+        };
+    }
+    if is_udp {
+        let _ = muxer.send_data_safe(stream_id, payload, true).await;
+        return !token.is_cancelled();
+    }
+    let deadline = tokio::time::Instant::now() + crate::net::STREAM_PAUSE_BUDGET;
+    loop {
+        if muxer
+            .send_data_safe(stream_id, payload.clone(), false)
+            .await
+            .is_ok()
+        {
+            return true;
+        }
+        if token.is_cancelled() || tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::select! {
+            _ = token.cancelled() => return false,
+            _ = tokio::time::sleep(crate::net::STREAM_PAUSE_RETRY) => {}
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_mesh_onion_bridge(
+    mesh: Arc<crate::net::NodeMesh>,
+    upstream_muxer: Arc<Muxer>,
+    upstream_stream_id: u32,
+    mut upstream_rx: mpsc::Receiver<Bytes>,
+    downstream_muxer: Arc<Muxer>,
+    downstream_stream_id: u32,
+    mut downstream_rx: mpsc::Receiver<Bytes>,
+    _peer_session: Arc<crate::net::connection::MeshPeerSession>,
+    token: CancellationToken,
+    is_udp: bool,
+    strong_privacy: bool,
+) {
+    let _upstream_cover = if strong_privacy {
+        Some(mesh.acquire_cover_lease(upstream_muxer.clone()).await)
+    } else {
+        None
+    };
+    let _downstream_cover = if strong_privacy {
+        Some(mesh.acquire_cover_lease(downstream_muxer.clone()).await)
+    } else {
+        None
+    };
+
+    let upload = async {
+        loop {
+            tokio::select! {
+                biased;
+                _ = token.cancelled() => break,
+                packet = upstream_rx.recv() => match packet {
+                    Some(packet) => {
+                        if !send_mesh_payload(
+                            &mesh,
+                            downstream_muxer.clone(),
+                            downstream_stream_id,
+                            packet,
+                            is_udp,
+                            strong_privacy,
+                            &token,
+                        ).await {
+                            break;
+                        }
+                    }
+                    None => break,
+                }
+            }
+        }
+    };
+    let download = async {
+        loop {
+            tokio::select! {
+                biased;
+                _ = token.cancelled() => break,
+                packet = downstream_rx.recv() => match packet {
+                    Some(packet) => {
+                        if !send_mesh_payload(
+                            &mesh,
+                            upstream_muxer.clone(),
+                            upstream_stream_id,
+                            packet,
+                            is_udp,
+                            strong_privacy,
+                            &token,
+                        ).await {
+                            break;
+                        }
+                    }
+                    None => break,
+                }
+            }
+        }
+    };
+    tokio::select! {
+        _ = token.cancelled() => {},
+        _ = upload => {},
+        _ = download => {},
+    }
+
+    let _ = downstream_muxer
+        .send_control(downstream_stream_id, FrameType::Close, Bytes::new())
+        .await;
+    downstream_muxer.remove_stream(downstream_stream_id);
+    if !token.is_cancelled() {
+        let _ = upstream_muxer
+            .send_control(upstream_stream_id, FrameType::Close, Bytes::new())
+            .await;
+    }
+    upstream_muxer.remove_stream(upstream_stream_id);
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_mesh_onion_exit(
+    mesh: Arc<crate::net::NodeMesh>,
+    muxer: Arc<Muxer>,
+    stream_id: u32,
+    target: String,
+    mut v_rx: mpsc::Receiver<Bytes>,
+    token: CancellationToken,
+    is_udp: bool,
+    strong_privacy: bool,
+) {
+    if is_udp {
+        let address = tokio::select! {
+            _ = token.cancelled() => None,
+            result = tokio::time::timeout(Duration::from_secs(5), tokio::net::lookup_host(&target)) => {
+                result.ok().and_then(Result::ok).and_then(|mut addresses| addresses.next())
+            }
+        };
+        let Some(address) = address else {
+            close_mesh_stream(muxer, stream_id, token).await;
+            return;
+        };
+        let bind = if address.is_ipv4() {
+            "0.0.0.0:0"
+        } else {
+            "[::]:0"
+        };
+        let socket = tokio::select! {
+            _ = token.cancelled() => None,
+            result = UdpSocket::bind(bind) => result.ok(),
+        };
+        let Some(socket) = socket else {
+            close_mesh_stream(muxer, stream_id, token).await;
+            return;
+        };
+        if socket.connect(address).await.is_err()
+            || muxer
+                .send_control(
+                    stream_id,
+                    FrameType::Heartbeat,
+                    Bytes::from_static(crate::net::MESH_ROUTE_READY),
+                )
+                .await
+                .is_err()
+        {
+            close_mesh_stream(muxer, stream_id, token).await;
+            return;
+        }
+        let _cover = if strong_privacy {
+            Some(mesh.acquire_cover_lease(muxer.clone()).await)
+        } else {
+            None
+        };
+        let socket = Arc::new(socket);
+        let download = async {
+            let mut buffer = vec![0u8; 65_535];
+            loop {
+                let received = tokio::select! {
+                    biased;
+                    _ = token.cancelled() => break,
+                    result = socket.recv(&mut buffer) => match result {
+                        Ok(received) => received,
+                        Err(_) => break,
+                    }
+                };
+                if !send_mesh_payload(
+                    &mesh,
+                    muxer.clone(),
+                    stream_id,
+                    Bytes::copy_from_slice(&buffer[..received]),
+                    true,
+                    strong_privacy,
+                    &token,
+                )
+                .await
+                {
+                    break;
+                }
+            }
+        };
+        if strong_privacy {
+            let (mixed_tx, mut mixed_rx) = mpsc::channel::<Bytes>(128);
+            let flow_id = format!("exit-up:{}:{stream_id}", muxer.session_id());
+            let upload = async {
+                while let Some(packet) = tokio::select! {
+                    biased;
+                    _ = token.cancelled() => None,
+                    packet = v_rx.recv() => packet,
+                } {
+                    if mesh
+                        .send_mixed_to_local(
+                            flow_id.clone(),
+                            mixed_tx.clone(),
+                            packet,
+                            true,
+                            token.clone(),
+                        )
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            };
+            let target_upload = async {
+                while let Some(packet) = tokio::select! {
+                    biased;
+                    _ = token.cancelled() => None,
+                    packet = mixed_rx.recv() => packet,
+                } {
+                    if socket.send(&packet).await.is_err() {
+                        break;
+                    }
+                }
+            };
+            tokio::select! {
+                _ = token.cancelled() => {},
+                _ = upload => {},
+                _ = target_upload => {},
+                _ = download => {},
+            }
+        } else {
+            let upload = async {
+                while let Some(packet) = tokio::select! {
+                    biased;
+                    _ = token.cancelled() => None,
+                    packet = v_rx.recv() => packet,
+                } {
+                    if socket.send(&packet).await.is_err() {
+                        break;
+                    }
+                }
+            };
+            tokio::select! {
+                _ = token.cancelled() => {},
+                _ = upload => {},
+                _ = download => {},
+            }
+        }
+    } else {
+        let stream = tokio::select! {
+            _ = token.cancelled() => None,
+            result = tokio::time::timeout(Duration::from_secs(7), TcpStream::connect(&target)) => {
+                result.ok().and_then(Result::ok)
+            }
+        };
+        let Some(stream) = stream else {
+            close_mesh_stream(muxer, stream_id, token).await;
+            return;
+        };
+        if muxer
+            .send_control(
+                stream_id,
+                FrameType::Heartbeat,
+                Bytes::from_static(crate::net::MESH_ROUTE_READY),
+            )
+            .await
+            .is_err()
+        {
+            close_mesh_stream(muxer, stream_id, token).await;
+            return;
+        }
+        let _cover = if strong_privacy {
+            Some(mesh.acquire_cover_lease(muxer.clone()).await)
+        } else {
+            None
+        };
+        let (mut reader, mut writer) = stream.into_split();
+        let download = async {
+            let mut buffer = [0u8; 16 * 1024];
+            loop {
+                let received = tokio::select! {
+                    biased;
+                    _ = token.cancelled() => break,
+                    result = reader.read(&mut buffer) => match result {
+                        Ok(0) | Err(_) => break,
+                        Ok(received) => received,
+                    }
+                };
+                if !send_mesh_payload(
+                    &mesh,
+                    muxer.clone(),
+                    stream_id,
+                    Bytes::copy_from_slice(&buffer[..received]),
+                    false,
+                    strong_privacy,
+                    &token,
+                )
+                .await
+                {
+                    break;
+                }
+            }
+        };
+        if strong_privacy {
+            let (mixed_tx, mut mixed_rx) = mpsc::channel::<Bytes>(128);
+            let flow_id = format!("exit-up:{}:{stream_id}", muxer.session_id());
+            let upload = async {
+                while let Some(packet) = tokio::select! {
+                    biased;
+                    _ = token.cancelled() => None,
+                    packet = v_rx.recv() => packet,
+                } {
+                    if mesh
+                        .send_mixed_to_local(
+                            flow_id.clone(),
+                            mixed_tx.clone(),
+                            packet,
+                            false,
+                            token.clone(),
+                        )
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            };
+            let target_upload = async {
+                while let Some(packet) = tokio::select! {
+                    biased;
+                    _ = token.cancelled() => None,
+                    packet = mixed_rx.recv() => packet,
+                } {
+                    if writer.write_all(&packet).await.is_err() {
+                        break;
+                    }
+                }
+            };
+            tokio::select! {
+                _ = token.cancelled() => {},
+                _ = upload => {},
+                _ = target_upload => {},
+                _ = download => {},
+            }
+        } else {
+            let upload = async {
+                while let Some(packet) = tokio::select! {
+                    biased;
+                    _ = token.cancelled() => None,
+                    packet = v_rx.recv() => packet,
+                } {
+                    if writer.write_all(&packet).await.is_err() {
+                        break;
+                    }
+                }
+            };
+            tokio::select! {
+                _ = token.cancelled() => {},
+                _ = upload => {},
+                _ = download => {},
+            }
+        }
+    }
+    close_mesh_stream(muxer, stream_id, token).await;
+}
+
 /// Маршрутизатор входящих кадров. Наличие `opener` определяет роль:
 /// `Some` — серверная сторона (умеет открывать соединения к целям),
 /// `None` — клиентская (входящие `Connect` отвергаются).
@@ -450,13 +1111,29 @@ impl StreamHandler {
                 let payload = frame.payload.as_ref();
                 if payload == b"PING" {
                     trace!(stream_id, "🤝 [Tunnel] PING received, replying PONG");
+                    let response: &'static [u8] = if self
+                        .opener
+                        .as_ref()
+                        .is_some_and(|opener| opener.mesh_onion_peer)
+                    {
+                        crate::net::MESH_ONION_READY
+                    } else {
+                        b"PONG"
+                    };
                     let muxer = self.muxer.clone();
                     tokio::spawn(async move {
                         let _ = muxer
-                            .send_control(stream_id, FrameType::Heartbeat, Bytes::from("PONG"))
+                            .send_control(
+                                stream_id,
+                                FrameType::Heartbeat,
+                                Bytes::from_static(response),
+                            )
                             .await;
                     });
-                } else if payload == b"PONG" || payload == crate::net::MESH_ROUTE_READY {
+                } else if payload == b"PONG"
+                    || payload == crate::net::MESH_ROUTE_READY
+                    || payload == crate::net::MESH_ONION_READY
+                {
                     trace!(stream_id, "🤝 [Tunnel] PONG received");
                     self.muxer.dispatch_to_local(stream_id, frame.payload);
                 } else {
@@ -478,11 +1155,27 @@ impl StreamHandler {
             }
 
             FrameType::Connect => {
-                self.handle_conn_request(stream_id, frame.payload, false)
+                self.handle_conn_request(stream_id, frame.payload, false, false)
                     .await
             }
             FrameType::UdpConnect => {
-                self.handle_conn_request(stream_id, frame.payload, true)
+                self.handle_conn_request(stream_id, frame.payload, true, false)
+                    .await
+            }
+            FrameType::SecureConnect => {
+                self.handle_conn_request(stream_id, frame.payload, false, true)
+                    .await
+            }
+            FrameType::SecureUdpConnect => {
+                self.handle_conn_request(stream_id, frame.payload, true, true)
+                    .await
+            }
+            FrameType::MeshOnionConnect => {
+                self.handle_mesh_onion_request(stream_id, frame.payload, false)
+                    .await
+            }
+            FrameType::MeshOnionUdpConnect => {
+                self.handle_mesh_onion_request(stream_id, frame.payload, true)
                     .await
             }
 
@@ -586,7 +1279,13 @@ impl StreamHandler {
     /// Обрабатывает `Connect`/`UdpConnect`: регистрирует поток (получая токен
     /// отмены) и просит [`RemoteOpener`] открыть соединение. На клиенте (нет
     /// opener) — отказ с `Close`. `payload` несёт адрес цели строкой `"ip:port"`.
-    async fn handle_conn_request(&self, stream_id: u32, payload: Bytes, is_udp: bool) {
+    async fn handle_conn_request(
+        &self,
+        stream_id: u32,
+        payload: Bytes,
+        is_udp: bool,
+        strong_privacy: bool,
+    ) {
         let target = String::from_utf8_lossy(&payload).to_string();
 
         if let Some(opener) = &self.opener {
@@ -604,15 +1303,41 @@ impl StreamHandler {
             );
 
             if is_udp {
-                opener.open_udp(stream_id, target, v_rx, cancel_token).await;
+                opener
+                    .open_udp_with_privacy(stream_id, target, v_rx, cancel_token, strong_privacy)
+                    .await;
             } else {
-                opener.open_tcp(stream_id, target, v_rx, cancel_token).await;
+                opener
+                    .open_tcp_with_privacy(stream_id, target, v_rx, cancel_token, strong_privacy)
+                    .await;
             }
         } else {
             warn!(
                 stream_id,
                 "⚠️ [Tunnel] Rejected incoming connection to {} (Client mode)", target
             );
+            let muxer = self.muxer.clone();
+            tokio::spawn(async move {
+                let _ = muxer
+                    .send_control(stream_id, FrameType::Close, Bytes::new())
+                    .await;
+            });
+        }
+    }
+
+    async fn handle_mesh_onion_request(&self, stream_id: u32, capsule: Bytes, is_udp: bool) {
+        if let Some(opener) = &self.opener {
+            let cap = NetworkConfig::global().channel_capacity;
+            let (v_tx, v_rx) = mpsc::channel::<Bytes>(cap);
+            let cancel_token = self.muxer.register_stream_with_backlog_cap(
+                stream_id,
+                v_tx,
+                crate::net::SERVER_STREAM_BACKLOG_MAX_BYTES,
+            );
+            opener
+                .open_mesh_onion(stream_id, capsule, v_rx, cancel_token, is_udp)
+                .await;
+        } else {
             let muxer = self.muxer.clone();
             tokio::spawn(async move {
                 let _ = muxer

@@ -23,8 +23,8 @@
 //! подключился бы к апстриму напрямую по TCP, только вместо
 //! `TcpStream::connect` здесь `TunnelStream::connect`.
 
-use crate::tunnel_stream::TunnelStream;
 use crate::browser_proxy::{self, Target as BrowserTarget};
+use crate::tunnel_stream::TunnelStream;
 use crate::EdgeConfig;
 use axum::body::Body;
 use axum::http::StatusCode;
@@ -37,9 +37,9 @@ use netrunner_logger::{error, warn};
 use rustls_pki_types::ServerName;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_rustls::rustls;
 use tokio_rustls::TlsConnector;
-use tokio::io::{AsyncRead, AsyncWrite};
 
 /// Один keep-alive HTTP/1.1-отправитель поверх уже установленного
 /// NRXP-туннеля + внутреннего TLS до бэкенда — то, чем реально владеет пул в
@@ -265,18 +265,16 @@ async fn try_proxy(cfg: &EdgeConfig, req: axum::extract::Request) -> Result<Resp
         .get(header::HOST)
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default();
-    let is_browser_gateway = host_without_port(request_host)
-        .eq_ignore_ascii_case(&cfg.browser_proxy_domain);
+    let is_browser_gateway =
+        host_without_port(request_host).eq_ignore_ascii_case(&cfg.browser_proxy_domain);
 
     if !is_browser_gateway {
         if let Some(search_path) = search_upstream_path(&path_and_query) {
             if let Some((search_route, search_query)) = search_path.split_once('?') {
                 if search_route.starts_with("/l/") {
                     if let Some(target) = browser_proxy::search_redirect(search_query) {
-                        let location = browser_proxy::gateway_url(
-                            &target,
-                            &cfg.browser_proxy_domain,
-                        );
+                        let location =
+                            browser_proxy::gateway_url(&target, &cfg.browser_proxy_domain);
                         return Response::builder()
                             .status(StatusCode::FOUND)
                             .header(header::LOCATION, location)
@@ -292,13 +290,13 @@ async fn try_proxy(cfg: &EdgeConfig, req: axum::extract::Request) -> Result<Resp
     let browser_target = if is_browser_gateway {
         let parsed = if path_and_query.starts_with("/browse/") {
             browser_proxy::parse_target(&path_and_query).await
-        } else if let Some(referer) = parts.headers.get(header::REFERER).and_then(|v| v.to_str().ok()) {
-            browser_proxy::parse_referer_target(
-                referer,
-                &path_and_query,
-                &cfg.browser_proxy_domain,
-            )
-            .await
+        } else if let Some(referer) = parts
+            .headers
+            .get(header::REFERER)
+            .and_then(|v| v.to_str().ok())
+        {
+            browser_proxy::parse_referer_target(referer, &path_and_query, &cfg.browser_proxy_domain)
+                .await
         } else {
             Err("browse URL is missing".to_string())
         };
@@ -485,7 +483,7 @@ async fn try_proxy(cfg: &EdgeConfig, req: axum::extract::Request) -> Result<Resp
         // прикидывающееся им ради маршрутизации".
         if browser_target.is_none() {
             if let Some(ref host) = original_host {
-            builder = builder.header("x-forwarded-host", host.as_str());
+                builder = builder.header("x-forwarded-host", host.as_str());
             }
         }
         builder
@@ -520,25 +518,12 @@ async fn try_proxy(cfg: &EdgeConfig, req: axum::extract::Request) -> Result<Resp
         }
     }
 
-    let first_fresh = fresh_attempt(
-        cfg,
-        &target_addr,
-        &target_host,
-        use_tls,
-        &build_request,
-    )
-    .await;
+    let first_fresh = fresh_attempt(cfg, &target_addr, &target_host, use_tls, &build_request).await;
     let (response_parts, response_bytes, fresh_sender) = match first_fresh {
         Ok(result) => result,
         Err(first_error) if retryable => {
             tokio::time::sleep(Duration::from_millis(100)).await;
-            fresh_attempt(
-                cfg,
-                &target_addr,
-                &target_host,
-                use_tls,
-                &build_request,
-            )
+            fresh_attempt(cfg, &target_addr, &target_host, use_tls, &build_request)
                 .await
                 .map_err(|retry_error| {
                     format!(
@@ -568,7 +553,9 @@ async fn try_proxy(cfg: &EdgeConfig, req: axum::extract::Request) -> Result<Resp
 
 fn host_without_port(authority: &str) -> &str {
     if authority.starts_with('[') {
-        authority.split_once(']').map_or(authority, |(host, _)| host)
+        authority
+            .split_once(']')
+            .map_or(authority, |(host, _)| host)
     } else {
         authority.split(':').next().unwrap_or(authority)
     }
@@ -609,7 +596,11 @@ fn rewrite_response(
     is_search: bool,
 ) -> Result<(), String> {
     if let Some(target) = target {
-        if let Some(location) = parts.headers.get(header::LOCATION).and_then(|v| v.to_str().ok()) {
+        if let Some(location) = parts
+            .headers
+            .get(header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+        {
             if let Ok(url) = target.url.join(location) {
                 if matches!(url.scheme(), "http" | "https") {
                     let proxied = browser_proxy::gateway_url(&url, &cfg.browser_proxy_domain);
@@ -639,12 +630,18 @@ fn rewrite_document_body(
     base_url: &url::Url,
     cfg: &EdgeConfig,
 ) -> Result<(), String> {
-    let Some(content_type) = parts.headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()) else {
+    let Some(content_type) = parts
+        .headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+    else {
         return Ok(());
     };
     let content_type = content_type.to_ascii_lowercase();
     if content_type.contains("text/css") {
-        if let Some(rewritten) = browser_proxy::rewrite_css(body, base_url, &cfg.browser_proxy_domain) {
+        if let Some(rewritten) =
+            browser_proxy::rewrite_css(body, base_url, &cfg.browser_proxy_domain)
+        {
             *body = Bytes::from(rewritten);
         }
         return Ok(());
@@ -847,10 +844,9 @@ async fn finish_http_handshake<S>(stream: S) -> Result<PooledSender, String>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let (send_request, connection) =
-        hyper::client::conn::http1::handshake(TokioIo::new(stream))
-            .await
-            .map_err(|e| format!("HTTP/1 handshake with backend failed: {e}"))?;
+    let (send_request, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+        .await
+        .map_err(|e| format!("HTTP/1 handshake with backend failed: {e}"))?;
 
     // Живёт, пока соединение не закроется (нода/бэкенд оборвали канал или
     // сама `SendRequest` вышла из пула по возрасту) — не обязательно на один

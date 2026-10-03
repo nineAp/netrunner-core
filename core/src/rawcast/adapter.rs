@@ -20,7 +20,7 @@ impl RawCastAdapter {
     /// RawCast → NRXP. Маппит протокол+событие в [`FrameType`]; для `Connect`
     /// без payload подставляет адрес цели строкой `"ip:port"`. ICMP отвергается —
     /// ядро NRXP его не проксирует.
-    pub(crate) fn to_nrxp(raw: RawCastFrame) -> Result<Frame, String> {
+    pub(crate) fn to_nrxp(raw: RawCastFrame, strong_privacy: bool) -> Result<Frame, String> {
         let stream_id = raw.socket_id as u32;
 
         let (frame_type, payload) = match (raw.protocol, raw.event) {
@@ -30,7 +30,14 @@ impl RawCastAdapter {
                 } else {
                     Bytes::from(format!("{}:{}", raw.dst_ip, raw.dst_port))
                 };
-                (FrameType::Connect, final_payload)
+                (
+                    if strong_privacy {
+                        FrameType::SecureConnect
+                    } else {
+                        FrameType::Connect
+                    },
+                    final_payload,
+                )
             }
             (LocalProtocol::Udp, RawCastEvent::Connect) => {
                 let final_payload = if !raw.payload.is_empty() {
@@ -38,7 +45,14 @@ impl RawCastAdapter {
                 } else {
                     Bytes::from(format!("{}:{}", raw.dst_ip, raw.dst_port))
                 };
-                (FrameType::UdpConnect, final_payload)
+                (
+                    if strong_privacy {
+                        FrameType::SecureUdpConnect
+                    } else {
+                        FrameType::UdpConnect
+                    },
+                    final_payload,
+                )
             }
             (LocalProtocol::Tcp, RawCastEvent::Data) => (FrameType::Data, raw.payload),
             (LocalProtocol::Udp, RawCastEvent::Data) => (FrameType::UdpData, raw.payload),
@@ -68,7 +82,12 @@ impl RawCastAdapter {
         };
 
         let event = match nrxp_frame.header.frame_type {
-            FrameType::Connect | FrameType::UdpConnect => RawCastEvent::Connect,
+            FrameType::Connect
+            | FrameType::UdpConnect
+            | FrameType::SecureConnect
+            | FrameType::SecureUdpConnect
+            | FrameType::MeshOnionConnect
+            | FrameType::MeshOnionUdpConnect => RawCastEvent::Connect,
             FrameType::Data | FrameType::UdpData => RawCastEvent::Data,
             FrameType::Close => RawCastEvent::Close,
             FrameType::Heartbeat => return Err("Heartbeat should be handled by muxer".into()),
@@ -91,5 +110,29 @@ impl RawCastAdapter {
             dst_port,
             payload: nrxp_frame.payload,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strong_privacy_uses_dedicated_tcp_and_udp_connect_bytes() {
+        let tcp = RawCastAdapter::to_nrxp(
+            RawCastFrame::connect(LocalProtocol::Tcp, 17, Ipv4Addr::new(203, 0, 113, 8), 443),
+            true,
+        )
+        .unwrap();
+        assert_eq!(tcp.header.frame_type, FrameType::SecureConnect);
+        assert_eq!(tcp.header.stream_id, 17);
+
+        let udp = RawCastAdapter::to_nrxp(
+            RawCastFrame::connect(LocalProtocol::Udp, 18, Ipv4Addr::new(203, 0, 113, 9), 443),
+            true,
+        )
+        .unwrap();
+        assert_eq!(udp.header.frame_type, FrameType::SecureUdpConnect);
+        assert_eq!(udp.header.stream_id, 18);
     }
 }

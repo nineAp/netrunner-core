@@ -23,8 +23,8 @@ use std::{
     io,
     net::{Ipv4Addr, SocketAddr},
     pin::Pin,
-    sync::Arc,
     sync::atomic::{AtomicU64, Ordering},
+    sync::Arc,
     task::{Context, Poll},
     time::{Duration, Instant},
 };
@@ -32,15 +32,15 @@ use std::{
 use crate::{
     crypto::{ChaChaCipher, Identity, SessionKeys},
     net::{
-        DNS_LOOKUP_TIMEOUT, FALLBACK_CONNECT_TIMEOUT, HTTPS_PORT, LEG_RECONNECT_DELAY,
-        LEG_STAGGER_DELAY, MAX_TUNNEL_LEGS, NETWORK_WATCHER_INTERVAL, NetworkConfig,
-        SECURE_HANDSHAKE_TIMEOUT, SESSION_CLEANUP_DELAY, STREAM_PAUSE_BUDGET, STREAM_PAUSE_RETRY,
-        TLS_HELLO_TIMEOUT, TOPOLOGY_PRINT_INTERVAL,
         connection::{
             engine::TunnelEngine,
             handler::{RemoteOpener, StreamHandler},
             muxer::{MuxMessage, Muxer},
         },
+        NetworkConfig, DNS_LOOKUP_TIMEOUT, FALLBACK_CONNECT_TIMEOUT, HTTPS_PORT,
+        LEG_RECONNECT_DELAY, LEG_STAGGER_DELAY, MAX_TUNNEL_LEGS, NETWORK_WATCHER_INTERVAL,
+        SECURE_HANDSHAKE_TIMEOUT, SESSION_CLEANUP_DELAY, STREAM_PAUSE_BUDGET, STREAM_PAUSE_RETRY,
+        TLS_HELLO_TIMEOUT, TOPOLOGY_PRINT_INTERVAL,
     },
     nrxp::{Codec, Frame, FrameType, TlsBridge},
     rawcast::{LocalProtocol, RawCastAdapter, RawCastFrame},
@@ -49,14 +49,14 @@ use crate::{
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use netrunner_logger::{
-    AppError, ERR_AUTH_FAILED, ERR_INFRA_TIMEOUT, ERR_NET_TLS_TAMPER, debug, error, info, warn,
+    debug, error, info, warn, AppError, ERR_AUTH_FAILED, ERR_INFRA_TIMEOUT, ERR_NET_TLS_TAMPER,
 };
 use rand::{Rng, RngExt};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
     net::{
-        TcpStream,
         tcp::{OwnedReadHalf, OwnedWriteHalf},
+        TcpStream,
     },
     sync::mpsc,
 };
@@ -83,6 +83,16 @@ pub(crate) struct DgramSessionEntry {
     /// (bug #12). Только для quic-записи (Initial адресуется её DCID); шлём
     /// ровно один раз, чтобы дубликат Initial не породил повторный flight.
     pub(crate) responded_to_initial: bool,
+}
+
+fn is_rawcast_connect_frame(frame_type: FrameType) -> bool {
+    matches!(
+        frame_type,
+        FrameType::Connect
+            | FrameType::UdpConnect
+            | FrameType::SecureConnect
+            | FrameType::SecureUdpConnect
+    )
 }
 
 /// One authenticated, persistent NRXP connection to a mesh peer. Multiple
@@ -119,6 +129,51 @@ impl MeshPeerSession {
         is_udp: bool,
         cancel: Option<&tokio_util::sync::CancellationToken>,
     ) -> Result<(u32, mpsc::Receiver<Bytes>), AppError> {
+        let frame_type = if is_udp {
+            FrameType::UdpConnect
+        } else {
+            FrameType::Connect
+        };
+        self.open_stream_frame(
+            frame_type,
+            Bytes::copy_from_slice(target.as_bytes()),
+            is_udp,
+            cancel,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn open_onion_stream(
+        &self,
+        capsule: &[u8],
+        is_udp: bool,
+        cancel: Option<&tokio_util::sync::CancellationToken>,
+        avoid_stream_id: Option<u32>,
+    ) -> Result<(u32, mpsc::Receiver<Bytes>), AppError> {
+        let frame_type = if is_udp {
+            FrameType::MeshOnionUdpConnect
+        } else {
+            FrameType::MeshOnionConnect
+        };
+        self.open_stream_frame(
+            frame_type,
+            Bytes::copy_from_slice(capsule),
+            is_udp,
+            cancel,
+            avoid_stream_id,
+        )
+        .await
+    }
+
+    async fn open_stream_frame(
+        &self,
+        frame_type: FrameType,
+        payload: Bytes,
+        is_udp: bool,
+        cancel: Option<&tokio_util::sync::CancellationToken>,
+        avoid_stream_id: Option<u32>,
+    ) -> Result<(u32, mpsc::Receiver<Bytes>), AppError> {
         if !self.is_usable() {
             return Err(AppError::new(
                 ERR_INFRA_TIMEOUT,
@@ -128,7 +183,10 @@ impl MeshPeerSession {
         }
 
         let started = Instant::now();
-        let stream_id = self.muxer.next_stream_id();
+        let mut stream_id = self.muxer.next_stream_id();
+        if avoid_stream_id == Some(stream_id) {
+            stream_id = self.muxer.next_stream_id();
+        }
         let cap = NetworkConfig::global().channel_capacity;
         let (stream_tx, mut stream_rx) = mpsc::channel::<Bytes>(cap);
         self.muxer.register_stream_with_backlog_cap(
@@ -137,11 +195,6 @@ impl MeshPeerSession {
             crate::net::SERVER_STREAM_BACKLOG_MAX_BYTES,
         );
 
-        let frame_type = if is_udp {
-            FrameType::UdpConnect
-        } else {
-            FrameType::Connect
-        };
         let open_result = if let Some(cancel) = cancel {
             tokio::select! {
                 biased;
@@ -149,17 +202,13 @@ impl MeshPeerSession {
                 result = self.muxer.send_control(
                     stream_id,
                     frame_type,
-                    Bytes::copy_from_slice(target.as_bytes()),
+                    payload.clone(),
                 ) => Some(result),
             }
         } else {
             Some(
                 self.muxer
-                    .send_control(
-                        stream_id,
-                        frame_type,
-                        Bytes::copy_from_slice(target.as_bytes()),
-                    )
+                    .send_control(stream_id, frame_type, payload)
                     .await,
             )
         };
@@ -1124,12 +1173,14 @@ impl ClientHandler {
                 engine_muxer.shutdown();
             });
 
-            let ready_payload =
-                if auth_token.starts_with("mesh2:") || auth_token.starts_with("mesh3:") {
-                    crate::net::MESH_ROUTE_READY
-                } else {
-                    b"PONG"
-                };
+            let ready_payload = if auth_token.starts_with("mesh2:")
+                || auth_token.starts_with("mesh3:")
+                || auth_token.starts_with("mesh4:")
+            {
+                crate::net::MESH_ROUTE_READY
+            } else {
+                b"PONG"
+            };
             let session = MeshPeerSession {
                 muxer: muxer.clone(),
                 engine_task: engine_task.abort_handle(),
@@ -1152,8 +1203,13 @@ impl ClientHandler {
                 return Err(error);
             }
             let pong = tokio::time::timeout(Duration::from_secs(8), probe_rx.recv()).await;
+            let expected_pong: &'static [u8] = if auth_token.starts_with("mesh4:") {
+                crate::net::MESH_ONION_READY
+            } else {
+                b"PONG"
+            };
             match pong {
-                Ok(Some(payload)) if payload.as_ref() == b"PONG" => {}
+                Ok(Some(payload)) if payload.as_ref() == expected_pong => {}
                 _ => {
                     engine_task.abort();
                     muxer.shutdown();
@@ -1485,8 +1541,32 @@ impl ClientHandler {
         decoy_sni: impl Into<Arc<str>>,
         auth_token: Option<String>,
         identity: Option<Identity>,
+        rx_from_engine: mpsc::Receiver<RawCastFrame>,
+        tx_to_engine: mpsc::Sender<RawCastFrame>,
+    ) -> Result<Arc<Muxer>, AppError> {
+        Self::connect_with_privacy_mode(
+            remote_proxy_addr,
+            decoy_sni,
+            auth_token,
+            identity,
+            rx_from_engine,
+            tx_to_engine,
+            false,
+        )
+        .await
+    }
+
+    /// Connect with an explicit per-engine privacy mode. In strong mode every
+    /// new TCP/UDP stream uses its dedicated security frame type so ingress can
+    /// fail closed instead of silently selecting the ordinary mesh route.
+    pub async fn connect_with_privacy_mode(
+        remote_proxy_addr: &str,
+        decoy_sni: impl Into<Arc<str>>,
+        auth_token: Option<String>,
+        identity: Option<Identity>,
         mut rx_from_engine: mpsc::Receiver<RawCastFrame>,
         tx_to_engine: mpsc::Sender<RawCastFrame>,
+        strong_privacy: bool,
     ) -> Result<Arc<Muxer>, AppError> {
         let decoy_sni: Arc<str> = decoy_sni.into();
         let auth_token: Arc<str> = auth_token.unwrap_or_default().into();
@@ -1677,13 +1757,13 @@ impl ClientHandler {
                     }
                 };
 
-                if let Ok(nrxp_frame) = RawCastAdapter::to_nrxp(raw_frame.clone()) {
+                if let Ok(nrxp_frame) = RawCastAdapter::to_nrxp(raw_frame.clone(), strong_privacy) {
                     let local_socket_id = raw_frame.socket_id;
                     let f_type = nrxp_frame.header.frame_type;
                     let payload = nrxp_frame.payload;
 
                     match f_type {
-                        FrameType::Connect | FrameType::UdpConnect => {
+                        frame_type if is_rawcast_connect_frame(frame_type) => {
                             let global_stream_id = muxer_inner.next_stream_id();
                             local_to_global.insert(local_socket_id, global_stream_id);
                             registry.insert(
@@ -2366,7 +2446,8 @@ impl TunnelHandler for ServerHandler {
         let parsed_mesh_auth = crate::net::parse_mesh_auth_token(&auth_token);
         let is_mesh_peer = auth_token.starts_with("mesh:")
             || auth_token.starts_with("mesh2:")
-            || auth_token.starts_with("mesh3:");
+            || auth_token.starts_with("mesh3:")
+            || auth_token.starts_with("mesh4:");
         #[cfg(feature = "mesh-quic")]
         if mesh_quic_connection.is_some() && !is_mesh_peer {
             metrics::counter!("netrunner_mesh_quic_non_mesh_rejected_total").increment(1);
@@ -2505,14 +2586,20 @@ impl TunnelHandler for ServerHandler {
         let route_has_more_hops = mesh_route
             .as_ref()
             .is_some_and(|route| route.remaining_hops > 1);
+        let mesh_onion_peer = auth_token.starts_with("mesh4:");
         let opener = Arc::new(RemoteOpener {
             muxer: muxer.clone(),
             // A peer route keeps moving until its hop budget reaches the final
             // egress. Local direct mode creates no initial route, but the node
             // can still forward authenticated routes from another ingress.
-            mesh: if route_has_more_hops { mesh } else { None },
+            mesh: if is_mesh_peer || route_has_more_hops {
+                mesh
+            } else {
+                None
+            },
             mesh_route,
             mesh_peer: is_mesh_peer,
+            mesh_onion_peer,
         });
         let handler = Arc::new(StreamHandler::new(muxer.clone(), Some(opener)));
 
@@ -2575,12 +2662,23 @@ impl TunnelHandler for ServerHandler {
 
 #[cfg(test)]
 mod tests {
-    use super::network_changed;
+    use super::{is_rawcast_connect_frame, network_changed};
+    use crate::nrxp::FrameType;
     use std::net::IpAddr;
     use std::time::Duration as StdDuration;
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
+    }
+
+    #[test]
+    fn rawcast_connect_dispatch_recognizes_the_privacy_mode_bytes() {
+        assert!(is_rawcast_connect_frame(FrameType::Connect));
+        assert!(is_rawcast_connect_frame(FrameType::UdpConnect));
+        assert!(is_rawcast_connect_frame(FrameType::SecureConnect));
+        assert!(is_rawcast_connect_frame(FrameType::SecureUdpConnect));
+        assert!(!is_rawcast_connect_frame(FrameType::Data));
+        assert!(!is_rawcast_connect_frame(FrameType::UdpData));
     }
 
     #[test]

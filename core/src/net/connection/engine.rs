@@ -24,7 +24,7 @@ use std::{
 
 use bytes::{Bytes, BytesMut};
 use netrunner_logger::{
-    AppError, ERR_INFRA_TIMEOUT, ERR_NET_TLS_TAMPER, ERR_SYS_PANIC, error, info, warn,
+    error, info, warn, AppError, ERR_INFRA_TIMEOUT, ERR_NET_TLS_TAMPER, ERR_SYS_PANIC,
 };
 use rand::RngExt;
 use tokio::{
@@ -37,17 +37,17 @@ use super::buftune::{self, BufTuner, Dir as BufDir};
 
 use crate::{
     net::{
-        FALLBACK_CONNECT_TIMEOUT, HEALTH_CHECK_INTERVAL, LEG_FLAP_WINDOW,
-        MAX_INTERNAL_RECONNECT_ATTEMPTS, MAX_RECONNECT_BACKOFF_MS, RECONNECT_BACKOFF_BASE,
-        RECONNECT_BACKOFF_JITTER_MS, TUNNEL_INTERLEAVE_CHUNK, TUNNEL_MAX_BUFFER_SIZE,
-        TUNNEL_READ_RESERVE,
         connection::{
             connection::{TunnelReadHalf, TunnelWriteHalf},
             handler::StreamHandler,
             muxer::{MuxMessage, TcpSocketStats},
         },
+        FALLBACK_CONNECT_TIMEOUT, HEALTH_CHECK_INTERVAL, LEG_FLAP_WINDOW,
+        MAX_INTERNAL_RECONNECT_ATTEMPTS, MAX_RECONNECT_BACKOFF_MS, RECONNECT_BACKOFF_BASE,
+        RECONNECT_BACKOFF_JITTER_MS, TUNNEL_INTERLEAVE_CHUNK, TUNNEL_MAX_BUFFER_SIZE,
+        TUNNEL_READ_RESERVE,
     },
-    nrxp::{ErrorAction, FrameType, MAX_FRAME_PAYLOAD, RxCodec, TxCodec},
+    nrxp::{ErrorAction, FrameType, RxCodec, TxCodec, MAX_FRAME_PAYLOAD},
 };
 
 /// Per-leg userspace flow queue.  The mpsc channel remains the bounded ingress

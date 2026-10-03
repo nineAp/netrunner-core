@@ -15,6 +15,7 @@ use std::collections::HashMap;
 
 pub const MAX_MESH_HOPS: u8 = 8;
 pub const MESH_ROUTE_READY: &[u8] = b"NRXP-MESH2-READY";
+pub const MESH_ONION_READY: &[u8] = b"NRXP-MESH-ONION1-READY";
 
 /// How the next peer is selected for a stream route.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -68,7 +69,8 @@ pub fn parse_mesh_auth_token(token: &str) -> Result<Option<MeshAuth>, &'static s
     if token.len() > 1024
         && (token.starts_with("mesh:")
             || token.starts_with("mesh2:")
-            || token.starts_with("mesh3:"))
+            || token.starts_with("mesh3:")
+            || token.starts_with("mesh4:"))
     {
         return Err("mesh credential exceeds the maximum size");
     }
@@ -161,6 +163,22 @@ pub fn parse_mesh_auth_token(token: &str) -> Result<Option<MeshAuth>, &'static s
     }
 
     if let Some(claim) = token.strip_prefix("mesh:") {
+        let (peer_id, peer_secret) = claim
+            .split_once(':')
+            .ok_or("malformed mesh peer credentials")?;
+        if !valid_mesh_node_id(peer_id) || !valid_mesh_peer_secret(peer_secret) {
+            return Err("incomplete mesh peer credentials");
+        }
+        return Ok(Some(MeshAuth {
+            peer_id: peer_id.to_owned(),
+            peer_secret: peer_secret.to_owned(),
+            route: None,
+        }));
+    }
+
+    // mesh4 carries no route, egress ID, or visited list. Per-stream route
+    // instructions arrive separately as HPKE onion capsules.
+    if let Some(claim) = token.strip_prefix("mesh4:") {
         let (peer_id, peer_secret) = claim
             .split_once(':')
             .ok_or("malformed mesh peer credentials")?;
@@ -312,6 +330,12 @@ mod mesh_auth_token_tests {
             .unwrap();
         assert_eq!(legacy.peer_id, "node-a");
         assert!(legacy.route.is_none());
+
+        let mesh4 = parse_mesh_auth_token("mesh4:node-a:secret")
+            .unwrap()
+            .unwrap();
+        assert_eq!(mesh4.peer_id, "node-a");
+        assert!(mesh4.route.is_none());
 
         let mesh2 = parse_mesh_auth_token("mesh2:node-a:secret:2:weighted-random:node-a")
             .unwrap()

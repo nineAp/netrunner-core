@@ -7,8 +7,11 @@
 use std::{
     cmp::Ordering,
     collections::{HashMap, VecDeque},
-    sync::Arc,
-    time::Duration,
+    sync::{
+        atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering},
+        Arc,
+    },
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use bytes::Bytes;
@@ -18,9 +21,10 @@ use rand::RngExt;
 use sha2::Digest;
 use tokio::{
     net::TcpStream,
-    sync::{mpsc, Mutex, RwLock},
+    sync::{mpsc, oneshot, Mutex, OnceCell, RwLock, Semaphore},
     time::timeout,
 };
+use tokio_util::sync::CancellationToken;
 
 use super::connection::{mesh_process_uptime_ms, ClientHandler, MeshPeerSession, Muxer};
 use super::{MeshPeer, MeshRoute, MeshRouteSelection, MAX_MESH_HOPS};
@@ -34,6 +38,40 @@ const PEER_PROBE_MAX_AGE: Duration = Duration::from_secs(90);
 const PEER_PROBE_FAILURES_TO_EVICT: u8 = 3;
 const MAX_CACHED_PEER_SESSIONS: usize = 256;
 const IDLE_PEER_SESSION_RETENTION: Duration = Duration::from_secs(300);
+const ONION_CAPSULE_MAX_AGE_SECS: u64 = 120;
+const MAX_ONION_REPLAY_ENTRIES: usize = 262_144;
+const ONION_REPLAY_SWEEP_INTERVAL: u64 = 1_024;
+const MIX_BATCH_WINDOW: Duration = Duration::from_millis(20);
+const MIX_BATCH_MAX_PACKETS: usize = 512;
+
+struct MixPacket {
+    flow_id: String,
+    target: MixTarget,
+    stream_id: u32,
+    payload: Bytes,
+    is_udp: bool,
+    cancel: CancellationToken,
+}
+
+enum MixTarget {
+    Tunnel(Arc<Muxer>),
+    Local(mpsc::Sender<Bytes>),
+}
+
+struct CoverState {
+    active_flows: AtomicUsize,
+    cancel: CancellationToken,
+}
+
+pub(crate) struct CoverLease(Arc<CoverState>);
+
+impl Drop for CoverLease {
+    fn drop(&mut self) {
+        if self.0.active_flows.fetch_sub(1, AtomicOrdering::AcqRel) == 1 {
+            self.0.cancel.cancel();
+        }
+    }
+}
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct PeerSessionKey {
@@ -77,8 +115,13 @@ pub struct NodeMesh {
     mesh_quic_port: u16,
     peers: RwLock<Vec<MeshPeer>>,
     rtt_ms: DashMap<String, PeerProbe>,
+    onion_identity: std::sync::RwLock<Option<crate::crypto::LocalIdentity>>,
+    onion_replays: DashMap<[u8; 16], Instant>,
+    onion_replay_insertions: AtomicU64,
     egress_rotation: Mutex<EgressRotation>,
     peer_sessions: Mutex<HashMap<PeerSessionKey, Arc<PeerSessionSlot>>>,
+    mixer: OnceCell<mpsc::Sender<MixPacket>>,
+    cover_tasks: Mutex<HashMap<String, Arc<CoverState>>>,
 }
 
 impl NodeMesh {
@@ -108,8 +151,13 @@ impl NodeMesh {
             mesh_quic_port,
             peers: RwLock::new(Vec::new()),
             rtt_ms: DashMap::new(),
+            onion_identity: std::sync::RwLock::new(None),
+            onion_replays: DashMap::new(),
+            onion_replay_insertions: AtomicU64::new(0),
             egress_rotation: Mutex::new(EgressRotation::default()),
             peer_sessions: Mutex::new(HashMap::new()),
+            mixer: OnceCell::new(),
+            cover_tasks: Mutex::new(HashMap::new()),
         }
     }
 
@@ -121,6 +169,258 @@ impl NodeMesh {
     /// session. Do not log or expose it through diagnostics.
     pub fn auth_token(&self) -> String {
         format!("mesh:{}:{}", self.local_node_id, self.local_node_secret)
+    }
+
+    pub(crate) fn onion_auth_token(&self) -> String {
+        format!("mesh4:{}:{}", self.local_node_id, self.local_node_secret)
+    }
+
+    pub fn set_onion_identity(&self, identity: crate::crypto::LocalIdentity) {
+        *self
+            .onion_identity
+            .write()
+            .expect("onion identity lock poisoned") = Some(identity);
+    }
+
+    pub(crate) async fn open_onion_capsule(
+        &self,
+        wire: &[u8],
+    ) -> Result<super::mesh_onion::OpenedOnionCapsule, String> {
+        let identity = self
+            .onion_identity
+            .read()
+            .map_err(|_| "mesh onion identity lock poisoned".to_owned())?
+            .clone()
+            .ok_or_else(|| "mesh onion identity is unavailable".to_owned())?;
+        let opened = super::mesh_onion::open_capsule(&self.local_node_id, &identity, wire)?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| "system clock is before UNIX epoch".to_owned())?
+            .as_secs();
+        if opened.expires_at_unix <= now
+            || opened.expires_at_unix > now.saturating_add(ONION_CAPSULE_MAX_AGE_SECS)
+        {
+            return Err("mesh onion capsule is expired or has an invalid lifetime".into());
+        }
+        let insertions = self
+            .onion_replay_insertions
+            .fetch_add(1, AtomicOrdering::Relaxed)
+            .saturating_add(1);
+        if insertions % ONION_REPLAY_SWEEP_INTERVAL == 0
+            || self.onion_replays.len() >= MAX_ONION_REPLAY_ENTRIES
+        {
+            self.onion_replays.retain(|_, inserted_at| {
+                inserted_at.elapsed() <= Duration::from_secs(ONION_CAPSULE_MAX_AGE_SECS + 1)
+            });
+        }
+        if self.onion_replays.len() >= MAX_ONION_REPLAY_ENTRIES {
+            return Err("mesh onion replay cache is full".into());
+        }
+        match self.onion_replays.entry(opened.replay_nonce) {
+            dashmap::mapref::entry::Entry::Occupied(_) => {
+                return Err("mesh onion capsule replay was rejected".into());
+            }
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                entry.insert(Instant::now());
+            }
+        }
+        Ok(opened)
+    }
+
+    /// Build a complete loop-free path at ingress and seal its instructions
+    /// backwards so each relay can decrypt only its own next-hop instruction.
+    pub(crate) async fn build_onion_route(
+        &self,
+        target: &str,
+        is_udp: bool,
+        strong_privacy: bool,
+        excluded_first_hops: &[String],
+    ) -> Option<(MeshPeer, Vec<u8>)> {
+        if self.max_hops <= 1 || target.is_empty() || target.len() > 2048 || target.contains('\0') {
+            return None;
+        }
+        let route = MeshRoute {
+            remaining_hops: self.max_hops,
+            selection: MeshRouteSelection::WeightedRandom,
+            egress_node_id: None,
+            visited: vec![self.local_node_id.clone()],
+        };
+        let mut candidates = self.peers_for_route(&route).await;
+        candidates.retain(|peer| {
+            !excluded_first_hops
+                .iter()
+                .any(|excluded| excluded.eq_ignore_ascii_case(&peer.node_id))
+        });
+        if candidates.is_empty() {
+            return None;
+        }
+
+        // Fresh RTT samples are preferred when there are enough healthy nodes
+        // to build at least the normal two-hop path. On cold start keep
+        // unprobed directory peers as a fallback; connection setup will still
+        // fail closed and retry a different first hop.
+        let probed: Vec<_> = candidates
+            .iter()
+            .filter(|peer| self.recent_rtt_ms(&peer.node_id).is_some())
+            .cloned()
+            .collect();
+        if probed.len() >= 1 {
+            candidates = probed;
+        }
+        let max_total_hops = self.max_hops.min(candidates.len().saturating_add(1) as u8);
+        let total_hops = if self.max_hops > 2 && max_total_hops >= 3 {
+            rand::rng().random_range(3..=max_total_hops)
+        } else {
+            2.min(max_total_hops)
+        };
+        let relay_count = usize::from(total_hops.saturating_sub(1));
+        if relay_count == 0 || candidates.len() < relay_count {
+            return None;
+        }
+        candidates.truncate(relay_count);
+
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+        let expires_at = now.saturating_add(60);
+        let mut rng = rand::rng();
+        let mut nonce = || std::array::from_fn(|_| rng.random::<u8>());
+        let last = candidates.last()?;
+        let mut capsule = super::mesh_onion::seal_capsule(
+            last,
+            strong_privacy,
+            is_udp,
+            1,
+            expires_at,
+            nonce(),
+            super::mesh_onion::OnionInstruction::Exit {
+                target: target.to_owned(),
+            },
+        )
+        .ok()?;
+        for index in (0..candidates.len().saturating_sub(1)).rev() {
+            capsule = super::mesh_onion::seal_capsule(
+                &candidates[index],
+                strong_privacy,
+                is_udp,
+                (candidates.len() - index) as u8,
+                expires_at,
+                nonce(),
+                super::mesh_onion::OnionInstruction::Forward {
+                    next_peer: candidates[index + 1].clone(),
+                    next_capsule: capsule,
+                },
+            )
+            .ok()?;
+        }
+        Some((candidates[0].clone(), capsule))
+    }
+
+    pub(crate) async fn send_mixed(
+        &self,
+        muxer: Arc<Muxer>,
+        stream_id: u32,
+        payload: Bytes,
+        is_udp: bool,
+        cancel: CancellationToken,
+    ) -> Result<(), ()> {
+        let sender = self
+            .mixer
+            .get_or_init(|| async {
+                let (sender, receiver) = mpsc::channel(4096);
+                tokio::spawn(run_mix_scheduler(receiver));
+                sender
+            })
+            .await;
+        sender
+            .send(MixPacket {
+                flow_id: format!("tunnel:{}:{stream_id}", muxer.session_id()),
+                target: MixTarget::Tunnel(muxer),
+                stream_id,
+                payload,
+                is_udp,
+                cancel,
+            })
+            .await
+            .map_err(|_| ())
+    }
+
+    pub(crate) async fn send_mixed_to_local(
+        &self,
+        flow_id: String,
+        target: mpsc::Sender<Bytes>,
+        payload: Bytes,
+        is_udp: bool,
+        cancel: CancellationToken,
+    ) -> Result<(), ()> {
+        let sender = self
+            .mixer
+            .get_or_init(|| async {
+                let (sender, receiver) = mpsc::channel(4096);
+                tokio::spawn(run_mix_scheduler(receiver));
+                sender
+            })
+            .await;
+        sender
+            .send(MixPacket {
+                flow_id,
+                target: MixTarget::Local(target),
+                stream_id: 0,
+                payload,
+                is_udp,
+                cancel,
+            })
+            .await
+            .map_err(|_| ())
+    }
+
+    pub(crate) async fn acquire_cover_lease(self: &Arc<Self>, muxer: Arc<Muxer>) -> CoverLease {
+        let session_id = muxer.session_id().to_owned();
+        let mut tasks = self.cover_tasks.lock().await;
+        let state = match tasks.get(&session_id) {
+            Some(state) if !state.cancel.is_cancelled() => state.clone(),
+            _ => {
+                let state = Arc::new(CoverState {
+                    active_flows: AtomicUsize::new(0),
+                    cancel: CancellationToken::new(),
+                });
+                tasks.insert(session_id.clone(), state.clone());
+                let task_state = state.clone();
+                let task_muxer = muxer.clone();
+                let weak_mesh = Arc::downgrade(self);
+                tokio::spawn(async move {
+                    loop {
+                        let delay_ms = rand::rng().random_range(900..=2400);
+                        tokio::select! {
+                            _ = task_state.cancel.cancelled() => break,
+                            _ = tokio::time::sleep(Duration::from_millis(delay_ms)) => {}
+                        }
+                        let payload_len = rand::rng().random_range(128..=384);
+                        let payload = (0..payload_len)
+                            .map(|_| rand::rng().random::<u8>())
+                            .collect::<Vec<_>>();
+                        if task_muxer
+                            .send_control(0, FrameType::Cover, Bytes::from(payload))
+                            .await
+                            .is_err()
+                            && task_muxer.is_fatal()
+                        {
+                            break;
+                        }
+                    }
+                    if let Some(mesh) = weak_mesh.upgrade() {
+                        let mut tasks = mesh.cover_tasks.lock().await;
+                        if tasks
+                            .get(&session_id)
+                            .is_some_and(|current| Arc::ptr_eq(current, &task_state))
+                        {
+                            tasks.remove(&session_id);
+                        }
+                    }
+                });
+                state
+            }
+        };
+        state.active_flows.fetch_add(1, AtomicOrdering::AcqRel);
+        CoverLease(state)
     }
 
     pub async fn update_peers(&self, peers: Vec<MeshPeer>) {
@@ -597,6 +897,33 @@ impl NodeMesh {
         is_udp: bool,
         cancel: Option<&tokio_util::sync::CancellationToken>,
     ) -> Result<(Arc<MeshPeerSession>, u32, mpsc::Receiver<Bytes>), AppError> {
+        let session = self.peer_session(peer, auth_token, cancel).await?;
+        let (stream_id, receiver) = session.open_stream(target, is_udp, cancel).await?;
+        Ok((session, stream_id, receiver))
+    }
+
+    pub(crate) async fn connect_onion_stream(
+        &self,
+        peer: &MeshPeer,
+        capsule: &[u8],
+        is_udp: bool,
+        cancel: Option<&CancellationToken>,
+        avoid_stream_id: Option<u32>,
+    ) -> Result<(Arc<MeshPeerSession>, u32, mpsc::Receiver<Bytes>), AppError> {
+        let auth_token = self.onion_auth_token();
+        let session = self.peer_session(peer, &auth_token, cancel).await?;
+        let (stream_id, receiver) = session
+            .open_onion_stream(capsule, is_udp, cancel, avoid_stream_id)
+            .await?;
+        Ok((session, stream_id, receiver))
+    }
+
+    async fn peer_session(
+        &self,
+        peer: &MeshPeer,
+        auth_token: &str,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<Arc<MeshPeerSession>, AppError> {
         let key = PeerSessionKey {
             node_id: peer.node_id.to_ascii_lowercase(),
             peer_fingerprint: peer_fingerprint(peer),
@@ -652,9 +979,7 @@ impl NodeMesh {
         if reused {
             metrics::counter!("netrunner_mesh_peer_sessions_reused_total").increment(1);
         }
-
-        let (stream_id, receiver) = session.open_stream(target, is_udp, cancel).await?;
-        Ok((session, stream_id, receiver))
+        Ok(session)
     }
 
     /// Open a destination stream over the route configured on this node.
@@ -732,6 +1057,99 @@ impl NodeMesh {
             "Mesh egress unavailable",
             "No reachable mesh peer accepted the connection",
         ))
+    }
+}
+
+async fn run_mix_scheduler(mut receiver: mpsc::Receiver<MixPacket>) {
+    let flow_tails: Arc<Mutex<HashMap<String, (u64, oneshot::Receiver<()>)>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let in_flight_packets = Arc::new(Semaphore::new(4096));
+    let mut sequence = 0u64;
+    while let Some(first) = receiver.recv().await {
+        let deadline = tokio::time::Instant::now() + MIX_BATCH_WINDOW;
+        let mut batch = vec![first];
+        while batch.len() < MIX_BATCH_MAX_PACKETS {
+            match tokio::time::timeout_at(deadline, receiver.recv()).await {
+                Ok(Some(packet)) => batch.push(packet),
+                Ok(None) | Err(_) => break,
+            }
+        }
+
+        // Shuffle flow groups, not packets within one flow. This adds
+        // cross-flow mixing while preserving TCP byte order and UDP datagram
+        // order for every individual stream.
+        let mut groups: HashMap<String, Vec<MixPacket>> = HashMap::new();
+        for packet in batch {
+            groups
+                .entry(packet.flow_id.clone())
+                .or_default()
+                .push(packet);
+        }
+        let mut flow_keys: Vec<_> = groups.keys().cloned().collect();
+        {
+            let mut rng = rand::rng();
+            for index in (1..flow_keys.len()).rev() {
+                let swap_with = rng.random_range(0..=index);
+                flow_keys.swap(index, swap_with);
+            }
+        }
+        for flow_key in flow_keys {
+            if let Some(packets) = groups.remove(&flow_key) {
+                let mut permits = Vec::with_capacity(packets.len());
+                for _ in 0..packets.len() {
+                    let Ok(permit) = in_flight_packets.clone().acquire_owned().await else {
+                        return;
+                    };
+                    permits.push(permit);
+                }
+                sequence = sequence.wrapping_add(1);
+                let this_sequence = sequence;
+                let (done_tx, done_rx) = oneshot::channel();
+                let previous = {
+                    let mut tails = flow_tails.lock().await;
+                    let previous = tails.remove(&flow_key).map(|(_, receiver)| receiver);
+                    tails.insert(flow_key.clone(), (this_sequence, done_rx));
+                    previous
+                };
+                let tails = flow_tails.clone();
+                tokio::spawn(async move {
+                    if let Some(previous) = previous {
+                        let _ = previous.await;
+                    }
+                    for packet in packets {
+                        if packet.cancel.is_cancelled() {
+                            continue;
+                        }
+                        let failed = match packet.target {
+                            MixTarget::Tunnel(muxer) => {
+                                muxer.is_fatal()
+                                    || muxer
+                                        .send_data_safe(
+                                            packet.stream_id,
+                                            packet.payload,
+                                            packet.is_udp,
+                                        )
+                                        .await
+                                        .is_err()
+                            }
+                            MixTarget::Local(target) => target.send(packet.payload).await.is_err(),
+                        };
+                        if failed {
+                            metrics::counter!("netrunner_mix_packet_drops_total").increment(1);
+                        }
+                    }
+                    drop(permits);
+                    let _ = done_tx.send(());
+                    let mut tails = tails.lock().await;
+                    if tails
+                        .get(&flow_key)
+                        .is_some_and(|(current_sequence, _)| *current_sequence == this_sequence)
+                    {
+                        tails.remove(&flow_key);
+                    }
+                });
+            }
+        }
     }
 }
 
@@ -924,11 +1342,16 @@ pub type SharedNodeMesh = Arc<NodeMesh>;
 
 #[cfg(test)]
 mod tests {
-    use super::{MeshPeer, MeshRoute, MeshRouteSelection, NodeMesh, PeerProbe, PEER_PROBE_MAX_AGE};
+    use super::{
+        run_mix_scheduler, MeshPeer, MeshRoute, MeshRouteSelection, MixPacket, MixTarget, NodeMesh,
+        PeerProbe, PEER_PROBE_MAX_AGE,
+    };
+    use hpke::{kem::X25519HkdfSha256, Kem as KemTrait, Serializable};
     use std::{
         collections::HashSet,
-        time::{Duration, Instant},
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
+    use tokio_util::sync::CancellationToken;
 
     fn peer(node_id: &str, host: &str, port: u16) -> MeshPeer {
         MeshPeer {
@@ -955,6 +1378,48 @@ mod tests {
             );
         }
         mesh
+    }
+
+    #[tokio::test]
+    async fn strong_privacy_mix_scheduler_preserves_flow_order_across_batches() {
+        let (mix_tx, mix_rx) = tokio::sync::mpsc::channel(8);
+        let (local_tx, mut local_rx) = tokio::sync::mpsc::channel(8);
+        tokio::spawn(run_mix_scheduler(mix_rx));
+        let cancel = CancellationToken::new();
+
+        for value in [1u8, 2] {
+            mix_tx
+                .send(MixPacket {
+                    flow_id: "flow-a".into(),
+                    target: MixTarget::Local(local_tx.clone()),
+                    stream_id: 0,
+                    payload: bytes::Bytes::from(vec![value]),
+                    is_udp: false,
+                    cancel: cancel.clone(),
+                })
+                .await
+                .unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        mix_tx
+            .send(MixPacket {
+                flow_id: "flow-a".into(),
+                target: MixTarget::Local(local_tx),
+                stream_id: 0,
+                payload: bytes::Bytes::from_static(&[3]),
+                is_udp: false,
+                cancel,
+            })
+            .await
+            .unwrap();
+
+        for expected in [1u8, 2, 3] {
+            let payload = tokio::time::timeout(Duration::from_secs(2), local_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(payload.as_ref(), &[expected]);
+        }
     }
 
     #[tokio::test]
@@ -1062,6 +1527,130 @@ mod tests {
         assert_eq!(route.remaining_hops, 2);
         assert_eq!(route.selection, MeshRouteSelection::Nearest);
         assert!(route.egress_node_id.is_some());
+    }
+
+    #[tokio::test]
+    async fn onion_route_is_preselected_loop_free_and_hides_the_exit_layer() {
+        let mesh = NodeMesh::with_max_hops("ingress".into(), "node-secret".into(), 5);
+        let mut peers = Vec::new();
+        let mut identities = std::collections::HashMap::new();
+        for index in 0..6 {
+            let node_id = format!("peer-{index}");
+            let (private, public) = X25519HkdfSha256::gen_keypair();
+            peers.push(MeshPeer {
+                node_id: node_id.clone(),
+                host: format!("192.0.2.{}", index + 1),
+                port: 443,
+                decoy_sni: "www.example.org".into(),
+                nrxp_secret: format!("secret-{index}"),
+                nrxp_static_public: hex::encode(public.to_bytes().as_slice()),
+            });
+            identities.insert(
+                node_id,
+                crate::crypto::LocalIdentity::from_hex(
+                    &hex::encode([index as u8 + 1; 32]),
+                    &hex::encode(private.to_bytes()),
+                    true,
+                )
+                .unwrap(),
+            );
+        }
+        mesh.update_peers(peers).await;
+        for peer in mesh.peers.read().await.iter() {
+            mesh.rtt_ms.insert(
+                peer.node_id.to_ascii_lowercase(),
+                PeerProbe {
+                    rtt_ms: 25,
+                    probed_at: Instant::now(),
+                    consecutive_failures: 0,
+                },
+            );
+        }
+
+        let (mut next_peer, mut capsule) = mesh
+            .build_onion_route("example.com:443", true, true, &[])
+            .await
+            .expect("healthy peers should build an onion path");
+        let mut visited = HashSet::from(["ingress".to_owned()]);
+        let mut remote_hops = 0;
+        loop {
+            assert!(visited.insert(next_peer.node_id.to_ascii_lowercase()));
+            remote_hops += 1;
+            let identity = identities.get(&next_peer.node_id).unwrap();
+            let layer =
+                super::super::mesh_onion::open_capsule(&next_peer.node_id, identity, &capsule)
+                    .unwrap();
+            assert!(layer.is_udp);
+            assert!(layer.strong_privacy);
+            match layer.instruction {
+                super::super::mesh_onion::OnionInstruction::Forward {
+                    next_peer: following,
+                    next_capsule,
+                } => {
+                    assert!(!following.node_id.eq_ignore_ascii_case("ingress"));
+                    next_peer = following;
+                    capsule = next_capsule;
+                }
+                super::super::mesh_onion::OnionInstruction::Exit { target } => {
+                    assert_eq!(target, "example.com:443");
+                    break;
+                }
+            }
+        }
+        assert!((2..=4).contains(&remote_hops));
+    }
+
+    #[tokio::test]
+    async fn onion_capsules_are_single_use_and_expire() {
+        let private = [7u8; 32];
+        let identity = crate::crypto::LocalIdentity::from_hex(
+            &hex::encode([8u8; 32]),
+            &hex::encode(private),
+            true,
+        )
+        .unwrap();
+        let peer = MeshPeer {
+            node_id: "local".into(),
+            host: "192.0.2.1".into(),
+            port: 443,
+            decoy_sni: "www.example.org".into(),
+            nrxp_secret: "secret".into(),
+            nrxp_static_public: identity.public_key_hex(),
+        };
+        let mesh = NodeMesh::new("local".into(), "node-secret".into());
+        mesh.set_onion_identity(identity);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let capsule = super::super::mesh_onion::seal_capsule(
+            &peer,
+            true,
+            false,
+            1,
+            now + 30,
+            [0x42; 16],
+            super::super::mesh_onion::OnionInstruction::Exit {
+                target: "example.com:443".into(),
+            },
+        )
+        .unwrap();
+        assert!(mesh.open_onion_capsule(&capsule).await.is_ok());
+        assert!(mesh.open_onion_capsule(&capsule).await.is_err());
+
+        let expired = super::super::mesh_onion::seal_capsule(
+            &peer,
+            false,
+            false,
+            1,
+            now.saturating_sub(1),
+            [0x43; 16],
+            super::super::mesh_onion::OnionInstruction::Exit {
+                target: "example.com:443".into(),
+            },
+        )
+        .unwrap();
+        assert!(mesh.open_onion_capsule(&expired).await.is_err());
     }
 
     #[tokio::test]

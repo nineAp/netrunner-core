@@ -15,6 +15,7 @@ cache_dir = "/tmp/netrunner"
 mtu = 1450
 killswitch_enabled = true
 log_level = "info"
+strong_privacy = false
 
 # all — весь IPv4-трафик через VPN; bypass_lan — приватные сети напрямую.
 tunnel_mode = "bypass_lan"

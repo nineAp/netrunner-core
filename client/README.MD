@@ -29,6 +29,16 @@
 `EngineBuilder::build` поднимает DNS, маршрутизацию и **устанавливает туннель**
 (`core::ClientHandler::connect`), затем `Engine::run` крутит главный poll-цикл.
 
+## Strong privacy mode
+
+UniFFI-приложение может включить режим перед запуском сессии через
+`SessionManager.set_strong_privacy(true)`. По умолчанию он выключен; настройка
+действует на сессии, которые запускаются после вызова. Режим добавляет
+перемешивание потоков и cover-трафик на relay-узлах, поэтому увеличивает
+задержку. Headless/Linux-клиент принимает тот же параметр через
+`--strong-privacy`, `NETRUNNER_STRONG_PRIVACY=1` или `strong_privacy = true` в
+TOML-конфиге.
+
 ## Сборка
 
 `client` зависит от приватного форка smoltcp (`nxrp-smoltcp`) как git-зависимости

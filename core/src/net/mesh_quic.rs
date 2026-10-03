@@ -22,7 +22,10 @@ const QUIC_DATAGRAM_SEND_BUFFER: usize = 64 * 1024;
 pub(crate) fn client_endpoint(bind_addr: SocketAddr) -> io::Result<Endpoint> {
     let mut endpoint = Endpoint::client(bind_addr)?;
     let verifier = Arc::new(SkipCertificateVerification::new());
-    let mut tls = rustls::ClientConfig::builder()
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut tls = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|error| io::Error::other(error.to_string()))?
         .dangerous()
         .with_custom_certificate_verifier(verifier)
         .with_no_client_auth();
@@ -42,7 +45,10 @@ pub fn server_endpoint(addr: SocketAddr) -> io::Result<Endpoint> {
     let cert_der: CertificateDer<'static> = certificate.cert.der().clone();
     let key_der = PrivatePkcs8KeyDer::from(certificate.signing_key.serialize_der());
 
-    let mut tls = rustls::ServerConfig::builder()
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut tls = rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|error| io::Error::other(error.to_string()))?
         .with_no_client_auth()
         .with_single_cert(vec![cert_der], key_der.into())
         .map_err(|error| io::Error::other(error.to_string()))?;

@@ -90,6 +90,10 @@ impl From<FrameType> for EdgeFrameKind {
             // Heartbeat как безопасный no-op, чтобы не заводить публичный
             // вариант перечисления под чисто внутреннюю механику маскировки.
             FrameType::Cover => EdgeFrameKind::Heartbeat,
+            FrameType::SecureConnect | FrameType::MeshOnionConnect => EdgeFrameKind::Connect,
+            FrameType::SecureUdpConnect | FrameType::MeshOnionUdpConnect => {
+                EdgeFrameKind::UdpConnect
+            }
         }
     }
 }

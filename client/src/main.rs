@@ -57,6 +57,7 @@ struct FileConfig {
     routed_cidrs: Vec<String>,
     router_mode: Option<bool>,
     lan_interfaces: Vec<String>,
+    strong_privacy: Option<bool>,
     log_level: Option<String>,
 }
 
@@ -127,6 +128,10 @@ struct Cli {
     #[arg(long, value_delimiter = ',')]
     lan_interface: Vec<String>,
 
+    /// Включает onion-маршрут с перемешиванием потоков и фоновой набивкой.
+    #[arg(long, env = "NETRUNNER_STRONG_PRIVACY", action = ArgAction::SetTrue)]
+    strong_privacy: bool,
+
     #[arg(long, env = "RUST_LOG")]
     log_level: Option<String>,
 }
@@ -147,6 +152,7 @@ struct EffectiveConfig {
     routed_cidrs: Vec<String>,
     router_mode: bool,
     lan_interfaces: Vec<String>,
+    strong_privacy: bool,
     log_level: String,
 }
 
@@ -238,6 +244,7 @@ fn build_config(cli: Cli, file: FileConfig) -> Result<EffectiveConfig> {
         routed_cidrs: prefer_cli_list(cli.routed_cidr, file.routed_cidrs),
         router_mode,
         lan_interfaces,
+        strong_privacy: cli.strong_privacy || file.strong_privacy.unwrap_or(false),
         log_level: non_empty(cli.log_level.or(file.log_level)).unwrap_or_else(|| "info".to_owned()),
     })
 }
@@ -309,7 +316,8 @@ async fn main() -> Result<()> {
         .with_auth_token(config.auth_token)
         .with_node_credentials(config.node_secret, config.node_public_key)
         .with_tunnel_mode(config.tunnel_mode.into(), config.routed_cidrs)
-        .with_router_mode(config.router_mode, config.lan_interfaces);
+        .with_router_mode(config.router_mode, config.lan_interfaces)
+        .with_strong_privacy(config.strong_privacy);
 
     let build_result = EngineBuilder::new(engine_config)
         .with_tun(tun_device)

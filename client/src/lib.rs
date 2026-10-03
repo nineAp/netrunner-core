@@ -38,7 +38,7 @@ use crate::{
 use netrunner_logger::{error, info};
 use std::sync::{
     Arc, OnceLock,
-    atomic::{AtomicU8, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
 };
 use tokio::runtime::Runtime;
 use tokio_util::sync::CancellationToken;
@@ -207,6 +207,21 @@ mod tunnel_mode_tests {
     }
 }
 
+#[cfg(test)]
+mod privacy_mode_tests {
+    use super::SessionManager;
+
+    #[test]
+    fn strong_privacy_is_opt_in_per_manager() {
+        let manager = SessionManager::new();
+        assert!(!manager.strong_privacy_enabled());
+        manager.set_strong_privacy(true);
+        assert!(manager.strong_privacy_enabled());
+        manager.set_strong_privacy(false);
+        assert!(!manager.strong_privacy_enabled());
+    }
+}
+
 #[derive(uniffi::Object)]
 pub struct Session {
     pub(crate) cancel_token: CancellationToken,
@@ -277,13 +292,29 @@ pub struct SessionParams {
 
 /// Фабрика VPN-сессий — главная точка входа FFI.
 #[derive(uniffi::Object)]
-pub struct SessionManager;
+pub struct SessionManager {
+    strong_privacy: AtomicBool,
+}
 
 #[uniffi::export]
 impl SessionManager {
     #[uniffi::constructor]
     pub fn new() -> Arc<Self> {
-        Arc::new(SessionManager)
+        Arc::new(SessionManager {
+            strong_privacy: AtomicBool::new(false),
+        })
+    }
+
+    /// Sets strong privacy for sessions started after this call. The mode
+    /// batches packets across flows, adds relay cover traffic, and has a
+    /// measurable latency cost; existing sessions keep their current mode.
+    pub fn set_strong_privacy(&self, enabled: bool) {
+        self.strong_privacy.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Returns the mode that will be used by sessions started from this manager.
+    pub fn strong_privacy_enabled(&self) -> bool {
+        self.strong_privacy.load(Ordering::Relaxed)
     }
 
     /// Поднимает VPN-сессию в фоне и возвращает управляющую [`Session`].
@@ -303,6 +334,7 @@ impl SessionManager {
     /// чужой. Не переданы — старый анонимный хендшейк, для нод, которым в
     /// админке ещё не завели ключи.
     pub fn spawn_session(&self, params: SessionParams) -> Arc<Session> {
+        let strong_privacy = self.strong_privacy.load(Ordering::Relaxed);
         let SessionParams {
             remote_address,
             sni,
@@ -359,7 +391,8 @@ impl SessionManager {
             .with_decoy_sni(sni)
             .with_auth_token(auth_token)
             .with_node_credentials(node_secret, node_public_key)
-            .with_tunnel_mode(parse_tunnel_mode(tunnel_mode.as_deref()), routed_cidrs);
+            .with_tunnel_mode(parse_tunnel_mode(tunnel_mode.as_deref()), routed_cidrs)
+            .with_strong_privacy(strong_privacy);
 
         #[cfg(any(target_os = "android", target_os = "ios"))]
         {

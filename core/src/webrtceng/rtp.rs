@@ -252,11 +252,7 @@ impl WebrtcRx {
         let seq = header.sequence_number as u64;
 
         let current = self.rx.current_epoch_id();
-        for epoch in [
-            current,
-            current.wrapping_add(1),
-            current.wrapping_sub(1),
-        ] {
+        for epoch in [current, current.wrapping_add(1), current.wrapping_sub(1)] {
             if let Ok(frame) = self.rx.open(epoch, seq, 16, &ciphertext, &header_bytes) {
                 return Ok((header, frame));
             }

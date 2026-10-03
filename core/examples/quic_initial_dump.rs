@@ -46,7 +46,9 @@ fn main() {
             }
         }
         _ => {
-            let sni = env::args().nth(2).unwrap_or_else(|| "www.example.com".to_string());
+            let sni = env::args()
+                .nth(2)
+                .unwrap_or_else(|| "www.example.com".to_string());
             hexdump(&netrunner_core::devtools::quic_client_initial(&sni));
         }
     }

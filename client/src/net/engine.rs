@@ -963,6 +963,8 @@ pub struct EngineConfig {
     /// аутентификация туннеля.
     pub node_secret: Option<String>,
     pub node_public_key: Option<String>,
+    /// Request opt-in strong privacy on all newly opened TCP/UDP flows.
+    pub strong_privacy: bool,
 }
 
 impl EngineConfig {
@@ -986,6 +988,7 @@ impl EngineConfig {
             auth_token: None,
             node_secret: None,
             node_public_key: None,
+            strong_privacy: false,
         }
     }
 
@@ -1008,6 +1011,12 @@ impl EngineConfig {
 
     pub fn with_auth_token(mut self, auth_token: Option<String>) -> Self {
         self.auth_token = auth_token;
+        self
+    }
+
+    /// Enables onion-route mixing mode for future connections in this engine.
+    pub fn with_strong_privacy(mut self, enabled: bool) -> Self {
+        self.strong_privacy = enabled;
         self
     }
 
@@ -1091,6 +1100,7 @@ impl std::fmt::Debug for EngineConfig {
                 "node_public_key",
                 &self.node_public_key.as_ref().map(|_| "[configured]"),
             )
+            .field("strong_privacy", &self.strong_privacy)
             .finish()
     }
 }
@@ -1206,13 +1216,14 @@ impl EngineBuilder {
         };
 
         info!("Establishing secure tunnel to proxy server...");
-        let muxer = ClientHandler::connect(
+        let muxer = ClientHandler::connect_with_privacy_mode(
             &self.config.remote_address,
             self.config.decoy_sni.clone(),
             self.config.auth_token.clone(),
             identity,
             rx_for_client_handler,
             tx_for_client_handler,
+            self.config.strong_privacy,
         )
         .await
         .map_err(|e| format!("Failed to establish secure tunnel: {}", e))?;

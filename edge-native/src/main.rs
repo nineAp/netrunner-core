@@ -180,7 +180,9 @@ pub struct EdgeConfig {
     /// a different upstream Host and TLS identity.
     pub(crate) search_pool: tokio::sync::Mutex<Vec<proxy_http::PooledSender>>,
     /// Dynamic keep-alive pools keyed by scheme, hostname, and port.
-    pub(crate) browser_pools: tokio::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<Vec<proxy_http::PooledSender>>>>>,
+    pub(crate) browser_pools: tokio::sync::Mutex<
+        std::collections::HashMap<String, Arc<tokio::sync::Mutex<Vec<proxy_http::PooledSender>>>>,
+    >,
 }
 
 impl EdgeConfig {
@@ -198,8 +200,8 @@ impl EdgeConfig {
             .expect("LANDING_ADDR обязателен — host:port витрины/лендинга за нодой");
         let backend_addr = std::env::var("BACKEND_ADDR")
             .expect("BACKEND_ADDR обязателен — host:port бэкенда (API) за нодой");
-        let edge_domain = std::env::var("EDGE_DOMAIN")
-            .expect("EDGE_DOMAIN обязателен — домен edge из Caddyfile");
+        let edge_domain =
+            std::env::var("EDGE_DOMAIN").expect("EDGE_DOMAIN обязателен — домен edge из Caddyfile");
         let decoy_sni = std::env::var("DECOY_SNI").unwrap_or_else(|_| "www.debian.org".to_string());
         let auth_token = std::env::var("AUTH_TOKEN").unwrap_or_default();
         validate_host_port("VPN_NODE_ADDR", &vpn_node_addr);

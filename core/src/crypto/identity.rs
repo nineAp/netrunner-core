@@ -120,6 +120,12 @@ impl LocalIdentity {
     pub fn public_key_hex(&self) -> String {
         hex::encode(PublicKey::from(&self.static_private).as_bytes())
     }
+
+    /// Private X25519 key material for HPKE mesh capsules. The caller must keep
+    /// the returned copy short-lived and never log or persist it.
+    pub(crate) fn onion_private_key_bytes(&self) -> [u8; 32] {
+        self.static_private.to_bytes()
+    }
 }
 
 /// Учётные данные стороны хендшейка — ровно одна из двух ролей.

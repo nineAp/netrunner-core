@@ -55,6 +55,15 @@ pub(crate) enum FrameType {
     /// клиенту, объявившему версию 1, такие кадры не отправляются — он бы не
     /// разобрал неизвестный тип и уронил ногу.
     Cover = 0x08,
+    /// Client requested the opt-in strong privacy route. The payload remains
+    /// the ordinary destination string; the frame type is the mode byte.
+    SecureConnect = 0x09,
+    /// UDP variant of `SecureConnect`.
+    SecureUdpConnect = 0x0a,
+    /// Internal mesh-only hop carrying one HPKE onion capsule.
+    MeshOnionConnect = 0x0b,
+    /// UDP variant of `MeshOnionConnect`.
+    MeshOnionUdpConnect = 0x0c,
 }
 
 /// Разобранный заголовок кадра (25 байт). Поля идут в том же порядке, что и в wire.
@@ -220,6 +229,10 @@ impl Parser for FrameHeader {
             0x06 => FrameType::Diag,
             0x07 => FrameType::Credit,
             0x08 => FrameType::Cover,
+            0x09 => FrameType::SecureConnect,
+            0x0a => FrameType::SecureUdpConnect,
+            0x0b => FrameType::MeshOnionConnect,
+            0x0c => FrameType::MeshOnionUdpConnect,
             unknown => {
                 // After successful AEAD decryption an unknown frame type means a
                 // protocol version mismatch or data corruption that the cipher
@@ -308,6 +321,23 @@ mod tests {
         assert_eq!(parsed.header.frame_type, FrameType::Data);
         assert_eq!(&parsed.payload[..], b"some tunnel payload");
         assert_eq!(parsed.header.auth_tag, AUTH_KEY);
+    }
+
+    #[test]
+    fn privacy_and_onion_frame_type_bytes_are_stable() {
+        for (frame_type, wire_byte) in [
+            (FrameType::SecureConnect, 0x09),
+            (FrameType::SecureUdpConnect, 0x0a),
+            (FrameType::MeshOnionConnect, 0x0b),
+            (FrameType::MeshOnionUdpConnect, 0x0c),
+        ] {
+            let wire =
+                Frame::new(7, frame_type, Bytes::from_static(b"payload")).into_bytes(&AUTH_KEY, 0);
+            assert_eq!(wire[20], wire_byte);
+            let mut parsed_wire = wire;
+            let parsed = Frame::parse(&mut parsed_wire).unwrap().unwrap();
+            assert_eq!(parsed.header.frame_type, frame_type);
+        }
     }
 
     #[test]
