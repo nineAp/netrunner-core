@@ -15,6 +15,9 @@ const ALPN: &[u8] = b"nrxp-mesh/1";
 // A bounded per-connection queue limits memory consumed by unauthenticated
 // peers before the inner NRXP identity handshake completes.
 const QUIC_DATAGRAM_BUFFER: usize = 256 * 1024;
+// Keep only a short burst of outgoing UDP in flight. The default is 1 MiB,
+// which can represent many seconds of stale packets on a slow mobile path.
+const QUIC_DATAGRAM_SEND_BUFFER: usize = 64 * 1024;
 
 pub(crate) fn client_endpoint(bind_addr: SocketAddr) -> io::Result<Endpoint> {
     let mut endpoint = Endpoint::client(bind_addr)?;
@@ -56,6 +59,7 @@ fn mesh_transport_config() -> Arc<TransportConfig> {
     let mut config = TransportConfig::default();
     config.keep_alive_interval(Some(Duration::from_secs(15)));
     config.datagram_receive_buffer_size(Some(QUIC_DATAGRAM_BUFFER));
+    config.datagram_send_buffer_size(QUIC_DATAGRAM_SEND_BUFFER);
     config.max_concurrent_bidi_streams(VarInt::from_u32(128));
     Arc::new(config)
 }
@@ -119,7 +123,7 @@ impl rustls::client::danger::ServerCertVerifier for SkipCertificateVerification 
 
 #[cfg(test)]
 mod tests {
-    use super::{client_endpoint, server_endpoint};
+    use super::{client_endpoint, server_endpoint, QUIC_DATAGRAM_SEND_BUFFER};
     use bytes::Bytes;
     use tokio::sync::oneshot;
 
@@ -149,6 +153,26 @@ mod tests {
             .unwrap()
             .await
             .unwrap();
+
+        assert_eq!(
+            connection.datagram_send_buffer_space(),
+            QUIC_DATAGRAM_SEND_BUFFER,
+            "mesh QUIC send queue must stay latency-bounded"
+        );
+        // Saturate the outgoing queue synchronously. `send_datagram` must
+        // remain non-blocking and keep accepting fresh UDP packets by dropping
+        // stale queued packets once the configured limit is reached.
+        let packet = Bytes::from(vec![0u8; 900]);
+        for _ in 0..(QUIC_DATAGRAM_SEND_BUFFER / packet.len() + 32) {
+            connection
+                .send_datagram(packet.clone())
+                .expect("UDP send should not wait for congestion buffer space");
+        }
+        assert!(
+            connection.datagram_send_buffer_space() < packet.len(),
+            "burst should exercise the bounded outgoing datagram queue"
+        );
+
         let (mut send, mut recv) = connection.open_bi().await.unwrap();
         send.write_all(b"ping").await.unwrap();
         let mut response = [0; 4];

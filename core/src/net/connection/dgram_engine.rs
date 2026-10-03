@@ -196,7 +196,7 @@ pub(crate) fn attach_mesh_quic_datagram_leg(
                             break;
                         }
                     };
-                    if writer_connection.send_datagram_wait(ping).await.is_err() {
+                    if send_mesh_quic_datagram(&writer_connection, ping).is_err() {
                         writer_muxer.clear_datagram_leg();
                         break;
                     }
@@ -210,7 +210,7 @@ pub(crate) fn attach_mesh_quic_datagram_leg(
                                 break;
                             }
                         };
-                        if writer_connection.send_datagram_wait(packet).await.is_err() {
+                        if send_mesh_quic_datagram(&writer_connection, packet).is_err() {
                             writer_muxer.clear_datagram_leg();
                             break;
                         }
@@ -234,10 +234,11 @@ pub(crate) fn attach_mesh_quic_datagram_leg(
                                 break;
                             }
                         };
-                        if writer_connection.send_datagram_wait(packet).await.is_err() {
+                        if send_mesh_quic_datagram(&writer_connection, packet).is_err() {
                             writer_muxer.clear_datagram_leg();
-                            // The QUIC datagram was not accepted. Retrying now
-                            // uses the reliable stream carried by this session.
+                            // The QUIC datagram could not be queued (for example
+                            // after a path MTU change). Retrying now uses the
+                            // reliable stream carried by this session.
                             writer_muxer
                                 .send_data_safe(message.stream_id, message.data, true)
                                 .await
@@ -272,6 +273,21 @@ pub(crate) fn attach_mesh_quic_datagram_leg(
         reader_muxer.clear_datagram_leg();
         reader_token.cancel();
     });
+}
+
+/// Queue one unreliable mesh packet without waiting for congestion recovery.
+/// Quinn's `send_datagram` drops the oldest unsent datagrams when its bounded
+/// queue fills, which keeps current UDP traffic moving instead of building a
+/// seconds-long backlog behind stale video packets.
+#[cfg(feature = "mesh-quic")]
+fn send_mesh_quic_datagram(
+    connection: &quinn::Connection,
+    packet: Bytes,
+) -> Result<(), quinn::SendDatagramError> {
+    if connection.datagram_send_buffer_space() < packet.len() {
+        metrics::counter!("netrunner_mesh_quic_datagram_queue_pressure_total").increment(1);
+    }
+    connection.send_datagram(packet)
 }
 
 /// Решает, что делать с уже РАСШИФРОВАННЫМ кадром: `PING` — немедленно

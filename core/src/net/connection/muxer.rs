@@ -59,8 +59,8 @@ use tokio::sync::Notify;
 use tokio::sync::mpsc::{Sender, error::TrySendError};
 use tokio_util::sync::CancellationToken;
 
-use crate::net::INITIAL_RTT_MS;
 use crate::net::diagnostics::{self, DIAG_COUNTERS, DiagnosticsEvent, LegMetrics, TunnelMetrics};
+use crate::net::INITIAL_RTT_MS;
 use crate::net::{
     BACKLOG_REAPER_IDLE_TIMEOUT, BACKLOG_REAPER_INTERVAL, BACKLOG_STUCK_GRACE, BRIDGE_READ_CHUNK,
     DATAGRAM_LEG_ID, MAX_DATAGRAM_LEG_PAYLOAD, MAX_PENDING_UDP_STREAMS, MAX_TUNNEL_LEGS,
@@ -1135,6 +1135,17 @@ impl Muxer {
         }
     }
 
+    fn record_data_tx(&self, leg: &MuxLeg, stream_id: u32, bytes: u64) {
+        leg.stats.tx_bytes.fetch_add(bytes, Ordering::Relaxed);
+        if let Some(stream_ref) = self.streams.get(&stream_id) {
+            stream_ref
+                .value()
+                .stats
+                .tx_bytes
+                .fetch_add(bytes, Ordering::Relaxed);
+        }
+    }
+
     /// Called by the writer after a fair-scheduled chunk has completed its
     /// `write_all`.  Saturating CAS avoids underflow if a dying leg races cleanup.
     pub(crate) fn record_leg_data_drained(&self, leg_id: u32, bytes: u64) {
@@ -1220,6 +1231,35 @@ impl Muxer {
                 let stream_id = message.stream_id;
                 let size = message.data.len() as u64;
 
+                // A full native datagram queue must never backpressure a UDP
+                // flow. Drop this datagram and keep draining the source; Quinn's
+                // own bounded queue retains newer traffic by evicting stale
+                // unsent datagrams. Reliable Data and UDP carried over TCP keep
+                // the existing await/backpressure path below.
+                if message.frame_type == FrameType::UdpData && leg.id == DATAGRAM_LEG_ID {
+                    match leg.data_tx.clone().try_reserve_owned() {
+                        Ok(permit) => {
+                            permit.send(message);
+                            self.record_data_tx(&leg, stream_id, size);
+                            return Ok(());
+                        }
+                        Err(TrySendError::Full(_)) => {
+                            metrics::counter!("netrunner_udp_native_queue_drops_total")
+                                .increment(1);
+                            return Ok(());
+                        }
+                        Err(TrySendError::Closed(_)) => {
+                            DIAG_COUNTERS.upload_fails.fetch_add(1, Ordering::Relaxed);
+                            diagnostics::send_diag_event(DiagnosticsEvent::UploadFailed {
+                                stream_id,
+                                reason: "datagram data channel closed — failing over".into(),
+                            });
+                            self.clear_datagram_leg();
+                            continue;
+                        }
+                    }
+                }
+
                 // Reserve first so queue accounting becomes visible before the
                 // receiver can dequeue the message.  The bounded channel still
                 // supplies the original local, sub-RTT backpressure.
@@ -1227,14 +1267,7 @@ impl Muxer {
                     Ok(permit) => {
                         self.record_leg_data_queued(&leg, size);
                         permit.send(message);
-                        leg.stats.tx_bytes.fetch_add(size, Ordering::Relaxed);
-                        if let Some(stream_ref) = self.streams.get(&stream_id) {
-                            stream_ref
-                                .value()
-                                .stats
-                                .tx_bytes
-                                .fetch_add(size, Ordering::Relaxed);
-                        }
+                        self.record_data_tx(&leg, stream_id, size);
                         return Ok(());
                     }
                     Err(_) => {
@@ -2196,6 +2229,36 @@ mod scheduling_tests {
 
         let selected = muxer.select_udp_leg(99, 100).unwrap();
         assert_eq!(selected.id, DATAGRAM_LEG_ID);
+    }
+
+    #[tokio::test]
+    async fn full_native_datagram_queue_drops_udp_without_blocking_the_flow() {
+        let muxer = Muxer::new(false, "native-udp-full".into());
+        let (control_tx, _control_rx) = tokio::sync::mpsc::channel(1);
+        let (data_tx, mut data_rx) = tokio::sync::mpsc::channel(1);
+        muxer.set_datagram_leg(control_tx, data_tx);
+        muxer.mark_datagram_leg_alive();
+
+        muxer
+            .send_data_safe(7, Bytes::from_static(b"first"), true)
+            .await
+            .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            muxer.send_data_safe(7, Bytes::from_static(b"second"), true),
+        )
+        .await
+        .expect("a full UDP queue must not stall the flow")
+        .unwrap();
+
+        assert_eq!(
+            data_rx.recv().await.unwrap().data,
+            Bytes::from_static(b"first")
+        );
+        assert!(
+            data_rx.try_recv().is_err(),
+            "overflow datagram should be dropped"
+        );
     }
 
     #[tokio::test]
