@@ -137,6 +137,9 @@ impl ClientHello {
         // клиент способен понять, до того как что-либо ему отправить.
         session_id_bytes[0] = keys.claimed_version();
         OsRng.fill_bytes(&mut session_id_bytes[1..16]);
+        if keys.claimed_version() >= crate::MIN_VERSION_FOR_CIPHER_PREFERENCE {
+            session_id_bytes[1] = keys.data_cipher_preference_wire_code();
+        }
 
         // session_id[16..32] = auth-тег: сервер проверит его первым делом и
         // отвергнет ClientHello без валидного тега. В схеме v3 тег считается на
@@ -322,6 +325,26 @@ impl ServerHello {
         record.serialize()
     }
 
+    pub(crate) fn make_server_hello_with_suite(
+        client_hello: &ClientHello,
+        server_public_key: &[u8],
+        salt: [u8; 32],
+        profile: &ServerProfile,
+        selected_suite: u16,
+    ) -> Bytes {
+        let mut server_hello =
+            Self::from_client_hello(client_hello, server_public_key, salt, profile);
+        server_hello.cipher_suite = selected_suite;
+
+        let record = TlsRecord::new(
+            ContentType::Handshake,
+            profile.record_layer_version,
+            server_hello.serialize(),
+        );
+
+        record.serialize()
+    }
+
     /// Конструирует `ServerHello` из принятого `ClientHello`.
     ///
     /// Выбор cipher-suite зависит от `honor_cipher_order`: либо берём первый из
@@ -335,23 +358,8 @@ impl ServerHello {
         salt: [u8; 32],
         profile: &ServerProfile,
     ) -> Self {
-        let server_random = salt;
-
-        let selected_suite = if profile.honor_cipher_order {
-            profile
-                .cipher_suites
-                .iter()
-                .find(|&&suite| client_hello.cipher_suites.contains(&suite))
-                .cloned()
-                .unwrap_or(0x1301)
-        } else {
-            client_hello
-                .cipher_suites
-                .iter()
-                .find(|&&suite| profile.cipher_suites.contains(&suite))
-                .cloned()
-                .unwrap_or(0x1301)
-        };
+        let selected_suite =
+            Self::select_cipher_suite(client_hello, profile, false).unwrap_or(0x1301);
 
         let mut extensions = BytesMut::new();
 
@@ -370,11 +378,41 @@ impl ServerHello {
 
         Self {
             version: ProtocolVersion::Tls12,
-            random: server_random,
+            random: salt,
             session_id: client_hello.session_id.clone(),
             cipher_suite: selected_suite,
             extensions,
         }
+    }
+
+    pub(crate) fn select_cipher_suite(
+        client_hello: &ClientHello,
+        profile: &ServerProfile,
+        require_aes_gcm: bool,
+    ) -> Option<u16> {
+        let is_allowed = |suite: &&u16| {
+            client_hello.cipher_suites.contains(suite)
+                && (!require_aes_gcm || matches!(**suite, 0x1301 | 0x1302))
+        };
+        if profile.honor_cipher_order {
+            profile.cipher_suites.iter().find(is_allowed).copied()
+        } else {
+            client_hello
+                .cipher_suites
+                .iter()
+                .find(|suite| profile.cipher_suites.contains(suite) && is_allowed(suite))
+                .copied()
+        }
+    }
+
+    pub(crate) fn select_requested_cipher_suite(
+        client_hello: &ClientHello,
+        profile: &ServerProfile,
+        requested_suite: u16,
+    ) -> Option<u16> {
+        (client_hello.cipher_suites.contains(&requested_suite)
+            && profile.cipher_suites.contains(&requested_suite))
+        .then_some(requested_suite)
     }
 
     /// Сериализует `ServerHello` в тело handshake с 24-битной длиной.
@@ -671,7 +709,7 @@ mod tests {
     }
 
     // ==================================================================
-    // Протокол v3: аутентифицированный хендшейк
+    // Аутентифицированный хендшейк: v3/ChaCha и v4/ring AES-GCM.
     // ==================================================================
 
     /// Пара учётных данных одной ноды: то, что лежит на ней самой, и то, что
@@ -699,10 +737,23 @@ mod tests {
         client_identity: Option<Identity>,
         server_identity: Option<Identity>,
     ) -> (SessionKeys, SessionKeys) {
-        let client_keys = match client_identity {
+        run_handshake_with_preference(
+            client_identity,
+            server_identity,
+            crate::DataCipherPreference::Auto,
+        )
+    }
+
+    fn run_handshake_with_preference(
+        client_identity: Option<Identity>,
+        server_identity: Option<Identity>,
+        preference: crate::DataCipherPreference,
+    ) -> (SessionKeys, SessionKeys) {
+        let mut client_keys = match client_identity {
             Some(id) => SessionKeys::with_identity(true, id),
             None => SessionKeys::new(true),
         };
+        client_keys.set_data_cipher_preference(preference);
         let ch_wire = ClientHello::make_client_hello(
             &BrowserProfile::CHROME_131,
             "example.com",
@@ -715,20 +766,58 @@ mod tests {
             None => SessionKeys::new(false),
         };
         server_keys.set_peer_version(client_hello.session_id[0]);
+        let peer_version = client_hello.session_id[0];
+        if peer_version >= crate::MIN_VERSION_FOR_CIPHER_PREFERENCE {
+            assert!(server_keys.set_peer_data_cipher_preference(client_hello.session_id[1]));
+        }
+        let selected_suite = server_keys
+            .data_cipher_preference()
+            .requested_tls_suite()
+            .filter(|_| peer_version >= crate::MIN_VERSION_FOR_CIPHER_PREFERENCE)
+            .and_then(|suite| {
+                ServerHello::select_requested_cipher_suite(
+                    &client_hello,
+                    &ServerProfile::MODERN,
+                    suite,
+                )
+            })
+            .or_else(|| {
+                (server_keys
+                    .data_cipher_preference()
+                    .requested_tls_suite()
+                    .is_none()
+                    || peer_version < crate::MIN_VERSION_FOR_CIPHER_PREFERENCE)
+                    .then(|| {
+                        ServerHello::select_cipher_suite(
+                            &client_hello,
+                            &ServerProfile::MODERN,
+                            peer_version >= crate::MIN_VERSION_FOR_RING_AEAD,
+                        )
+                    })
+                    .flatten()
+            })
+            .expect("client and server profiles have a common data cipher");
+        server_keys
+            .set_tls_cipher_suite(selected_suite)
+            .expect("selected data cipher is supported");
         server_keys
             .update_keys(client_hello.random, &client_ext, true)
             .expect("server key derivation must succeed");
 
         let server_pub = server_keys.public_key_bytes();
-        let sh_wire = ServerHello::make_server_hello(
+        let sh_wire = ServerHello::make_server_hello_with_suite(
             &client_hello,
             &server_pub,
             server_keys.local_salt(),
             &ServerProfile::MODERN,
+            selected_suite,
         );
         let (server_hello, server_ext) = parse_server_hello_record(&sh_wire);
 
         let mut client_keys = client_keys;
+        client_keys
+            .set_tls_cipher_suite(server_hello.cipher_suite)
+            .expect("server-selected data cipher is supported");
         client_keys
             .update_keys(server_hello.random, &server_ext, false)
             .expect("client key derivation must succeed");
@@ -737,7 +826,7 @@ mod tests {
     }
 
     #[test]
-    fn v3_handshake_derives_matching_keys_and_claims_version_3() {
+    fn authenticated_handshake_derives_matching_keys_and_claims_current_version() {
         let (peer, local) = identity_pair([7u8; 32], [9u8; 32], true);
 
         let client_keys = SessionKeys::with_identity(true, peer.clone());
@@ -750,10 +839,10 @@ mod tests {
         assert_eq!(
             client_hello.session_id[0],
             crate::PROTOCOL_VERSION,
-            "клиент с учётными данными обязан заявлять v3"
+            "клиент с учётными данными обязан заявлять текущую версию протокола"
         );
         // Раскладка `session_id` не изменилась: те же 32 байта, тег на том же
-        // месте. Схема v3 не стоит на проводе ни одного лишнего байта.
+        // месте. Версия шифра не добавляет новых байтов.
         assert_eq!(client_hello.session_id.len(), 32);
 
         let (client_keys, server_keys) = run_handshake(Some(peer), Some(local));
@@ -763,6 +852,74 @@ mod tests {
         assert_eq!(c_tx_k, s_rx_k);
         assert_eq!(c_rx_k, s_tx_k);
         assert_eq!(client_keys.get_auth_key(), server_keys.get_auth_key());
+    }
+
+    #[cfg(feature = "ring-aead")]
+    #[test]
+    fn v4_handshake_binds_aes_gcm_to_the_nrxp_data_stream() {
+        use crate::crypto::{AeadPacker, ChaChaStream};
+
+        let (peer, local) = identity_pair([0x17; 32], [0x28; 32], true);
+        let (client, server) = run_handshake(Some(peer), Some(local));
+        let suite = crate::crypto::AeadSuite::Aes128Gcm;
+        assert_eq!(client.aead_suite(), suite);
+        assert_eq!(server.aead_suite(), suite);
+
+        let (client_tx_key, client_tx_iv, _, _) = client.get_aead_parameters();
+        let (_, _, server_rx_key, server_rx_iv) = server.get_aead_parameters();
+        let mut tx = ChaChaStream::with_suite(suite, &client_tx_key, client_tx_iv);
+        let mut rx = ChaChaStream::with_suite(suite, &server_rx_key, server_rx_iv);
+        let mut record = bytes::BytesMut::from(&b"v4 ring protected NRXP record"[..]);
+        tx.encrypt(&mut record).unwrap();
+        rx.decrypt(&mut record).unwrap();
+        assert_eq!(&record[..], b"v4 ring protected NRXP record");
+    }
+
+    #[cfg(feature = "ring-aead")]
+    #[test]
+    fn v5_handshake_negotiates_each_requested_data_cipher() {
+        let preferences = [
+            (crate::DataCipherPreference::Auto, 0x1301),
+            (crate::DataCipherPreference::Aes128Gcm, 0x1301),
+            (crate::DataCipherPreference::Aes256Gcm, 0x1302),
+            (crate::DataCipherPreference::ChaCha20Poly1305, 0x1303),
+        ];
+
+        for (preference, expected_suite) in preferences {
+            let (peer, local) = identity_pair([0x17; 32], [0x28; 32], true);
+            let (client, server) =
+                run_handshake_with_preference(Some(peer), Some(local), preference);
+            assert_eq!(client.aead_suite().tls_suite(), expected_suite);
+            assert_eq!(server.aead_suite().tls_suite(), expected_suite);
+
+            let (client_tx, _, _, _) = client.get_aead_parameters();
+            let (_, _, server_rx, _) = server.get_aead_parameters();
+            assert_eq!(client_tx, server_rx);
+        }
+    }
+
+    #[cfg(feature = "ring-aead")]
+    #[test]
+    fn v4_handshake_tag_rejects_version_downgrade() {
+        let (peer, local) = identity_pair([0x31; 32], [0x42; 32], false);
+        let client = SessionKeys::with_identity(true, peer);
+        let wire =
+            ClientHello::make_client_hello(&BrowserProfile::CHROME_131, "example.com", &client);
+        let (mut hello, extensions) = parse_client_hello_record(&wire);
+        let mut session_id = hello.session_id.to_vec();
+        session_id[0] = 3;
+        hello.session_id = bytes::Bytes::from(session_id);
+        let message = crate::nrxp::HandshakeMessage::Client {
+            base: hello,
+            extensions,
+        };
+        let mut server = SessionKeys::with_identity(false, local);
+        assert!(crate::nrxp::TlsBridge::wrap_server_hello(
+            &message,
+            &mut server,
+            &ServerProfile::MODERN,
+        )
+        .is_err());
     }
 
     /// Главный тест на активного посредника.

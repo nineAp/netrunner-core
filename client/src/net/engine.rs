@@ -19,6 +19,7 @@
 //! установка туннеля ([`ClientHandler::connect`]) и параметры интерфейса.
 
 use bytes::Bytes;
+use netrunner_core::DataCipherPreference;
 use netrunner_core::net::ClientHandler;
 use netrunner_core::net::Muxer;
 use netrunner_core::net::NetworkConfig;
@@ -965,6 +966,8 @@ pub struct EngineConfig {
     pub node_public_key: Option<String>,
     /// Request opt-in strong privacy on all newly opened TCP/UDP flows.
     pub strong_privacy: bool,
+    /// Preferred NRXP data-plane AEAD; `Auto` lets the node choose AES-GCM.
+    pub data_cipher_preference: DataCipherPreference,
 }
 
 impl EngineConfig {
@@ -989,6 +992,7 @@ impl EngineConfig {
             node_secret: None,
             node_public_key: None,
             strong_privacy: false,
+            data_cipher_preference: DataCipherPreference::Auto,
         }
     }
 
@@ -1017,6 +1021,11 @@ impl EngineConfig {
     /// Enables onion-route mixing mode for future connections in this engine.
     pub fn with_strong_privacy(mut self, enabled: bool) -> Self {
         self.strong_privacy = enabled;
+        self
+    }
+
+    pub fn with_data_cipher_preference(mut self, preference: DataCipherPreference) -> Self {
+        self.data_cipher_preference = preference;
         self
     }
 
@@ -1216,7 +1225,7 @@ impl EngineBuilder {
         };
 
         info!("Establishing secure tunnel to proxy server...");
-        let muxer = ClientHandler::connect_with_privacy_mode(
+        let muxer = ClientHandler::connect_with_privacy_and_cipher(
             &self.config.remote_address,
             self.config.decoy_sni.clone(),
             self.config.auth_token.clone(),
@@ -1224,6 +1233,7 @@ impl EngineBuilder {
             rx_for_client_handler,
             tx_for_client_handler,
             self.config.strong_privacy,
+            self.config.data_cipher_preference,
         )
         .await
         .map_err(|e| format!("Failed to establish secure tunnel: {}", e))?;

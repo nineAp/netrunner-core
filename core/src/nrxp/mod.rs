@@ -54,6 +54,8 @@ mod datagram;
 mod errors;
 mod frame;
 
+#[cfg(all(test, feature = "ring-aead"))]
+pub(crate) use bridge::HandshakeMessage;
 pub(crate) use bridge::TlsBridge;
 pub(crate) use codec::{Codec, RxCodec, TxCodec};
 // `expand_counter`/`SealedDatagram` are used only inside `datagram` itself —

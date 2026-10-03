@@ -29,10 +29,8 @@
 //! обратно — он ничего не знает о QUIC или RTP.
 
 use bytes::{Bytes, BytesMut};
-use chacha20poly1305::aead::generic_array::GenericArray;
-use chacha20poly1305::{AeadInPlace, ChaCha20Poly1305, Key, KeyInit, Nonce};
 
-use crate::crypto::{DatagramEpochKeys, DatagramKeyMaterial};
+use crate::crypto::{AeadCipher, DatagramEpochKeys, DatagramKeyMaterial};
 use crate::nrxp::errors::{ErrorAction, ErrorStage, TlsError};
 use crate::nrxp::frame::{Frame, FrameType};
 use crate::parser::Parser;
@@ -186,7 +184,7 @@ impl ReplayWindow {
     }
 }
 
-fn build_nonce(salt: &[u8; 12], counter: u64) -> Nonce {
+fn build_nonce(salt: &[u8; 12], counter: u64) -> [u8; 12] {
     // Та же конструкция, что `crypto::chacha::NonceState::next_nonce`
     // (`salt XOR big_endian(counter)` по младшим 8 байтам), только со внешне
     // управляемым счётчиком: здесь его на TX-стороне не "следующий
@@ -197,11 +195,7 @@ fn build_nonce(salt: &[u8; 12], counter: u64) -> Nonce {
     for i in 0..8 {
         iv[i + 4] ^= counter_bytes[i];
     }
-    *GenericArray::from_slice(&iv)
-}
-
-fn cipher_for(key: &[u8; 32]) -> ChaCha20Poly1305 {
-    ChaCha20Poly1305::new(Key::from_slice(key))
+    iv
 }
 
 fn auth_fail(what: &'static str) -> TlsError {
@@ -221,11 +215,21 @@ pub(crate) struct SealedDatagram {
 pub(crate) struct DatagramTx {
     keys: DatagramKeyMaterial,
     counter: u64,
+    epoch: DatagramEpochKeys,
+    cipher: AeadCipher,
 }
 
 impl DatagramTx {
     pub(crate) fn new(keys: DatagramKeyMaterial) -> Self {
-        Self { keys, counter: 0 }
+        let epoch = keys.tx_current();
+        let cipher = AeadCipher::new(epoch.suite, &epoch.key)
+            .expect("negotiated datagram AEAD has a fixed-size key");
+        Self {
+            keys,
+            counter: 0,
+            epoch,
+            cipher,
+        }
     }
 
     /// Сдвигает НАЧАЛЬНЫЙ счётчик эпохи 0 — нужно `webrtceng`, чтобы RTP `seq`
@@ -254,7 +258,9 @@ impl DatagramTx {
     /// за тем же приёмом внутри этого модуля).
     #[cfg(test)]
     pub(crate) fn force_rekey_for_test(&mut self) {
-        self.keys.tx_advance();
+        self.epoch = self.keys.tx_advance();
+        self.cipher = AeadCipher::new(self.epoch.suite, &self.epoch.key)
+            .expect("negotiated datagram AEAD has a fixed-size key");
         self.counter = 0;
     }
 
@@ -295,11 +301,13 @@ impl DatagramTx {
         aad: &[u8],
     ) -> Result<SealedDatagram, TlsError> {
         if self.counter >= REKEY_AFTER_DATAGRAMS {
-            self.keys.tx_advance();
+            self.epoch = self.keys.tx_advance();
+            self.cipher = AeadCipher::new(self.epoch.suite, &self.epoch.key)
+                .expect("negotiated datagram AEAD has a fixed-size key");
             self.counter = 0;
         }
 
-        let epoch: DatagramEpochKeys = self.keys.tx_current();
+        let epoch = &self.epoch;
         let counter = self.counter;
         self.counter += 1;
 
@@ -311,12 +319,10 @@ impl DatagramTx {
         buf.reserve(16);
 
         let nonce = build_nonce(&epoch.salt, counter);
-        cipher_for(&epoch.key)
-            .encrypt_in_place(&nonce, aad, &mut buf)
-            .map_err(|e| {
-                netrunner_logger::error!(error = ?e, "Datagram AEAD seal failed");
-                auth_fail("Datagram AEAD seal failed")
-            })?;
+        self.cipher.seal(nonce, aad, &mut buf).map_err(|e| {
+            netrunner_logger::error!(error = ?e, "Datagram AEAD seal failed");
+            auth_fail("Datagram AEAD seal failed")
+        })?;
 
         Ok(SealedDatagram {
             epoch_id: epoch.epoch_id,
@@ -331,14 +337,18 @@ struct EpochSlot {
     epoch_id: u8,
     keys: DatagramEpochKeys,
     window: ReplayWindow,
+    cipher: AeadCipher,
 }
 
 impl EpochSlot {
     fn fresh(keys: DatagramEpochKeys) -> Self {
+        let cipher = AeadCipher::new(keys.suite, &keys.key)
+            .expect("negotiated datagram AEAD has a fixed-size key");
         Self {
             epoch_id: keys.epoch_id,
             keys,
             window: ReplayWindow::new(),
+            cipher,
         }
     }
 
@@ -356,9 +366,7 @@ impl EpochSlot {
         let nonce = build_nonce(&self.keys.salt, full_counter);
 
         let mut buf = BytesMut::from(ciphertext);
-        cipher_for(&self.keys.key)
-            .decrypt_in_place(&nonce, aad, &mut buf)
-            .ok()?;
+        self.cipher.open(nonce, aad, &mut buf).ok()?;
 
         if self.window.accept(full_counter) {
             Some(buf)
@@ -612,8 +620,7 @@ mod tests {
 
         // То же самое верно и через границу ratchet-перевыпуска — ради этого
         // и существует особый случай в `peek_next_epoch_and_counter`.
-        tx.keys.tx_advance();
-        tx.counter = 0;
+        tx.force_rekey_for_test();
         let (peeked_epoch, peeked_counter) = tx.peek_next_epoch_and_counter();
         let sealed = tx
             .seal(1, FrameType::UdpData, Bytes::from_static(b"y"), b"aad")
@@ -641,6 +648,54 @@ mod tests {
         assert_eq!(frame.header.stream_id, 3);
         assert_eq!(frame.header.frame_type, FrameType::UdpData);
         assert_eq!(&frame.payload[..], b"hello");
+    }
+
+    #[cfg(feature = "ring-aead")]
+    #[test]
+    fn ring_aes_gcm_datagrams_interoperate_across_ratchet_update() {
+        let root =
+            crate::crypto::DatagramRoot::new([0x64; 32], crate::crypto::AeadSuite::Aes128Gcm);
+        let mut tx = DatagramTx::new(DatagramKeyMaterial::derive_from_root(root, true));
+        let mut rx = DatagramRx::new(DatagramKeyMaterial::derive_from_root(root, false));
+
+        let first = tx
+            .seal(
+                7,
+                FrameType::UdpData,
+                Bytes::from_static(b"aes before"),
+                b"udp aad",
+            )
+            .unwrap();
+        let frame = rx
+            .open(
+                first.epoch_id,
+                first.counter,
+                32,
+                &first.ciphertext,
+                b"udp aad",
+            )
+            .unwrap();
+        assert_eq!(&frame.payload[..], b"aes before");
+
+        tx.force_rekey_for_test();
+        let next = tx
+            .seal(
+                7,
+                FrameType::UdpData,
+                Bytes::from_static(b"aes after"),
+                b"udp aad",
+            )
+            .unwrap();
+        let frame = rx
+            .open(
+                next.epoch_id,
+                next.counter,
+                32,
+                &next.ciphertext,
+                b"udp aad",
+            )
+            .unwrap();
+        assert_eq!(&frame.payload[..], b"aes after");
     }
 
     #[test]
@@ -731,8 +786,7 @@ mod tests {
 
         // Форсируем ratchet вручную, минуя счётчик-порог — тестируем именно
         // переход эпохи, а не то, что порог когда-нибудь наступит.
-        tx.keys.tx_advance();
-        tx.counter = 0;
+        tx.force_rekey_for_test();
 
         let after = tx
             .seal(2, FrameType::UdpData, Bytes::from_static(b"after"), b"aad")
@@ -754,8 +808,7 @@ mod tests {
             .seal(1, FrameType::UdpData, Bytes::from_static(b"before"), b"aad")
             .unwrap();
 
-        tx.keys.tx_advance();
-        tx.counter = 0;
+        tx.force_rekey_for_test();
         let after = tx
             .seal(2, FrameType::UdpData, Bytes::from_static(b"after"), b"aad")
             .unwrap();
@@ -807,16 +860,14 @@ mod tests {
             .seal(1, FrameType::UdpData, Bytes::from_static(b"before"), b"aad")
             .unwrap();
 
-        tx.keys.tx_advance();
-        tx.counter = 0;
+        tx.force_rekey_for_test();
         let _mid = tx
             .seal(2, FrameType::UdpData, Bytes::from_static(b"mid"), b"aad")
             .unwrap();
         rx.open(_mid.epoch_id, _mid.counter, 32, &_mid.ciphertext, b"aad")
             .unwrap();
 
-        tx.keys.tx_advance();
-        tx.counter = 0;
+        tx.force_rekey_for_test();
         let after = tx
             .seal(3, FrameType::UdpData, Bytes::from_static(b"after"), b"aad")
             .unwrap();

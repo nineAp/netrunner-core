@@ -1,6 +1,6 @@
 [package]
 name = "netrunner-core"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 
 
@@ -83,6 +83,7 @@ metrics = "0.24.3"
 quinn = { version = "0.11.9", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"], optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
 rcgen = { version = "0.14", optional = true }
+ring = { version = "0.17", optional = true }
 
 # `std::time::SystemTime::now()` panics on wasm32-unknown-unknown ("time not
 # implemented on this platform" — no OS clock syscall there). web-time is an
@@ -97,7 +98,8 @@ web-time = "1.1"
 # сборки/тесты не попадает, прод-путь не трогает.
 [features]
 dev-dump = []
-mesh-quic = ["dep:quinn", "dep:rustls", "dep:rcgen"]
+mesh-quic = ["dep:quinn", "dep:rustls", "dep:rcgen", "ring-aead"]
+ring-aead = ["dep:ring"]
 
 # Пример собирается ТОЛЬКО с `--features dev-dump`, иначе `cargo build --examples`
 # не тянет его в обычных сборках.

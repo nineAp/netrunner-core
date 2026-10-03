@@ -50,8 +50,23 @@
 /// (`TlsBridge::wrap_server_hello` возвращает наряду с готовым `ServerHello`)
 /// и решает, какое поведение включать для конкретного клиента.
 ///
-/// Это НЕ версия крипто-протокола — обмен ключами (X25519/HKDF/ChaCha20) не
-/// зависит от неё и не меняется. Это версия «протокольного шума»: вещей вроде
+/// Это версия поведения NRXP. В v5 preference шифра клиента передаётся в уже
+/// существующем `session_id` и подтверждается тегом; v4 оставлен для клиентов,
+/// которые автоматически выбирают AES-GCM.
+#[cfg(feature = "ring-aead")]
+pub(crate) const PROTOCOL_VERSION: u8 = 5;
+
+/// Сборки без ring сохраняют протокол v3 и ChaCha, в том числе wasm edge.
+#[cfg(not(feature = "ring-aead"))]
+pub(crate) const PROTOCOL_VERSION: u8 = 3;
+
+/// Minimum protocol version that negotiates ring-backed AES-GCM for NRXP data.
+pub(crate) const MIN_VERSION_FOR_RING_AEAD: u8 = 4;
+
+/// First version that carries an authenticated client data-cipher preference.
+pub(crate) const MIN_VERSION_FOR_CIPHER_PREFERENCE: u8 = 5;
+
+/// Это НЕ версия TLS. Это версия «протокольного шума»: вещей вроде
 /// middlebox-compat `ChangeCipherSpec` (см. [`MIN_VERSION_FOR_CCS`]), которые
 /// старый пир молча не поймёт и из-за которых соединение порвётся, если
 /// включить их безусловно для вообще всех клиентов сразу.
@@ -62,8 +77,6 @@
 /// клиентских сборок можно катить независимо, не единым синхронным релизом
 /// (в отличие от того, как пришлось вводить сам CCS в этом патче — на момент
 /// его добавления версионирования в протоколе ещё не было).
-pub(crate) const PROTOCOL_VERSION: u8 = 3;
-
 /// Версия, которую заявляет сторона **без** учётных данных ноды: клиент,
 /// которому бэкенд их ещё не выдал, или нода без настроенных ключей.
 ///
@@ -118,6 +131,7 @@ pub(crate) const MIN_VERSION_FOR_CCS: u8 = 1;
 pub(crate) const MIN_VERSION_FOR_COVER: u8 = 2;
 
 mod crypto;
+pub use crypto::DataCipherPreference;
 mod dgram_leg;
 /// Учётные данные ноды, которые заводит админка бэкенда: секрет входа и
 /// статическая пара X25519. Собирают их связывающие бинари (`netrunner-server`

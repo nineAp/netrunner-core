@@ -17,7 +17,7 @@ default = []
 cli = ["dep:clap", "dep:serde", "dep:toml"]
 
 [dependencies]
-netrunner-core = { path = "../core" }
+netrunner-core = { path = "../core", features = ["ring-aead"] }
 smoltcp = { package = "nxrp-smoltcp", git = "https://gitea.netrunner-vpn.com/nineap/nxrp-smoltcp.git", branch = "main", default-features = false, features = [
     "std",
     "log",

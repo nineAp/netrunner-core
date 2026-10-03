@@ -270,6 +270,8 @@ pub(crate) struct TunnelEngine {
     /// Молчаливый откат на анонимную схему при реконнекте означал бы, что
     /// достаточно оборвать ноге TCP, чтобы снять с неё аутентификацию.
     pub identity: Option<crate::Identity>,
+    /// User-selected cipher carried across reconnect handshakes.
+    pub data_cipher_preference: crate::DataCipherPreference,
 }
 
 impl TunnelEngine {
@@ -291,7 +293,7 @@ impl TunnelEngine {
             RxCodec,
             TxCodec,
             BytesMut,
-            [u8; 32],
+            crate::crypto::DatagramRoot,
         ),
         AppError,
     > {
@@ -332,6 +334,7 @@ impl TunnelEngine {
             &self.decoy_sni,
             &self.auth_token,
             self.identity.as_ref(),
+            self.data_cipher_preference,
         )
         .await
     }
@@ -346,7 +349,7 @@ impl TunnelEngine {
     ///
     /// Только клиент: у сервера `remote_addr` пуст и до реконнекта дело не
     /// доходит (см. ветку `remote_addr.is_empty()` в [`run`](Self::run)).
-    fn rearm_datagram_leg(&self, datagram_root: [u8; 32]) {
+    fn rearm_datagram_leg(&self, datagram_root: crate::crypto::DatagramRoot) {
         if self.remote_addr.is_empty() {
             return;
         }

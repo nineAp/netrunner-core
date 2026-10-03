@@ -33,10 +33,37 @@
 //! эпоху), а именно та половина свойства, которую можно получить бесплатно
 //! (без нового round-trip) поверх уже установленной сессии.
 
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
+use crate::crypto::aead::AeadSuite;
 use crate::crypto::hkdf::HKDF;
 use crate::crypto::session::SessionKeys;
+
+/// Session root plus the AEAD negotiated by the enclosing NRXP handshake.
+/// Carrying the suite beside the secret keeps UDP legs on the same cipher.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DatagramRoot {
+    bytes: [u8; 32],
+    suite: AeadSuite,
+}
+
+impl DatagramRoot {
+    pub(crate) fn new(bytes: [u8; 32], suite: AeadSuite) -> Self {
+        Self { bytes, suite }
+    }
+
+    fn bytes(&self) -> &[u8; 32] {
+        &self.bytes
+    }
+}
+
+impl From<[u8; 32]> for DatagramRoot {
+    /// Raw roots used by old fixtures and direct protocol tests remain legacy
+    /// ChaCha roots. Production handshakes carry the negotiated suite.
+    fn from(bytes: [u8; 32]) -> Self {
+        Self::new(bytes, AeadSuite::ChaCha20Poly1305)
+    }
+}
 
 /// Метка движка UDP-ноги, вплетаемая в вывод AEAD/HP-ключей (НЕ в `leg_token`).
 ///
@@ -122,26 +149,36 @@ pub(crate) struct DatagramEpochKeys {
     pub(crate) epoch_id: u8,
     pub(crate) key: [u8; 32],
     pub(crate) salt: [u8; 12],
+    pub(crate) suite: AeadSuite,
+}
+
+impl Drop for DatagramEpochKeys {
+    fn drop(&mut self) {
+        self.key.zeroize();
+        self.salt.zeroize();
+    }
 }
 
 /// Однонаправленная HKDF-цепочка для одного направления (c2s либо s2c).
 struct KeyRatchet {
     chain: Zeroizing<[u8; 32]>,
     epoch_id: u8,
+    suite: AeadSuite,
 }
 
 impl KeyRatchet {
-    fn from_root(chain0: [u8; 32]) -> Self {
+    fn from_root(chain0: [u8; 32], suite: AeadSuite) -> Self {
         Self {
             chain: Zeroizing::new(chain0),
             epoch_id: 0,
+            suite,
         }
     }
 
     /// Ключи текущей эпохи — без продвижения состояния. Вызывается сколько
     /// угодно раз на каждый исходящий/входящий пакет этой эпохи.
     fn current(&self) -> DatagramEpochKeys {
-        Self::derive_epoch(&self.chain, self.epoch_id)
+        Self::derive_epoch(&self.chain, self.epoch_id, self.suite)
     }
 
     /// Ключи СЛЕДУЮЩЕЙ эпохи, если бы ratchet продвинулся — не продвигает его
@@ -152,7 +189,7 @@ impl KeyRatchet {
     /// пакет с чужим/случайным содержимым сдвигал бы состояние вхолостую.
     fn peek_next(&self) -> DatagramEpochKeys {
         let next_chain = Self::step_chain(&self.chain);
-        Self::derive_epoch(&next_chain, self.epoch_id.wrapping_add(1))
+        Self::derive_epoch(&next_chain, self.epoch_id.wrapping_add(1), self.suite)
     }
 
     /// Необратимо продвигает цепочку на один шаг и возвращает ключи новой
@@ -165,7 +202,7 @@ impl KeyRatchet {
         self.current()
     }
 
-    fn derive_epoch(chain: &[u8; 32], epoch_id: u8) -> DatagramEpochKeys {
+    fn derive_epoch(chain: &[u8; 32], epoch_id: u8, suite: AeadSuite) -> DatagramEpochKeys {
         let hk = HKDF::from_prk(chain);
         DatagramEpochKeys {
             epoch_id,
@@ -173,6 +210,7 @@ impl KeyRatchet {
                 .expect("fixed-length HKDF-expand cannot fail"),
             salt: HKDF::expand_key::<12>(&hk, b"dgram-epoch-salt")
                 .expect("fixed-length HKDF-expand cannot fail"),
+            suite,
         }
     }
 
@@ -226,7 +264,7 @@ impl DatagramKeyMaterial {
     /// [`crate::nrxp::datagram::DatagramTx`]/[`crate::nrxp::datagram::DatagramRx`],
     /// каждый из которых владеет своей копией целиком). `derive` выше — тонкая
     /// обёртка поверх этого метода.
-    pub(crate) fn derive_from_root(root: [u8; 32], is_initiator: bool) -> Self {
+    pub(crate) fn derive_from_root(root: impl Into<DatagramRoot>, is_initiator: bool) -> Self {
         Self::derive_from_root_ctx(root, is_initiator, DgramKdfContext::BASE)
     }
 
@@ -237,11 +275,12 @@ impl DatagramKeyMaterial {
     /// `build_matching_tx` — каждый со своей меткой движка, чтобы raw и мимикрия
     /// не делили ключ (bug #18). См. докстринг [`DgramEngineLabel`].
     pub(crate) fn derive_from_root_ctx(
-        root: [u8; 32],
+        root: impl Into<DatagramRoot>,
         is_initiator: bool,
         ctx: DgramKdfContext,
     ) -> Self {
-        let hk = HKDF::from_prk(&root);
+        let root = root.into();
+        let hk = HKDF::from_prk(root.bytes());
 
         // `leg_token` — БЕЗ контекста: сервер выводит его, не зная выбранного
         // клиентом движка (см. докстринг `DgramEngineLabel`).
@@ -271,8 +310,8 @@ impl DatagramKeyMaterial {
 
         Self {
             leg_token,
-            tx: KeyRatchet::from_root(tx0),
-            rx: KeyRatchet::from_root(rx0),
+            tx: KeyRatchet::from_root(tx0, root.suite),
+            rx: KeyRatchet::from_root(rx0, root.suite),
             hp_key_tx,
             hp_key_rx,
         }

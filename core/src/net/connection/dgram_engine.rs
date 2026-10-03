@@ -47,7 +47,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::crypto::{DatagramKeyMaterial, DgramEngineLabel, DgramKdfContext};
+use crate::crypto::{DatagramKeyMaterial, DatagramRoot, DgramEngineLabel, DgramKdfContext};
 use crate::dgram_leg::{self, DgramEngineKind, DgramRx, DgramTx};
 use crate::net::connection::connection::{DgramSessionEntry, SessionManager};
 use crate::net::connection::handler::{RemoteOpener, StreamHandler};
@@ -157,7 +157,7 @@ pub(crate) fn attach_mesh_quic_datagram_leg(
     muxer: Arc<Muxer>,
     connection: quinn::Connection,
     handler: Arc<StreamHandler>,
-    datagram_root: [u8; 32],
+    datagram_root: impl Into<DatagramRoot>,
     is_client: bool,
 ) {
     let Some(max_datagram) = connection.max_datagram_size() else {
@@ -177,7 +177,7 @@ pub(crate) fn attach_mesh_quic_datagram_leg(
     let (data_tx, mut data_rx) = mpsc::channel::<MuxMessage>(cap);
     muxer.set_datagram_leg_with_max_payload(control_tx.clone(), data_tx, max_payload);
     muxer.mark_datagram_leg_alive();
-    let (mut tx, mut rx) = build_raw_pair(datagram_root, is_client);
+    let (mut tx, mut rx) = build_raw_pair(datagram_root.into(), is_client);
 
     let token = muxer.network_epoch_token().child_token();
     let reader_token = token.clone();
@@ -350,9 +350,10 @@ async fn dispatch_open_frame(
 /// исходящие пакеты (см. `dgram_leg::{quic_dcid_client,...}`).
 fn build_mimicry_pair(
     kind: &DgramEngineKind,
-    datagram_root: [u8; 32],
+    datagram_root: impl Into<DatagramRoot>,
     is_client: bool,
 ) -> (DgramTx, DgramRx) {
+    let datagram_root = datagram_root.into();
     match kind {
         DgramEngineKind::Quic => {
             let ctx = DgramKdfContext::new(DgramEngineLabel::Quic, ATTEMPT);
@@ -403,7 +404,8 @@ fn build_mimicry_pair(
     }
 }
 
-fn build_raw_pair(datagram_root: [u8; 32], is_client: bool) -> (DgramTx, DgramRx) {
+fn build_raw_pair(datagram_root: impl Into<DatagramRoot>, is_client: bool) -> (DgramTx, DgramRx) {
+    let datagram_root = datagram_root.into();
     let ctx = DgramKdfContext::new(DgramEngineLabel::Raw, ATTEMPT);
     let tx_material = DatagramKeyMaterial::derive_from_root_ctx(datagram_root, is_client, ctx);
     let rx_material = DatagramKeyMaterial::derive_from_root_ctx(datagram_root, is_client, ctx);
@@ -419,9 +421,10 @@ fn build_raw_pair(datagram_root: [u8; 32], is_client: bool) -> (DgramTx, DgramRx
 /// (см. `quiceng::initial` module docs).
 fn build_decorative_initial(
     kind: &DgramEngineKind,
-    datagram_root: [u8; 32],
+    datagram_root: impl Into<DatagramRoot>,
     decoy_sni: &str,
 ) -> Option<Bytes> {
+    let datagram_root = datagram_root.into();
     match kind {
         DgramEngineKind::Quic => {
             // `leg_token` для DCID выводится из нейтрального контекста: он
@@ -568,8 +571,9 @@ pub(crate) async fn attempt_client_datagram_leg(
     udp_addr: SocketAddr,
     decoy_sni: Arc<str>,
     session_id: String,
-    datagram_root: [u8; 32],
+    datagram_root: impl Into<DatagramRoot>,
 ) {
+    let datagram_root = datagram_root.into();
     if muxer.is_fatal() {
         return;
     }
@@ -1049,7 +1053,8 @@ async fn process_datagram(
 
 /// Строит `DgramTx`, симметричный уже собранному `entry.rx` (тот же
 /// движок), на серверную половину `leg_token`/HP-ключей (`is_client=false`).
-fn build_matching_tx(rx: &DgramRx, datagram_root: [u8; 32]) -> DgramTx {
+fn build_matching_tx(rx: &DgramRx, datagram_root: impl Into<DatagramRoot>) -> DgramTx {
+    let datagram_root = datagram_root.into();
     match rx {
         DgramRx::Quic(_) => {
             let ctx = DgramKdfContext::new(DgramEngineLabel::Quic, ATTEMPT);

@@ -12,11 +12,15 @@
 //! - **In-place.** Шифр работает прямо в [`BytesMut`] без копий и аллокаций.
 
 use bytes::BytesMut;
-use chacha20poly1305::aead::generic_array::GenericArray;
-use chacha20poly1305::{AeadInPlace, ChaCha20Poly1305, Key, KeyInit, Nonce};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
-use crate::crypto::aead::AeadPacker;
+use crate::crypto::aead::{AeadCipher, AeadError, AeadPacker, AeadSuite};
+use crate::crypto::hkdf::HKDF;
+
+/// Implicit key update cadence for the ordered NRXP record stream. Both peers
+/// count authenticated records independently in each direction, so no new
+/// wire field or round trip is required.
+const STREAM_REKEY_AFTER_RECORDS: u64 = 1 << 20;
 
 /// Генератор nonce для одного направления.
 ///
@@ -45,7 +49,11 @@ impl NonceState {
     /// XOR накладывается на байты `iv[4..12]` (младшие 8 байт 12-байтового IV),
     /// старшие 4 байта остаются «солью» из IV. После вызова `counter`
     /// увеличивается, поэтому следующий кадр получит другой nonce.
-    pub fn next_nonce(&mut self) -> Nonce {
+    pub fn next_nonce(&mut self) -> Result<[u8; 12], AeadError> {
+        let next = self
+            .counter
+            .checked_add(1)
+            .ok_or(AeadError::NonceExhausted)?;
         let mut iv = self.base_iv;
         let counter_bytes = self.counter.to_be_bytes();
 
@@ -53,8 +61,8 @@ impl NonceState {
             iv[i + 4] ^= counter_bytes[i];
         }
 
-        self.counter += 1;
-        *GenericArray::from_slice(&iv)
+        self.counter = next;
+        Ok(iv)
     }
 }
 
@@ -73,30 +81,68 @@ impl Drop for NonceState {
 /// Однонаправленный шифр: одна пара (ключ, IV) + её счётчик nonce.
 ///
 /// Реализует [`AeadPacker`]. Используется парами внутри [`ChaChaCipher`].
-pub struct ChaChaStream {
-    cipher: ChaCha20Poly1305,
+pub struct AeadStream {
+    cipher: AeadCipher,
     state: NonceState,
+    suite: AeadSuite,
+    ratchet: Zeroizing<[u8; 32]>,
+    records_in_epoch: u64,
 }
 
-impl ChaChaStream {
+impl AeadStream {
     pub fn new(key: &[u8; 32], iv: [u8; 12]) -> Self {
+        Self::with_suite(AeadSuite::ChaCha20Poly1305, key, iv)
+    }
+
+    pub fn with_suite(suite: AeadSuite, key: &[u8; 32], iv: [u8; 12]) -> Self {
         Self {
-            cipher: ChaCha20Poly1305::new(Key::from_slice(key)),
+            cipher: AeadCipher::new(suite, key).expect("fixed-size AEAD key is valid"),
             state: NonceState::new(iv),
+            suite,
+            ratchet: Zeroizing::new(*key),
+            records_in_epoch: 0,
         }
+    }
+
+    fn rekey(&mut self) {
+        let root_hk = HKDF::from_prk(&self.ratchet);
+        let mut next_root = HKDF::expand_key::<32>(&root_hk, b"nrxp-stream-ratchet-next")
+            .expect("fixed-length HKDF-expand cannot fail");
+        let epoch_hk = HKDF::from_prk(&next_root);
+        let mut key = HKDF::expand_key::<32>(&epoch_hk, b"nrxp-stream-aead-key")
+            .expect("fixed-length HKDF-expand cannot fail");
+        let mut iv = HKDF::expand_key::<12>(&epoch_hk, b"nrxp-stream-aead-iv")
+            .expect("fixed-length HKDF-expand cannot fail");
+
+        self.cipher =
+            AeadCipher::new(self.suite, &key).expect("fixed-size AEAD rekey material is valid");
+        self.state = NonceState::new(iv);
+        self.ratchet = Zeroizing::new(next_root);
+        self.records_in_epoch = 0;
+        next_root.zeroize();
+        key.zeroize();
+        iv.zeroize();
+    }
+
+    fn should_rekey(&self) -> bool {
+        self.suite != AeadSuite::ChaCha20Poly1305
+            && self.records_in_epoch >= STREAM_REKEY_AFTER_RECORDS
     }
 }
 
-impl AeadPacker for ChaChaStream {
-    fn encrypt(&mut self, data: &mut BytesMut) -> Result<(), chacha20poly1305::aead::Error> {
+impl AeadPacker for AeadStream {
+    fn encrypt(&mut self, data: &mut BytesMut) -> Result<(), AeadError> {
+        if self.should_rekey() {
+            self.rekey();
+        }
         let current_counter = self.state.counter;
-        let nonce = self.state.next_nonce();
+        let nonce = self.state.next_nonce()?;
         let data_len = data.len();
 
         // Убеждаемся, что в BytesMut есть место для тега, чтобы избежать аллокации
         data.reserve(16);
 
-        match self.cipher.encrypt_in_place(&nonce, &nonce, data) {
+        match self.cipher.seal(nonce, &[], data) {
             Ok(_) => {
                 netrunner_logger::trace!(
                     counter = current_counter,
@@ -104,6 +150,7 @@ impl AeadPacker for ChaChaStream {
                     len = data_len,
                     "Encryption successful"
                 );
+                self.records_in_epoch += 1;
                 Ok(())
             }
             Err(e) => {
@@ -119,12 +166,15 @@ impl AeadPacker for ChaChaStream {
         }
     }
 
-    fn decrypt(&mut self, data: &mut BytesMut) -> Result<(), chacha20poly1305::aead::Error> {
+    fn decrypt(&mut self, data: &mut BytesMut) -> Result<(), AeadError> {
+        if self.should_rekey() {
+            self.rekey();
+        }
         let saved_counter = self.state.counter;
-        let nonce = self.state.next_nonce();
+        let nonce = self.state.next_nonce()?;
         let data_len = data.len();
 
-        match self.cipher.decrypt_in_place(&nonce, &nonce, data) {
+        match self.cipher.open(nonce, &[], data) {
             Ok(_) => {
                 netrunner_logger::trace!(
                     counter = saved_counter,
@@ -132,6 +182,7 @@ impl AeadPacker for ChaChaStream {
                     len = data_len,
                     "Decryption successful"
                 );
+                self.records_in_epoch += 1;
                 Ok(())
             }
             Err(e) => {
@@ -166,19 +217,25 @@ impl AeadPacker for ChaChaStream {
 ///
 /// Создаётся «пустым» (нулевые ключи) до завершения хендшейка, затем
 /// [`set_keys`](ChaChaCipher::set_keys) заряжает реальные ключи из HKDF.
-pub struct ChaChaCipher {
+pub struct SessionCipher {
     /// Исходящее направление (шифрование того, что отправляем).
-    pub tx: ChaChaStream,
+    pub tx: AeadStream,
     /// Входящее направление (расшифровка того, что приняли).
-    pub rx: ChaChaStream,
+    pub rx: AeadStream,
+    suite: AeadSuite,
 }
 
-impl ChaChaCipher {
+impl SessionCipher {
     /// Создаёт шифр с нулевыми ключами-заглушками (до хендшейка).
     pub fn new() -> Self {
+        Self::with_suite(AeadSuite::ChaCha20Poly1305)
+    }
+
+    pub fn with_suite(suite: AeadSuite) -> Self {
         Self {
-            tx: ChaChaStream::new(&[0u8; 32], [0u8; 12]),
-            rx: ChaChaStream::new(&[0u8; 32], [0u8; 12]),
+            tx: AeadStream::with_suite(suite, &[0u8; 32], [0u8; 12]),
+            rx: AeadStream::with_suite(suite, &[0u8; 32], [0u8; 12]),
+            suite,
         }
     }
 
@@ -191,8 +248,8 @@ impl ChaChaCipher {
         mut r_key: [u8; 32],
         r_iv: [u8; 12],
     ) {
-        self.tx = ChaChaStream::new(&w_key, w_iv);
-        self.rx = ChaChaStream::new(&r_key, r_iv);
+        self.tx = AeadStream::with_suite(self.suite, &w_key, w_iv);
+        self.rx = AeadStream::with_suite(self.suite, &r_key, r_iv);
         // Ключи пришли по значению — это копии на стеке поверх тех, что уже
         // легли внутрь шифра. Свои копии затираем сразу: дальше они не нужны,
         // а `[u8; 32]` при выходе из области видимости не затирается сам.
@@ -206,7 +263,51 @@ impl ChaChaCipher {
     ///
     /// Нужно, чтобы отдать чтение и запись в разные задачи tokio (reader/writer),
     /// не деля шифр под мьютексом — каждое направление владеет своим потоком.
-    pub fn split(self) -> (ChaChaStream, ChaChaStream) {
+    pub fn split(self) -> (AeadStream, AeadStream) {
         (self.rx, self.tx)
+    }
+}
+
+pub(crate) type ChaChaStream = AeadStream;
+pub(crate) type ChaChaCipher = SessionCipher;
+
+#[cfg(all(test, feature = "ring-aead"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn implicit_stream_rekey_is_synchronized_without_a_wire_marker() {
+        let key = [0x41; 32];
+        let iv = [0x27; 12];
+        let mut tx = AeadStream::with_suite(AeadSuite::Aes128Gcm, &key, iv);
+        let mut rx = AeadStream::with_suite(AeadSuite::Aes128Gcm, &key, iv);
+
+        // Fast-forward both ordered directions to the rekey boundary. The next
+        // record must transparently use the next key and nonce sequence.
+        tx.records_in_epoch = STREAM_REKEY_AFTER_RECORDS;
+        rx.records_in_epoch = STREAM_REKEY_AFTER_RECORDS;
+        tx.state.counter = STREAM_REKEY_AFTER_RECORDS;
+        rx.state.counter = STREAM_REKEY_AFTER_RECORDS;
+
+        let mut record = BytesMut::from(&b"record after implicit update"[..]);
+        tx.encrypt(&mut record).unwrap();
+        rx.decrypt(&mut record).unwrap();
+        assert_eq!(&record[..], b"record after implicit update");
+        assert_eq!(tx.records_in_epoch, 1);
+        assert_eq!(rx.records_in_epoch, 1);
+    }
+
+    #[test]
+    fn ring_aes_gcm_round_trips_with_associated_data() {
+        for suite in [AeadSuite::Aes128Gcm, AeadSuite::Aes256Gcm] {
+            let key = [0x5a; 32];
+            let nonce = [0x93; 12];
+            let tx = AeadCipher::new(suite, &key).unwrap();
+            let rx = AeadCipher::new(suite, &key).unwrap();
+            let mut data = BytesMut::from(&b"ring data plane"[..]);
+            tx.seal(nonce, b"nrxp header", &mut data).unwrap();
+            rx.open(nonce, b"nrxp header", &mut data).unwrap();
+            assert_eq!(&data[..], b"ring data plane");
+        }
     }
 }

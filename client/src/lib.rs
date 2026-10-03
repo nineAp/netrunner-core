@@ -288,6 +288,8 @@ pub struct SessionParams {
     pub tunnel_mode: Option<String>,
     /// Подсети ресурсов организации, только для режима "resources".
     pub routed_cidrs: Vec<String>,
+    /// User-selected NRXP data cipher; absent/unknown keeps automatic choice.
+    pub cipher_preference: Option<String>,
 }
 
 /// Фабрика VPN-сессий — главная точка входа FFI.
@@ -348,7 +350,12 @@ impl SessionManager {
             node_public_key,
             tunnel_mode,
             routed_cidrs,
+            cipher_preference,
         } = params;
+        let data_cipher_preference = cipher_preference
+            .as_deref()
+            .and_then(netrunner_core::DataCipherPreference::from_config)
+            .unwrap_or_default();
 
         // На мобильных Logger::init здесь — первый и единственный вызов (нет
         // отдельного main.rs), поэтому production-флаг должен зависеть от
@@ -392,7 +399,8 @@ impl SessionManager {
             .with_auth_token(auth_token)
             .with_node_credentials(node_secret, node_public_key)
             .with_tunnel_mode(parse_tunnel_mode(tunnel_mode.as_deref()), routed_cidrs)
-            .with_strong_privacy(strong_privacy);
+            .with_strong_privacy(strong_privacy)
+            .with_data_cipher_preference(data_cipher_preference);
 
         #[cfg(any(target_os = "android", target_os = "ios"))]
         {

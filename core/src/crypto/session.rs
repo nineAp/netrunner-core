@@ -27,7 +27,10 @@ use x25519_dalek::PublicKey;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
-    crypto::{ecdh::ECDH, hkdf::HKDF, identity::Identity},
+    crypto::{
+        aead::AeadSuite, datagram_keys::DatagramRoot, ecdh::ECDH, hkdf::HKDF, identity::Identity,
+        DataCipherPreference,
+    },
     net::{AUTH_TIME_STEP, AUTH_WINDOW_SIZE},
     tlseng::ExtensionStack,
 };
@@ -38,6 +41,8 @@ use crate::{
 /// v2 (один DH) даже теоретически: у них разный входной материал по построению,
 /// а не «просто разной длины».
 const IKM_DOMAIN_V3: &[u8] = b"nrxp-v3-static-dh";
+const IKM_DOMAIN_V4: &[u8] = b"nrxp-v4-ring-aead";
+const IKM_DOMAIN_V5: &[u8] = b"nrxp-v5-cipher-preference";
 
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -141,6 +146,8 @@ pub struct SessionKeys {
     /// (в криптографическом смысле) функция от него, как и любой другой
     /// производный ключ сессии, которые точно так же живут до `Drop`.
     datagram_root: Option<Zeroizing<[u8; 32]>>,
+    aead_suite: AeadSuite,
+    data_cipher_preference: DataCipherPreference,
 }
 
 impl SessionKeys {
@@ -154,11 +161,13 @@ impl SessionKeys {
             identity: None,
             peer_version: crate::PROTOCOL_VERSION_ANONYMOUS,
             datagram_root: None,
+            aead_suite: AeadSuite::ChaCha20Poly1305,
+            data_cipher_preference: DataCipherPreference::Auto,
         }
     }
 
-    /// Аутентифицированная схема (протокол v3): в хендшейк входят секрет ноды
-    /// (тег `ClientHello`) и её статический ключ (второй DH).
+    /// Аутентифицированная схема (протокол v3+): в хендшейк входят секрет
+    /// ноды (тег `ClientHello`) и её статический ключ (второй DH).
     pub(crate) fn with_identity(is_initiator: bool, identity: Identity) -> Self {
         // Не `..Self::new(is_initiator)`: functional record update вытаскивает
         // поля из временного значения, а у типа с `Drop` (см. impl ниже —
@@ -186,7 +195,75 @@ impl SessionKeys {
         self.peer_version = version;
     }
 
-    /// Идти ли по схеме v3 (второй DH + ключевой тег хендшейка).
+    pub(crate) fn set_peer_data_cipher_preference(&mut self, wire_code: u8) -> bool {
+        let Some(preference) = DataCipherPreference::from_wire_code(wire_code) else {
+            return false;
+        };
+        self.data_cipher_preference = preference;
+        true
+    }
+
+    pub(crate) fn set_data_cipher_preference(&mut self, preference: DataCipherPreference) {
+        self.data_cipher_preference = preference;
+    }
+
+    pub(crate) fn data_cipher_preference(&self) -> DataCipherPreference {
+        self.data_cipher_preference
+    }
+
+    pub(crate) fn data_cipher_preference_wire_code(&self) -> u8 {
+        self.data_cipher_preference.wire_code()
+    }
+
+    /// Select data-plane AEAD from the already parsed TLS 1.3 suite.
+    /// Legacy protocol versions deliberately keep ChaCha regardless of the
+    /// camouflage suite, preserving existing client/server interoperability.
+    pub(crate) fn set_tls_cipher_suite(&mut self, suite: u16) -> Result<(), AppError> {
+        if self.peer_version < crate::MIN_VERSION_FOR_RING_AEAD {
+            self.aead_suite = AeadSuite::ChaCha20Poly1305;
+            return Ok(());
+        }
+        let selected = AeadSuite::from_tls_suite(suite).filter(|selected| {
+            if self.peer_version >= crate::MIN_VERSION_FOR_CIPHER_PREFERENCE {
+                self.data_cipher_preference.matches_suite(*selected)
+            } else {
+                matches!(selected, AeadSuite::Aes128Gcm | AeadSuite::Aes256Gcm)
+            }
+        });
+        let Some(selected) = selected else {
+            return Err(AppError::new(
+                ERR_NET_TLS_TAMPER,
+                "Unsupported data cipher",
+                format!(
+                    "Unsupported data cipher for protocol v{}: {suite:#06x}",
+                    self.peer_version
+                ),
+            ));
+        };
+        #[cfg(not(feature = "ring-aead"))]
+        {
+            if matches!(selected, AeadSuite::Aes128Gcm | AeadSuite::Aes256Gcm) {
+                return Err(AppError::new(
+                    ERR_NET_TLS_TAMPER,
+                    "Unsupported data cipher",
+                    "Selected AES-GCM suite requires ring-aead support",
+                ));
+            }
+            self.aead_suite = selected;
+            Ok(())
+        }
+        #[cfg(feature = "ring-aead")]
+        {
+            self.aead_suite = selected;
+            Ok(())
+        }
+    }
+
+    pub(crate) fn aead_suite(&self) -> AeadSuite {
+        self.aead_suite
+    }
+
+    /// Идти ли по аутентифицированной схеме (второй DH + ключевой тег).
     ///
     /// Обе стороны должны ответить на это одинаково, иначе они выведут разные
     /// ключи и сессия умрёт на первом же кадре. Условие поэтому симметричное:
@@ -208,12 +285,17 @@ impl SessionKeys {
 
     /// Тег для `session_id` своего `ClientHello` (только клиент).
     ///
-    /// В схеме v3 считается на ключе ноды и привязан к этому конкретному
-    /// соединению; в v2 — старый безключевой тег от времени.
+    /// В аутентифицированной схеме считается на ключе ноды и привязан к этому
+    /// соединению; анонимная v2 использует старый безключевой тег от времени.
     pub(crate) fn handshake_tag(&self, random: &[u8; 32]) -> [u8; 16] {
         match &self.identity {
             Some(id) => SessionAuth::new(*id.secret())
-                .generate_handshake_tag(random, &self.public_key_bytes()),
+                .generate_handshake_tag_for_version_and_preference(
+                    random,
+                    &self.public_key_bytes(),
+                    self.claimed_version(),
+                    self.data_cipher_preference_wire_code(),
+                ),
             None => SessionAuth::new(self.auth_key).generate_current_tag(),
         }
     }
@@ -229,11 +311,22 @@ impl SessionKeys {
         random: &[u8; 32],
         peer_public: &[u8; 32],
     ) -> bool {
+        // v4 is authenticated-only. An unprovisioned node cannot silently
+        // accept a v4 client and then derive incompatible legacy keys.
+        if self.peer_version >= crate::MIN_VERSION_FOR_RING_AEAD && self.identity.is_none() {
+            return false;
+        }
         if self.uses_static_dh() {
             let Some(id) = &self.identity else {
                 return false;
             };
-            SessionAuth::new(*id.secret()).verify_handshake_tag(received_tag, random, peer_public)
+            SessionAuth::new(*id.secret()).verify_handshake_tag_for_version_and_preference(
+                received_tag,
+                random,
+                peer_public,
+                self.peer_version,
+                self.data_cipher_preference_wire_code(),
+            )
         } else if self.rejects_anonymous() {
             false
         } else {
@@ -262,13 +355,13 @@ impl SessionKeys {
     /// Копия `PRK`, из которого выведен `current_aead` (см.
     /// [`datagram_root`](Self::datagram_root) на поле). Паникует, если вызвана
     /// до хендшейка — тот же контракт, что у [`get_aead_parameters`](Self::get_aead_parameters).
-    pub(crate) fn datagram_root(&self) -> [u8; 32] {
+    pub(crate) fn datagram_root(&self) -> DatagramRoot {
         let root: &Zeroizing<[u8; 32]> = self
             .datagram_root
             .as_ref()
             .expect("Keys not generated yet. Call update_keys first.");
         let bytes: [u8; 32] = **root;
-        bytes
+        DatagramRoot::new(bytes, self.aead_suite)
     }
 
     /// Завершает хендшейк: принимает удалённую соль и публичный ключ из
@@ -426,11 +519,13 @@ impl SessionKeys {
     /// rx=`client_*`, для клиента — наоборот. Так одна и та же пара ключей
     /// у клиента служит на запись, а у сервера — на чтение, и наоборот.
     ///
-    /// ## Что именно уходит в `ikm` (v2 против v3)
+    /// ## Что именно уходит в `ikm`
     ///
     /// ```text
     /// v2:  ikm = DH(своя эфемерная, чужая эфемерная)
-    /// v3:  ikm = DH(своя эфемерная, чужая эфемерная) ‖ static_dh ‖ "nrxp-v3-static-dh"
+    /// v3:  ikm = DH(эфемерный) ‖ static_dh ‖ "nrxp-v3-static-dh"
+    /// v4:  ikm = DH(эфемерный) ‖ static_dh ‖ "nrxp-v4-ring-aead" ‖ cipher_suite
+    /// v5:  ikm = DH(эфемерный) ‖ static_dh ‖ "nrxp-v5-cipher-preference" ‖ cipher_suite
     /// ```
     ///
     /// Первый DH даёт forward secrecy, второй — аутентификацию: посчитать его
@@ -461,7 +556,7 @@ impl SessionKeys {
         // Ёмкость взята с запасом под оба слагаемых и домен, поэтому `Vec` не
         // реаллоцируется: иначе старый буфер с секретом остался бы в куче
         // нетронутым — `Zeroizing` затирает только текущий.
-        let mut ikm = Zeroizing::new(Vec::with_capacity(64 + IKM_DOMAIN_V3.len()));
+        let mut ikm = Zeroizing::new(Vec::with_capacity(66 + IKM_DOMAIN_V4.len()));
         ikm.extend_from_slice(&ephemeral_dh);
         ephemeral_dh.zeroize();
 
@@ -475,7 +570,15 @@ impl SessionKeys {
                 .ok_or_else(|| AppError::new(ERR_NET_TLS_TAMPER, "Сбой", "No static secret"))?;
             ikm.extend_from_slice(&static_dh);
             static_dh.zeroize();
-            ikm.extend_from_slice(IKM_DOMAIN_V3);
+            if self.peer_version >= crate::MIN_VERSION_FOR_CIPHER_PREFERENCE {
+                ikm.extend_from_slice(IKM_DOMAIN_V5);
+                ikm.extend_from_slice(&self.aead_suite.tls_suite().to_be_bytes());
+            } else if self.peer_version >= crate::MIN_VERSION_FOR_RING_AEAD {
+                ikm.extend_from_slice(IKM_DOMAIN_V4);
+                ikm.extend_from_slice(&self.aead_suite.tls_suite().to_be_bytes());
+            } else {
+                ikm.extend_from_slice(IKM_DOMAIN_V3);
+            }
         }
 
         // Forward secrecy: приватный эфемерный ключ больше не нужен ни одной
@@ -661,8 +764,43 @@ impl SessionAuth {
         random: &[u8; 32],
         peer_public: &[u8; 32],
     ) -> [u8; 16] {
+        Self::compute_handshake_tag_for_version(secret, step, random, peer_public, 3)
+    }
+
+    pub fn compute_handshake_tag_for_version(
+        secret: &[u8],
+        step: u64,
+        random: &[u8; 32],
+        peer_public: &[u8; 32],
+        version: u8,
+    ) -> [u8; 16] {
+        Self::compute_handshake_tag_for_version_and_preference(
+            secret,
+            step,
+            random,
+            peer_public,
+            version,
+            DataCipherPreference::Auto.wire_code(),
+        )
+    }
+
+    pub fn compute_handshake_tag_for_version_and_preference(
+        secret: &[u8],
+        step: u64,
+        random: &[u8; 32],
+        peer_public: &[u8; 32],
+        version: u8,
+        preference: u8,
+    ) -> [u8; 16] {
         let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC error");
-        mac.update(b"nrxp-handshake-v3");
+        if version >= crate::MIN_VERSION_FOR_CIPHER_PREFERENCE {
+            mac.update(b"nrxp-handshake-v5-cipher-pref");
+            mac.update(&[preference]);
+        } else if version >= crate::MIN_VERSION_FOR_RING_AEAD {
+            mac.update(b"nrxp-handshake-v4-ring-aead");
+        } else {
+            mac.update(b"nrxp-handshake-v3");
+        }
         mac.update(&step.to_be_bytes());
         mac.update(random);
         mac.update(peer_public);
@@ -674,9 +812,40 @@ impl SessionAuth {
 
     /// Тег `ClientHello` на текущий момент — кладётся в `session_id[16..32]`.
     pub fn generate_handshake_tag(&self, random: &[u8; 32], peer_public: &[u8; 32]) -> [u8; 16] {
+        self.generate_handshake_tag_for_version(random, peer_public, 3)
+    }
+
+    pub fn generate_handshake_tag_for_version(
+        &self,
+        random: &[u8; 32],
+        peer_public: &[u8; 32],
+        version: u8,
+    ) -> [u8; 16] {
+        self.generate_handshake_tag_for_version_and_preference(
+            random,
+            peer_public,
+            version,
+            DataCipherPreference::Auto.wire_code(),
+        )
+    }
+
+    pub fn generate_handshake_tag_for_version_and_preference(
+        &self,
+        random: &[u8; 32],
+        peer_public: &[u8; 32],
+        version: u8,
+        preference: u8,
+    ) -> [u8; 16] {
         let now = now_unix_secs();
 
-        Self::compute_handshake_tag(&self.auth_key, now / AUTH_TIME_STEP, random, peer_public)
+        Self::compute_handshake_tag_for_version_and_preference(
+            &self.auth_key,
+            now / AUTH_TIME_STEP,
+            random,
+            peer_public,
+            version,
+            preference,
+        )
     }
 
     /// Проверяет тег `ClientHello` против того же окна `[step-W .. step+W]`.
@@ -695,13 +864,47 @@ impl SessionAuth {
         random: &[u8; 32],
         peer_public: &[u8; 32],
     ) -> bool {
+        self.verify_handshake_tag_for_version(received_tag, random, peer_public, 3)
+    }
+
+    pub fn verify_handshake_tag_for_version(
+        &self,
+        received_tag: &[u8; 16],
+        random: &[u8; 32],
+        peer_public: &[u8; 32],
+        version: u8,
+    ) -> bool {
+        self.verify_handshake_tag_for_version_and_preference(
+            received_tag,
+            random,
+            peer_public,
+            version,
+            DataCipherPreference::Auto.wire_code(),
+        )
+    }
+
+    pub fn verify_handshake_tag_for_version_and_preference(
+        &self,
+        received_tag: &[u8; 16],
+        random: &[u8; 32],
+        peer_public: &[u8; 32],
+        version: u8,
+        preference: u8,
+    ) -> bool {
         let current_step = now_unix_secs() / AUTH_TIME_STEP;
 
         let mut matched = Choice::from(0u8);
         for step in (current_step.saturating_sub(AUTH_WINDOW_SIZE))
             ..=(current_step.saturating_add(AUTH_WINDOW_SIZE))
         {
-            let candidate = Self::compute_handshake_tag(&self.auth_key, step, random, peer_public);
+            let candidate = Self::compute_handshake_tag_for_version_and_preference(
+                &self.auth_key,
+                step,
+                random,
+                peer_public,
+                version,
+                preference,
+            );
             // Никакого раннего выхода: накапливаем результат по всем шагам.
             matched |= candidate[..].ct_eq(&received_tag[..]);
         }
@@ -878,6 +1081,44 @@ mod tests {
             verdicts.iter().all(|&ok| ok),
             "окно тега хендшейка обязано совпадать с окном кадра, получено: {verdicts:?}"
         );
+    }
+
+    #[test]
+    fn v5_handshake_tag_authenticates_cipher_preference() {
+        let secret = [13u8; 32];
+        let auth = SessionAuth::new(secret);
+        let random = [14u8; 32];
+        let peer_public = [15u8; 32];
+
+        let (accepted, rejected) = stable(|step| {
+            let tag = SessionAuth::compute_handshake_tag_for_version_and_preference(
+                &secret,
+                step,
+                &random,
+                &peer_public,
+                5,
+                2,
+            );
+            (
+                auth.verify_handshake_tag_for_version_and_preference(
+                    &tag,
+                    &random,
+                    &peer_public,
+                    5,
+                    2,
+                ),
+                auth.verify_handshake_tag_for_version_and_preference(
+                    &tag,
+                    &random,
+                    &peer_public,
+                    5,
+                    3,
+                ),
+            )
+        });
+
+        assert!(accepted);
+        assert!(!rejected);
     }
 
     /// Разделение доменов: на одном ключе и одном шаге пер-кадровый тег и тег

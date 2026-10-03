@@ -47,10 +47,13 @@ mod hkdf;
 pub mod identity;
 mod session;
 
-pub(crate) use aead::AeadPacker;
+#[cfg(all(test, feature = "ring-aead"))]
+pub(crate) use aead::AeadSuite;
+pub use aead::DataCipherPreference;
+pub(crate) use aead::{AeadCipher, AeadPacker};
 pub(crate) use chacha::{ChaChaCipher, ChaChaStream};
 pub(crate) use datagram_keys::{
-    DatagramEpochKeys, DatagramKeyMaterial, DgramEngineLabel, DgramKdfContext,
+    DatagramEpochKeys, DatagramKeyMaterial, DatagramRoot, DgramEngineLabel, DgramKdfContext,
 };
 pub use identity::{Identity, LocalIdentity, PeerIdentity};
 pub(crate) use session::{SessionAuth, SessionKeys};

@@ -30,7 +30,7 @@ use std::{
 };
 
 use crate::{
-    crypto::{ChaChaCipher, Identity, SessionKeys},
+    crypto::{ChaChaCipher, DatagramRoot, Identity, SessionKeys},
     net::{
         connection::{
             engine::TunnelEngine,
@@ -45,6 +45,7 @@ use crate::{
     nrxp::{Codec, Frame, FrameType, TlsBridge},
     rawcast::{LocalProtocol, RawCastAdapter, RawCastFrame},
     tlseng::{BrowserProfile, ServerProfile},
+    DataCipherPreference,
 };
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
@@ -73,7 +74,7 @@ pub(crate) struct DgramSessionEntry {
     /// же движок, что и у `rx`) в момент, когда нога впервые устанавливается
     /// (см. `dgram_engine::build_matching_tx`) — раньше этого момента писать
     /// в ответ попросту некому.
-    pub(crate) datagram_root: [u8; 32],
+    pub(crate) datagram_root: DatagramRoot,
     /// `None` до первой успешно расшифрованной датаграммы этой сессии;
     /// `Some` — нога поднята, здесь всё, что нужно для ответа и
     /// диспетчеризации дальнейших пакетов (см.
@@ -382,10 +383,12 @@ impl SessionManager {
         &self,
         muxer: &Arc<Muxer>,
         leg_id: u32,
-        datagram_root: [u8; 32],
+        datagram_root: impl Into<DatagramRoot>,
     ) {
         use crate::crypto::{DatagramKeyMaterial, DgramEngineLabel, DgramKdfContext};
         use crate::nrxp::DatagramRx as CoreDatagramRx;
+
+        let datagram_root = datagram_root.into();
 
         // `leg_token` НЕ зависит от контекста движка (см. `DgramEngineLabel`) —
         // считаем его один раз (нейтральным выводом) и по нему заводим все три
@@ -847,7 +850,7 @@ impl ClientHandler {
     /// стреляло только потому, что сервер до первого слова клиента молчал.
     ///
     /// `identity` — учётные данные ноды, полученные приложением от бэкенда.
-    /// `Some` включает аутентифицированную схему v3 (ключевой тег + второй DH,
+    /// `Some` включает аутентифицированную схему v3/v4 (ключевой тег + второй DH,
     /// см. [`crate::crypto::identity`]); `None` оставляет старый анонимный
     /// хендшейк — так подключается клиент к ноде, для которой бэкенд ещё не
     /// выдал ключей.
@@ -859,6 +862,7 @@ impl ClientHandler {
         decoy_sni: &str,
         auth_token: &str,
         identity: Option<&Identity>,
+        data_cipher_preference: DataCipherPreference,
     ) -> Result<
         (
             TunnelReadHalf,
@@ -866,7 +870,7 @@ impl ClientHandler {
             crate::nrxp::RxCodec,
             crate::nrxp::TxCodec,
             BytesMut,
-            [u8; 32],
+            DatagramRoot,
         ),
         AppError,
     > {
@@ -879,6 +883,7 @@ impl ClientHandler {
             decoy_sni,
             auth_token,
             identity,
+            data_cipher_preference,
         )
         .await
     }
@@ -900,7 +905,7 @@ impl ClientHandler {
             crate::nrxp::RxCodec,
             crate::nrxp::TxCodec,
             BytesMut,
-            [u8; 32],
+            DatagramRoot,
         ),
         AppError,
     > {
@@ -912,6 +917,7 @@ impl ClientHandler {
             decoy_sni,
             auth_token,
             identity,
+            DataCipherPreference::Auto,
         )
         .await
     }
@@ -924,6 +930,7 @@ impl ClientHandler {
         decoy_sni: &str,
         auth_token: &str,
         identity: Option<&Identity>,
+        data_cipher_preference: DataCipherPreference,
     ) -> Result<
         (
             TunnelReadHalf,
@@ -931,7 +938,7 @@ impl ClientHandler {
             crate::nrxp::RxCodec,
             crate::nrxp::TxCodec,
             BytesMut,
-            [u8; 32],
+            DatagramRoot,
         ),
         AppError,
     > {
@@ -939,6 +946,7 @@ impl ClientHandler {
             Some(id) => SessionKeys::with_identity(true, id.clone()),
             None => SessionKeys::new(true),
         };
+        session_keys.set_data_cipher_preference(data_cipher_preference);
         let ch = TlsBridge::wrap_client_hello(profile, decoy_sni, &session_keys);
 
         conn.outbound
@@ -958,6 +966,9 @@ impl ClientHandler {
         loop {
             match TlsBridge::unpack_handshake(&mut conn.read_buf) {
                 Ok(Some(msg)) => {
+                    if let Some(suite) = msg.cipher_suite() {
+                        session_keys.set_tls_cipher_suite(suite)?;
+                    }
                     session_keys.update_keys(msg.random(), msg.extensions(), false)?;
                     break;
                 }
@@ -1015,7 +1026,7 @@ impl ClientHandler {
         // функция (AEAD-ключи), поэтому дополнительных мер защиты в передаче
         // не требует.
         let datagram_root = session_keys.datagram_root();
-        let mut cipher = ChaChaCipher::new();
+        let mut cipher = ChaChaCipher::with_suite(session_keys.aead_suite());
         cipher.set_keys(tx_key, tx_iv, rx_key, rx_iv);
         let codec = Codec::new(cipher, session_keys.get_auth_key());
         let (rx_codec, mut tx_codec) = codec.split();
@@ -1164,6 +1175,7 @@ impl ClientHandler {
                 decoy_sni: Arc::from(peer.decoy_sni.as_str()),
                 auth_token: Arc::from(auth_token),
                 identity: Some(identity),
+                data_cipher_preference: DataCipherPreference::Auto,
             };
 
             let engine_muxer = muxer.clone();
@@ -1263,7 +1275,7 @@ impl ClientHandler {
                 crate::nrxp::RxCodec,
                 crate::nrxp::TxCodec,
                 BytesMut,
-                [u8; 32],
+                DatagramRoot,
             ),
             Option<SocketAddr>,
             String,
@@ -1292,6 +1304,7 @@ impl ClientHandler {
             &peer.decoy_sni,
             auth_token,
             Some(identity),
+            DataCipherPreference::Auto,
         )
         .await?;
         Ok((handshake, udp_addr, remote_addr.to_owned()))
@@ -1383,6 +1396,7 @@ impl ClientHandler {
         decoy_sni: &Arc<str>,
         auth_token: &Arc<str>,
         identity: &Option<Identity>,
+        data_cipher_preference: DataCipherPreference,
     ) -> Result<(), AppError> {
         let leg_name = format!("TCP-Leg-{}", leg_id);
 
@@ -1437,6 +1451,7 @@ impl ClientHandler {
                 decoy_sni,
                 auth_token,
                 identity.as_ref(),
+                data_cipher_preference,
             )
             .await?;
 
@@ -1498,6 +1513,7 @@ impl ClientHandler {
             decoy_sni: decoy_sni.clone(),
             auth_token: auth_token.clone(),
             identity: identity.clone(),
+            data_cipher_preference,
         };
 
         let run_result = engine.run().await;
@@ -1534,7 +1550,7 @@ impl ClientHandler {
     ///
     /// `identity` — учётные данные этой ноды из конфига, который приложение
     /// получило от бэкенда (`nrxp_secret` + `nrxp_public_key`). `Some` включает
-    /// аутентифицированный хендшейк v3 на **всех** ногах сессии; `None` —
+    /// аутентифицированный хендшейк на **всех** ногах сессии; `None` —
     /// старая анонимная схема для нод, которым учётные данные ещё не заведены.
     pub async fn connect(
         remote_proxy_addr: &str,
@@ -1564,9 +1580,32 @@ impl ClientHandler {
         decoy_sni: impl Into<Arc<str>>,
         auth_token: Option<String>,
         identity: Option<Identity>,
+        rx_from_engine: mpsc::Receiver<RawCastFrame>,
+        tx_to_engine: mpsc::Sender<RawCastFrame>,
+        strong_privacy: bool,
+    ) -> Result<Arc<Muxer>, AppError> {
+        Self::connect_with_privacy_and_cipher(
+            remote_proxy_addr,
+            decoy_sni,
+            auth_token,
+            identity,
+            rx_from_engine,
+            tx_to_engine,
+            strong_privacy,
+            DataCipherPreference::Auto,
+        )
+        .await
+    }
+
+    pub async fn connect_with_privacy_and_cipher(
+        remote_proxy_addr: &str,
+        decoy_sni: impl Into<Arc<str>>,
+        auth_token: Option<String>,
+        identity: Option<Identity>,
         mut rx_from_engine: mpsc::Receiver<RawCastFrame>,
         tx_to_engine: mpsc::Sender<RawCastFrame>,
         strong_privacy: bool,
+        data_cipher_preference: DataCipherPreference,
     ) -> Result<Arc<Muxer>, AppError> {
         let decoy_sni: Arc<str> = decoy_sni.into();
         let auth_token: Arc<str> = auth_token.unwrap_or_default().into();
@@ -1618,6 +1657,7 @@ impl ClientHandler {
             let decoy_sni = decoy_sni.clone();
             let auth_token = auth_token.clone();
             let identity = identity.clone();
+            let data_cipher_preference = data_cipher_preference;
             tokio::spawn(async move {
                 // Разброс старта ног. Ровный шаг `LEG_STAGGER_DELAY * id` открывал
                 // четыре соединения строго по метроному — арифметическая прогрессия
@@ -1644,6 +1684,7 @@ impl ClientHandler {
                         &decoy_sni,
                         &auth_token,
                         &identity,
+                        data_cipher_preference,
                     )
                     .await
                     {
@@ -2337,7 +2378,7 @@ impl TunnelHandler for ServerHandler {
         // `session_keys` не переживёт конец этой функции, а UDP-нога
         // выводит свой материал из её корня позже.
         let datagram_root = session_keys.datagram_root();
-        let mut cipher = ChaChaCipher::new();
+        let mut cipher = ChaChaCipher::with_suite(session_keys.aead_suite());
         cipher.set_keys(tx_key, tx_iv, rx_key, rx_iv);
 
         let codec = Codec::new(cipher, session_keys.get_auth_key());
@@ -2639,6 +2680,7 @@ impl TunnelHandler for ServerHandler {
             decoy_sni: Arc::from(""),
             auth_token: Arc::from(""),
             identity: None,
+            data_cipher_preference: DataCipherPreference::Auto,
         };
 
         let res = engine.run().await;
@@ -2917,6 +2959,7 @@ mod tests {
                 &Arc::<str>::from("example.com"),
                 "",
                 client_identity.as_ref(),
+                DataCipherPreference::Auto,
             ),
         )
         .await

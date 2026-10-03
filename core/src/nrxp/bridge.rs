@@ -71,6 +71,13 @@ impl HandshakeMessage {
             Self::Server { extensions, .. } => extensions,
         }
     }
+
+    pub fn cipher_suite(&self) -> Option<u16> {
+        match self {
+            Self::Server { base, .. } => Some(base.cipher_suite),
+            Self::Client { .. } => None,
+        }
+    }
 }
 
 impl TlsInterceptor for HandshakeMessage {
@@ -226,6 +233,15 @@ impl TlsBridge {
 
             let peer_version = base.session_id[0];
             keys.set_peer_version(peer_version);
+            if peer_version >= crate::MIN_VERSION_FOR_CIPHER_PREFERENCE
+                && !keys.set_peer_data_cipher_preference(base.session_id[1])
+            {
+                return Err(TlsError::new(
+                    ErrorStage::Handshake("Invalid cipher preference"),
+                    ErrorAction::Drop,
+                    Bytes::new(),
+                ));
+            }
 
             let mut received_tag = [0u8; 16];
             received_tag.copy_from_slice(&base.session_id[16..32]);
@@ -244,7 +260,7 @@ impl TlsBridge {
             })?;
 
             // Порядок сохранён: тег проверяется до вывода ключей. Какой именно
-            // тег ожидается — ключевой (v3) или старый безключевой (v2) —
+            // тег ожидается — ключевой (v3/v4) или старый безключевой (v2) —
             // решает `SessionKeys` по учётным данным ноды и заявленной версии
             // клиента; нода в строгом режиме отвергает анонимную схему целиком.
             if !keys.verify_handshake_tag(&received_tag, &base.random, &peer_public) {
@@ -259,6 +275,43 @@ impl TlsBridge {
                 ));
             }
 
+            let selected_suite = keys
+                .data_cipher_preference()
+                .requested_tls_suite()
+                .filter(|_| peer_version >= crate::MIN_VERSION_FOR_CIPHER_PREFERENCE)
+                .and_then(|requested| {
+                    ServerHello::select_requested_cipher_suite(base, profile, requested)
+                })
+                .or_else(|| {
+                    (keys
+                        .data_cipher_preference()
+                        .requested_tls_suite()
+                        .is_none()
+                        || peer_version < crate::MIN_VERSION_FOR_CIPHER_PREFERENCE)
+                        .then(|| {
+                            ServerHello::select_cipher_suite(
+                                base,
+                                profile,
+                                peer_version >= crate::MIN_VERSION_FOR_RING_AEAD,
+                            )
+                        })
+                        .flatten()
+                })
+                .ok_or_else(|| {
+                    TlsError::new(
+                        ErrorStage::Handshake("No compatible data cipher"),
+                        ErrorAction::Drop,
+                        Bytes::new(),
+                    )
+                })?;
+            keys.set_tls_cipher_suite(selected_suite).map_err(|e| {
+                TlsError::new(
+                    ErrorStage::Handshake("Unsupported data cipher"),
+                    ErrorAction::Drop,
+                    Bytes::from(e.to_string()),
+                )
+            })?;
+
             keys.update_keys(base.random, extensions, true)
                 .map_err(|e| {
                     netrunner_logger::error!(error = %e, "Server failed key update");
@@ -271,8 +324,13 @@ impl TlsBridge {
 
             let server_pub_key = keys.public_key_bytes();
 
-            let hello =
-                ServerHello::make_server_hello(base, &server_pub_key, keys.local_salt(), profile);
+            let hello = ServerHello::make_server_hello_with_suite(
+                base,
+                &server_pub_key,
+                keys.local_salt(),
+                profile,
+                selected_suite,
+            );
 
             Ok((hello, peer_version))
         } else {

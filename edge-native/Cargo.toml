@@ -8,7 +8,7 @@ name = "netrunner-edge"
 path = "src/main.rs"
 
 [dependencies]
-netrunner-core = { path = "../core" }
+netrunner-core = { path = "../core", features = ["ring-aead"] }
 netrunner-logger = { path = "../tools/log" }
 tokio = { version = "1.49.0", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
