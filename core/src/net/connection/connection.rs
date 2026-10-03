@@ -229,7 +229,19 @@ impl MeshPeerSession {
             }
         }
 
-        let response = tokio::time::timeout(Duration::from_secs(8), stream_rx.recv());
+        let setup_timeout = if matches!(
+            frame_type,
+            FrameType::MeshOnionConnect | FrameType::MeshOnionUdpConnect
+        ) {
+            // A remote egress may try the primary target plus up to seven
+            // preselected backups, each with a bounded connect timeout. Keep
+            // one end-to-end deadline long enough for that chain and its
+            // capsule lifetime, rather than timing out after one peer RTT.
+            Duration::from_secs(65)
+        } else {
+            Duration::from_secs(8)
+        };
+        let response = tokio::time::timeout(setup_timeout, stream_rx.recv());
         let response = if let Some(cancel) = cancel {
             tokio::select! {
                 biased;
@@ -249,6 +261,14 @@ impl MeshPeerSession {
                 metrics::histogram!("netrunner_mesh_stream_setup_seconds")
                     .record(started.elapsed().as_secs_f64());
                 Ok((stream_id, stream_rx))
+            }
+            Some(payload) if payload.as_ref() == crate::net::MESH_EGRESS_EXHAUSTED => {
+                self.close_stream(stream_id).await;
+                Err(AppError::new(
+                    crate::net::ERR_MESH_EGRESS_EXHAUSTED,
+                    "No egress route available",
+                    "The bounded egress failover chain has no remaining healthy candidate",
+                ))
             }
             _ => {
                 self.close_stream(stream_id).await;
@@ -863,6 +883,7 @@ impl ClientHandler {
         auth_token: &str,
         identity: Option<&Identity>,
         data_cipher_preference: DataCipherPreference,
+        mesh_route_preference: crate::net::MeshRoutePreference,
     ) -> Result<
         (
             TunnelReadHalf,
@@ -884,6 +905,7 @@ impl ClientHandler {
             auth_token,
             identity,
             data_cipher_preference,
+            mesh_route_preference,
         )
         .await
     }
@@ -918,6 +940,7 @@ impl ClientHandler {
             auth_token,
             identity,
             DataCipherPreference::Auto,
+            crate::net::MeshRoutePreference::ServerDefault,
         )
         .await
     }
@@ -931,6 +954,7 @@ impl ClientHandler {
         auth_token: &str,
         identity: Option<&Identity>,
         data_cipher_preference: DataCipherPreference,
+        mesh_route_preference: crate::net::MeshRoutePreference,
     ) -> Result<
         (
             TunnelReadHalf,
@@ -947,6 +971,7 @@ impl ClientHandler {
             None => SessionKeys::new(true),
         };
         session_keys.set_data_cipher_preference(data_cipher_preference);
+        session_keys.set_mesh_route_preference(mesh_route_preference);
         let ch = TlsBridge::wrap_client_hello(profile, decoy_sni, &session_keys);
 
         conn.outbound
@@ -1176,6 +1201,7 @@ impl ClientHandler {
                 auth_token: Arc::from(auth_token),
                 identity: Some(identity),
                 data_cipher_preference: DataCipherPreference::Auto,
+                mesh_route_preference: crate::net::MeshRoutePreference::ServerDefault,
             };
 
             let engine_muxer = muxer.clone();
@@ -1305,6 +1331,7 @@ impl ClientHandler {
             auth_token,
             Some(identity),
             DataCipherPreference::Auto,
+            crate::net::MeshRoutePreference::ServerDefault,
         )
         .await?;
         Ok((handshake, udp_addr, remote_addr.to_owned()))
@@ -1397,6 +1424,7 @@ impl ClientHandler {
         auth_token: &Arc<str>,
         identity: &Option<Identity>,
         data_cipher_preference: DataCipherPreference,
+        mesh_route_preference: crate::net::MeshRoutePreference,
     ) -> Result<(), AppError> {
         let leg_name = format!("TCP-Leg-{}", leg_id);
 
@@ -1452,6 +1480,7 @@ impl ClientHandler {
                 auth_token,
                 identity.as_ref(),
                 data_cipher_preference,
+                mesh_route_preference,
             )
             .await?;
 
@@ -1514,6 +1543,7 @@ impl ClientHandler {
             auth_token: auth_token.clone(),
             identity: identity.clone(),
             data_cipher_preference,
+            mesh_route_preference,
         };
 
         let run_result = engine.run().await;
@@ -1602,10 +1632,35 @@ impl ClientHandler {
         decoy_sni: impl Into<Arc<str>>,
         auth_token: Option<String>,
         identity: Option<Identity>,
+        rx_from_engine: mpsc::Receiver<RawCastFrame>,
+        tx_to_engine: mpsc::Sender<RawCastFrame>,
+        strong_privacy: bool,
+        data_cipher_preference: DataCipherPreference,
+    ) -> Result<Arc<Muxer>, AppError> {
+        Self::connect_with_privacy_and_preferences(
+            remote_proxy_addr,
+            decoy_sni,
+            auth_token,
+            identity,
+            rx_from_engine,
+            tx_to_engine,
+            strong_privacy,
+            data_cipher_preference,
+            crate::net::MeshRoutePreference::ServerDefault,
+        )
+        .await
+    }
+
+    pub async fn connect_with_privacy_and_preferences(
+        remote_proxy_addr: &str,
+        decoy_sni: impl Into<Arc<str>>,
+        auth_token: Option<String>,
+        identity: Option<Identity>,
         mut rx_from_engine: mpsc::Receiver<RawCastFrame>,
         tx_to_engine: mpsc::Sender<RawCastFrame>,
         strong_privacy: bool,
         data_cipher_preference: DataCipherPreference,
+        mesh_route_preference: crate::net::MeshRoutePreference,
     ) -> Result<Arc<Muxer>, AppError> {
         let decoy_sni: Arc<str> = decoy_sni.into();
         let auth_token: Arc<str> = auth_token.unwrap_or_default().into();
@@ -1658,6 +1713,7 @@ impl ClientHandler {
             let auth_token = auth_token.clone();
             let identity = identity.clone();
             let data_cipher_preference = data_cipher_preference;
+            let mesh_route_preference = mesh_route_preference;
             tokio::spawn(async move {
                 // Разброс старта ног. Ровный шаг `LEG_STAGGER_DELAY * id` открывал
                 // четыре соединения строго по метроному — арифметическая прогрессия
@@ -1685,6 +1741,7 @@ impl ClientHandler {
                         &auth_token,
                         &identity,
                         data_cipher_preference,
+                        mesh_route_preference,
                     )
                     .await
                     {
@@ -2378,6 +2435,7 @@ impl TunnelHandler for ServerHandler {
         // `session_keys` не переживёт конец этой функции, а UDP-нога
         // выводит свой материал из её корня позже.
         let datagram_root = session_keys.datagram_root();
+        let mesh_route_preference = session_keys.mesh_route_preference();
         let mut cipher = ChaChaCipher::with_suite(session_keys.aead_suite());
         cipher.set_keys(tx_key, tx_iv, rx_key, rx_iv);
 
@@ -2622,7 +2680,8 @@ impl TunnelHandler for ServerHandler {
         let mesh_route = if is_mesh_peer {
             peer_route
         } else {
-            mesh.as_ref().and_then(|mesh| mesh.initial_route())
+            mesh.as_ref()
+                .and_then(|mesh| mesh.initial_route_for_preference(mesh_route_preference))
         };
         let route_has_more_hops = mesh_route
             .as_ref()
@@ -2631,9 +2690,13 @@ impl TunnelHandler for ServerHandler {
         let opener = Arc::new(RemoteOpener {
             muxer: muxer.clone(),
             // A peer route keeps moving until its hop budget reaches the final
-            // egress. Local direct mode creates no initial route, but the node
-            // can still forward authenticated routes from another ingress.
-            mesh: if is_mesh_peer || route_has_more_hops {
+            // egress. Local direct mode has no initial route, but its egress
+            // can still use a mesh peer as a bounded backup if the target
+            // connect fails before the flow is established.
+            mesh: if is_mesh_peer
+                || route_has_more_hops
+                || mesh.as_ref().is_some_and(|mesh| mesh.is_direct_output())
+            {
                 mesh
             } else {
                 None
@@ -2681,6 +2744,7 @@ impl TunnelHandler for ServerHandler {
             auth_token: Arc::from(""),
             identity: None,
             data_cipher_preference: DataCipherPreference::Auto,
+            mesh_route_preference: crate::net::MeshRoutePreference::ServerDefault,
         };
 
         let res = engine.run().await;
@@ -2960,6 +3024,7 @@ mod tests {
                 "",
                 client_identity.as_ref(),
                 DataCipherPreference::Auto,
+                crate::net::MeshRoutePreference::ServerDefault,
             ),
         )
         .await

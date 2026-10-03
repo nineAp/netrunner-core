@@ -14,10 +14,12 @@ use hpke::{
 use crate::net::MAX_MESH_HOPS;
 use crate::{crypto::LocalIdentity, net::MeshPeer};
 
-const CAPSULE_VERSION: u8 = 1;
+const LEGACY_CAPSULE_VERSION: u8 = 1;
+const CAPSULE_VERSION: u8 = 2;
 const HPKE_ENCAPSULATED_KEY_LEN: usize = 32;
 pub(crate) const MAX_ONION_CAPSULE_SIZE: usize = 12 * 1024;
 const MAX_TARGET_LEN: usize = 2048;
+pub(crate) const MAX_EGRESS_FAILOVERS: u8 = MAX_MESH_HOPS - 1;
 
 type Kem = X25519HkdfSha256;
 type Kdf = HkdfSha256;
@@ -31,7 +33,17 @@ pub(crate) enum OnionInstruction {
     },
     Exit {
         target: String,
+        /// Opaque capsule for the one preselected backup egress.
+        fallback: Option<OnionFallback>,
+        /// Number of later egresses in this preselected chain.
+        failovers_left: u8,
     },
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct OnionFallback {
+    pub(crate) peer: MeshPeer,
+    pub(crate) capsule: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -131,8 +143,23 @@ fn encode_capsule(
     instruction: OnionInstruction,
 ) -> Result<Vec<u8>, String> {
     match (&instruction, remaining_hops) {
-        (OnionInstruction::Exit { .. }, 1)
-        | (OnionInstruction::Forward { .. }, 2..=MAX_MESH_HOPS) => {}
+        (
+            OnionInstruction::Exit {
+                fallback: None,
+                failovers_left: 0,
+                ..
+            },
+            1,
+        ) => {}
+        (
+            OnionInstruction::Exit {
+                fallback: Some(_),
+                failovers_left: 1..=MAX_EGRESS_FAILOVERS,
+                ..
+            },
+            1,
+        ) => {}
+        (OnionInstruction::Forward { .. }, 2..=MAX_MESH_HOPS) => {}
         _ => return Err("mesh onion instruction does not match its hop budget".into()),
     }
     let mut out = BytesMut::with_capacity(512);
@@ -156,12 +183,34 @@ fn encode_capsule(
             put_string_u8(&mut out, &next_peer.nrxp_static_public, 64)?;
             put_bytes_u16(&mut out, &next_capsule, MAX_ONION_CAPSULE_SIZE)?;
         }
-        OnionInstruction::Exit { target } => {
+        OnionInstruction::Exit {
+            target,
+            fallback,
+            failovers_left,
+        } => {
             if target.is_empty() || target.len() > MAX_TARGET_LEN || target.contains('\0') {
                 return Err("mesh onion target is invalid".into());
             }
+            if failovers_left > MAX_EGRESS_FAILOVERS || (fallback.is_some() != (failovers_left > 0))
+            {
+                return Err("mesh onion egress failover budget is invalid".into());
+            }
             out.put_u8(2);
             put_string_u16(&mut out, &target, MAX_TARGET_LEN)?;
+            out.put_u8(failovers_left);
+            match fallback {
+                None => out.put_u8(0),
+                Some(fallback) => {
+                    out.put_u8(1);
+                    put_string_u8(&mut out, &fallback.peer.node_id, 64)?;
+                    put_string_u16(&mut out, &fallback.peer.host, 255)?;
+                    out.put_u16(fallback.peer.port);
+                    put_string_u16(&mut out, &fallback.peer.decoy_sni, 255)?;
+                    put_string_u8(&mut out, &fallback.peer.nrxp_secret, 128)?;
+                    put_string_u8(&mut out, &fallback.peer.nrxp_static_public, 64)?;
+                    put_bytes_u16(&mut out, &fallback.capsule, MAX_ONION_CAPSULE_SIZE)?;
+                }
+            }
         }
     }
     if out.len() > MAX_ONION_CAPSULE_SIZE - HPKE_ENCAPSULATED_KEY_LEN - 16 {
@@ -171,7 +220,8 @@ fn encode_capsule(
 }
 
 fn decode_capsule(mut input: &[u8]) -> Result<OpenedOnionCapsule, String> {
-    if take(&mut input, 1)?[0] != CAPSULE_VERSION {
+    let version = take(&mut input, 1)?[0];
+    if !matches!(version, LEGACY_CAPSULE_VERSION | CAPSULE_VERSION) {
         return Err("unsupported mesh onion capsule version".into());
     }
     let strong_privacy = match take(&mut input, 1)?[0] {
@@ -225,7 +275,55 @@ fn decode_capsule(mut input: &[u8]) -> Result<OpenedOnionCapsule, String> {
             if target.is_empty() || target.contains('\0') {
                 return Err("mesh onion exit target is invalid".into());
             }
-            OnionInstruction::Exit { target }
+            let (failovers_left, fallback) = if version == LEGACY_CAPSULE_VERSION {
+                (0, None)
+            } else {
+                let failovers_left = take(&mut input, 1)?[0];
+                if failovers_left > MAX_EGRESS_FAILOVERS {
+                    return Err("mesh onion egress failover budget is invalid".into());
+                }
+                let fallback = match take(&mut input, 1)?[0] {
+                    0 => None,
+                    1 => {
+                        let node_id = take_string_u8(&mut input, 64)?;
+                        let host = take_string_u16(&mut input, 255)?;
+                        let port = u16::from_be_bytes(take(&mut input, 2)?.try_into().unwrap());
+                        let decoy_sni = take_string_u16(&mut input, 255)?;
+                        let nrxp_secret = take_string_u8(&mut input, 128)?;
+                        let nrxp_static_public = take_string_u8(&mut input, 64)?;
+                        let capsule = take_bytes_u16(&mut input, MAX_ONION_CAPSULE_SIZE)?;
+                        if node_id.is_empty()
+                            || host.is_empty()
+                            || port == 0
+                            || nrxp_secret.is_empty()
+                            || nrxp_static_public.len() != 64
+                        {
+                            return Err("mesh onion fallback peer is incomplete".into());
+                        }
+                        Some(OnionFallback {
+                            peer: MeshPeer {
+                                node_id,
+                                host,
+                                port,
+                                decoy_sni,
+                                nrxp_secret,
+                                nrxp_static_public,
+                            },
+                            capsule,
+                        })
+                    }
+                    _ => return Err("invalid mesh onion fallback flag".into()),
+                };
+                if fallback.is_some() != (failovers_left > 0) {
+                    return Err("mesh onion egress failover budget is inconsistent".into());
+                }
+                (failovers_left, fallback)
+            };
+            OnionInstruction::Exit {
+                target,
+                fallback,
+                failovers_left,
+            }
         }
         _ => return Err("unknown mesh onion instruction".into()),
     };
@@ -338,6 +436,8 @@ mod tests {
             [0x5a; 16],
             OnionInstruction::Exit {
                 target: "203.0.113.5:443".into(),
+                fallback: None,
+                failovers_left: 0,
             },
         )
         .unwrap();
@@ -356,7 +456,7 @@ mod tests {
         assert_eq!(opened.replay_nonce, [0x5a; 16]);
         assert!(matches!(
             opened.instruction,
-            OnionInstruction::Exit { ref target } if target == "203.0.113.5:443"
+            OnionInstruction::Exit { ref target, failovers_left: 0, .. } if target == "203.0.113.5:443"
         ));
         assert!(open_capsule("node-b", &local, &capsule).is_err());
     }
@@ -377,6 +477,8 @@ mod tests {
             [0x22; 16],
             OnionInstruction::Exit {
                 target: target.into(),
+                fallback: None,
+                failovers_left: 0,
             },
         )
         .unwrap();
@@ -425,7 +527,7 @@ mod tests {
         assert_eq!(exit_layer.remaining_hops, 1);
         assert!(matches!(
             exit_layer.instruction,
-            OnionInstruction::Exit { target: ref opened } if opened == target
+            OnionInstruction::Exit { target: ref opened, .. } if opened == target
         ));
     }
 
@@ -442,6 +544,8 @@ mod tests {
             [0x11; 16],
             OnionInstruction::Exit {
                 target: "203.0.113.5:443".into(),
+                fallback: None,
+                failovers_left: 0,
             },
         )
         .unwrap();
@@ -453,5 +557,136 @@ mod tests {
         )
         .unwrap();
         assert!(open_capsule("node-a", &local, &capsule).is_err());
+    }
+
+    #[test]
+    fn fallback_capsule_reveals_only_the_immediate_next_egress() {
+        let (private_a, public_a) = X25519HkdfSha256::gen_keypair();
+        let (private_b, public_b) = X25519HkdfSha256::gen_keypair();
+        let (private_c, public_c) = X25519HkdfSha256::gen_keypair();
+        let peer_a = test_peer("exit-a", public_a.to_bytes().as_slice());
+        let peer_b = test_peer("exit-b", public_b.to_bytes().as_slice());
+        let peer_c = test_peer("exit-c", public_c.to_bytes().as_slice());
+        let capsule_c = seal_capsule(
+            &peer_c,
+            false,
+            false,
+            1,
+            1234,
+            [0x13; 16],
+            OnionInstruction::Exit {
+                target: "video.example:443".into(),
+                fallback: None,
+                failovers_left: 0,
+            },
+        )
+        .unwrap();
+        let capsule_b = seal_capsule(
+            &peer_b,
+            false,
+            false,
+            1,
+            1234,
+            [0x12; 16],
+            OnionInstruction::Exit {
+                target: "video.example:443".into(),
+                fallback: Some(OnionFallback {
+                    peer: peer_c.clone(),
+                    capsule: capsule_c,
+                }),
+                failovers_left: 1,
+            },
+        )
+        .unwrap();
+        let capsule_a = seal_capsule(
+            &peer_a,
+            false,
+            false,
+            1,
+            1234,
+            [0x11; 16],
+            OnionInstruction::Exit {
+                target: "video.example:443".into(),
+                fallback: Some(OnionFallback {
+                    peer: peer_b.clone(),
+                    capsule: capsule_b,
+                }),
+                failovers_left: 2,
+            },
+        )
+        .unwrap();
+        let identity_a = LocalIdentity::from_hex(
+            &hex::encode([1u8; 32]),
+            &hex::encode(private_a.to_bytes()),
+            true,
+        )
+        .unwrap();
+        let identity_b = LocalIdentity::from_hex(
+            &hex::encode([2u8; 32]),
+            &hex::encode(private_b.to_bytes()),
+            true,
+        )
+        .unwrap();
+        let identity_c = LocalIdentity::from_hex(
+            &hex::encode([3u8; 32]),
+            &hex::encode(private_c.to_bytes()),
+            true,
+        )
+        .unwrap();
+
+        let exit_a = open_capsule("exit-a", &identity_a, &capsule_a).unwrap();
+        let OnionInstruction::Exit {
+            fallback: Some(fallback_b),
+            failovers_left: 2,
+            ..
+        } = exit_a.instruction
+        else {
+            panic!("first egress should receive one backup")
+        };
+        assert_eq!(fallback_b.peer.node_id, "exit-b");
+        assert!(!capsule_a
+            .windows(b"exit-c".len())
+            .any(|part| part == b"exit-c"));
+
+        let exit_b = open_capsule("exit-b", &identity_b, &fallback_b.capsule).unwrap();
+        let OnionInstruction::Exit {
+            fallback: Some(fallback_c),
+            failovers_left: 1,
+            ..
+        } = exit_b.instruction
+        else {
+            panic!("second egress should receive only the next backup")
+        };
+        assert_eq!(fallback_c.peer.node_id, "exit-c");
+
+        let exit_c = open_capsule("exit-c", &identity_c, &fallback_c.capsule).unwrap();
+        assert!(matches!(
+            exit_c.instruction,
+            OnionInstruction::Exit {
+                fallback: None,
+                failovers_left: 0,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn exit_capsule_rejects_failover_budget_above_the_global_limit() {
+        let (_, public) = X25519HkdfSha256::gen_keypair();
+        let peer = test_peer("exit", public.to_bytes().as_slice());
+        let result = seal_capsule(
+            &peer,
+            false,
+            false,
+            1,
+            1234,
+            [0x44; 16],
+            OnionInstruction::Exit {
+                target: "example.com:443".into(),
+                fallback: None,
+                failovers_left: MAX_EGRESS_FAILOVERS.saturating_add(1),
+            },
+        );
+        assert!(result.is_err());
     }
 }

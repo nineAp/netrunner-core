@@ -139,7 +139,7 @@ impl EdgeHandshake {
 
     /// То же самое, но с учётными данными ноды (`nrxp_secret` +
     /// `nrxp_public_key` из админки бэкенда): включает аутентифицированный
-    /// хендшейк v3.
+    /// аутентифицированный хендшейк (v3/ChaCha или v4/ring AES-GCM).
     ///
     /// Edge ходит на ту же ноду тем же протоколом, что и приложение, и без
     /// учётных данных он остаётся ровно так же уязвим к активному посреднику —
@@ -181,6 +181,11 @@ impl EdgeHandshake {
         if !self.hello_parsed {
             match TlsBridge::unpack_handshake(buf).map_err(|e| format!("{:?}", e.stage))? {
                 Some(msg) => {
+                    if let Some(suite) = msg.cipher_suite() {
+                        self.session_keys
+                            .set_tls_cipher_suite(suite)
+                            .map_err(|e| e.to_string())?;
+                    }
                     self.session_keys
                         .update_keys(msg.random(), msg.extensions(), false)
                         .map_err(|e| e.to_string())?;
@@ -198,7 +203,7 @@ impl EdgeHandshake {
         }
 
         let (tx_key, tx_iv, rx_key, rx_iv) = self.session_keys.get_aead_parameters();
-        let mut cipher = ChaChaCipher::new();
+        let mut cipher = ChaChaCipher::with_suite(self.session_keys.aead_suite());
         cipher.set_keys(tx_key, tx_iv, rx_key, rx_iv);
         let codec = Codec::new(cipher, self.session_keys.get_auth_key());
         let (rx_codec, tx_codec) = codec.split();

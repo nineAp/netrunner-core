@@ -51,10 +51,10 @@
 /// и решает, какое поведение включать для конкретного клиента.
 ///
 /// Это версия поведения NRXP. В v5 preference шифра клиента передаётся в уже
-/// существующем `session_id` и подтверждается тегом; v4 оставлен для клиентов,
-/// которые автоматически выбирают AES-GCM.
+/// существующем `session_id` и подтверждается тегом; v6 добавляет туда же
+/// аутентифицированную политику маршрута.
 #[cfg(feature = "ring-aead")]
-pub(crate) const PROTOCOL_VERSION: u8 = 5;
+pub(crate) const PROTOCOL_VERSION: u8 = 6;
 
 /// Сборки без ring сохраняют протокол v3 и ChaCha, в том числе wasm edge.
 #[cfg(not(feature = "ring-aead"))]
@@ -65,6 +65,9 @@ pub(crate) const MIN_VERSION_FOR_RING_AEAD: u8 = 4;
 
 /// First version that carries an authenticated client data-cipher preference.
 pub(crate) const MIN_VERSION_FOR_CIPHER_PREFERENCE: u8 = 5;
+
+/// First version that carries an authenticated client mesh-route preference.
+pub(crate) const MIN_VERSION_FOR_MESH_ROUTE_PREFERENCE: u8 = 6;
 
 /// Это НЕ версия TLS. Это версия «протокольного шума»: вещей вроде
 /// middlebox-compat `ChangeCipherSpec` (см. [`MIN_VERSION_FOR_CCS`]), которые

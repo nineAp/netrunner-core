@@ -16,6 +16,72 @@ use std::collections::HashMap;
 pub const MAX_MESH_HOPS: u8 = 8;
 pub const MESH_ROUTE_READY: &[u8] = b"NRXP-MESH2-READY";
 pub const MESH_ONION_READY: &[u8] = b"NRXP-MESH-ONION1-READY";
+/// Internal stream-setup failure propagated from an exhausted egress chain.
+pub const MESH_EGRESS_EXHAUSTED: &[u8] = b"NRXP-MESH-EGRESS-EXHAUSTED";
+pub(crate) const ERR_MESH_EGRESS_EXHAUSTED: &str = "MESH_EGRESS_EXHAUSTED";
+
+/// Client preference for how the ingress should route its traffic. The server's
+/// `--mesh-max-hops` is always a hard upper bound; `ServerDefault` preserves the
+/// node's existing policy.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MeshRoutePreference {
+    #[default]
+    ServerDefault,
+    Direct,
+    TwoHop,
+    RandomUpTo(u8),
+}
+
+impl MeshRoutePreference {
+    /// Parse the stable app/FFI values. Unknown values keep server policy.
+    pub fn from_config(value: Option<&str>) -> Self {
+        match value.map(str::trim) {
+            Some("direct") => Self::Direct,
+            Some("two-hop") => Self::TwoHop,
+            Some(value) => value
+                .strip_prefix("x-hop-")
+                .and_then(|hops| hops.parse::<u8>().ok())
+                .filter(|hops| (3..=MAX_MESH_HOPS).contains(hops))
+                .map(Self::RandomUpTo)
+                .unwrap_or_default(),
+            None => Self::ServerDefault,
+        }
+    }
+
+    /// Clamp the requested cap to the node's configured maximum.
+    pub fn effective_max_hops(self, server_max_hops: u8) -> u8 {
+        let server_max_hops = server_max_hops.clamp(1, MAX_MESH_HOPS);
+        match self {
+            Self::ServerDefault => server_max_hops,
+            Self::Direct => 1,
+            Self::TwoHop => 2.min(server_max_hops),
+            Self::RandomUpTo(requested) if (3..=MAX_MESH_HOPS).contains(&requested) => {
+                requested.min(server_max_hops)
+            }
+            Self::RandomUpTo(_) => server_max_hops,
+        }
+    }
+
+    pub(crate) fn wire_codes(self) -> (u8, u8) {
+        match self {
+            Self::ServerDefault => (0, 0),
+            Self::Direct => (1, 1),
+            Self::TwoHop => (2, 2),
+            Self::RandomUpTo(hops) if (3..=MAX_MESH_HOPS).contains(&hops) => (3, hops),
+            Self::RandomUpTo(_) => (0, 0),
+        }
+    }
+
+    pub(crate) fn from_wire_codes(mode: u8, hops: u8) -> Option<Self> {
+        match (mode, hops) {
+            (0, 0) => Some(Self::ServerDefault),
+            (1, 1) => Some(Self::Direct),
+            (2, 2) => Some(Self::TwoHop),
+            (3, hops) if (3..=MAX_MESH_HOPS).contains(&hops) => Some(Self::RandomUpTo(hops)),
+            _ => None,
+        }
+    }
+}
 
 /// How the next peer is selected for a stream route.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -321,7 +387,60 @@ pub trait AuthValidator: Send + Sync {
 
 #[cfg(test)]
 mod mesh_auth_token_tests {
-    use super::{parse_mesh_auth_token, MeshRouteSelection};
+    use super::{parse_mesh_auth_token, MeshRoutePreference, MeshRouteSelection};
+
+    #[test]
+    fn route_preferences_parse_and_obey_server_hop_cap() {
+        assert_eq!(
+            MeshRoutePreference::from_config(None),
+            MeshRoutePreference::ServerDefault
+        );
+        assert_eq!(
+            MeshRoutePreference::from_config(Some("direct")),
+            MeshRoutePreference::Direct
+        );
+        assert_eq!(
+            MeshRoutePreference::from_config(Some("two-hop")),
+            MeshRoutePreference::TwoHop
+        );
+        assert_eq!(
+            MeshRoutePreference::from_config(Some("x-hop-5")),
+            MeshRoutePreference::RandomUpTo(5)
+        );
+        assert_eq!(
+            MeshRoutePreference::from_config(Some("x-hop-9")),
+            MeshRoutePreference::ServerDefault
+        );
+
+        assert_eq!(MeshRoutePreference::Direct.effective_max_hops(8), 1);
+        assert_eq!(MeshRoutePreference::TwoHop.effective_max_hops(8), 2);
+        assert_eq!(MeshRoutePreference::TwoHop.effective_max_hops(1), 1);
+        assert_eq!(MeshRoutePreference::RandomUpTo(5).effective_max_hops(3), 3);
+        assert_eq!(MeshRoutePreference::RandomUpTo(5).effective_max_hops(8), 5);
+        assert_eq!(MeshRoutePreference::ServerDefault.effective_max_hops(5), 5);
+    }
+
+    #[test]
+    fn route_preferences_have_strict_wire_encoding() {
+        for preference in [
+            MeshRoutePreference::ServerDefault,
+            MeshRoutePreference::Direct,
+            MeshRoutePreference::TwoHop,
+            MeshRoutePreference::RandomUpTo(3),
+            MeshRoutePreference::RandomUpTo(8),
+        ] {
+            assert_eq!(
+                MeshRoutePreference::from_wire_codes(
+                    preference.wire_codes().0,
+                    preference.wire_codes().1
+                ),
+                Some(preference)
+            );
+        }
+        for (mode, hops) in [(0, 1), (1, 0), (2, 3), (3, 2), (3, 9), (4, 4)] {
+            assert!(MeshRoutePreference::from_wire_codes(mode, hops).is_none());
+        }
+    }
 
     #[test]
     fn accepts_legacy_and_versioned_mesh_claims() {

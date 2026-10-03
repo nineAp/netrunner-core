@@ -68,6 +68,10 @@ impl RemoteOpener {
                 .is_some_and(|route| route.remaining_hops > 1)
         {
             if let Some(mesh) = self.mesh.clone() {
+                let max_hops = self
+                    .mesh_route
+                    .as_ref()
+                    .map_or(1, |route| route.remaining_hops);
                 tokio::spawn(Self::open_via_onion(
                     self.muxer.clone(),
                     mesh,
@@ -77,6 +81,7 @@ impl RemoteOpener {
                     token,
                     false,
                     strong_privacy,
+                    max_hops,
                 ));
                 return;
             }
@@ -84,6 +89,21 @@ impl RemoteOpener {
         if strong_privacy {
             self.reject_stream(stream_id, token).await;
             return;
+        }
+        if !self.mesh_peer && self.mesh_route.is_none() {
+            if let Some(mesh) = self.mesh.clone() {
+                if mesh.is_direct_output() {
+                    tokio::spawn(Self::open_local_tcp_with_egress_failover(
+                        self.muxer.clone(),
+                        mesh,
+                        stream_id,
+                        target,
+                        v_rx,
+                        token,
+                    ));
+                    return;
+                }
+            }
         }
         self.open_tcp(stream_id, target, v_rx, token).await;
     }
@@ -103,6 +123,10 @@ impl RemoteOpener {
                 .is_some_and(|route| route.remaining_hops > 1)
         {
             if let Some(mesh) = self.mesh.clone() {
+                let max_hops = self
+                    .mesh_route
+                    .as_ref()
+                    .map_or(1, |route| route.remaining_hops);
                 tokio::spawn(Self::open_via_onion(
                     self.muxer.clone(),
                     mesh,
@@ -112,6 +136,7 @@ impl RemoteOpener {
                     token,
                     true,
                     strong_privacy,
+                    max_hops,
                 ));
                 return;
             }
@@ -120,7 +145,135 @@ impl RemoteOpener {
             self.reject_stream(stream_id, token).await;
             return;
         }
+        if !self.mesh_peer && self.mesh_route.is_none() {
+            if let Some(mesh) = self.mesh.clone() {
+                if mesh.is_direct_output() {
+                    tokio::spawn(Self::open_local_udp_with_egress_failover(
+                        self.muxer.clone(),
+                        mesh,
+                        stream_id,
+                        target,
+                        v_rx,
+                        token,
+                    ));
+                    return;
+                }
+            }
+        }
         self.open_udp(stream_id, target, v_rx, token).await;
+    }
+
+    async fn open_local_tcp_with_egress_failover(
+        muxer: Arc<Muxer>,
+        mesh: Arc<crate::net::NodeMesh>,
+        stream_id: u32,
+        target: String,
+        v_rx: mpsc::Receiver<Bytes>,
+        token: CancellationToken,
+    ) {
+        let stream = tokio::select! {
+            _ = token.cancelled() => None,
+            result = tokio::time::timeout(Duration::from_secs(7), TcpStream::connect(&target)) => {
+                result.ok().and_then(Result::ok)
+            }
+        };
+        if let Some(stream) = stream {
+            let (reader, writer) = stream.into_split();
+            tokio::select! {
+                _ = token.cancelled() => {},
+                _ = run_tcp_bridge(stream_id, reader, writer, muxer.clone(), v_rx) => {},
+            }
+            if !token.is_cancelled() {
+                let _ = muxer
+                    .send_control(stream_id, FrameType::Close, Bytes::new())
+                    .await;
+            }
+            muxer.remove_stream(stream_id);
+            return;
+        }
+        if token.is_cancelled() {
+            muxer.remove_stream(stream_id);
+            return;
+        }
+
+        let fallback = mesh
+            .build_direct_onion_fallback(&target, false, false)
+            .await;
+        let (fallback, failovers_left) = fallback
+            .map(|(fallback, count)| (Some(fallback), count))
+            .unwrap_or((None, 0));
+        run_mesh_onion_failover(
+            mesh,
+            muxer,
+            stream_id,
+            v_rx,
+            token,
+            false,
+            false,
+            fallback,
+            failovers_left,
+            false,
+        )
+        .await;
+    }
+
+    async fn open_local_udp_with_egress_failover(
+        muxer: Arc<Muxer>,
+        mesh: Arc<crate::net::NodeMesh>,
+        stream_id: u32,
+        target: String,
+        v_rx: mpsc::Receiver<Bytes>,
+        token: CancellationToken,
+    ) {
+        let address = tokio::select! {
+            _ = token.cancelled() => None,
+            result = tokio::time::timeout(Duration::from_secs(5), tokio::net::lookup_host(&target)) => {
+                result.ok().and_then(Result::ok).and_then(|mut addresses| addresses.next())
+            }
+        };
+        if let Some(address) = address {
+            let bind = if address.is_ipv4() {
+                "0.0.0.0:0"
+            } else {
+                "[::]:0"
+            };
+            let socket = tokio::select! {
+                _ = token.cancelled() => None,
+                result = UdpSocket::bind(bind) => result.ok(),
+            };
+            if let Some(socket) = socket {
+                if socket.connect(address).await.is_ok() {
+                    tokio::select! {
+                        _ = token.cancelled() => {},
+                        _ = run_udp_bridge(stream_id, socket, muxer.clone(), v_rx) => {},
+                    }
+                    muxer.remove_stream(stream_id);
+                    return;
+                }
+            }
+        }
+        if token.is_cancelled() {
+            muxer.remove_stream(stream_id);
+            return;
+        }
+
+        let fallback = mesh.build_direct_onion_fallback(&target, true, false).await;
+        let (fallback, failovers_left) = fallback
+            .map(|(fallback, count)| (Some(fallback), count))
+            .unwrap_or((None, 0));
+        run_mesh_onion_failover(
+            mesh,
+            muxer,
+            stream_id,
+            v_rx,
+            token,
+            true,
+            false,
+            fallback,
+            failovers_left,
+            false,
+        )
+        .await;
     }
 
     async fn reject_stream(&self, stream_id: u32, token: CancellationToken) {
@@ -305,8 +458,10 @@ impl RemoteOpener {
         token: CancellationToken,
         is_udp: bool,
         strong_privacy: bool,
+        max_hops: u8,
     ) {
         let started = Instant::now();
+        let setup_deadline = tokio::time::Instant::now() + Duration::from_secs(65);
         let mut excluded_first_hops = Vec::new();
         let mut connected = None;
         let max_attempts = mesh
@@ -314,27 +469,89 @@ impl RemoteOpener {
             .await
             .clamp(1, usize::from(crate::net::MAX_MESH_HOPS));
         for _ in 0..max_attempts {
-            if token.is_cancelled() {
+            if token.is_cancelled() || tokio::time::Instant::now() >= setup_deadline {
                 break;
             }
             let Some((peer, capsule)) = mesh
-                .build_onion_route(&target, is_udp, strong_privacy, &excluded_first_hops)
-                .await
-            else {
-                break;
-            };
-            match mesh
-                .connect_onion_stream(
-                    &peer,
-                    &capsule,
+                .build_onion_route(
+                    &target,
                     is_udp,
-                    Some(&token),
-                    Some(ingress_stream_id),
+                    strong_privacy,
+                    &excluded_first_hops,
+                    max_hops,
                 )
                 .await
-            {
+            else {
+                metrics::counter!("netrunner_mesh_egress_failover_exhausted_total").increment(1);
+                warn!(
+                    stream_id = ingress_stream_id,
+                    "mesh route setup has no unused egress candidate"
+                );
+                break;
+            };
+            let attempt_cancel = token.child_token();
+            let attempt_call_cancel = attempt_cancel.clone();
+            let attempt_mesh = mesh.clone();
+            let attempt_peer = peer.clone();
+            let mut attempt_task = tokio::spawn(async move {
+                attempt_mesh
+                    .connect_onion_stream(
+                        &attempt_peer,
+                        &capsule,
+                        is_udp,
+                        Some(&attempt_call_cancel),
+                        Some(ingress_stream_id),
+                    )
+                    .await
+            });
+            let attempt_result = tokio::select! {
+                biased;
+                _ = token.cancelled() => None,
+                _ = tokio::time::sleep_until(setup_deadline) => None,
+                result = &mut attempt_task => Some(result),
+            };
+            let Some(result) = attempt_result else {
+                attempt_cancel.cancel();
+                if let Ok(Ok((late_session, late_stream_id, _))) = attempt_task.await {
+                    let _ = late_session
+                        .muxer
+                        .send_control(late_stream_id, FrameType::Close, Bytes::new())
+                        .await;
+                    late_session.muxer.remove_stream(late_stream_id);
+                }
+                if !token.is_cancelled() {
+                    metrics::counter!("netrunner_mesh_onion_route_failures_total").increment(1);
+                    warn!(
+                        stream_id = ingress_stream_id,
+                        "mesh route setup deadline expired"
+                    );
+                }
+                break;
+            };
+            let result = match result {
+                Ok(result) => result,
+                Err(_) => {
+                    excluded_first_hops.push(peer.node_id);
+                    metrics::counter!("netrunner_mesh_onion_route_failures_total").increment(1);
+                    continue;
+                }
+            };
+            match result {
                 Ok((peer_session, peer_stream_id, peer_rx)) => {
                     connected = Some((peer_session, peer_stream_id, peer_rx));
+                    break;
+                }
+                Err(error) if error.code == crate::net::ERR_MESH_EGRESS_EXHAUSTED => {
+                    // The preselected chain's bounded egress budget is spent.
+                    // Preserve the explicit exhaustion result instead of
+                    // silently starting a fresh chain for the same flow.
+                    warn!(
+                        stream_id = ingress_stream_id,
+                        "mesh egress failover chain exhausted before destination CONNECT"
+                    );
+                    break;
+                }
+                Err(error) if error.code != netrunner_logger::ERR_INFRA_TIMEOUT => {
                     break;
                 }
                 Err(_) => {
@@ -425,6 +642,10 @@ impl RemoteOpener {
                         .await
                     {
                         Ok(stream) => stream,
+                        Err(error) if error.code == crate::net::ERR_MESH_EGRESS_EXHAUSTED => {
+                            fail_mesh_stream_exhausted(muxer, stream_id, token, true).await;
+                            return;
+                        }
                         Err(_) => {
                             metrics::counter!("netrunner_mesh_onion_forward_failures_total")
                                 .increment(1);
@@ -455,7 +676,19 @@ impl RemoteOpener {
                     )
                     .await;
                 }
-                crate::net::mesh_onion::OnionInstruction::Exit { target } => {
+                crate::net::mesh_onion::OnionInstruction::Exit {
+                    target,
+                    fallback,
+                    failovers_left,
+                } => {
+                    if fallback.as_ref().is_some_and(|next| {
+                        next.peer.node_id.eq_ignore_ascii_case(mesh.local_node_id())
+                    }) {
+                        metrics::counter!("netrunner_mesh_onion_loop_rejections_total")
+                            .increment(1);
+                        close_mesh_stream(muxer, stream_id, token).await;
+                        return;
+                    }
                     run_mesh_onion_exit(
                         mesh,
                         muxer,
@@ -465,6 +698,8 @@ impl RemoteOpener {
                         token,
                         is_udp,
                         strong_privacy,
+                        fallback,
+                        failovers_left,
                     )
                     .await;
                 }
@@ -698,6 +933,27 @@ async fn close_mesh_stream(muxer: Arc<Muxer>, stream_id: u32, token: Cancellatio
     muxer.remove_stream(stream_id);
 }
 
+async fn fail_mesh_stream_exhausted(
+    muxer: Arc<Muxer>,
+    stream_id: u32,
+    token: CancellationToken,
+    propagate_marker: bool,
+) {
+    if !token.is_cancelled() {
+        if propagate_marker {
+            let _ = muxer
+                .send_control(
+                    stream_id,
+                    FrameType::Heartbeat,
+                    Bytes::from_static(crate::net::MESH_EGRESS_EXHAUSTED),
+                )
+                .await;
+        }
+        metrics::counter!("netrunner_mesh_egress_failover_exhausted_total").increment(1);
+    }
+    close_mesh_stream(muxer, stream_id, token).await;
+}
+
 async fn send_mesh_payload(
     mesh: &Arc<crate::net::NodeMesh>,
     muxer: Arc<Muxer>,
@@ -840,6 +1096,8 @@ async fn run_mesh_onion_exit(
     token: CancellationToken,
     is_udp: bool,
     strong_privacy: bool,
+    fallback: Option<crate::net::mesh_onion::OnionFallback>,
+    failovers_left: u8,
 ) {
     if is_udp {
         let address = tokio::select! {
@@ -849,7 +1107,23 @@ async fn run_mesh_onion_exit(
             }
         };
         let Some(address) = address else {
-            close_mesh_stream(muxer, stream_id, token).await;
+            if token.is_cancelled() {
+                close_mesh_stream(muxer, stream_id, token).await;
+            } else {
+                run_mesh_onion_failover(
+                    mesh,
+                    muxer,
+                    stream_id,
+                    v_rx,
+                    token,
+                    is_udp,
+                    strong_privacy,
+                    fallback,
+                    failovers_left,
+                    true,
+                )
+                .await;
+            }
             return;
         };
         let bind = if address.is_ipv4() {
@@ -862,18 +1136,49 @@ async fn run_mesh_onion_exit(
             result = UdpSocket::bind(bind) => result.ok(),
         };
         let Some(socket) = socket else {
-            close_mesh_stream(muxer, stream_id, token).await;
+            if token.is_cancelled() {
+                close_mesh_stream(muxer, stream_id, token).await;
+            } else {
+                run_mesh_onion_failover(
+                    mesh,
+                    muxer,
+                    stream_id,
+                    v_rx,
+                    token,
+                    is_udp,
+                    strong_privacy,
+                    fallback,
+                    failovers_left,
+                    true,
+                )
+                .await;
+            }
             return;
         };
-        if socket.connect(address).await.is_err()
-            || muxer
-                .send_control(
-                    stream_id,
-                    FrameType::Heartbeat,
-                    Bytes::from_static(crate::net::MESH_ROUTE_READY),
-                )
-                .await
-                .is_err()
+        if socket.connect(address).await.is_err() {
+            run_mesh_onion_failover(
+                mesh,
+                muxer,
+                stream_id,
+                v_rx,
+                token,
+                is_udp,
+                strong_privacy,
+                fallback,
+                failovers_left,
+                true,
+            )
+            .await;
+            return;
+        }
+        if muxer
+            .send_control(
+                stream_id,
+                FrameType::Heartbeat,
+                Bytes::from_static(crate::net::MESH_ROUTE_READY),
+            )
+            .await
+            .is_err()
         {
             close_mesh_stream(muxer, stream_id, token).await;
             return;
@@ -977,7 +1282,23 @@ async fn run_mesh_onion_exit(
             }
         };
         let Some(stream) = stream else {
-            close_mesh_stream(muxer, stream_id, token).await;
+            if token.is_cancelled() {
+                close_mesh_stream(muxer, stream_id, token).await;
+            } else {
+                run_mesh_onion_failover(
+                    mesh,
+                    muxer,
+                    stream_id,
+                    v_rx,
+                    token,
+                    is_udp,
+                    strong_privacy,
+                    fallback,
+                    failovers_left,
+                    true,
+                )
+                .await;
+            }
             return;
         };
         if muxer
@@ -1087,6 +1408,102 @@ async fn run_mesh_onion_exit(
     close_mesh_stream(muxer, stream_id, token).await;
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn run_mesh_onion_failover(
+    mesh: Arc<crate::net::NodeMesh>,
+    muxer: Arc<Muxer>,
+    stream_id: u32,
+    v_rx: mpsc::Receiver<Bytes>,
+    token: CancellationToken,
+    is_udp: bool,
+    strong_privacy: bool,
+    fallback: Option<crate::net::mesh_onion::OnionFallback>,
+    failovers_left: u8,
+    send_ready_to_upstream: bool,
+) {
+    if token.is_cancelled() {
+        close_mesh_stream(muxer, stream_id, token).await;
+        return;
+    }
+    let Some(fallback) = fallback.filter(|_| failovers_left > 0) else {
+        warn!(
+            stream_id,
+            "mesh egress failover chain is exhausted; no unused next egress is available"
+        );
+        fail_mesh_stream_exhausted(muxer, stream_id, token, send_ready_to_upstream).await;
+        return;
+    };
+
+    if fallback
+        .peer
+        .node_id
+        .eq_ignore_ascii_case(mesh.local_node_id())
+    {
+        metrics::counter!("netrunner_mesh_onion_loop_rejections_total").increment(1);
+        close_mesh_stream(muxer, stream_id, token).await;
+        return;
+    }
+    metrics::counter!("netrunner_mesh_egress_failover_attempts_total").increment(1);
+    match mesh
+        .connect_onion_stream(
+            &fallback.peer,
+            &fallback.capsule,
+            is_udp,
+            Some(&token),
+            Some(stream_id),
+        )
+        .await
+    {
+        Ok((peer_session, peer_stream_id, peer_rx)) => {
+            let peer_muxer = peer_session.muxer.clone();
+            if send_ready_to_upstream
+                && muxer
+                    .send_control(
+                        stream_id,
+                        FrameType::Heartbeat,
+                        Bytes::from_static(crate::net::MESH_ROUTE_READY),
+                    )
+                    .await
+                    .is_err()
+            {
+                let _ = peer_muxer
+                    .send_control(peer_stream_id, FrameType::Close, Bytes::new())
+                    .await;
+                peer_muxer.remove_stream(peer_stream_id);
+                close_mesh_stream(muxer, stream_id, token).await;
+                return;
+            }
+            run_mesh_onion_bridge(
+                mesh,
+                muxer,
+                stream_id,
+                v_rx,
+                peer_muxer,
+                peer_stream_id,
+                peer_rx,
+                peer_session,
+                token,
+                is_udp,
+                strong_privacy,
+            )
+            .await;
+        }
+        Err(error) if error.code == crate::net::ERR_MESH_EGRESS_EXHAUSTED => {
+            fail_mesh_stream_exhausted(muxer, stream_id, token, send_ready_to_upstream).await;
+        }
+        Err(error) if error.code == netrunner_logger::ERR_INFRA_TIMEOUT => {
+            // The preselected backup itself is unreachable. This chain cannot
+            // be skipped without disclosing later peers, so report exhaustion.
+            fail_mesh_stream_exhausted(muxer, stream_id, token, send_ready_to_upstream).await;
+        }
+        Err(_) => {
+            // Authentication or protocol errors are not destination network
+            // failures and must not trigger another egress.
+            close_mesh_stream(muxer, stream_id, token).await;
+        }
+    }
+}
+
 /// Маршрутизатор входящих кадров. Наличие `opener` определяет роль:
 /// `Some` — серверная сторона (умеет открывать соединения к целям),
 /// `None` — клиентская (входящие `Connect` отвергаются).
@@ -1133,6 +1550,7 @@ impl StreamHandler {
                 } else if payload == b"PONG"
                     || payload == crate::net::MESH_ROUTE_READY
                     || payload == crate::net::MESH_ONION_READY
+                    || payload == crate::net::MESH_EGRESS_EXHAUSTED
                 {
                     trace!(stream_id, "🤝 [Tunnel] PONG received");
                     self.muxer.dispatch_to_local(stream_id, frame.payload);

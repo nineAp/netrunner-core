@@ -272,6 +272,8 @@ pub(crate) struct TunnelEngine {
     pub identity: Option<crate::Identity>,
     /// User-selected cipher carried across reconnect handshakes.
     pub data_cipher_preference: crate::DataCipherPreference,
+    /// User-selected routing policy carried across reconnect handshakes.
+    pub mesh_route_preference: crate::net::MeshRoutePreference,
 }
 
 impl TunnelEngine {
@@ -335,6 +337,7 @@ impl TunnelEngine {
             &self.auth_token,
             self.identity.as_ref(),
             self.data_cipher_preference,
+            self.mesh_route_preference,
         )
         .await
     }

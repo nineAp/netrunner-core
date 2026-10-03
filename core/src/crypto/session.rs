@@ -31,7 +31,7 @@ use crate::{
         aead::AeadSuite, datagram_keys::DatagramRoot, ecdh::ECDH, hkdf::HKDF, identity::Identity,
         DataCipherPreference,
     },
-    net::{AUTH_TIME_STEP, AUTH_WINDOW_SIZE},
+    net::{MeshRoutePreference, AUTH_TIME_STEP, AUTH_WINDOW_SIZE},
     tlseng::ExtensionStack,
 };
 
@@ -148,6 +148,7 @@ pub struct SessionKeys {
     datagram_root: Option<Zeroizing<[u8; 32]>>,
     aead_suite: AeadSuite,
     data_cipher_preference: DataCipherPreference,
+    mesh_route_preference: MeshRoutePreference,
 }
 
 impl SessionKeys {
@@ -163,6 +164,7 @@ impl SessionKeys {
             datagram_root: None,
             aead_suite: AeadSuite::ChaCha20Poly1305,
             data_cipher_preference: DataCipherPreference::Auto,
+            mesh_route_preference: MeshRoutePreference::ServerDefault,
         }
     }
 
@@ -174,7 +176,9 @@ impl SessionKeys {
         // затирание ключей) это запрещено (E0509). Присваиваем поверх.
         let mut keys = Self::new(is_initiator);
         keys.identity = Some(identity);
-        keys.peer_version = crate::PROTOCOL_VERSION;
+        // Keep default-policy clients compatible with v5 nodes. A non-default
+        // route preference opts into v6 in `set_mesh_route_preference`.
+        keys.peer_version = crate::PROTOCOL_VERSION.min(crate::MIN_VERSION_FOR_CIPHER_PREFERENCE);
         keys
     }
 
@@ -184,7 +188,7 @@ impl SessionKeys {
     /// проверять у него ключевой тег, которого он посчитать не может.
     pub(crate) fn claimed_version(&self) -> u8 {
         if self.identity.is_some() {
-            crate::PROTOCOL_VERSION
+            self.peer_version
         } else {
             crate::PROTOCOL_VERSION_ANONYMOUS
         }
@@ -213,6 +217,32 @@ impl SessionKeys {
 
     pub(crate) fn data_cipher_preference_wire_code(&self) -> u8 {
         self.data_cipher_preference.wire_code()
+    }
+
+    pub(crate) fn set_mesh_route_preference(&mut self, preference: MeshRoutePreference) {
+        let (mode, hops) = preference.wire_codes();
+        let preference = MeshRoutePreference::from_wire_codes(mode, hops)
+            .unwrap_or(MeshRoutePreference::ServerDefault);
+        self.mesh_route_preference = preference;
+        if preference != MeshRoutePreference::ServerDefault {
+            self.peer_version = crate::PROTOCOL_VERSION;
+        }
+    }
+
+    pub(crate) fn set_peer_mesh_route_preference(&mut self, mode: u8, hops: u8) -> bool {
+        let Some(preference) = MeshRoutePreference::from_wire_codes(mode, hops) else {
+            return false;
+        };
+        self.mesh_route_preference = preference;
+        true
+    }
+
+    pub(crate) fn mesh_route_preference(&self) -> MeshRoutePreference {
+        self.mesh_route_preference
+    }
+
+    pub(crate) fn mesh_route_preference_wire_codes(&self) -> (u8, u8) {
+        self.mesh_route_preference.wire_codes()
     }
 
     /// Select data-plane AEAD from the already parsed TLS 1.3 suite.
@@ -289,13 +319,17 @@ impl SessionKeys {
     /// соединению; анонимная v2 использует старый безключевой тег от времени.
     pub(crate) fn handshake_tag(&self, random: &[u8; 32]) -> [u8; 16] {
         match &self.identity {
-            Some(id) => SessionAuth::new(*id.secret())
-                .generate_handshake_tag_for_version_and_preference(
+            Some(id) => {
+                let (route_mode, route_hops) = self.mesh_route_preference_wire_codes();
+                SessionAuth::new(*id.secret()).generate_handshake_tag_for_version_cipher_and_route(
                     random,
                     &self.public_key_bytes(),
                     self.claimed_version(),
                     self.data_cipher_preference_wire_code(),
-                ),
+                    route_mode,
+                    route_hops,
+                )
+            }
             None => SessionAuth::new(self.auth_key).generate_current_tag(),
         }
     }
@@ -320,12 +354,15 @@ impl SessionKeys {
             let Some(id) = &self.identity else {
                 return false;
             };
-            SessionAuth::new(*id.secret()).verify_handshake_tag_for_version_and_preference(
+            let (route_mode, route_hops) = self.mesh_route_preference_wire_codes();
+            SessionAuth::new(*id.secret()).verify_handshake_tag_for_version_cipher_and_route(
                 received_tag,
                 random,
                 peer_public,
                 self.peer_version,
                 self.data_cipher_preference_wire_code(),
+                route_mode,
+                route_hops,
             )
         } else if self.rejects_anonymous() {
             false
@@ -792,10 +829,35 @@ impl SessionAuth {
         version: u8,
         preference: u8,
     ) -> [u8; 16] {
+        Self::compute_handshake_tag_for_version_cipher_and_route(
+            secret,
+            step,
+            random,
+            peer_public,
+            version,
+            preference,
+            0,
+            0,
+        )
+    }
+
+    pub fn compute_handshake_tag_for_version_cipher_and_route(
+        secret: &[u8],
+        step: u64,
+        random: &[u8; 32],
+        peer_public: &[u8; 32],
+        version: u8,
+        cipher_preference: u8,
+        route_mode: u8,
+        route_hops: u8,
+    ) -> [u8; 16] {
         let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC error");
-        if version >= crate::MIN_VERSION_FOR_CIPHER_PREFERENCE {
+        if version >= crate::MIN_VERSION_FOR_MESH_ROUTE_PREFERENCE {
+            mac.update(b"nrxp-handshake-v6-routing-policy");
+            mac.update(&[cipher_preference, route_mode, route_hops]);
+        } else if version >= crate::MIN_VERSION_FOR_CIPHER_PREFERENCE {
             mac.update(b"nrxp-handshake-v5-cipher-pref");
-            mac.update(&[preference]);
+            mac.update(&[cipher_preference]);
         } else if version >= crate::MIN_VERSION_FOR_RING_AEAD {
             mac.update(b"nrxp-handshake-v4-ring-aead");
         } else {
@@ -836,15 +898,36 @@ impl SessionAuth {
         version: u8,
         preference: u8,
     ) -> [u8; 16] {
+        self.generate_handshake_tag_for_version_cipher_and_route(
+            random,
+            peer_public,
+            version,
+            preference,
+            0,
+            0,
+        )
+    }
+
+    pub fn generate_handshake_tag_for_version_cipher_and_route(
+        &self,
+        random: &[u8; 32],
+        peer_public: &[u8; 32],
+        version: u8,
+        cipher_preference: u8,
+        route_mode: u8,
+        route_hops: u8,
+    ) -> [u8; 16] {
         let now = now_unix_secs();
 
-        Self::compute_handshake_tag_for_version_and_preference(
+        Self::compute_handshake_tag_for_version_cipher_and_route(
             &self.auth_key,
             now / AUTH_TIME_STEP,
             random,
             peer_public,
             version,
-            preference,
+            cipher_preference,
+            route_mode,
+            route_hops,
         )
     }
 
@@ -891,19 +974,42 @@ impl SessionAuth {
         version: u8,
         preference: u8,
     ) -> bool {
+        self.verify_handshake_tag_for_version_cipher_and_route(
+            received_tag,
+            random,
+            peer_public,
+            version,
+            preference,
+            0,
+            0,
+        )
+    }
+
+    pub fn verify_handshake_tag_for_version_cipher_and_route(
+        &self,
+        received_tag: &[u8; 16],
+        random: &[u8; 32],
+        peer_public: &[u8; 32],
+        version: u8,
+        cipher_preference: u8,
+        route_mode: u8,
+        route_hops: u8,
+    ) -> bool {
         let current_step = now_unix_secs() / AUTH_TIME_STEP;
 
         let mut matched = Choice::from(0u8);
         for step in (current_step.saturating_sub(AUTH_WINDOW_SIZE))
             ..=(current_step.saturating_add(AUTH_WINDOW_SIZE))
         {
-            let candidate = Self::compute_handshake_tag_for_version_and_preference(
+            let candidate = Self::compute_handshake_tag_for_version_cipher_and_route(
                 &self.auth_key,
                 step,
                 random,
                 peer_public,
                 version,
-                preference,
+                cipher_preference,
+                route_mode,
+                route_hops,
             );
             // Никакого раннего выхода: накапливаем результат по всем шагам.
             matched |= candidate[..].ct_eq(&received_tag[..]);
@@ -1119,6 +1225,60 @@ mod tests {
 
         assert!(accepted);
         assert!(!rejected);
+    }
+
+    #[test]
+    fn v6_handshake_tag_authenticates_route_preference() {
+        let secret = [23u8; 32];
+        let auth = SessionAuth::new(secret);
+        let random = [24u8; 32];
+        let peer_public = [25u8; 32];
+
+        let (accepted, changed_mode, changed_hops) = stable(|step| {
+            let tag = SessionAuth::compute_handshake_tag_for_version_cipher_and_route(
+                &secret,
+                step,
+                &random,
+                &peer_public,
+                6,
+                1,
+                3,
+                5,
+            );
+            (
+                auth.verify_handshake_tag_for_version_cipher_and_route(
+                    &tag,
+                    &random,
+                    &peer_public,
+                    6,
+                    1,
+                    3,
+                    5,
+                ),
+                auth.verify_handshake_tag_for_version_cipher_and_route(
+                    &tag,
+                    &random,
+                    &peer_public,
+                    6,
+                    1,
+                    2,
+                    5,
+                ),
+                auth.verify_handshake_tag_for_version_cipher_and_route(
+                    &tag,
+                    &random,
+                    &peer_public,
+                    6,
+                    1,
+                    3,
+                    4,
+                ),
+            )
+        });
+
+        assert!(accepted);
+        assert!(!changed_mode);
+        assert!(!changed_hops);
     }
 
     /// Разделение доменов: на одном ключе и одном шаге пер-кадровый тег и тег

@@ -20,13 +20,13 @@
 
 use bytes::Bytes;
 use netrunner_core::DataCipherPreference;
-use netrunner_core::net::ClientHandler;
 use netrunner_core::net::Muxer;
 use netrunner_core::net::NetworkConfig;
 use netrunner_core::net::diagnostics::{
     self, DiagnosisRx, DiagnosticsEvent, DiagnosticsSnapshot, DiagnosticsStore, EngineMetrics,
     SocketMetrics, current_timestamp_ms,
 };
+use netrunner_core::net::{ClientHandler, MeshRoutePreference};
 use netrunner_core::rawcast::{RawCastEvent, RawCastFrame};
 use smoltcp::iface::PollResult;
 use smoltcp::phy::ChannelDevice;
@@ -968,6 +968,9 @@ pub struct EngineConfig {
     pub strong_privacy: bool,
     /// Preferred NRXP data-plane AEAD; `Auto` lets the node choose AES-GCM.
     pub data_cipher_preference: DataCipherPreference,
+    /// Client route preference; the ingress node's `--mesh-max-hops` remains
+    /// the hard limit.
+    pub mesh_route_preference: MeshRoutePreference,
 }
 
 impl EngineConfig {
@@ -993,6 +996,7 @@ impl EngineConfig {
             node_public_key: None,
             strong_privacy: false,
             data_cipher_preference: DataCipherPreference::Auto,
+            mesh_route_preference: MeshRoutePreference::ServerDefault,
         }
     }
 
@@ -1026,6 +1030,11 @@ impl EngineConfig {
 
     pub fn with_data_cipher_preference(mut self, preference: DataCipherPreference) -> Self {
         self.data_cipher_preference = preference;
+        self
+    }
+
+    pub fn with_mesh_route_preference(mut self, preference: MeshRoutePreference) -> Self {
+        self.mesh_route_preference = preference;
         self
     }
 
@@ -1110,6 +1119,7 @@ impl std::fmt::Debug for EngineConfig {
                 &self.node_public_key.as_ref().map(|_| "[configured]"),
             )
             .field("strong_privacy", &self.strong_privacy)
+            .field("mesh_route_preference", &self.mesh_route_preference)
             .finish()
     }
 }
@@ -1132,6 +1142,18 @@ mod engine_config_tests {
         assert!(!debug.contains("node-secret-value"));
         assert!(!debug.contains("node-public-value"));
         assert!(debug.contains("[redacted]"));
+    }
+
+    #[test]
+    fn route_preference_defaults_to_node_policy_and_can_be_overridden() {
+        let default = EngineConfig::new("198.51.100.10:443");
+        assert_eq!(default.mesh_route_preference, MeshRoutePreference::ServerDefault);
+
+        let selected = default.with_mesh_route_preference(MeshRoutePreference::RandomUpTo(5));
+        assert_eq!(
+            selected.mesh_route_preference,
+            MeshRoutePreference::RandomUpTo(5)
+        );
     }
 }
 
@@ -1225,7 +1247,7 @@ impl EngineBuilder {
         };
 
         info!("Establishing secure tunnel to proxy server...");
-        let muxer = ClientHandler::connect_with_privacy_and_cipher(
+        let muxer = ClientHandler::connect_with_privacy_and_preferences(
             &self.config.remote_address,
             self.config.decoy_sni.clone(),
             self.config.auth_token.clone(),
@@ -1234,6 +1256,7 @@ impl EngineBuilder {
             tx_for_client_handler,
             self.config.strong_privacy,
             self.config.data_cipher_preference,
+            self.config.mesh_route_preference,
         )
         .await
         .map_err(|e| format!("Failed to establish secure tunnel: {}", e))?;

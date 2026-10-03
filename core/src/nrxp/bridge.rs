@@ -242,6 +242,15 @@ impl TlsBridge {
                     Bytes::new(),
                 ));
             }
+            if peer_version >= crate::MIN_VERSION_FOR_MESH_ROUTE_PREFERENCE
+                && !keys.set_peer_mesh_route_preference(base.session_id[2], base.session_id[3])
+            {
+                return Err(TlsError::new(
+                    ErrorStage::Handshake("Invalid mesh route preference"),
+                    ErrorAction::Drop,
+                    Bytes::new(),
+                ));
+            }
 
             let mut received_tag = [0u8; 16];
             received_tag.copy_from_slice(&base.session_id[16..32]);

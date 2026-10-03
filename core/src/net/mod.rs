@@ -54,10 +54,11 @@ mod connection;
 mod constants;
 pub mod diagnostics;
 
+pub(crate) use auth::ERR_MESH_EGRESS_EXHAUSTED;
 pub use auth::{
-    parse_mesh_auth_token, AuthValidator, MeshAuth, MeshPeer, MeshRoute, MeshRouteSelection,
-    NodeHealthReport, UsageDelta, UsageReport, UserQuota, MAX_MESH_HOPS, MESH_ONION_READY,
-    MESH_ROUTE_READY,
+    parse_mesh_auth_token, AuthValidator, MeshAuth, MeshPeer, MeshRoute, MeshRoutePreference,
+    MeshRouteSelection, NodeHealthReport, UsageDelta, UsageReport, UserQuota, MAX_MESH_HOPS,
+    MESH_EGRESS_EXHAUSTED, MESH_ONION_READY, MESH_ROUTE_READY,
 };
 pub use config::NetworkConfig;
 #[cfg(not(target_arch = "wasm32"))]

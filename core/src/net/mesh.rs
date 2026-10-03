@@ -27,6 +27,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use super::connection::{mesh_process_uptime_ms, ClientHandler, MeshPeerSession, Muxer};
+use super::mesh_onion::{OnionFallback, OnionInstruction, MAX_EGRESS_FAILOVERS};
 use super::{MeshPeer, MeshRoute, MeshRouteSelection, MAX_MESH_HOPS};
 use crate::nrxp::FrameType;
 
@@ -165,6 +166,10 @@ impl NodeMesh {
         &self.local_node_id
     }
 
+    pub(crate) fn is_direct_output(&self) -> bool {
+        self.max_hops <= 1
+    }
+
     /// A mesh auth token is carried only inside the already encrypted NRXP
     /// session. Do not log or expose it through diagnostics.
     pub fn auth_token(&self) -> String {
@@ -235,83 +240,107 @@ impl NodeMesh {
         is_udp: bool,
         strong_privacy: bool,
         excluded_first_hops: &[String],
+        requested_max_hops: u8,
     ) -> Option<(MeshPeer, Vec<u8>)> {
-        if self.max_hops <= 1 || target.is_empty() || target.len() > 2048 || target.contains('\0') {
+        let max_hops = self.max_hops.min(requested_max_hops);
+        if max_hops <= 1 || target.is_empty() || target.len() > 2048 || target.contains('\0') {
             return None;
         }
         let route = MeshRoute {
-            remaining_hops: self.max_hops,
+            remaining_hops: max_hops,
             selection: MeshRouteSelection::WeightedRandom,
             egress_node_id: None,
             visited: vec![self.local_node_id.clone()],
         };
-        let mut candidates = self.peers_for_route(&route).await;
-        candidates.retain(|peer| {
+        let mut all_candidates = self.peers_for_route(&route).await;
+        all_candidates.retain(|peer| {
             !excluded_first_hops
                 .iter()
                 .any(|excluded| excluded.eq_ignore_ascii_case(&peer.node_id))
         });
-        if candidates.is_empty() {
+        all_candidates = unique_mesh_peers(all_candidates);
+        if all_candidates.is_empty() {
             return None;
         }
 
-        // Fresh RTT samples are preferred when there are enough healthy nodes
-        // to build at least the normal two-hop path. On cold start keep
-        // unprobed directory peers as a fallback; connection setup will still
-        // fail closed and retry a different first hop.
-        let probed: Vec<_> = candidates
+        // Prefer measured peers for the primary route, while keeping unprobed
+        // peers available as the encrypted egress fallback chain. This lets a
+        // cold or small mesh retain a reserve instead of discarding it merely
+        // because only one node has an RTT sample.
+        let probed: Vec<_> = all_candidates
             .iter()
             .filter(|peer| self.recent_rtt_ms(&peer.node_id).is_some())
             .cloned()
             .collect();
-        if probed.len() >= 1 {
-            candidates = probed;
-        }
-        let max_total_hops = self.max_hops.min(candidates.len().saturating_add(1) as u8);
-        let total_hops = if self.max_hops > 2 && max_total_hops >= 3 {
+        let mut route_candidates = if probed.is_empty() {
+            all_candidates.clone()
+        } else {
+            probed
+        };
+        let route_peer_limit = route_candidates
+            .len()
+            .min(all_candidates.len().saturating_sub(1).max(1));
+        let max_total_hops = max_hops.min(route_peer_limit.saturating_add(1) as u8);
+        let total_hops = if max_hops > 2 && max_total_hops >= 3 {
             rand::rng().random_range(3..=max_total_hops)
         } else {
             2.min(max_total_hops)
         };
         let relay_count = usize::from(total_hops.saturating_sub(1));
-        if relay_count == 0 || candidates.len() < relay_count {
+        if relay_count == 0 || route_candidates.len() < relay_count {
             return None;
         }
-        candidates.truncate(relay_count);
+        route_candidates.truncate(relay_count);
+        let selected_ids: std::collections::HashSet<_> = route_candidates
+            .iter()
+            .map(|peer| peer.node_id.to_ascii_lowercase())
+            .collect();
+        let backup_candidates: Vec<_> = all_candidates
+            .into_iter()
+            .filter(|peer| !selected_ids.contains(&peer.node_id.to_ascii_lowercase()))
+            .collect();
 
         let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
         let expires_at = now.saturating_add(60);
-        let mut rng = rand::rng();
-        let mut nonce = || std::array::from_fn(|_| rng.random::<u8>());
-        let last = candidates.last()?;
+        let (fallback, failovers_left) = seal_onion_fallback_chain(
+            &backup_candidates,
+            target,
+            is_udp,
+            strong_privacy,
+            expires_at,
+        )
+        .ok()?;
+        let last = route_candidates.last()?;
         let mut capsule = super::mesh_onion::seal_capsule(
             last,
             strong_privacy,
             is_udp,
             1,
             expires_at,
-            nonce(),
-            super::mesh_onion::OnionInstruction::Exit {
+            fresh_onion_nonce(),
+            OnionInstruction::Exit {
                 target: target.to_owned(),
+                fallback,
+                failovers_left,
             },
         )
         .ok()?;
-        for index in (0..candidates.len().saturating_sub(1)).rev() {
+        for index in (0..route_candidates.len().saturating_sub(1)).rev() {
             capsule = super::mesh_onion::seal_capsule(
-                &candidates[index],
+                &route_candidates[index],
                 strong_privacy,
                 is_udp,
-                (candidates.len() - index) as u8,
+                (route_candidates.len() - index) as u8,
                 expires_at,
-                nonce(),
+                fresh_onion_nonce(),
                 super::mesh_onion::OnionInstruction::Forward {
-                    next_peer: candidates[index + 1].clone(),
+                    next_peer: route_candidates[index + 1].clone(),
                     next_capsule: capsule,
                 },
             )
             .ok()?;
         }
-        Some((candidates[0].clone(), capsule))
+        Some((route_candidates[0].clone(), capsule))
     }
 
     pub(crate) async fn send_mixed(
@@ -523,8 +552,19 @@ impl NodeMesh {
     /// two-node route and selects a healthy RTT-weighted egress per flow. For
     /// a larger limit, each flow also picks a random path length up to the cap.
     pub fn initial_route(&self) -> Option<MeshRoute> {
-        (self.max_hops > 1).then(|| MeshRoute {
-            remaining_hops: self.max_hops,
+        self.initial_route_for_preference(super::MeshRoutePreference::ServerDefault)
+    }
+
+    /// Apply the client request while retaining this ingress's configured hop
+    /// limit as a hard cap. A direct preference deliberately creates no mesh
+    /// route; every other route stays pinned to the flow after selection.
+    pub fn initial_route_for_preference(
+        &self,
+        preference: super::MeshRoutePreference,
+    ) -> Option<MeshRoute> {
+        let max_hops = preference.effective_max_hops(self.max_hops);
+        (max_hops > 1).then(|| MeshRoute {
+            remaining_hops: max_hops,
             // Even the normal two-hop mode must rotate healthy egress IPs.
             // `WeightedRandom` selects the egress in route_for_flow; path
             // length is randomized there only when the configured cap is > 2.
@@ -884,6 +924,36 @@ impl NodeMesh {
 
     pub async fn peer_count(&self) -> usize {
         self.peers.read().await.len()
+    }
+
+    /// Build the locally chosen backup chain used after this node's direct
+    /// egress attempt fails. Each peer receives a capsule for only its next
+    /// backup, so neither this node nor a downstream egress learns the full
+    /// chain. The local node is excluded before the chain is sealed.
+    pub(crate) async fn build_direct_onion_fallback(
+        &self,
+        target: &str,
+        is_udp: bool,
+        strong_privacy: bool,
+    ) -> Option<(OnionFallback, u8)> {
+        if target.is_empty() || target.len() > 2048 || target.contains('\0') {
+            return None;
+        }
+        let route = MeshRoute {
+            remaining_hops: 2,
+            selection: MeshRouteSelection::WeightedRandom,
+            egress_node_id: None,
+            visited: vec![self.local_node_id.clone()],
+        };
+        let peers = unique_mesh_peers(self.peers_for_route(&route).await);
+        let expires_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()?
+            .as_secs()
+            .saturating_add(60);
+        seal_onion_fallback_chain(&peers, target, is_udp, strong_privacy, expires_at)
+            .ok()
+            .and_then(|(fallback, count)| fallback.map(|fallback| (fallback, count)))
     }
 
     /// Open one logical flow over a pooled authenticated connection to `peer`.
@@ -1390,6 +1460,55 @@ impl MeshTunnelSender {
     }
 }
 
+fn unique_mesh_peers(peers: Vec<MeshPeer>) -> Vec<MeshPeer> {
+    let mut seen = std::collections::HashSet::with_capacity(peers.len());
+    peers
+        .into_iter()
+        .filter(|peer| seen.insert(peer.node_id.to_ascii_lowercase()))
+        .collect()
+}
+
+fn fresh_onion_nonce() -> [u8; 16] {
+    let mut rng = rand::rng();
+    std::array::from_fn(|_| rng.random::<u8>())
+}
+
+/// Seal the backup egresses into a one-link-at-a-time chain. The list is
+/// selected at the origin, but each capsule discloses only its immediate next
+/// peer and carries the rest encrypted for that peer.
+fn seal_onion_fallback_chain(
+    peers: &[MeshPeer],
+    target: &str,
+    is_udp: bool,
+    strong_privacy: bool,
+    expires_at: u64,
+) -> Result<(Option<OnionFallback>, u8), String> {
+    let peers = unique_mesh_peers(peers.to_vec());
+    let count = peers.len().min(usize::from(MAX_EGRESS_FAILOVERS));
+    let mut next: Option<OnionFallback> = None;
+    for index in (0..count).rev() {
+        let failovers_left = (count - index - 1) as u8;
+        let capsule = super::mesh_onion::seal_capsule(
+            &peers[index],
+            strong_privacy,
+            is_udp,
+            1,
+            expires_at,
+            fresh_onion_nonce(),
+            OnionInstruction::Exit {
+                target: target.to_owned(),
+                fallback: next,
+                failovers_left,
+            },
+        )?;
+        next = Some(OnionFallback {
+            peer: peers[index].clone(),
+            capsule,
+        });
+    }
+    Ok((next, count as u8))
+}
+
 impl std::fmt::Debug for NodeMesh {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NodeMesh")
@@ -1678,6 +1797,36 @@ mod tests {
         assert_ne!(peers[0].node_id, mesh.local_node_id());
     }
 
+    #[test]
+    fn initial_route_honors_client_preference_but_never_exceeds_server_cap() {
+        let mesh = NodeMesh::with_max_hops("ingress".into(), "node-secret".into(), 5);
+        assert!(mesh
+            .initial_route_for_preference(super::super::MeshRoutePreference::Direct)
+            .is_none());
+        assert_eq!(
+            mesh.initial_route_for_preference(super::super::MeshRoutePreference::TwoHop)
+                .unwrap()
+                .remaining_hops,
+            2
+        );
+        assert_eq!(
+            mesh.initial_route_for_preference(super::super::MeshRoutePreference::RandomUpTo(4))
+                .unwrap()
+                .remaining_hops,
+            4
+        );
+        assert_eq!(mesh.initial_route().unwrap().remaining_hops, 5);
+
+        let capped = NodeMesh::with_max_hops("ingress".into(), "node-secret".into(), 2);
+        assert_eq!(
+            capped
+                .initial_route_for_preference(super::super::MeshRoutePreference::RandomUpTo(8))
+                .unwrap()
+                .remaining_hops,
+            2
+        );
+    }
+
     #[tokio::test]
     async fn two_hop_routes_rotate_over_unique_healthy_egress_ips() {
         let mesh = mesh_with_healthy_peers(
@@ -1805,7 +1954,7 @@ mod tests {
         }
 
         let (mut next_peer, mut capsule) = mesh
-            .build_onion_route("example.com:443", true, true, &[])
+            .build_onion_route("example.com:443", true, true, &[], 5)
             .await
             .expect("healthy peers should build an onion path");
         let mut visited = HashSet::from(["ingress".to_owned()]);
@@ -1828,13 +1977,132 @@ mod tests {
                     next_peer = following;
                     capsule = next_capsule;
                 }
-                super::super::mesh_onion::OnionInstruction::Exit { target } => {
+                super::super::mesh_onion::OnionInstruction::Exit {
+                    target,
+                    fallback,
+                    failovers_left,
+                } => {
                     assert_eq!(target, "example.com:443");
+                    assert_eq!(fallback.is_some(), failovers_left > 0);
+                    let expected_failovers = failovers_left;
+                    let mut current_fallback = fallback;
+                    let mut observed = 0;
+                    while let Some(next) = current_fallback {
+                        assert!(visited.insert(next.peer.node_id.to_ascii_lowercase()));
+                        observed += 1;
+                        let backup_identity = identities.get(&next.peer.node_id).unwrap();
+                        let backup_layer = super::super::mesh_onion::open_capsule(
+                            &next.peer.node_id,
+                            backup_identity,
+                            &next.capsule,
+                        )
+                        .unwrap();
+                        assert_eq!(backup_layer.remaining_hops, 1);
+                        let super::super::mesh_onion::OnionInstruction::Exit {
+                            target: backup_target,
+                            fallback: following,
+                            failovers_left: remaining,
+                        } = backup_layer.instruction
+                        else {
+                            panic!("backup egress must receive an exit instruction")
+                        };
+                        assert_eq!(backup_target, "example.com:443");
+                        assert_eq!(remaining, expected_failovers - observed);
+                        assert_eq!(following.is_some(), remaining > 0);
+                        current_fallback = following;
+                    }
+                    assert_eq!(observed, expected_failovers);
                     break;
                 }
             }
         }
         assert!((2..=4).contains(&remote_hops));
+    }
+
+    #[tokio::test]
+    async fn direct_egress_fallback_is_empty_when_no_backup_is_available() {
+        let mesh = NodeMesh::new("local".into(), "secret".into());
+        mesh.update_peers(vec![peer("local", "192.0.2.1", 443)])
+            .await;
+        assert!(mesh
+            .build_direct_onion_fallback("example.com:443", false, false)
+            .await
+            .is_none());
+
+        let (_, public) = X25519HkdfSha256::gen_keypair();
+        let mut backup = peer("backup", "192.0.2.2", 443);
+        backup.nrxp_static_public = hex::encode(public.to_bytes().as_slice());
+        mesh.update_peers(vec![peer("local", "192.0.2.1", 443), backup])
+            .await;
+        let (fallback, count) = mesh
+            .build_direct_onion_fallback("example.com:443", false, false)
+            .await
+            .expect("one backup should be available");
+        assert_eq!(count, 1);
+        assert_eq!(fallback.peer.node_id, "backup");
+    }
+
+    #[test]
+    fn maximum_fallback_chain_is_bounded_and_each_capsule_has_one_next_peer() {
+        use super::super::mesh_onion::MAX_EGRESS_FAILOVERS;
+
+        let mut peers = Vec::new();
+        let mut identities = std::collections::HashMap::new();
+        for index in 0..usize::from(MAX_EGRESS_FAILOVERS) {
+            let node_id = format!("backup-{index}");
+            let (private, public) = X25519HkdfSha256::gen_keypair();
+            peers.push(MeshPeer {
+                node_id: node_id.clone(),
+                host: format!("192.0.2.{}", index + 10),
+                port: 443,
+                decoy_sni: "www.example.org".into(),
+                nrxp_secret: format!("secret-{index}"),
+                nrxp_static_public: hex::encode(public.to_bytes().as_slice()),
+            });
+            identities.insert(
+                node_id,
+                crate::crypto::LocalIdentity::from_hex(
+                    &hex::encode([index as u8 + 20; 32]),
+                    &hex::encode(private.to_bytes()),
+                    true,
+                )
+                .unwrap(),
+            );
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let (mut fallback, count) =
+            super::seal_onion_fallback_chain(&peers, "example.com:443", false, false, now + 60)
+                .unwrap();
+        assert_eq!(count, MAX_EGRESS_FAILOVERS);
+
+        let mut seen = HashSet::new();
+        for remaining in (0..MAX_EGRESS_FAILOVERS).rev() {
+            let current = fallback.take().expect("chain must contain every backup");
+            assert!(seen.insert(current.peer.node_id.clone()));
+            let identity = identities.get(&current.peer.node_id).unwrap();
+            let opened = super::super::mesh_onion::open_capsule(
+                &current.peer.node_id,
+                identity,
+                &current.capsule,
+            )
+            .unwrap();
+            let super::super::mesh_onion::OnionInstruction::Exit {
+                fallback: next,
+                failovers_left,
+                ..
+            } = opened.instruction
+            else {
+                panic!("fallback capsule must contain an exit instruction")
+            };
+            assert_eq!(failovers_left, remaining);
+            assert_eq!(next.is_some(), remaining > 0);
+            fallback = next;
+        }
+        assert!(fallback.is_none());
+        assert_eq!(seen.len(), usize::from(MAX_EGRESS_FAILOVERS));
     }
 
     #[tokio::test]
@@ -1869,6 +2137,8 @@ mod tests {
             [0x42; 16],
             super::super::mesh_onion::OnionInstruction::Exit {
                 target: "example.com:443".into(),
+                fallback: None,
+                failovers_left: 0,
             },
         )
         .unwrap();
@@ -1884,6 +2154,8 @@ mod tests {
             [0x43; 16],
             super::super::mesh_onion::OnionInstruction::Exit {
                 target: "example.com:443".into(),
+                fallback: None,
+                failovers_left: 0,
             },
         )
         .unwrap();

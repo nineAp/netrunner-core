@@ -140,6 +140,11 @@ impl ClientHello {
         if keys.claimed_version() >= crate::MIN_VERSION_FOR_CIPHER_PREFERENCE {
             session_id_bytes[1] = keys.data_cipher_preference_wire_code();
         }
+        if keys.claimed_version() >= crate::MIN_VERSION_FOR_MESH_ROUTE_PREFERENCE {
+            let (mode, hops) = keys.mesh_route_preference_wire_codes();
+            session_id_bytes[2] = mode;
+            session_id_bytes[3] = hops;
+        }
 
         // session_id[16..32] = auth-тег: сервер проверит его первым делом и
         // отвергнет ClientHello без валидного тега. В схеме v3 тег считается на
@@ -826,7 +831,7 @@ mod tests {
     }
 
     #[test]
-    fn authenticated_handshake_derives_matching_keys_and_claims_current_version() {
+    fn authenticated_default_handshake_keeps_v5_compatibility() {
         let (peer, local) = identity_pair([7u8; 32], [9u8; 32], true);
 
         let client_keys = SessionKeys::with_identity(true, peer.clone());
@@ -838,8 +843,8 @@ mod tests {
         let (client_hello, _) = parse_client_hello_record(&ch_wire);
         assert_eq!(
             client_hello.session_id[0],
-            crate::PROTOCOL_VERSION,
-            "клиент с учётными данными обязан заявлять текущую версию протокола"
+            crate::PROTOCOL_VERSION.min(crate::MIN_VERSION_FOR_CIPHER_PREFERENCE),
+            "default route policy must remain compatible with v5 nodes"
         );
         // Раскладка `session_id` не изменилась: те же 32 байта, тег на том же
         // месте. Версия шифра не добавляет новых байтов.
@@ -1001,6 +1006,52 @@ mod tests {
         assert!(
             !wrong.verify_handshake_tag(&tag, &client_hello.random, &peer_public),
             "нода с другим секретом обязана отвергнуть тег"
+        );
+    }
+
+    #[cfg(feature = "ring-aead")]
+    #[test]
+    fn route_preference_is_authenticated_and_default_remains_v5_compatible() {
+        let (peer, local) = identity_pair([27u8; 32], [29u8; 32], true);
+        let mut client_keys = SessionKeys::with_identity(true, peer);
+        client_keys.set_mesh_route_preference(crate::net::MeshRoutePreference::RandomUpTo(5));
+        let ch_wire = ClientHello::make_client_hello(
+            &BrowserProfile::CHROME_131,
+            "example.com",
+            &client_keys,
+        );
+        let (client_hello, client_ext) = parse_client_hello_record(&ch_wire);
+        assert_eq!(
+            client_hello.session_id[0],
+            crate::MIN_VERSION_FOR_MESH_ROUTE_PREFERENCE
+        );
+        assert_eq!(&client_hello.session_id[2..4], &[3, 5]);
+
+        let mut server_keys = SessionKeys::with_identity(false, local);
+        server_keys.set_peer_version(client_hello.session_id[0]);
+        assert!(server_keys.set_peer_mesh_route_preference(
+            client_hello.session_id[2],
+            client_hello.session_id[3],
+        ));
+        let mut tag = [0u8; 16];
+        tag.copy_from_slice(&client_hello.session_id[16..32]);
+        let peer_public = SessionKeys::extract_peer_public(&client_ext, true).unwrap();
+        assert!(server_keys.verify_handshake_tag(&tag, &client_hello.random, &peer_public));
+
+        assert!(server_keys.set_peer_mesh_route_preference(3, 4));
+        assert!(!server_keys.verify_handshake_tag(&tag, &client_hello.random, &peer_public));
+
+        let (peer, _) = identity_pair([31u8; 32], [33u8; 32], true);
+        let default_keys = SessionKeys::with_identity(true, peer);
+        let default_wire = ClientHello::make_client_hello(
+            &BrowserProfile::CHROME_131,
+            "example.com",
+            &default_keys,
+        );
+        let (default_hello, _) = parse_client_hello_record(&default_wire);
+        assert_eq!(
+            default_hello.session_id[0],
+            crate::PROTOCOL_VERSION.min(crate::MIN_VERSION_FOR_CIPHER_PREFERENCE)
         );
     }
 
