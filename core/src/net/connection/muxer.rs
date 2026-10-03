@@ -1153,13 +1153,19 @@ impl Muxer {
             return;
         };
         let stats = &leg.stats;
-        let new_value = stats
-            .queued_data_bytes
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                Some(current.saturating_sub(bytes))
-            })
-            .map(|previous| previous.saturating_sub(bytes))
-            .unwrap_or(0);
+        let mut current = stats.queued_data_bytes.load(Ordering::Acquire);
+        let new_value = loop {
+            let updated = current.saturating_sub(bytes);
+            match stats.queued_data_bytes.compare_exchange_weak(
+                current,
+                updated,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break updated,
+                Err(actual) => current = actual,
+            }
+        };
         if new_value == 0 {
             stats.queued_since_ms.store(0, Ordering::Release);
         }
