@@ -1061,7 +1061,7 @@ impl NodeMesh {
 }
 
 async fn run_mix_scheduler(mut receiver: mpsc::Receiver<MixPacket>) {
-    let lane_tails: Arc<Mutex<HashMap<String, (u64, oneshot::Receiver<()>)>>> =
+    let flow_tails: Arc<Mutex<HashMap<String, (u64, oneshot::Receiver<()>)>>> =
         Arc::new(Mutex::new(HashMap::new()));
     let in_flight_packets = Arc::new(Semaphore::new(4096));
     let mut sequence = 0u64;
@@ -1075,19 +1075,22 @@ async fn run_mix_scheduler(mut receiver: mpsc::Receiver<MixPacket>) {
             }
         }
 
-        // Queue packets by their actual outbound lane. Flows sharing one peer
-        // QUIC session are mixed together; different peer sessions stay
-        // independent so congestion on one relay cannot stall the others.
-        let mut lanes: HashMap<String, Vec<MixPacket>> = HashMap::new();
-        let mut lane_order = Vec::new();
-        for packet in batch {
+        let (schedule, flow_count) = interleave_mix_batch(batch);
+        metrics::histogram!("netrunner_mix_batch_packets").record(schedule.len() as f64);
+        metrics::histogram!("netrunner_mix_batch_flows").record(flow_count as f64);
+
+        // Keep each stream ordered, but submit different streams concurrently.
+        // A slow or full leg for one stream must not hold every other stream in
+        // the same peer session behind its send_data_safe().await.
+        let mut flow_groups: HashMap<String, Vec<MixPacket>> = HashMap::new();
+        let mut flow_order = Vec::new();
+        for packet in schedule {
             if packet.cancel.is_cancelled() {
                 continue;
             }
-            let lane_key = mix_lane_key(&packet);
-            match lanes.entry(lane_key) {
+            match flow_groups.entry(packet.flow_id.clone()) {
                 std::collections::hash_map::Entry::Vacant(entry) => {
-                    lane_order.push(entry.key().clone());
+                    flow_order.push(entry.key().clone());
                     entry.insert(vec![packet]);
                 }
                 std::collections::hash_map::Entry::Occupied(mut entry) => {
@@ -1096,22 +1099,12 @@ async fn run_mix_scheduler(mut receiver: mpsc::Receiver<MixPacket>) {
             }
         }
 
-        for lane_key in lane_order {
-            let Some(packets) = lanes.remove(&lane_key) else {
+        for flow_key in flow_order {
+            let Some(packets) = flow_groups.remove(&flow_key) else {
                 continue;
             };
-            let (schedule, flow_count) = interleave_mix_batch(packets);
-            metrics::histogram!("netrunner_mix_batch_packets").record(schedule.len() as f64);
-            metrics::histogram!("netrunner_mix_batch_flows").record(flow_count as f64);
-            if schedule.is_empty() {
-                continue;
-            }
-
-            // Task count tracks active outbound lanes, not packet count. Each
-            // lane worker submits packets in the randomized schedule; the
-            // packet's target and stream id travel with it unchanged.
-            let mut permits = Vec::with_capacity(schedule.len());
-            for _ in 0..schedule.len() {
+            let mut permits = Vec::with_capacity(packets.len());
+            for _ in 0..packets.len() {
                 let Ok(permit) = in_flight_packets.clone().acquire_owned().await else {
                     return;
                 };
@@ -1119,19 +1112,23 @@ async fn run_mix_scheduler(mut receiver: mpsc::Receiver<MixPacket>) {
             }
             sequence = sequence.wrapping_add(1);
             let this_sequence = sequence;
+            let cancel = packets[0].cancel.clone();
             let (done_tx, done_rx) = oneshot::channel();
             let previous = {
-                let mut tails = lane_tails.lock().await;
-                let previous = tails.remove(&lane_key).map(|(_, receiver)| receiver);
-                tails.insert(lane_key.clone(), (this_sequence, done_rx));
+                let mut tails = flow_tails.lock().await;
+                let previous = tails.remove(&flow_key).map(|(_, receiver)| receiver);
+                tails.insert(flow_key.clone(), (this_sequence, done_rx));
                 previous
             };
-            let tails = lane_tails.clone();
+            let tails = flow_tails.clone();
             tokio::spawn(async move {
                 if let Some(previous) = previous {
-                    let _ = previous.await;
+                    tokio::select! {
+                        _ = cancel.cancelled() => {},
+                        _ = previous => {},
+                    }
                 }
-                for (packet, permit) in schedule.into_iter().zip(permits) {
+                for (packet, permit) in packets.into_iter().zip(permits) {
                     if !packet.cancel.is_cancelled() {
                         let failed = match packet.target {
                             MixTarget::Tunnel(muxer) => {
@@ -1159,23 +1156,16 @@ async fn run_mix_scheduler(mut receiver: mpsc::Receiver<MixPacket>) {
                 let _ = done_tx.send(());
                 let mut tails = tails.lock().await;
                 if tails
-                    .get(&lane_key)
+                    .get(&flow_key)
                     .is_some_and(|(current_sequence, _)| *current_sequence == this_sequence)
                 {
-                    tails.remove(&lane_key);
+                    tails.remove(&flow_key);
                 }
             });
+            if flow_count > 1 {
+                tokio::task::yield_now().await;
+            }
         }
-    }
-}
-
-fn mix_lane_key(packet: &MixPacket) -> String {
-    match &packet.target {
-        MixTarget::Tunnel(muxer) => format!("peer:{}", muxer.session_id()),
-        // Public Internet sockets are already separate destinations at the
-        // exit. Keep their backpressure isolated instead of coupling unrelated
-        // sites through one local socket writer.
-        MixTarget::Local(_) => format!("local:{}", packet.flow_id),
     }
 }
 
@@ -1617,7 +1607,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn strong_privacy_mixer_interleaves_shared_peer_lane_without_crossing_streams() {
+    async fn strong_privacy_mixer_preserves_order_on_shared_peer_session() {
         let muxer = std::sync::Arc::new(crate::net::connection::Muxer::new(
             false,
             "shared-peer-session".into(),
@@ -1650,7 +1640,6 @@ mod tests {
 
         let mut youtube_sequences = Vec::new();
         let mut other_sequences = Vec::new();
-        let mut observed_streams = Vec::new();
         for _ in 0..16 {
             let message = tokio::time::timeout(Duration::from_secs(2), data_rx.recv())
                 .await
@@ -1664,14 +1653,10 @@ mod tests {
                 (b'O', 202) => other_sequences.push(sequence),
                 _ => panic!("packet was delivered with another flow's stream id"),
             }
-            observed_streams.push(message.stream_id);
         }
 
         assert_eq!(youtube_sequences, (0..8).collect::<Vec<_>>());
         assert_eq!(other_sequences, (0..8).collect::<Vec<_>>());
-        for round in observed_streams.chunks_exact(2) {
-            assert_ne!(round[0], round[1]);
-        }
     }
 
     #[tokio::test]
