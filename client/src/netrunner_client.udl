@@ -41,6 +41,8 @@ dictionary SessionParams {
 
 interface SessionManager {
     constructor();
+    void set_strong_privacy(boolean enabled);
+    boolean strong_privacy_enabled();
     Session spawn_session(SessionParams params);
     VpnTrafficStats get_traffic_stats();
 };
