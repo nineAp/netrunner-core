@@ -1061,7 +1061,7 @@ impl NodeMesh {
 }
 
 async fn run_mix_scheduler(mut receiver: mpsc::Receiver<MixPacket>) {
-    let flow_tails: Arc<Mutex<HashMap<String, (u64, oneshot::Receiver<()>)>>> =
+    let lane_tails: Arc<Mutex<HashMap<String, (u64, oneshot::Receiver<()>)>>> =
         Arc::new(Mutex::new(HashMap::new()));
     let in_flight_packets = Arc::new(Semaphore::new(4096));
     let mut sequence = 0u64;
@@ -1075,51 +1075,64 @@ async fn run_mix_scheduler(mut receiver: mpsc::Receiver<MixPacket>) {
             }
         }
 
-        // Shuffle flow groups, not packets within one flow. This adds
-        // cross-flow mixing while preserving TCP byte order and UDP datagram
-        // order for every individual stream.
-        let mut groups: HashMap<String, Vec<MixPacket>> = HashMap::new();
+        // Queue packets by their actual outbound lane. Flows sharing one peer
+        // QUIC session are mixed together; different peer sessions stay
+        // independent so congestion on one relay cannot stall the others.
+        let mut lanes: HashMap<String, Vec<MixPacket>> = HashMap::new();
+        let mut lane_order = Vec::new();
         for packet in batch {
-            groups
-                .entry(packet.flow_id.clone())
-                .or_default()
-                .push(packet);
-        }
-        let mut flow_keys: Vec<_> = groups.keys().cloned().collect();
-        {
-            let mut rng = rand::rng();
-            for index in (1..flow_keys.len()).rev() {
-                let swap_with = rng.random_range(0..=index);
-                flow_keys.swap(index, swap_with);
+            if packet.cancel.is_cancelled() {
+                continue;
+            }
+            let lane_key = mix_lane_key(&packet);
+            match lanes.entry(lane_key) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    lane_order.push(entry.key().clone());
+                    entry.insert(vec![packet]);
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    entry.get_mut().push(packet);
+                }
             }
         }
-        for flow_key in flow_keys {
-            if let Some(packets) = groups.remove(&flow_key) {
-                let mut permits = Vec::with_capacity(packets.len());
-                for _ in 0..packets.len() {
-                    let Ok(permit) = in_flight_packets.clone().acquire_owned().await else {
-                        return;
-                    };
-                    permits.push(permit);
-                }
-                sequence = sequence.wrapping_add(1);
-                let this_sequence = sequence;
-                let (done_tx, done_rx) = oneshot::channel();
-                let previous = {
-                    let mut tails = flow_tails.lock().await;
-                    let previous = tails.remove(&flow_key).map(|(_, receiver)| receiver);
-                    tails.insert(flow_key.clone(), (this_sequence, done_rx));
-                    previous
+
+        for lane_key in lane_order {
+            let Some(packets) = lanes.remove(&lane_key) else {
+                continue;
+            };
+            let (schedule, flow_count) = interleave_mix_batch(packets);
+            metrics::histogram!("netrunner_mix_batch_packets").record(schedule.len() as f64);
+            metrics::histogram!("netrunner_mix_batch_flows").record(flow_count as f64);
+            if schedule.is_empty() {
+                continue;
+            }
+
+            // Task count tracks active outbound lanes, not packet count. Each
+            // lane worker submits packets in the randomized schedule; the
+            // packet's target and stream id travel with it unchanged.
+            let mut permits = Vec::with_capacity(schedule.len());
+            for _ in 0..schedule.len() {
+                let Ok(permit) = in_flight_packets.clone().acquire_owned().await else {
+                    return;
                 };
-                let tails = flow_tails.clone();
-                tokio::spawn(async move {
-                    if let Some(previous) = previous {
-                        let _ = previous.await;
-                    }
-                    for packet in packets {
-                        if packet.cancel.is_cancelled() {
-                            continue;
-                        }
+                permits.push(permit);
+            }
+            sequence = sequence.wrapping_add(1);
+            let this_sequence = sequence;
+            let (done_tx, done_rx) = oneshot::channel();
+            let previous = {
+                let mut tails = lane_tails.lock().await;
+                let previous = tails.remove(&lane_key).map(|(_, receiver)| receiver);
+                tails.insert(lane_key.clone(), (this_sequence, done_rx));
+                previous
+            };
+            let tails = lane_tails.clone();
+            tokio::spawn(async move {
+                if let Some(previous) = previous {
+                    let _ = previous.await;
+                }
+                for (packet, permit) in schedule.into_iter().zip(permits) {
+                    if !packet.cancel.is_cancelled() {
                         let failed = match packet.target {
                             MixTarget::Tunnel(muxer) => {
                                 muxer.is_fatal()
@@ -1138,19 +1151,77 @@ async fn run_mix_scheduler(mut receiver: mpsc::Receiver<MixPacket>) {
                             metrics::counter!("netrunner_mix_packet_drops_total").increment(1);
                         }
                     }
-                    drop(permits);
-                    let _ = done_tx.send(());
-                    let mut tails = tails.lock().await;
-                    if tails
-                        .get(&flow_key)
-                        .is_some_and(|(current_sequence, _)| *current_sequence == this_sequence)
-                    {
-                        tails.remove(&flow_key);
+                    drop(permit);
+                    if flow_count > 1 {
+                        tokio::task::yield_now().await;
                     }
-                });
-            }
+                }
+                let _ = done_tx.send(());
+                let mut tails = tails.lock().await;
+                if tails
+                    .get(&lane_key)
+                    .is_some_and(|(current_sequence, _)| *current_sequence == this_sequence)
+                {
+                    tails.remove(&lane_key);
+                }
+            });
         }
     }
+}
+
+fn mix_lane_key(packet: &MixPacket) -> String {
+    match &packet.target {
+        MixTarget::Tunnel(muxer) => format!("peer:{}", muxer.session_id()),
+        // Public Internet sockets are already separate destinations at the
+        // exit. Keep their backpressure isolated instead of coupling unrelated
+        // sites through one local socket writer.
+        MixTarget::Local(_) => format!("local:{}", packet.flow_id),
+    }
+}
+
+/// Randomly interleave packets across flows without changing packet contents,
+/// routing target, stream id, or order within an individual flow.
+fn interleave_mix_batch(batch: Vec<MixPacket>) -> (Vec<MixPacket>, usize) {
+    let mut groups: HashMap<String, VecDeque<MixPacket>> = HashMap::new();
+    for packet in batch {
+        if packet.cancel.is_cancelled() {
+            continue;
+        }
+        groups
+            .entry(packet.flow_id.clone())
+            .or_default()
+            .push_back(packet);
+    }
+
+    let flow_count = groups.len();
+    let mut active_flows: Vec<_> = groups.keys().cloned().collect();
+    let mut schedule = Vec::with_capacity(groups.values().map(VecDeque::len).sum());
+    let mut rng = rand::rng();
+
+    while !active_flows.is_empty() {
+        // Shuffle each round independently. A flow with a large burst cannot
+        // monopolize the batch while short flows wait behind it.
+        for index in (1..active_flows.len()).rev() {
+            let swap_with = rng.random_range(0..=index);
+            active_flows.swap(index, swap_with);
+        }
+
+        let mut next_round = Vec::with_capacity(active_flows.len());
+        for flow_id in active_flows.drain(..) {
+            let Some(queue) = groups.get_mut(&flow_id) else {
+                continue;
+            };
+            if let Some(packet) = queue.pop_front() {
+                schedule.push(packet);
+            }
+            if !queue.is_empty() {
+                next_round.push(flow_id);
+            }
+        }
+        active_flows = next_round;
+    }
+
+    (schedule, flow_count)
 }
 
 fn sha256(value: &[u8]) -> [u8; 32] {
@@ -1343,8 +1414,8 @@ pub type SharedNodeMesh = Arc<NodeMesh>;
 #[cfg(test)]
 mod tests {
     use super::{
-        run_mix_scheduler, MeshPeer, MeshRoute, MeshRouteSelection, MixPacket, MixTarget, NodeMesh,
-        PeerProbe, PEER_PROBE_MAX_AGE,
+        interleave_mix_batch, run_mix_scheduler, MeshPeer, MeshRoute, MeshRouteSelection,
+        MixPacket, MixTarget, NodeMesh, PeerProbe, PEER_PROBE_MAX_AGE,
     };
     use hpke::{kem::X25519HkdfSha256, Kem as KemTrait, Serializable};
     use std::{
@@ -1419,6 +1490,187 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(payload.as_ref(), &[expected]);
+        }
+    }
+
+    #[test]
+    fn strong_privacy_batch_interleaves_flows_without_changing_routes_or_order() {
+        let (youtube_tx, _youtube_rx) = tokio::sync::mpsc::channel(32);
+        let (other_tx, _other_rx) = tokio::sync::mpsc::channel(32);
+        let cancel = CancellationToken::new();
+        let mut batch = Vec::new();
+        for sequence in 0..16u8 {
+            batch.push(MixPacket {
+                flow_id: "youtube-flow".into(),
+                target: MixTarget::Local(youtube_tx.clone()),
+                stream_id: 101,
+                payload: bytes::Bytes::from(vec![b'Y', sequence]),
+                is_udp: true,
+                cancel: cancel.clone(),
+            });
+            batch.push(MixPacket {
+                flow_id: "other-flow".into(),
+                target: MixTarget::Local(other_tx.clone()),
+                stream_id: 202,
+                payload: bytes::Bytes::from(vec![b'O', sequence]),
+                is_udp: false,
+                cancel: cancel.clone(),
+            });
+        }
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        batch.push(MixPacket {
+            flow_id: "cancelled-flow".into(),
+            target: MixTarget::Local(other_tx.clone()),
+            stream_id: 303,
+            payload: bytes::Bytes::from_static(b"X"),
+            is_udp: false,
+            cancel: cancelled,
+        });
+
+        let (schedule, flow_count) = interleave_mix_batch(batch);
+        assert_eq!(flow_count, 2);
+        assert_eq!(schedule.len(), 32);
+
+        let mut youtube_sequences = Vec::new();
+        let mut other_sequences = Vec::new();
+        for round in schedule.chunks_exact(2) {
+            assert_ne!(round[0].flow_id, round[1].flow_id);
+            for packet in round {
+                let tag = packet.payload[0];
+                let sequence = packet.payload[1];
+                match tag {
+                    b'Y' => {
+                        assert_eq!(packet.flow_id, "youtube-flow");
+                        assert_eq!(packet.stream_id, 101);
+                        assert!(packet.is_udp);
+                        assert!(matches!(
+                            &packet.target,
+                            MixTarget::Local(target) if target.same_channel(&youtube_tx)
+                        ));
+                        youtube_sequences.push(sequence);
+                    }
+                    b'O' => {
+                        assert_eq!(packet.flow_id, "other-flow");
+                        assert_eq!(packet.stream_id, 202);
+                        assert!(!packet.is_udp);
+                        assert!(matches!(
+                            &packet.target,
+                            MixTarget::Local(target) if target.same_channel(&other_tx)
+                        ));
+                        other_sequences.push(sequence);
+                    }
+                    _ => panic!("unexpected packet payload"),
+                }
+            }
+        }
+        assert_eq!(youtube_sequences, (0..16).collect::<Vec<_>>());
+        assert_eq!(other_sequences, (0..16).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn strong_privacy_scheduler_keeps_packets_on_their_original_targets() {
+        let (mix_tx, mix_rx) = tokio::sync::mpsc::channel(32);
+        let (youtube_tx, mut youtube_rx) = tokio::sync::mpsc::channel(8);
+        let (other_tx, mut other_rx) = tokio::sync::mpsc::channel(8);
+        tokio::spawn(run_mix_scheduler(mix_rx));
+        let cancel = CancellationToken::new();
+
+        for sequence in 0..4u8 {
+            mix_tx
+                .send(MixPacket {
+                    flow_id: "youtube-flow".into(),
+                    target: MixTarget::Local(youtube_tx.clone()),
+                    stream_id: 11,
+                    payload: bytes::Bytes::from(vec![b'Y', sequence]),
+                    is_udp: false,
+                    cancel: cancel.clone(),
+                })
+                .await
+                .unwrap();
+            mix_tx
+                .send(MixPacket {
+                    flow_id: "other-flow".into(),
+                    target: MixTarget::Local(other_tx.clone()),
+                    stream_id: 22,
+                    payload: bytes::Bytes::from(vec![b'O', sequence]),
+                    is_udp: false,
+                    cancel: cancel.clone(),
+                })
+                .await
+                .unwrap();
+        }
+        drop(mix_tx);
+
+        for sequence in 0..4u8 {
+            let youtube = tokio::time::timeout(Duration::from_secs(2), youtube_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let other = tokio::time::timeout(Duration::from_secs(2), other_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(youtube.as_ref(), &[b'Y', sequence]);
+            assert_eq!(other.as_ref(), &[b'O', sequence]);
+        }
+    }
+
+    #[tokio::test]
+    async fn strong_privacy_mixer_interleaves_shared_peer_lane_without_crossing_streams() {
+        let muxer = std::sync::Arc::new(crate::net::connection::Muxer::new(
+            false,
+            "shared-peer-session".into(),
+        ));
+        let (control_tx, _control_rx) = tokio::sync::mpsc::channel(32);
+        let (data_tx, mut data_rx) = tokio::sync::mpsc::channel(32);
+        muxer.add_leg(0, control_tx, data_tx);
+
+        let (mix_tx, mix_rx) = tokio::sync::mpsc::channel(32);
+        tokio::spawn(run_mix_scheduler(mix_rx));
+        let cancel = CancellationToken::new();
+        for sequence in 0..8u8 {
+            for (flow_id, stream_id, tag) in
+                [("youtube-flow", 101, b'Y'), ("other-flow", 202, b'O')]
+            {
+                mix_tx
+                    .send(MixPacket {
+                        flow_id: flow_id.into(),
+                        target: MixTarget::Tunnel(muxer.clone()),
+                        stream_id,
+                        payload: bytes::Bytes::from(vec![tag, sequence]),
+                        is_udp: false,
+                        cancel: cancel.clone(),
+                    })
+                    .await
+                    .unwrap();
+            }
+        }
+        drop(mix_tx);
+
+        let mut youtube_sequences = Vec::new();
+        let mut other_sequences = Vec::new();
+        let mut observed_streams = Vec::new();
+        for _ in 0..16 {
+            let message = tokio::time::timeout(Duration::from_secs(2), data_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(message.frame_type, crate::nrxp::FrameType::Data);
+            let tag = message.data[0];
+            let sequence = message.data[1];
+            match (tag, message.stream_id) {
+                (b'Y', 101) => youtube_sequences.push(sequence),
+                (b'O', 202) => other_sequences.push(sequence),
+                _ => panic!("packet was delivered with another flow's stream id"),
+            }
+            observed_streams.push(message.stream_id);
+        }
+
+        assert_eq!(youtube_sequences, (0..8).collect::<Vec<_>>());
+        assert_eq!(other_sequences, (0..8).collect::<Vec<_>>());
+        for round in observed_streams.chunks_exact(2) {
+            assert_ne!(round[0], round[1]);
         }
     }
 
