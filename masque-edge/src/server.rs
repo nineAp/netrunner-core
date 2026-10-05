@@ -16,7 +16,7 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use h3::{ext::Protocol, quic::StreamId, server::RequestStream};
 use h3_datagram::datagram_handler::HandleDatagramsExt;
 use http::{Method, Request, Response, StatusCode};
-use netrunner_core::net::{MeshPeer, MeshTunnel, MeshTunnelSender, NodeMesh};
+use netrunner_core::net::{MeshPeer, MeshTunnel, MeshTunnelSender, NetworkConfig, NodeMesh};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpStream, UdpSocket},
@@ -60,6 +60,26 @@ pub fn install_crypto_provider() {
     });
 }
 
+/// MTU, под который `netrunner-server` инициализирует глобальный
+/// [`NetworkConfig`]. Релей ходит в меш теми же NRXP-ногами, поэтому берёт то же
+/// значение: размеры буферов и ёмкости каналов обязаны совпадать у обоих концов.
+const NETWORK_CONFIG_MTU: usize = 1450;
+
+/// Инициализирует глобальный [`NetworkConfig`] ядра — ровно один раз на процесс.
+///
+/// Код меша в `netrunner-core` (`connect_mesh_session`, `Connection::new_*`,
+/// `MeshPeerSession::open_stream`) читает `NetworkConfig::global()`, а тот
+/// паникует, пока кто-нибудь не вызвал `init_global`. В `netrunner-server` это
+/// делает `Network::run`, а релей — отдельный процесс с собственным `main`, до
+/// которого этот вызов не доходил: любой CONNECT/CONNECT-UDP при
+/// `MESH_ENABLED=true` падал паникой в задаче запроса, клиент не получал ответа
+/// вовсе, а само QUIC-соединение при этом оставалось «живым». Снаружи это
+/// выглядело как «подключения идут, а дальше всё глохнет».
+pub fn init_network_config() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| NetworkConfig::init_global(NETWORK_CONFIG_MTU));
+}
+
 pub struct Config {
     pub bind: SocketAddr,
     pub cert: PathBuf,
@@ -78,6 +98,7 @@ pub struct MeshConfig {
 }
 
 pub async fn run(config: Config) -> Result<()> {
+    init_network_config();
     let mesh = config.mesh.map(|mesh_config| {
         let mesh = Arc::new(NodeMesh::with_max_hops(
             mesh_config.node_id.clone(),
@@ -204,6 +225,9 @@ async fn handle_connection(
     mesh: Option<Arc<NodeMesh>>,
 ) -> Result<()> {
     let remote = connection.remote_address();
+    // Исходящие CONNECT-UDP датаграммы пишем в QUIC напрямую, см.
+    // `encode_connect_udp_datagram`.
+    let datagram_connection = connection.clone();
     let quinn_connection = h3_quinn::Connection::new(connection);
     let mut builder = h3::server::builder();
     builder.enable_extended_connect(true).enable_datagram(true);
@@ -288,7 +312,7 @@ async fn handle_connection(
                 continue;
             }
         };
-        let datagram_sender = h3.get_datagram_sender(stream.id());
+        let request_datagram_connection = datagram_connection.clone();
         let request_auth = auth.clone();
         let request_sessions = Arc::clone(&sessions);
         let request_mesh = mesh.clone();
@@ -297,7 +321,7 @@ async fn handle_connection(
             if let Err(error) = handle_request(
                 request,
                 stream,
-                datagram_sender,
+                request_datagram_connection,
                 request_sessions,
                 request_auth,
                 allow_private_targets,
@@ -320,10 +344,7 @@ async fn handle_connection(
 async fn handle_request(
     request: Request<()>,
     mut stream: RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
-    datagram_sender: h3_datagram::datagram_handler::DatagramSender<
-        h3_quinn::datagram::SendDatagramHandler,
-        Bytes,
-    >,
+    datagram_connection: quinn::Connection,
     sessions: Sessions,
     auth: BearerAuth,
     allow_private_targets: bool,
@@ -350,7 +371,7 @@ async fn handle_request(
             handle_connect_udp(
                 request,
                 stream,
-                datagram_sender,
+                datagram_connection,
                 sessions,
                 auth,
                 grant,
@@ -530,10 +551,7 @@ async fn handle_mesh_connect_tcp(
 async fn handle_connect_udp(
     request: Request<()>,
     mut stream: RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
-    mut datagram_sender: h3_datagram::datagram_handler::DatagramSender<
-        h3_quinn::datagram::SendDatagramHandler,
-        Bytes,
-    >,
+    datagram_connection: quinn::Connection,
     sessions: Sessions,
     auth: BearerAuth,
     grant: AuthGrant,
@@ -592,10 +610,8 @@ async fn handle_connect_udp(
                 received = recv_udp_payload(&mut mesh_tunnel, session.socket.as_ref(), &mut buffer) => {
                     let Some(payload) = received? else { break; };
                     session.unreported_bytes.fetch_add(payload.len() as u64, Ordering::Relaxed);
-                    let mut datagram = BytesMut::with_capacity(payload.len() + 1);
-                    datagram.put_u8(0); // RFC 9298 context ID 0.
-                    datagram.put_slice(&payload);
-                    if let Err(error) = datagram_sender.send_datagram(datagram.freeze()) {
+                    let datagram = encode_connect_udp_datagram(stream_id, &payload);
+                    if let Err(error) = datagram_connection.send_datagram(datagram) {
                         warn!(?stream_id, %error, "dropping UDP response datagram");
                     }
                 }
@@ -652,6 +668,38 @@ async fn send_status(
         .await?;
     stream.finish().await?;
     Ok(())
+}
+
+/// Собирает HTTP Datagram для CONNECT-UDP: Quarter Stream ID (RFC 9297 §2.1),
+/// затем Context ID 0 (RFC 9298 §5) и сам UDP-пейлоад.
+///
+/// Заголовок кодируется вручную, а не через `DatagramSender::send_datagram` из
+/// `h3-datagram` 0.0.2: тот считает `stream_id / 4` в локальный буфер, но в
+/// `EncodedDatagram` кладёт нулевой массив (`stream_id: [0; MAX_SIZE]`), поэтому
+/// Quarter Stream ID на проводе всегда 0. Пока CONNECT-UDP — самый первый запрос
+/// соединения (stream 0), ошибка не видна и юнит-тест её не ловит. Но у iPhone
+/// UDP-потоки идут после других запросов (stream 4, 8, …), и каждый ответ
+/// релея уезжал бы в чужой контекст: DNS, QUIC и всё остальное по UDP глохло,
+/// хотя аплинк (его кодирует Apple) доходил нормально. Входящие датаграммы
+/// `h3-datagram` декодирует правильно, поэтому читаем их как раньше.
+fn encode_connect_udp_datagram(stream_id: StreamId, payload: &[u8]) -> Bytes {
+    let mut datagram = BytesMut::with_capacity(8 + 1 + payload.len());
+    put_quic_varint(&mut datagram, stream_id.into_inner() / 4);
+    datagram.put_u8(0); // RFC 9298 context ID 0.
+    datagram.put_slice(payload);
+    datagram.freeze()
+}
+
+/// QUIC variable-length integer (RFC 9000 §16). Значение — Quarter Stream ID,
+/// меньше 2^60, поэтому 8-байтовая форма всегда достаточна.
+fn put_quic_varint(buffer: &mut BytesMut, value: u64) {
+    debug_assert!(value < (1 << 62));
+    match value {
+        0..=0x3f => buffer.put_u8(value as u8),
+        0x40..=0x3fff => buffer.put_u16(0x4000 | value as u16),
+        0x4000..=0x3fff_ffff => buffer.put_u32(0x8000_0000 | value as u32),
+        _ => buffer.put_u64(0xc000_0000_0000_0000 | value),
+    }
 }
 
 fn strip_context_zero(mut payload: Bytes) -> Option<Bytes> {
@@ -737,16 +785,49 @@ mod tests {
         server: &TestServer,
     ) -> Result<(
         quinn::Endpoint,
+        quinn::Connection,
         h3::client::Connection<h3_quinn::Connection, Bytes>,
         h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>,
     )> {
         let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse()?)?;
         endpoint.set_default_client_config(server.client_config.clone());
         let connection = endpoint.connect(server.address, "localhost")?.await?;
+        let raw_connection = connection.clone();
         let mut builder = h3::client::builder();
         builder.enable_extended_connect(true).enable_datagram(true);
         let (driver, sender) = builder.build(h3_quinn::Connection::new(connection)).await?;
-        Ok((endpoint, driver, sender))
+        Ok((endpoint, raw_connection, driver, sender))
+    }
+
+    #[test]
+    fn network_config_init_is_idempotent_and_makes_global_available() {
+        // Меш-код ядра паникует на `NetworkConfig::global()` без инициализации —
+        // именно так релей молча ронял каждый запрос при MESH_ENABLED=true.
+        init_network_config();
+        init_network_config();
+        assert!(NetworkConfig::global().channel_capacity > 0);
+    }
+
+    #[test]
+    fn connect_udp_datagram_carries_quarter_stream_id_and_context_zero() {
+        // Клиентские bidi-потоки: 0, 4, 8, … → Quarter Stream ID 0, 1, 2, …
+        let payload = b"hi";
+        for (stream_id, header) in [
+            (0_u64, &[0x00_u8][..]),
+            (4, &[0x01]),
+            (8, &[0x02]),
+            (4 * 63, &[0x3f]),
+            (4 * 64, &[0x40, 0x40]),
+            (4 * 16_383, &[0x7f, 0xff]),
+            (4 * 16_384, &[0x80, 0x00, 0x40, 0x00]),
+        ] {
+            let datagram =
+                encode_connect_udp_datagram(StreamId::try_from(stream_id).unwrap(), payload);
+            let mut expected = header.to_vec();
+            expected.push(0); // RFC 9298 context ID 0.
+            expected.extend_from_slice(payload);
+            assert_eq!(datagram.as_ref(), expected.as_slice(), "stream {stream_id}");
+        }
     }
 
     #[test]
@@ -769,7 +850,8 @@ mod tests {
         });
 
         let server = start_test_server().await?;
-        let (_endpoint, mut driver, mut sender) = connect_test_client(&server).await?;
+        let (_endpoint, _connection, mut driver, mut sender) =
+            connect_test_client(&server).await?;
         let driver_task = tokio::spawn(async move {
             let error = poll_fn(|context| driver.poll_close(context)).await;
             Err::<(), _>(error)
@@ -814,7 +896,8 @@ mod tests {
         };
 
         let server = start_test_server().await?;
-        let (_endpoint, mut driver, mut sender) = connect_test_client(&server).await?;
+        let (_endpoint, _connection, mut driver, mut sender) =
+            connect_test_client(&server).await?;
         let mut datagram_reader = driver.get_datagram_reader();
         let (stream_id_tx, mut stream_id_rx) = tokio::sync::mpsc::channel(1);
         let (datagram_tx, mut datagram_rx) = tokio::sync::mpsc::channel(1);
@@ -860,6 +943,75 @@ mod tests {
         );
 
         stream.finish().await?;
+        driver_task.abort();
+        echo_task.await??;
+        Ok(())
+    }
+
+    /// Регрессия: ответы релея должны адресоваться тому потоку, на котором открыт
+    /// CONNECT-UDP, а не потоку 0. iPhone открывает UDP-потоки после других
+    /// запросов, поэтому проверяем сессию на stream 4, а датаграммы гоняем «сырыми»
+    /// через quinn — с `h3-datagram` 0.0.2 клиентская сторона теста кодировала бы
+    /// заголовок с той же ошибкой, что и сервер, и они бы взаимно не заметили её.
+    #[tokio::test]
+    async fn connect_udp_replies_are_addressed_to_their_own_request_stream() -> Result<()> {
+        let echo = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
+        let echo_address = echo.local_addr()?;
+        let echo_task = {
+            let echo = Arc::clone(&echo);
+            tokio::spawn(async move {
+                let mut buffer = [0_u8; 1024];
+                let (read, peer) = echo.recv_from(&mut buffer).await?;
+                echo.send_to(&buffer[..read], peer).await?;
+                Ok::<(), std::io::Error>(())
+            })
+        };
+
+        let server = start_test_server().await?;
+        let (_endpoint, connection, mut driver, mut sender) = connect_test_client(&server).await?;
+        let driver_task = tokio::spawn(async move {
+            let error = poll_fn(|context| driver.poll_close(context)).await;
+            Err::<(), _>(error)
+        });
+
+        // Stream 0 занимает обычный TCP CONNECT, как у реального клиента.
+        let tcp_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let tcp_address = tcp_listener.local_addr()?;
+        let _tcp_hold = tokio::spawn(async move { tcp_listener.accept().await });
+        let tcp_request = Request::builder()
+            .method(Method::CONNECT)
+            .uri(format!("https://{tcp_address}"))
+            .header("authorization", "Bearer test-token")
+            .body(())?;
+        let mut tcp_stream = sender.send_request(tcp_request).await?;
+        assert_eq!(tcp_stream.id().into_inner(), 0);
+        let response = timeout(Duration::from_secs(3), tcp_stream.recv_response()).await??;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let udp_request = Request::builder()
+            .method(Method::CONNECT)
+            .uri(format!(
+                "https://localhost/.well-known/masque/udp/{}/{}/",
+                echo_address.ip(),
+                echo_address.port()
+            ))
+            .header("authorization", "Bearer test-token")
+            .extension(Protocol::CONNECT_UDP)
+            .body(())?;
+        let mut udp_stream = sender.send_request(udp_request).await?;
+        assert_eq!(udp_stream.id().into_inner(), 4);
+        let response = timeout(Duration::from_secs(3), udp_stream.recv_response()).await??;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // RFC 9297: Quarter Stream ID = 4 / 4 = 1; RFC 9298: context ID 0.
+        connection.send_datagram(Bytes::from_static(b"\x01\x00ping"))?;
+        let reply = timeout(Duration::from_secs(3), connection.read_datagram()).await??;
+        assert_eq!(
+            reply.as_ref(),
+            b"\x01\x00ping",
+            "reply must carry quarter stream id 1 for request stream 4"
+        );
+
         driver_task.abort();
         echo_task.await??;
         Ok(())
