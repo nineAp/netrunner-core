@@ -30,8 +30,16 @@ pub struct NetworkConfig {
     /// Сколько байт читать из локального TCP-сокета за один проход.
     pub tcp_chunk_size: usize,
 
-    /// Единая ёмкость всех Tokio-каналов (в пакетах). Маленькая — против bufferbloat.
+    /// Ёмкость Tokio-каналов потоков (в сообщениях). Маленькая — против bufferbloat.
     pub channel_capacity: usize,
+    /// Ёмкость каналов control/data ОДНОЙ ноги туннеля (в сообщениях).
+    ///
+    /// Канал ноги — общая FIFO для всех потоков на ней, перед честной очередью
+    /// писателя. Раньше он был `channel_capacity` (64 сообщения по ≤64 КБ = 4 МБ):
+    /// мелкий поток стоял в конце очереди из чужих массивных сообщений и под нагрузкой
+    /// получал +100…400 мс задержки. Глубину «в полёте» (BDP) держит буфер сокета ноги
+    /// (`buftune`), а не этот канал, поэтому он может быть коротким без потери скорости.
+    pub leg_channel_capacity: usize,
 
     // ── Буферы TCP-сокетов smoltcp: heavy (bulk) и light (интерактив) ──
     /// RX-буфер «толстого» TCP-сокета.
@@ -68,17 +76,27 @@ impl NetworkConfig {
         const BULK_WINDOW_SEGMENTS: usize = 128;
         const LIGHT_WINDOW_SEGMENTS: usize = 32;
 
-        // How many messages the Tokio mpsc channels hold.
+        // How many messages the per-STREAM Tokio mpsc channels hold (each message is up
+        // to `BRIDGE_READ_CHUNK` = 64 KB).
         //
-        // 🔥 ANTI-BUFFERBLOAT vs HIGH-RTT THROUGHPUT TRADE-OFF:
-        // At low RTT (50 ms), 16 slots = ~3 MB queue drains fast. At high RTT
-        // (300+ ms), BDP = 300 Mbps × 0.35s ≈ 13 MB required for full throughput.
-        // Increased to 64: provides ~11 MB per leg (64 × ~180 KB), matching BDP
-        // at high RTT while still preventing pathological post-speedtest queuing.
-        // Anti-bufferbloat protection remains via per-stream dispatch backpressure
-        // and read-chunk sizing in dispatch_to_local (byte-bounded backlog closes
-        // genuinely stalled streams — see STREAM_BACKLOG_MAX_BYTES).
-        const CHANNEL_PACKETS: usize = 64;
+        // 🔥 ANTI-BUFFERBLOAT: this used to be 64 on the theory that the channel has to
+        // hold a BDP at high RTT. It does not: the depth that fills a long fat pipe is
+        // the leg socket's buffer (`buftune`, ~2×BDP) and, for downloads, the credit
+        // window. A deep per-stream channel only lets the app run ahead of the real
+        // network: 64 slots = 4 MB per channel, so 8 parallel uploads parked ~60 MB
+        // inside the client, kept the engine saturated with bulk packets and added
+        // 100+ ms to every other flow. Measured in the netns stand (8 parallel uploads,
+        // 1 Gbit): UDP echo p50 113 ms at 64 → 60 ms at 16; TCP small-request p50
+        // 134 → 89 ms; aggregate throughput, CPU per GB and 200 ms-RTT throughput
+        // unchanged; 2 Gbit downloads unchanged.
+        const CHANNEL_PACKETS: usize = 16;
+
+        // Messages queued in FRONT OF a leg's fair writer, shared by every stream on
+        // the leg. Measured in the netns stand (8 parallel uploads, 1 Gbit): UDP echo
+        // p50 121 ms at 64, 70 ms at 16, 61 ms at 8; TCP small-request p50 156 → 89 →
+        // 81 ms, aggregate throughput unchanged (also at 200 ms RTT / 300 Mbit, where
+        // the kernel socket buffer — not this channel — carries the BDP).
+        const LEG_CHANNEL_MESSAGES: usize = 16;
 
         // Payload bytes per segment (no IP/TCP headers in the smoltcp buffer).
         let seg = mtu.saturating_sub(40).max(512); // subtract typical IP+TCP overhead
@@ -99,6 +117,7 @@ impl NetworkConfig {
             tcp_chunk_size: 64 * 1024,
 
             channel_capacity: CHANNEL_PACKETS,
+            leg_channel_capacity: LEG_CHANNEL_MESSAGES,
 
             tcp_rx_heavy: tcp_heavy,
             tcp_tx_heavy: tcp_heavy,

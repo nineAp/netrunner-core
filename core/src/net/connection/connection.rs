@@ -1346,7 +1346,7 @@ impl ClientHandler {
             let (inbound, outbound, rx_codec, tx_codec, read_buf, datagram_root) = handshake;
 
             let muxer = Arc::new(Muxer::new(true, session_id.clone()));
-            let cap = NetworkConfig::global().channel_capacity;
+            let cap = NetworkConfig::global().leg_channel_capacity;
             let (probe_tx, mut probe_rx) = mpsc::channel::<Bytes>(1);
             muxer.register_stream(0, probe_tx);
 
@@ -1697,7 +1697,7 @@ impl ClientHandler {
             });
         }
 
-        let cap = NetworkConfig::global().channel_capacity;
+        let cap = NetworkConfig::global().leg_channel_capacity;
         let (control_tx, control_rx) = mpsc::channel::<MuxMessage>(cap);
         let (data_tx, data_rx) = mpsc::channel::<MuxMessage>(cap);
 
@@ -2903,7 +2903,7 @@ impl TunnelHandler for ServerHandler {
             }
         }
 
-        let cap = NetworkConfig::global().channel_capacity;
+        let cap = NetworkConfig::global().leg_channel_capacity;
         let (control_tx, control_rx) = mpsc::channel::<MuxMessage>(cap);
         let (data_tx, data_rx) = mpsc::channel::<MuxMessage>(cap);
 

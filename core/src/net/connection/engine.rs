@@ -581,7 +581,7 @@ impl TunnelEngine {
                         internal_attempt = 0; // successful reconnect — reset counter
                         last_reconnect = Some(std::time::Instant::now());
 
-                        let cap = crate::net::NetworkConfig::global().channel_capacity;
+                        let cap = crate::net::NetworkConfig::global().leg_channel_capacity;
                         let (control_tx, control_rx) =
                             tokio::sync::mpsc::channel::<MuxMessage>(cap);
                         let (data_tx, data_rx) = tokio::sync::mpsc::channel::<MuxMessage>(cap);
