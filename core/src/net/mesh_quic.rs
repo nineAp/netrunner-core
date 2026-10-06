@@ -61,12 +61,33 @@ pub fn server_endpoint(addr: SocketAddr) -> io::Result<Endpoint> {
     Endpoint::server(config, addr)
 }
 
+/// Packets that may overtake an unacknowledged one before it is declared lost
+/// (quinn/RFC 9002 default: 3).
+///
+/// Node-to-node paths reorder packets: jitter of 1 ms was enough for the default
+/// to read reordering as loss, cut the congestion window and overflow the small
+/// datagram queue below, so 15-45% of UDP flows silently vanished while nothing
+/// was really lost (isolated test: `quic_datagram_jitter_probe`). 30 packets /
+/// 2 RTT of tolerance keeps delivery at 97-100% there; genuine loss is still
+/// detected, a little later.
+const PACKET_REORDER_THRESHOLD: u32 = 30;
+const TIME_REORDER_THRESHOLD: f32 = 2.0;
+
+/// `MESH_QUIC_CC=bbr` switches the inter-node congestion controller from Cubic to
+/// BBR, which does not treat reordering or sparse loss as congestion (99-100%
+/// delivery at 7 Mbit with 10 ms jitter and 0.3% loss, where tuned Cubic keeps
+/// 33-62%). Opt-in: it changes how every inter-node flow shares the link.
 fn mesh_transport_config() -> Arc<TransportConfig> {
     let mut config = TransportConfig::default();
     config.keep_alive_interval(Some(Duration::from_secs(15)));
     config.datagram_receive_buffer_size(Some(QUIC_DATAGRAM_BUFFER));
     config.datagram_send_buffer_size(QUIC_DATAGRAM_SEND_BUFFER);
     config.max_concurrent_bidi_streams(VarInt::from_u32(128));
+    config.packet_threshold(PACKET_REORDER_THRESHOLD);
+    config.time_threshold(TIME_REORDER_THRESHOLD);
+    if std::env::var("MESH_QUIC_CC").is_ok_and(|value| value.eq_ignore_ascii_case("bbr")) {
+        config.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
+    }
     Arc::new(config)
 }
 
@@ -132,6 +153,69 @@ mod tests {
     use super::{client_endpoint, server_endpoint, QUIC_DATAGRAM_SEND_BUFFER};
     use bytes::Bytes;
     use tokio::sync::oneshot;
+
+    /// Delivery of an unreliable datagram flow over the mesh transport when the
+    /// path reorders packets. Needs jitter on loopback, so it only runs on
+    /// request, inside a network namespace:
+    ///
+    /// ```text
+    /// unshare -Urn sh -c 'ip link set lo up; tc qdisc add dev lo root netem delay 60ms 10ms;
+    ///   cargo test -p netrunner-core --features mesh-quic --lib quic_datagram_jitter_probe -- --ignored --nocapture'
+    /// ```
+    ///
+    /// With quinn's default loss detection (reordering threshold 3) 1 ms of
+    /// jitter already lost 15-45% of the datagrams.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "diagnostic: needs netem on loopback"]
+    async fn quic_datagram_jitter_probe() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let env = |k: &str, d: u64| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+        let (pps, size, secs) = (env("PPS", 200), env("SIZE", 900) as usize, env("SECS", 15));
+
+        let server = server_endpoint("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = server.local_addr().unwrap();
+        let client = client_endpoint("127.0.0.1:0".parse().unwrap()).unwrap();
+        let received = std::sync::Arc::new(AtomicU64::new(0));
+        let counter = received.clone();
+        tokio::spawn(async move {
+            let connection = server.accept().await.unwrap().await.unwrap();
+            let _stream = connection.accept_bi().await.unwrap();
+            while connection.read_datagram().await.is_ok() {
+                counter.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        let connection = client.connect(addr, "mesh.netrunner").unwrap().await.unwrap();
+        let (mut send, _recv) = connection.open_bi().await.unwrap();
+        send.write_all(b"hi").await.unwrap();
+
+        let payload = bytes::Bytes::from(vec![0xA5u8; size]);
+        let mut tick = tokio::time::interval(std::time::Duration::from_micros(1_000_000 / pps));
+        let mut sent = 0u64;
+        for _ in 0..pps * secs {
+            tick.tick().await;
+            if connection.send_datagram(payload.clone()).is_ok() {
+                sent += 1;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        let stats = connection.stats();
+        println!(
+            "sent={sent} received={} ({}%) | cwnd={} rtt={:?} lost_packets={} congestion_events={} sent_packets={} black_holes={} | send_buffer_space_end={}",
+            received.load(Ordering::Relaxed),
+            received.load(Ordering::Relaxed) * 100 / sent.max(1),
+            stats.path.cwnd,
+            stats.path.rtt,
+            stats.path.lost_packets,
+            stats.path.congestion_events,
+            stats.path.sent_packets,
+            stats.path.black_holes_detected,
+            connection.datagram_send_buffer_space(),
+        );
+        assert!(
+            received.load(Ordering::Relaxed) * 100 / sent.max(1) >= 90,
+            "datagram delivery collapsed under jitter"
+        );
+    }
 
     #[tokio::test]
     async fn mesh_quic_negotiates_streams_and_datagrams_with_ephemeral_tls() {
