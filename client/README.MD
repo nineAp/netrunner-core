@@ -41,8 +41,8 @@ TOML-конфиге.
 
 ## Сборка
 
-`client` зависит от приватного форка smoltcp (`nxrp-smoltcp`) как git-зависимости
-по HTTPS из Gitea (`https://gitea.netrunner-vpn.com/nineap/nxrp-smoltcp.git`, см.
+`client` зависит от приватного форка smoltcp (`nrxp-smoltcp`) как git-зависимости
+по HTTPS из Gitea (`https://gitea.netrunner-vpn.com/nineap/nrxp-smoltcp.git`, см.
 `client/Cargo.toml`) — доступ нужен именно к этому Gitea-инстансу, отдельного
 SSH/GitHub-доступа больше не требуется.
 Android-сборка `.so` + Kotlin-биндингов — через `make build-android` (см.

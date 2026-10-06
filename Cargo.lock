@@ -2165,7 +2165,7 @@ dependencies = [
  "lru",
  "netrunner-core",
  "netrunner-logger",
- "nxrp-smoltcp",
+ "nrxp-smoltcp",
  "reqwest 0.13.2",
  "serde",
  "shlex",
@@ -2362,6 +2362,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "nrxp-smoltcp"
+version = "0.13.0"
+source = "git+https://gitea.netrunner-vpn.com/nineap/nrxp-smoltcp.git?branch=main#2f5d4cabd4d012fb0d9f3bfb0a5ccfdf37ccdb7a"
+dependencies = [
+ "bitflags 1.3.2",
+ "byteorder",
+ "bytes",
+ "cfg-if",
+ "defmt 0.3.100",
+ "heapless",
+ "log",
+ "managed",
+]
+
+[[package]]
 name = "nu-ansi-term"
 version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2402,21 +2417,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
 dependencies = [
  "autocfg",
-]
-
-[[package]]
-name = "nxrp-smoltcp"
-version = "0.13.0"
-source = "git+https://gitea.netrunner-vpn.com/nineap/nxrp-smoltcp.git?branch=main#9079204927633e6b439066a9123d14be070f48c8"
-dependencies = [
- "bitflags 1.3.2",
- "byteorder",
- "bytes",
- "cfg-if",
- "defmt 0.3.100",
- "heapless",
- "log",
- "managed",
 ]
 
 [[package]]

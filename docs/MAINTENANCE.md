@@ -1,7 +1,7 @@
 # MAINTENANCE.md — эксплуатация и поддержка netrunner-proxy
 
 Практическое руководство: что где лежит, как собрать/запустить/тестировать,
-как это связано с `netrunner-backend` и `nxrp-smoltcp`, известные грабли и
+как это связано с `netrunner-backend` и `nrxp-smoltcp`, известные грабли и
 куда смотреть первым делом, если что-то сломалось. Протокол как таковой —
 в [`ARCH.md`](../ARCH.md); архитектурная карта модулей — в [`README.MD`](../README.MD)
 и во вложенных `README.MD` каждого блока. Этот файл — эксплуатационный слой
@@ -249,23 +249,23 @@ CLI-аргументами при запуске контейнера — их �
 
 ---
 
-## 4. Связь с `nxrp-smoltcp`
+## 4. Связь с `nrxp-smoltcp`
 
 `client/Cargo.toml` тянет `smoltcp` как **git-зависимость** (не path, не
 crates.io) из приватного Gitea-зеркала:
 
 ```toml
-smoltcp = { git = "https://gitea.netrunner-vpn.com/nineap/nxrp-smoltcp.git", branch = "main", ... }
+smoltcp = { git = "https://gitea.netrunner-vpn.com/nineap/nrxp-smoltcp.git", branch = "main", ... }
 ```
 
-Это форк `smoltcp` (репозиторий `nxrp-smoltcp` в `/home/k/netrunner/` — не
+Это форк `smoltcp` (репозиторий `nrxp-smoltcp` в `/home/k/netrunner/` — не
 трогать напрямую из этого репозитория). Используется только в `client/` —
 для userspace-разбора TCP/IP на TUN-интерфейсе (стейт-машина TCP + собственный
 UDP NAT). `core/` и `client-edge/` от него не зависят: у `client-edge` нет
 TUN/L3-перехвата, только релей уже собранного потока байт.
 
 **Важно:** до коммита `a5181b0` зависимость шла по SSH с GitHub
-(`ssh://git@github.com/nineAp/nxrp-smoltcp.git`) — с этим совпадает и
+(`ssh://git@github.com/nineAp/nrxp-smoltcp.git`) — с этим совпадает и
 устаревший текст в `client/README.MD` ("зависит от приватного форка smoltcp
 по SSH... из чистого Windows-shell cargo его не достанет"). Сейчас
 зависимость идёт по HTTPS от Gitea, и эта проблема с Windows-shell больше не
@@ -315,7 +315,7 @@ TUN/L3-перехвата, только релей уже собранного �
   `cargo test -p netrunner-core` (46 тестов) никогда не проверяется
   автоматически. Регрессия в крипто/кадрах/хендшейке может уехать в прод
   незамеченной, если разработчик не прогнал тесты руками.
-- **`client/README.MD` устарел**: описывает зависимость от `nxrp-smoltcp`
+- **`client/README.MD` устарел**: описывает зависимость от `nrxp-smoltcp`
   через SSH/GitHub, хотя с коммита `a5181b0` она идёт по HTTPS через Gitea
   (см. раздел 4). Утверждение "из чистого Windows-shell cargo его не
   достанет" больше не актуально.
