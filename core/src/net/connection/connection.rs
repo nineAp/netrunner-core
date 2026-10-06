@@ -501,6 +501,22 @@ impl SessionManager {
         self.dgram_by_raw_token.remove(leg_token);
     }
 
+    /// Убирает сессию, к которой не подключено ни одной ноги.
+    ///
+    /// Для ранних возвратов `ServerHandler::run` после `get_or_create`: сессия
+    /// создаётся до проверки токена, и при отказе её некому больше закрыть —
+    /// нормальная уборка стоит только после работы движка. Сессия с живыми
+    /// ногами (другая нога того же клиента) остаётся нетронутой.
+    pub fn remove_if_unused(&self, session_id: &str) {
+        let unused = self
+            .sessions
+            .get(session_id)
+            .is_some_and(|muxer| muxer.active_legs_count() == 0);
+        if unused {
+            self.remove(session_id);
+        }
+    }
+
     pub fn remove(&self, session_id: &str) {
         if self.sessions.remove(session_id).is_some() {
             // Снимаем записи ВСЕХ ног сессии (каждая нога регистрировала свой
@@ -2661,6 +2677,7 @@ impl TunnelHandler for ServerHandler {
         #[cfg(feature = "mesh-quic")]
         if mesh_quic_connection.is_some() && !is_mesh_peer {
             metrics::counter!("netrunner_mesh_quic_non_mesh_rejected_total").increment(1);
+            self.session_manager.remove_if_unused(&session_id);
             return Err(AppError::new(
                 ERR_AUTH_FAILED,
                 "Доступ запрещен",
@@ -2763,6 +2780,9 @@ impl TunnelHandler for ServerHandler {
                 ) {
                     let _ = outbound.write_all(&reject_frame).await;
                 }
+                // Сессия создана выше, до проверки токена; ног у неё нет и уже
+                // не будет — без этого каждый отказ оставлял бы на ноде зомби.
+                self.session_manager.remove_if_unused(&session_id);
                 return Err(AppError::new(
                     ERR_AUTH_FAILED,
                     "Доступ запрещен",
@@ -3356,10 +3376,19 @@ mod tests {
 
     /// Нода на 127.0.0.1 с заданным валидатором; возвращает адрес.
     async fn spawn_node(validator: Arc<CountingValidator>) -> std::net::SocketAddr {
+        spawn_node_with_sessions(validator).await.0
+    }
+
+    /// То же, но отдаёт и реестр сессий ноды — чтобы тесты видели, что в нём
+    /// остаётся после отказов.
+    async fn spawn_node_with_sessions(
+        validator: Arc<CountingValidator>,
+    ) -> (std::net::SocketAddr, Arc<SessionManager>) {
         NetworkConfig::init_global(1500);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let sm = Arc::new(SessionManager::new());
+        let node_sessions = sm.clone();
         tokio::spawn(async move {
             loop {
                 let (stream, _) = listener.accept().await.unwrap();
@@ -3377,7 +3406,7 @@ mod tests {
                 });
             }
         });
-        addr
+        (addr, node_sessions)
     }
 
     async fn connect_client(addr: std::net::SocketAddr) -> Arc<Muxer> {
@@ -3399,6 +3428,47 @@ mod tests {
 
     fn calls(v: &CountingValidator) -> usize {
         v.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[tokio::test]
+    async fn remove_if_unused_keeps_sessions_that_have_legs() {
+        let sm = SessionManager::new();
+        let idle = sm.get_or_create("idle");
+        let busy = sm.get_or_create("busy");
+        let (control_tx, _control_rx) = mpsc::channel(4);
+        let (data_tx, _data_rx) = mpsc::channel(4);
+        busy.add_leg(0, control_tx, data_tx);
+        assert_eq!(idle.active_legs_count(), 0);
+
+        sm.remove_if_unused("idle");
+        sm.remove_if_unused("busy");
+        sm.remove_if_unused("missing"); // не паникует
+
+        assert!(sm.get_session().get("idle").is_none());
+        assert!(sm.get_session().get("busy").is_some());
+    }
+
+    /// Отказ по токену не должен оставлять за собой сессию. Раньше сессия
+    /// создавалась до проверки токена, а при отказе возврат шёл мимо очистки:
+    /// каждый клиент с протухшим токеном оставлял на ноде зомби-сессию (с
+    /// UDP-регистрациями) навсегда. Прод: на Хельсинки накопилось ~32 тысячи таких
+    /// сессий, нода печатала каждую раз в минуту (16 МБ лога за 10 минут).
+    #[tokio::test]
+    async fn rejected_token_leaves_no_session_behind() {
+        let validator = Arc::new(CountingValidator {
+            reject: true,
+            calls: Default::default(),
+        });
+        let (addr, sessions) = spawn_node_with_sessions(validator.clone()).await;
+        let _muxer = connect_client(addr).await;
+
+        tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+        assert!(calls(&validator) >= 1, "нода должна была проверить токен");
+        assert_eq!(
+            sessions.get_session().len(),
+            0,
+            "сессия отвергнутого клиента обязана быть убрана"
+        );
     }
 
     /// Сервер отверг токен — клиент перестаёт подключаться. Раньше каждая нога
