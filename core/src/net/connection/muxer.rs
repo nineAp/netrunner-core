@@ -29,16 +29,17 @@
 //!   ошибочно убивали, например, upload в реальную цель под высоким RTT) —
 //!   решение никогда не принимается изнутри горячего пути доставки, см.
 //!   докстринг `StreamBacklog`.
-//! - **Credit flow control (сейчас не подключён).** В `Muxer` остаётся API
-//!   (`init_credit`/`grant_credit`/`consume_credit`) и кадр `FrameType::Credit`
-//!   для сквозного окна получатель→отправитель — идея была не дать отправителю
-//!   производить данные быстрее приёмника, вместо того чтобы копить и потом
-//!   эвиктить. На практике привязка паузы к сетевому round-trip (ожидание
-//!   `Credit`-кадра) оказалась хуже уже работавшего локального backpressure
-//!   `data_tx.send().await` (тот реагирует мгновенно, без RTT): давала
-//!   burst-then-stall на скачивании и подрывала джиттер/пинг на общей ноге.
-//!   Отключено в `run_tcp_bridge` (там просто читают без гейта), байтовый
-//!   бэклог + reaper выше остаются единственной защитой.
+//! - **Credit flow control (включён).** Нога — одно TCP на много потоков, поэтому
+//!   притормозить один медленный поток ею нельзя; приёмник (клиентский стек)
+//!   сообщает отправителю абсолютный лимит байт Data потока кадром
+//!   `FrameType::Credit` и растит окно по скорости потребления — см.
+//!   [`crate::net::credit`]. Шлюз [`Muxer::credit_gate`] стоит в
+//!   `send_to_network`, единственной точке входа Data на ногу, и блокирует только
+//!   отправителя этого потока: его источник перестаёт читаться, соседние потоки не
+//!   страдают. Первая версия гейтила чтение моста по сетевому round-trip с фиксированным
+//!   малым окном и давала burst-then-stall; теперь окно авто-настраивается (≥ 2×BDP),
+//!   лимит абсолютный и идемпотентный, а без грантов (старый пир) поток не ограничен.
+//!   Байтовый бэклог + reaper выше остаются последней страховкой.
 //!
 //! ## Адаптация под RTT
 //!
@@ -413,24 +414,6 @@ pub fn adaptive_write_timeout(floor: Duration) -> Duration {
 pub fn adaptive_batch_chunk(base: usize) -> usize {
     let rtt_ms = GLOBAL_MIN_RTT.load(Ordering::Relaxed) as usize;
     let factor = (1 + rtt_ms / 250).clamp(1, 4);
-    base.saturating_mul(factor)
-}
-
-/// Credit window that grows with RTT, same idea as [`adaptive_batch_chunk`].
-///
-/// A stream's credit window should hold roughly one bandwidth-delay product
-/// in flight so the sender never has to stall waiting for a grant under
-/// normal operation. A flat window sized for a healthy path (tens of ms RTT)
-/// would be far too small once RTT climbs into the hundreds/low thousands of
-/// ms (mobile network, as seen in production — `GLOBAL_MIN_RTT` peaks well
-/// past 1 s): the fallback in `consume_credit` prevents that from ever
-/// stalling a stream outright, but scaling the window up front means it
-/// mostly doesn't need to. Wider cap than `adaptive_batch_chunk` (up to 8×,
-/// matching `SERVER_STREAM_BACKLOG_MAX_BYTES` at the top end) since BDP grows
-/// with RTT much faster than a comfortable interleave chunk does.
-pub fn adaptive_credit_window(base: u32) -> u32 {
-    let rtt_ms = GLOBAL_MIN_RTT.load(Ordering::Relaxed);
-    let factor = (1 + rtt_ms / 250).clamp(1, 8);
     base.saturating_mul(factor)
 }
 

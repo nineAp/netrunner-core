@@ -350,12 +350,9 @@ impl RemoteOpener {
                             debug!(stream_id, elapsed_ms = start.elapsed().as_millis() as u64, "✅ [Remote] Connected");
                             let (r, w) = stream.into_split();
 
-                            // Credit-gated reads (Muxer::consume_credit) were tried here and
-                            // reverted: tying read pacing to a network round-trip produced
-                            // burst-then-stall downloads and jitter on the shared physical leg,
-                            // on top of the local mpsc backpressure that already paced reads
-                            // correctly. The Credit frame/API stays in Muxer for a possible
-                            // future redesign but isn't wired up on this path anymore.
+                            // No read gating here: pacing against a slow receiver is done by
+                            // the credit gate inside `Muxer::send_to_network`, which blocks
+                            // only this stream's sender (see `net::credit`).
 
                             // 🔥 Защищаем и сам мост токеном отмены
                             tokio::select! {
@@ -1663,12 +1660,12 @@ impl StreamHandler {
             }
 
             FrameType::Credit => {
-                // Сквозной flow control (см. Muxer::consume_credit/grant_credit):
-                // приёмник шлёт "можешь прислать ещё N байт". Синхронно и дёшево —
-                // просто прибавляет к атомарному счётчику и будит ждущего отправителя.
-                if let Ok(bytes) = frame.payload.as_ref().try_into().map(u32::from_be_bytes) {
-                    trace!(stream_id, bytes, "💳 [Tunnel] Credit received");
-                    self.muxer.grant_credit(stream_id, bytes);
+                // Сквозной flow control (см. `net::credit`, Muxer::grant_credit):
+                // приёмник шлёт абсолютный лимит байт Data потока. Синхронно и дёшево —
+                // двигает атомарный лимит вперёд и будит ждущего отправителя.
+                if let Ok(offset) = frame.payload.as_ref().try_into().map(u32::from_be_bytes) {
+                    trace!(stream_id, offset, "💳 [Tunnel] Credit received");
+                    self.muxer.grant_credit(stream_id, offset);
                 } else {
                     warn!(stream_id, "Malformed Credit frame payload, ignoring");
                 }
