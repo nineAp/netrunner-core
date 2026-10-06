@@ -57,3 +57,14 @@ uniffi = { version = "0.31.0", features = ["build"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 wintun = "0.5.1"
+
+# Релизные мобильные сборки не пишут логов вообще: `release_max_level_off` делает
+# каждый макрос `tracing::*!` / `log::*!` (в том числе в `smoltcp`, у которого
+# включена фича `log` и на каждый пакет приходятся `trace!`/`debug!`) пустым на
+# этапе компиляции — ни проверки уровня, ни моста tracing-log, ни форматирования
+# JSON с regex-вычисткой IP. В debug-сборках (`debug_assertions`) фича не
+# действует, поэтому отладка на устройстве работает как раньше. Фичи целевые:
+# серверные и десктопные сборки не затрагиваются.
+[target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
+tracing = { version = "0.1", features = ["release_max_level_off"] }
+log = { version = "0.4", features = ["release_max_level_off"] }

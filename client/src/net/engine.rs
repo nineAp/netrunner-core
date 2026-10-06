@@ -490,7 +490,12 @@ impl Engine {
             }
 
             // ── 5. Stats logging ─────────────────────────────────────────
-            if last_stats_log.elapsed() >= STATS_LOG_INTERVAL {
+            // Сводки считаются вне макросов (обход сокетов, суммы по бэклогам), поэтому
+            // без проверки уровня они работали бы впустую и при выключенном логе
+            // (в мобильном релизе `level_enabled!` — константа `false`, блок удаляется).
+            if tracing::level_enabled!(tracing::Level::INFO)
+                && last_stats_log.elapsed() >= STATS_LOG_INTERVAL
+            {
                 let stats = self.stats.get_stats();
                 info!(
                     "TunDevice Traffic: ↓ {:.2} MB ({} pkts) | ↑ {:.2} MB ({} pkts) | Speed: ↓{:.2} MB/s, ↑{:.2} MB/s",

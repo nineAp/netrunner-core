@@ -201,12 +201,33 @@ fn read_tcp_socket_stats(outbound: &TunnelWriteHalf) -> Option<TcpSocketStats> {
 fn read_tcp_socket_stats(outbound: &TunnelWriteHalf) -> Option<TcpSocketStats> {
     use std::os::fd::AsRawFd;
 
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    // SELinux (`untrusted_app`) запрещает `ioctl(SIOCOUTQNSD)` на сокетах приложения
+    // на большинстве сборок Android. Каждый такой вызов — это отказ с записью в
+    // audit-журнал (на устройстве набегали миллионы `avc: denied`, что забивало
+    // logcat и тратило время ядра), а значение всё равно недоступно. После первого
+    // отказа по правам больше не спрашиваем.
+    static NOTSENT_FORBIDDEN: AtomicBool = AtomicBool::new(false);
+    if NOTSENT_FORBIDDEN.load(Ordering::Relaxed) {
+        return None;
+    }
+
     // Android's libc bindings omit `tcp_info`, but the kernel still exposes the
     // not-yet-sent byte count that matters most for avoiding a queued leg.
     let fd = outbound.tcp_owned()?.as_ref().as_raw_fd();
     let mut notsent_bytes: libc::c_int = 0;
     let rc = unsafe { libc::ioctl(fd, libc::SIOCOUTQNSD as libc::Ioctl, &mut notsent_bytes) };
-    (rc == 0).then_some(TcpSocketStats {
+    if rc != 0 {
+        if matches!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EACCES) | Some(libc::EPERM)
+        ) {
+            NOTSENT_FORBIDDEN.store(true, Ordering::Relaxed);
+        }
+        return None;
+    }
+    Some(TcpSocketStats {
         notsent_bytes: notsent_bytes.max(0) as u64,
         ..TcpSocketStats::default()
     })
