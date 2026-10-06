@@ -865,6 +865,7 @@ impl RemoteOpener {
             }
         };
 
+        let mut relay_credit = (!is_udp).then(|| RelayCredit::open(peer_muxer.clone(), peer_stream_id));
         let download = async {
             loop {
                 tokio::select! {
@@ -878,6 +879,7 @@ impl RemoteOpener {
                                 .await;
                         }
                         Some(data) => {
+                            let forwarded = data.len();
                             let deadline = tokio::time::Instant::now()
                                 + crate::net::STREAM_PAUSE_BUDGET;
                             let sent = loop {
@@ -901,6 +903,9 @@ impl RemoteOpener {
                             if !sent {
                                 break;
                             }
+                            if let Some(credit) = relay_credit.as_mut() {
+                                credit.consumed(forwarded);
+                            }
                         }
                     }
                 }
@@ -923,6 +928,55 @@ impl RemoteOpener {
                 .await;
         }
         ingress_muxer.remove_stream(ingress_stream_id);
+    }
+}
+
+/// A relay hop is the RECEIVER of the stream it pulls from the next hop: it must hand
+/// that stream's sender a credit window, and refill it only as the data actually moves
+/// on towards the client. Without this, the client's own credit window would stop at
+/// the first hop — the relay would still drain the next hop at full speed into its own
+/// backlog (a slow reader would then cost the relay megabytes of RAM instead of costing
+/// the egress its read rate). Chained, the windows give TCP-like end-to-end flow control
+/// across any number of hops. Not used for UDP.
+struct RelayCredit {
+    receiver: crate::net::CreditReceiver,
+    muxer: Arc<Muxer>,
+    stream_id: u32,
+}
+
+impl RelayCredit {
+    /// Opens the window right after the next hop confirmed the stream.
+    fn open(muxer: Arc<Muxer>, stream_id: u32) -> Self {
+        let credit = Self {
+            receiver: crate::net::CreditReceiver::new(),
+            muxer,
+            stream_id,
+        };
+        credit.grant(crate::net::CreditReceiver::initial_offset());
+        credit
+    }
+
+    /// `n` bytes of the stream were forwarded towards the client.
+    fn consumed(&mut self, n: usize) {
+        let rtt_ms = crate::net::GLOBAL_MIN_RTT.load(std::sync::atomic::Ordering::Relaxed);
+        let rtt = Duration::from_millis(if rtt_ms == 0 { 100 } else { rtt_ms as u64 });
+        if let Some(offset) = self.receiver.on_consumed(n, Instant::now(), rtt) {
+            self.grant(offset);
+        }
+    }
+
+    fn grant(&self, offset: u32) {
+        let muxer = self.muxer.clone();
+        let stream_id = self.stream_id;
+        tokio::spawn(async move {
+            let _ = muxer
+                .send_control(
+                    stream_id,
+                    FrameType::Credit,
+                    Bytes::copy_from_slice(&offset.to_be_bytes()),
+                )
+                .await;
+        });
     }
 }
 
@@ -1046,6 +1100,8 @@ async fn run_mesh_onion_bridge(
             }
         }
     };
+    let mut relay_credit =
+        (!is_udp).then(|| RelayCredit::open(downstream_muxer.clone(), downstream_stream_id));
     let download = async {
         loop {
             tokio::select! {
@@ -1053,6 +1109,7 @@ async fn run_mesh_onion_bridge(
                 _ = token.cancelled() => break,
                 packet = downstream_rx.recv() => match packet {
                     Some(packet) => {
+                        let forwarded = packet.len();
                         if !send_mesh_payload(
                             &mesh,
                             upstream_muxer.clone(),
@@ -1063,6 +1120,9 @@ async fn run_mesh_onion_bridge(
                             &token,
                         ).await {
                             break;
+                        }
+                        if let Some(credit) = relay_credit.as_mut() {
+                            credit.consumed(forwarded);
                         }
                     }
                     None => break,
@@ -1837,5 +1897,39 @@ mod tests {
         handler.handle(frame).await;
 
         assert!(!muxer.is_fatal());
+    }
+
+    /// A relay opens its window towards the next hop right away and refills it as the
+    /// data moves on — otherwise the client's credit would stop at the first hop.
+    #[tokio::test]
+    async fn relay_credit_opens_a_window_and_refills_it_as_data_moves_on() {
+        let muxer = Arc::new(Muxer::new(false, "relay".into()));
+        let (control_tx, mut control_rx) = mpsc::channel(8);
+        let (data_tx, _data_rx) = mpsc::channel(8);
+        muxer.add_leg(0, control_tx, data_tx);
+
+        let mut credit = RelayCredit::open(muxer.clone(), 7);
+        let first = control_rx.recv().await.expect("initial grant");
+        assert_eq!((first.stream_id, first.frame_type), (7, FrameType::Credit));
+        let initial = u32::from_be_bytes(first.data.as_ref().try_into().unwrap());
+        assert_eq!(initial, crate::net::CreditReceiver::initial_offset());
+
+        // A tenth of the window: nothing to announce yet.
+        credit.consumed((initial / 10) as usize);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), control_rx.recv())
+                .await
+                .is_err(),
+            "no grant expected before a quarter of the window moved on"
+        );
+
+        // Past a quarter: the limit moves forward by what was forwarded.
+        credit.consumed((initial / 4) as usize);
+        let refill = tokio::time::timeout(Duration::from_secs(1), control_rx.recv())
+            .await
+            .expect("refill grant")
+            .unwrap();
+        let limit = u32::from_be_bytes(refill.data.as_ref().try_into().unwrap());
+        assert!(limit > initial, "the window must move forward ({limit} <= {initial})");
     }
 }
