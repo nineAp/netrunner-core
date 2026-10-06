@@ -57,6 +57,10 @@ impl RawCastAdapter {
             (LocalProtocol::Tcp, RawCastEvent::Data) => (FrameType::Data, raw.payload),
             (LocalProtocol::Udp, RawCastEvent::Data) => (FrameType::UdpData, raw.payload),
             (_, RawCastEvent::Close) => (FrameType::Close, Bytes::new()),
+            (LocalProtocol::Tcp, RawCastEvent::Credit) => (FrameType::Credit, raw.payload),
+            (LocalProtocol::Udp, RawCastEvent::Credit) => {
+                return Err("UDP streams have no credit flow control".into())
+            }
             (LocalProtocol::Icmp, _) => {
                 return Err("ICMP protocol is not supported by NRXP core".into())
             }

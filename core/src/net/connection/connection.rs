@@ -1786,6 +1786,11 @@ impl ClientHandler {
             Arc::new(DashMap::new());
         let local_to_global: Arc<DashMap<u64, u32>> = Arc::new(DashMap::new());
         let local_to_upload_tx: Arc<DashMap<u64, mpsc::Sender<Bytes>>> = Arc::new(DashMap::new());
+        // Per local socket: flips to `true` once the Connect frame has been handed to the
+        // muxer. A stream's first credit grant must not overtake its Connect (the server
+        // would not know the stream yet and ignore the grant).
+        let local_connect_done: Arc<DashMap<u64, tokio::sync::watch::Receiver<bool>>> =
+            Arc::new(DashMap::new());
 
         let watcher_muxer = muxer.clone();
         tokio::spawn(async move {
@@ -1999,6 +2004,7 @@ impl ClientHandler {
                             let reg = registry.clone();
                             let l2g = local_to_global.clone();
                             let up_tx_map = local_to_upload_tx.clone();
+                            let connect_done_map = local_connect_done.clone();
 
                             tokio::spawn(async move {
                                 while let Some(back_payload) = v_rx.recv().await {
@@ -2031,6 +2037,7 @@ impl ClientHandler {
                                 {
                                     l2g.remove(&orig_local_id);
                                     up_tx_map.remove(&orig_local_id);
+                                    connect_done_map.remove(&orig_local_id);
                                     // Still registered here means the PEER ended the stream
                                     // (a local close removes the entry first), and everything
                                     // it sent has already been forwarded above, in order. Tell
@@ -2055,12 +2062,15 @@ impl ClientHandler {
 
                             let m_clone = muxer_inner.clone();
                             let is_udp = raw_frame.protocol == LocalProtocol::Udp;
+                            let (connect_done_tx, connect_done_rx) =
+                                tokio::sync::watch::channel(false);
+                            local_connect_done.insert(local_socket_id, connect_done_rx);
 
                             tokio::spawn(async move {
                                 let _ = m_clone
                                     .send_control(global_stream_id, f_type, payload)
                                     .await;
-
+                                let _ = connect_done_tx.send(true);
                                 while let Some(data_payload) = up_rx.recv().await {
                                     if is_udp {
                                         // UDP has no delivery guarantee — best-effort like
@@ -2158,6 +2168,29 @@ impl ClientHandler {
                                 }
                             }
                         }
+                        FrameType::Credit => {
+                            // The engine consumed more of this stream's download: pass the
+                            // new absolute limit on. Control frames of one stream are
+                            // sent in order from one place, and the value is absolute, so
+                            // a late task can't move the sender's limit backwards.
+                            if let Some(global_stream_id) =
+                                local_to_global.get(&local_socket_id).map(|kv| *kv.value())
+                            {
+                                let m_clone = muxer_inner.clone();
+                                let connect_done = local_connect_done
+                                    .get(&local_socket_id)
+                                    .map(|r| r.value().clone());
+                                tokio::spawn(async move {
+                                    // Never ahead of the stream's own Connect.
+                                    if let Some(mut done) = connect_done {
+                                        let _ = done.wait_for(|sent| *sent).await;
+                                    }
+                                    let _ = m_clone
+                                        .send_control(global_stream_id, FrameType::Credit, payload)
+                                        .await;
+                                });
+                            }
+                        }
                         FrameType::Close => {
                             pending_upload.remove(&local_socket_id);
                             if let Some(kv) = local_to_global.remove(&local_socket_id) {
@@ -2177,6 +2210,7 @@ impl ClientHandler {
 
                                 registry.remove(&global_stream_id);
                                 local_to_upload_tx.remove(&local_socket_id);
+                                local_connect_done.remove(&local_socket_id);
                             }
                         }
                         _ => {}
@@ -3783,5 +3817,103 @@ mod tests {
                 "leg {leg_id} never got the PONG for its own PING"
             );
         }
+    }
+
+    /// Отправитель обязан уважать кредитное окно приёмника: без новых грантов он
+    /// останавливается у объявленного лимита (а не сливает всё в память приёмника),
+    /// а с грантами доставляет поток целиком. Раньше сервер не знал, как быстро
+    /// клиент забирает данные, и клиент убивал потоки по лимиту бэклога.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sender_stops_at_the_credit_limit_and_resumes_on_grants() {
+        const TOTAL: usize = 24 * 1024 * 1024;
+        let validator = Arc::new(CountingValidator {
+            reject: false,
+            calls: Default::default(),
+        });
+        let (addr, _sessions, _finished) = spawn_node_full(validator).await;
+        let target = spawn_burst_target(TOTAL, 64 * 1024).await;
+        let (muxer, to_tunnel, mut from_tunnel) = connect_client_raw(addr).await;
+        for _ in 0..200 {
+            if muxer.active_legs_count() >= 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        let mut connect = RawCastFrame::connect(
+            LocalProtocol::Tcp,
+            1,
+            std::net::Ipv4Addr::LOCALHOST,
+            target.port(),
+        );
+        connect.payload = Bytes::from(target.to_string());
+        to_tunnel.send(connect).await.unwrap();
+        // Как и настоящий клиентский движок: первый грант — сразу за Connect.
+        to_tunnel
+            .send(RawCastFrame::credit(
+                LocalProtocol::Tcp,
+                1,
+                std::net::Ipv4Addr::LOCALHOST,
+                target.port(),
+                crate::net::CreditReceiver::initial_offset(),
+            ))
+            .await
+            .unwrap();
+
+        // Фаза 1: никаких грантов, кроме начального окна.
+        let initial = crate::net::CREDIT_INITIAL_WINDOW as usize;
+        let mut received = 0usize;
+        let quiet = std::time::Duration::from_secs(2);
+        while let Ok(Some(frame)) = tokio::time::timeout(quiet, from_tunnel.recv()).await {
+            if frame.event == crate::rawcast::RawCastEvent::Data {
+                received += frame.payload.len();
+            }
+        }
+        assert!(
+            received >= initial / 2,
+            "the initial window never arrived ({received} B)"
+        );
+        assert!(
+            received <= initial + 256 * 1024,
+            "sender ignored the window: {received} B arrived against a {initial} B limit"
+        );
+
+        // Фаза 2: приёмник «потребляет» и щедро продлевает лимит — поток доезжает целиком.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut closed = false;
+        let grant = |limit: u64| {
+            RawCastFrame::credit(
+                LocalProtocol::Tcp,
+                1,
+                std::net::Ipv4Addr::LOCALHOST,
+                target.port(),
+                limit as u32,
+            )
+        };
+        let mut limit = received as u64 + 4 * 1024 * 1024;
+        to_tunnel.send(grant(limit)).await.unwrap();
+        while !closed {
+            let Ok(Some(frame)) = tokio::time::timeout_at(deadline, from_tunnel.recv()).await
+            else {
+                break;
+            };
+            match frame.event {
+                crate::rawcast::RawCastEvent::Data => {
+                    received += frame.payload.len();
+                    assert!(
+                        received as u64 <= limit + 256 * 1024,
+                        "received {received} B past the granted limit {limit}"
+                    );
+                    if limit < received as u64 + 2 * 1024 * 1024 {
+                        limit = received as u64 + 4 * 1024 * 1024;
+                        to_tunnel.send(grant(limit)).await.unwrap();
+                    }
+                }
+                crate::rawcast::RawCastEvent::Close => closed = true,
+                _ => {}
+            }
+        }
+        assert_eq!(received, TOTAL, "granted stream must arrive in full");
+        assert!(closed, "stream must end with Close");
     }
 }

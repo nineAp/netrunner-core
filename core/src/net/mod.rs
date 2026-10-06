@@ -37,6 +37,7 @@
 
 mod auth;
 mod config;
+mod credit;
 #[cfg(not(target_arch = "wasm32"))]
 mod mesh;
 #[cfg(not(target_arch = "wasm32"))]
@@ -61,6 +62,9 @@ pub use auth::{
     MESH_EGRESS_EXHAUSTED, MESH_ONION_READY, MESH_ROUTE_READY,
 };
 pub use config::NetworkConfig;
+pub use credit::{
+    CreditReceiver, CREDIT_GLOBAL_BUDGET, CREDIT_INITIAL_WINDOW, CREDIT_MAX_WINDOW, CREDIT_MIN_WINDOW,
+};
 #[cfg(not(target_arch = "wasm32"))]
 pub use connection::{
     run_datagram_listener, ClientHandler, Connection, Muxer, ServerHandler, SessionManager,

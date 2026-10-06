@@ -155,30 +155,16 @@ pub const BACKLOG_STUCK_GRACE: Duration = Duration::from_secs(5);
 /// that has served many short-lived client sessions.
 pub const BACKLOG_REAPER_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
-// ── End-to-end credit flow control (Muxer::init_credit/grant_credit/consume_credit) ──
-/// Initial credit window granted to a stream's sender: how many bytes it may
-/// push into the tunnel before it must wait for the receiver to grant more via
-/// a `Credit` frame. Bounds how much can ever be "in flight" for one stream —
-/// unlike the local byte-budget backlog (a last-resort backstop), this stops
-/// the sender from ever producing the excess in the first place, so a slow
-/// receiver never has to buffer-then-give-up.
-pub const STREAM_CREDIT_INITIAL: u32 = 2 * 1024 * 1024;
-/// The receiver batches freed bytes and sends one `Credit` frame per this many
-/// bytes reclaimed, instead of one per delivered frame — same idea as TCP
-/// delayed window updates, avoids flooding tiny control frames. Deliberately
-/// finer than a quarter of the (possibly RTT-scaled, see
-/// `adaptive_credit_window`) sender window: the receiver has no way to know
-/// the sender's actual multiplier, and smaller/more frequent grants keep the
-/// window topped up with less slack regardless of how big it ended up being.
-pub const STREAM_CREDIT_RETURN_THRESHOLD: u32 = STREAM_CREDIT_INITIAL / 8;
-/// How long `consume_credit` waits on each poll before re-checking the balance
-/// (bounds the delay from a `notify` race, not a hard deadline by itself).
+// ── End-to-end credit flow control (see `net::credit` and `Muxer::credit_gate`) ──
+/// How long a sender blocked on an exhausted credit window waits per poll before
+/// re-checking the balance (bounds the delay from a `notify` race, not a deadline).
 pub const CREDIT_WAIT_POLL: Duration = Duration::from_secs(2);
-/// If the peer hasn't granted any credit at all for this long, treat it as not
-/// speaking the credit protocol (or badly behind) and fall back to unrestricted
-/// sending rather than stalling the stream forever — the byte-budget backlog
-/// and its reaper remain the ultimate backstop either way.
-pub const CREDIT_FALLBACK_AFTER: Duration = Duration::from_secs(10);
+/// Safety valve: a sender blocked this long without ANY new grant proceeds anyway
+/// (and logs). Grants are absolute and idempotent, so a healthy peer heals a lost
+/// one with the next frame; this only guards against a peer that stopped granting
+/// because of a bug. It is deliberately long: a consumer that merely paused (a
+/// video player with a full buffer) must NOT be mistaken for a broken peer.
+pub const CREDIT_STALL_FALLBACK: Duration = Duration::from_secs(600);
 pub const TLS_HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 pub const SECURE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
 pub const FALLBACK_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);

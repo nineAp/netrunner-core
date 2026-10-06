@@ -183,30 +183,43 @@ struct PendingUdp {
     since_ms: u64,
 }
 
-/// Кредитное окно одного потока на СТОРОНЕ ОТПРАВИТЕЛЯ: сколько байт ещё можно
-/// протолкнуть в туннель, прежде чем ждать `Credit`-кадр от приёмника.
+/// Кредитное окно одного потока на СТОРОНЕ ОТПРАВИТЕЛЯ (см. [`crate::net::credit`]).
 ///
-/// Существует отдельно от `StreamBacklog` (тот — на стороне приёмника, отвечает
-/// за "что делать, если консьюмер не успевает"). Кредит — упреждающая мера:
-/// если он работает как задумано, `StreamBacklog` почти никогда не разрастается,
-/// потому что отправитель сам не производит данные быстрее, чем приёмник может
-/// их принять. `available` — `i64`, а не `usize`, чтобы `fetch_sub` мог уводить
-/// его в отрицательные значения без паники при гонках (`consume_credit` всё
-/// равно трактует `<= 0` как "кредита нет").
+/// Создаётся при регистрации потока с лимитом «без ограничений»: пока приёмник не
+/// прислал ни одного `Credit`-кадра (старый пир, не знающий про кредиты), поток
+/// ведёт себя как раньше. Первый грант включает ограничение; дальше лимит только
+/// растёт. Счётчик отправленного байта ведётся с самого начала потока, поэтому
+/// абсолютный лимит приёмника сравнивается с честным `sent`, без дрейфа.
 struct CreditState {
-    available: std::sync::atomic::AtomicI64,
+    /// Абсолютный лимит отправки (байт Data с начала потока); `u64::MAX` — грантов
+    /// ещё не было.
+    limit: AtomicU64,
+    /// Сколько байт Data уже отправлено в этом потоке.
+    sent: AtomicU64,
     notify: Notify,
-    /// Метка времени (мс) последнего РЕАЛЬНОГО пополнения — либо `init_credit`,
-    /// либо `grant_credit` от входящего `Credit`-кадра. `consume_credit`
-    /// откатывается на неограниченную отправку, только если с последнего
-    /// такого пополнения прошло больше [`crate::net::CREDIT_FALLBACK_AFTER`] —
-    /// НЕ если истёк дедлайн текущего вызова (это была ошибка: дедлайн
-    /// пересчитывался с нуля на каждый вызов `consume_credit`, поэтому после
-    /// исчерпания стартового окна на высокой скорости отправитель получал
-    /// жалкие `BRIDGE_READ_CHUNK` раз в `CREDIT_FALLBACK_AFTER` — то есть
-    /// credit-контроль топил скачивание СИЛЬНЕЕ, чем если бы его не было
-    /// вовсе, вместо того чтобы просто подождать очередной грант).
+    /// Метка времени (мс) последнего РЕАЛЬНОГО гранта — для аварийного отката
+    /// (`CREDIT_STALL_FALLBACK`).
     last_grant_ms: AtomicU64,
+    /// Поток снят: ждущего отправителя нужно отпустить, чтобы он не завис.
+    closed: AtomicBool,
+}
+
+impl CreditState {
+    fn new() -> Self {
+        Self {
+            limit: AtomicU64::new(u64::MAX),
+            sent: AtomicU64::new(0),
+            notify: Notify::new(),
+            last_grant_ms: AtomicU64::new(diagnostics::current_timestamp_ms()),
+            closed: AtomicBool::new(false),
+        }
+    }
+
+    /// Окно исчерпано: лимит задан и отправлено не меньше него.
+    fn exhausted(&self) -> bool {
+        let limit = self.limit.load(Ordering::Acquire);
+        limit != u64::MAX && self.sent.load(Ordering::Acquire) >= limit
+    }
 }
 
 /// Регистрационная запись потока в реестре `Muxer::streams`.
@@ -1220,6 +1233,12 @@ impl Muxer {
     pub async fn send_to_network(&self, message: MuxMessage) -> Result<(), AppError> {
         let is_data = matches!(message.frame_type, FrameType::Data | FrameType::UdpData);
 
+        // End-to-end flow control: if the receiver of this stream grants credit, don't
+        // outrun it. Datagrams are exempt (UDP is best-effort and drops when late).
+        if message.frame_type == FrameType::Data {
+            self.credit_gate(message.stream_id).await;
+        }
+
         if is_data {
             // 🔥 ANTI-DOMINO FAILOVER.
             // A single leg dropping must NOT close the stream. We evict the dead
@@ -1282,8 +1301,12 @@ impl Muxer {
                 match leg.data_tx.clone().reserve_owned().await {
                     Ok(permit) => {
                         self.record_leg_data_queued(&leg, size);
+                        let is_tcp_data = message.frame_type == FrameType::Data;
                         permit.send(message);
                         self.record_data_tx(&leg, stream_id, size);
+                        if is_tcp_data {
+                            self.debit_credit(stream_id, size as usize);
+                        }
                         return Ok(());
                     }
                     Err(_) => {
@@ -1330,7 +1353,11 @@ impl Muxer {
             // Close: dropping it leaks stream resources.
             // Heartbeat (PONG): dropping it via try_send causes the health-check
             // probe to time out after HEALTH_CHECK_TIMEOUT and evict a live leg.
-            let is_critical = matches!(message.frame_type, FrameType::Close | FrameType::Heartbeat);
+            // Credit too: a dropped grant would leave the sender blocked until the next one.
+            let is_critical = matches!(
+                message.frame_type,
+                FrameType::Close | FrameType::Heartbeat | FrameType::Credit
+            );
 
             if is_critical {
                 match leg.control_tx.send(message).await {
@@ -1465,6 +1492,13 @@ impl Muxer {
         self.send_control(stream_id, f_type, data).await
     }
 
+    /// Списывает отправленные `size` байт Data с кредитного окна потока.
+    fn debit_credit(&self, stream_id: u32, size: usize) {
+        if let Some(state) = self.credits.get(&stream_id) {
+            state.sent.fetch_add(size as u64, Ordering::AcqRel);
+        }
+    }
+
     /// Whether the leg has answered a heartbeat/PING at least once and is still fresh.
     #[cfg(test)]
     pub(crate) fn leg_has_pong(&self, leg_id: u32) -> bool {
@@ -1517,10 +1551,11 @@ impl Muxer {
             backlog.clone(),
             stats.clone(),
             token.clone(),
-            self.streams.clone(),
-            self.closing_tokens.clone(),
+            self.clone(),
         );
 
+        self.credits
+            .insert(stream_id, Arc::new(CreditState::new()));
         self.streams.insert(
             stream_id,
             StreamSlot {
@@ -1550,8 +1585,7 @@ impl Muxer {
         backlog: Arc<StreamBacklog>,
         stats: Arc<StreamStats>,
         token: CancellationToken,
-        streams: Arc<DashMap<u32, StreamSlot>>,
-        closing_tokens: Arc<DashMap<u32, CancellationToken>>,
+        muxer: Muxer,
     ) {
         tokio::spawn(async move {
             loop {
@@ -1591,14 +1625,21 @@ impl Muxer {
                 if backlog.closing.load(Ordering::Acquire)
                     && backlog.bytes.load(Ordering::Acquire) == 0
                 {
-                    if let Some((_, slot)) =
-                        streams.remove_if(&stream_id, |_, s| Arc::ptr_eq(&s.backlog, &backlog))
+                    if let Some((_, slot)) = muxer
+                        .streams
+                        .remove_if(&stream_id, |_, s| Arc::ptr_eq(&s.backlog, &backlog))
                     {
                         let linger = slot.token.clone();
-                        closing_tokens.insert(stream_id, linger.clone());
+                        muxer.closing_tokens.insert(stream_id, linger.clone());
                         drop(slot);
+                        // The stream is over for both directions: free its credit window
+                        // (releasing any sender still waiting on it), leg binding and the
+                        // rest of its state. Only the consumer's tasks stay alive until
+                        // they see EOF.
+                        muxer.release_stream_state(stream_id);
                         // A consumer that ignores EOF must not live forever; the
                         // owner's `remove_stream` normally cancels the token first.
+                        let closing_tokens = muxer.closing_tokens.clone();
                         tokio::spawn(async move {
                             let _ = tokio::time::timeout(
                                 crate::net::STREAM_EOF_LINGER,
@@ -1657,6 +1698,13 @@ impl Muxer {
     /// бэклог-дренер) и снимая привязку к ноге.
     pub fn remove_stream(&self, stream_id: u32) {
         self.release_stream_inbound(stream_id);
+        self.release_stream_state(stream_id);
+    }
+
+    /// Everything about a stream except its receiving half: credit window, leg
+    /// binding, UDP flowlet and early-datagram buffer.
+    fn release_stream_state(&self, stream_id: u32) {
+        self.drop_credit(stream_id);
         self.stream_bindings.remove(&stream_id);
         self.udp_flowlets.remove(&stream_id);
         // Поток закрыт — держать под ним ранний UDP-буфер незачем.
@@ -1818,83 +1866,76 @@ impl Muxer {
         }
     }
 
-    /// Инициализирует кредитное окно потока: столько байт отправитель (эта
-    /// сторона) может протолкнуть, не дожидаясь `Credit`-кадра от приёмника.
-    /// Вызывает тот, кто НАЧИНАЕТ производить данные для потока (например,
-    /// `RemoteOpener::open_tcp` перед запуском моста к цели).
-    pub fn init_credit(&self, stream_id: u32, initial_bytes: u32) {
-        self.credits.insert(
-            stream_id,
-            Arc::new(CreditState {
-                available: std::sync::atomic::AtomicI64::new(initial_bytes as i64),
-                notify: Notify::new(),
-                last_grant_ms: AtomicU64::new(diagnostics::current_timestamp_ms()),
-            }),
-        );
-    }
-
-    /// Снимает кредитное окно потока. Вызывать при завершении отправки для
-    /// этого потока (симметрично `remove_stream`, но для другой карты —
-    /// `credits` живёт по циклу жизни ОТПРАВКИ, а не приёма).
+    /// Снимает кредитное окно потока и отпускает ждущего в [`credit_gate`] отправителя.
     pub fn drop_credit(&self, stream_id: u32) {
-        self.credits.remove(&stream_id);
-    }
-
-    /// Обрабатывает входящий `Credit`-кадр: пополняет окно и будит того, кто
-    /// сейчас ждёт кредит в [`consume_credit`]. No-op, если для этого
-    /// `stream_id` кредит не инициализирован (например, кадр пришёл уже после
-    /// `drop_credit`, или писала сторона, которая credit вообще не считает).
-    pub fn grant_credit(&self, stream_id: u32, bytes: u32) {
-        if let Some(state) = self.credits.get(&stream_id) {
-            let state = state.value();
-            state.available.fetch_add(bytes as i64, Ordering::AcqRel);
-            state
-                .last_grant_ms
-                .store(diagnostics::current_timestamp_ms(), Ordering::Relaxed);
+        if let Some((_, state)) = self.credits.remove(&stream_id) {
+            state.closed.store(true, Ordering::Release);
+            state.notify.notify_waiters();
             state.notify.notify_one();
         }
     }
 
-    /// Ждёт, пока для потока не появится кредит, и забирает `min(available, want)`
-    /// байт. Возвращает `want` без ожидания, если credit для этого потока не
-    /// инициализирован (тот, кто вызвал, просто не участвует в этой схеме —
-    /// поведение как до появления credit-контроля).
-    ///
-    /// Не блокирует НАВСЕГДА: если приёмник ни разу не прислал `Credit` дольше
-    /// [`CREDIT_FALLBACK_AFTER`] С МОМЕНТА ПОСЛЕДНЕГО РЕАЛЬНОГО ГРАНТА (не
-    /// понимает кадр, или сильно отстал), считаем credit-контроль неработающим
-    /// для этого потока и откатываемся на неограниченную отправку — байтовый
-    /// бюджет бэклога и его ридер остаются подстраховкой в любом случае.
-    ///
-    /// Дедлайн считается от `last_grant_ms`, а НЕ от момента входа в эту
-    /// функцию: на высокой скорости `consume_credit` вызывается на каждый
-    /// ~64 КБ чанк, и если бы каждый вызов заново отсчитывал полный
-    /// `CREDIT_FALLBACK_AFTER`, окно, работающее штатно, но чуть отстающее от
-    /// потребления, топило бы скачивание до пары кадров в 10 секунд — то есть
-    /// сильнее, чем при полном отсутствии credit-контроля. Пока приёмник шлёт
-    /// гранты хоть с какой-то регулярностью, ожидание прерывается по `notify`
-    /// в течение примерно одного RTT, а не по этому дедлайну.
-    pub async fn consume_credit(&self, stream_id: u32, want: usize) -> usize {
+    /// Обрабатывает входящий `Credit`-кадр: `offset` — абсолютный лимит отправки в
+    /// байтах Data с начала потока (по модулю 2³²). Идемпотентно: дубликат или
+    /// запоздавший кадр лимит не откатывают. No-op для неизвестного потока (кадр
+    /// пришёл после его снятия).
+    pub fn grant_credit(&self, stream_id: u32, offset: u32) {
         let Some(state) = self.credits.get(&stream_id).map(|e| e.value().clone()) else {
-            return want;
+            return;
         };
-
         loop {
-            let avail = state.available.load(Ordering::Acquire);
-            if avail > 0 {
-                let take = (avail as usize).min(want);
-                state.available.fetch_sub(take as i64, Ordering::AcqRel);
-                return take;
+            let current = state.limit.load(Ordering::Acquire);
+            let next = if current == u64::MAX {
+                // Первый грант: лимит абсолютный от начала потока, продолжать нечего.
+                Some(offset as u64)
+            } else {
+                crate::net::credit::extend_limit(current, offset)
+            };
+            let Some(next) = next else { return };
+            if state
+                .limit
+                .compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                break;
             }
-            let since_last_grant = diagnostics::current_timestamp_ms()
+        }
+        state
+            .last_grant_ms
+            .store(diagnostics::current_timestamp_ms(), Ordering::Relaxed);
+        state.notify.notify_one();
+    }
+
+    /// Шлюз отправки Data: ждёт, пока у потока есть кредит. Списание делает
+    /// [`debit_credit`](Self::debit_credit) уже после того, как кадр принят каналом
+    /// ноги — повтор отправки после failover не должен списывать дважды.
+    ///
+    /// Стоит в единственном месте, через которое проходят все Data на ногу
+    /// ([`send_to_network`](Self::send_to_network)), поэтому работает для любого
+    /// отправителя — моста сервера, мост-реле меша, клиентской выгрузки — без
+    /// изменений в каждом. Ожидание блокирует именно отправителя этого потока: его
+    /// источник перестаёт читаться, и TCP-backpressure доходит до цели/приложения,
+    /// а соседние потоки на той же ноге не страдают.
+    ///
+    /// Без грантов (старый пир) возвращается сразу. Списание «в долг» (одним чанком
+    /// сверх окна) допустимо: окно мягкое, перелёт не больше одного чанка.
+    async fn credit_gate(&self, stream_id: u32) {
+        let Some(state) = self.credits.get(&stream_id).map(|e| e.value().clone()) else {
+            return;
+        };
+        loop {
+            if !state.exhausted() || state.closed.load(Ordering::Acquire) {
+                return;
+            }
+            let since_grant = diagnostics::current_timestamp_ms()
                 .saturating_sub(state.last_grant_ms.load(Ordering::Relaxed));
-            if since_last_grant >= crate::net::CREDIT_FALLBACK_AFTER.as_millis() as u64 {
-                trace!(
+            if since_grant >= crate::net::CREDIT_STALL_FALLBACK.as_millis() as u64 {
+                warn!(
                     stream_id,
-                    "consume_credit: no grant for {:?} — falling back to unrestricted",
-                    crate::net::CREDIT_FALLBACK_AFTER
+                    "credit gate: no grant for {:?} — sending unrestricted",
+                    crate::net::CREDIT_STALL_FALLBACK
                 );
-                return want;
+                return;
             }
             let _ =
                 tokio::time::timeout(crate::net::CREDIT_WAIT_POLL, state.notify.notified()).await;

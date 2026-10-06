@@ -357,8 +357,14 @@ impl ConnectionManager {
             let socket_id = self.tracker.next_id();
             let (dst_ip, target) = self.resolver.resolve_destination(local.addr, local.port);
 
-            let (conn, rx_smol, tx_smol, handshake_tx, is_saturated) =
-                TcpConnection::new(handle, permit);
+            let (conn, rx_smol, tx_smol, handshake_tx, is_saturated) = TcpConnection::new(
+                handle,
+                permit,
+                self.tx_to_tunnel.clone(),
+                socket_id,
+                dst_ip,
+                local.port,
+            );
             self.tracker
                 .register_tcp(handle, socket_id, conn, tx_smol, is_saturated);
 

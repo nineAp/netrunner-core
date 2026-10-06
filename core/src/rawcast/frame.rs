@@ -36,6 +36,10 @@ pub enum RawCastEvent {
     Data = 0x02,
     /// Закрытие соединения.
     Close = 0x03,
+    /// Кредит потока (`payload` — абсолютный лимит, `u32` BE): приёмник сообщает
+    /// отправителю, сколько ещё готов принять. Только внутри процесса, между
+    /// клиентским движком и мостом.
+    Credit = 0x04,
 }
 
 /// Описание одного события локального сокета — единица обмена RawCast.
@@ -85,6 +89,18 @@ impl RawCastFrame {
     /// Кадр с данными соединения.
     pub fn data(protocol: LocalProtocol, id: u64, ip: Ipv4Addr, port: u16, data: Bytes) -> Self {
         Self::new(protocol, RawCastEvent::Data, id, ip, port, data)
+    }
+
+    /// Кадр-кредит: абсолютный лимит байт Data потока, который приёмник разрешает.
+    pub fn credit(protocol: LocalProtocol, id: u64, ip: Ipv4Addr, port: u16, offset: u32) -> Self {
+        Self::new(
+            protocol,
+            RawCastEvent::Credit,
+            id,
+            ip,
+            port,
+            Bytes::copy_from_slice(&offset.to_be_bytes()),
+        )
     }
 
     /// Кадр-событие закрытия соединения (без payload).
@@ -145,6 +161,7 @@ impl Parser for RawCastFrame {
             0x01 => RawCastEvent::Connect,
             0x02 => RawCastEvent::Data,
             0x03 => RawCastEvent::Close,
+            0x04 => RawCastEvent::Credit,
             e => return Err(format!("Unknown local event: {}", e)),
         };
 

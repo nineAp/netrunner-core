@@ -17,7 +17,7 @@
 
 use bytes::Bytes;
 use netrunner_core::{
-    net::{GLOBAL_MIN_RTT, NetworkConfig, UDP_IDLE_TIMEOUT},
+    net::{CreditReceiver, GLOBAL_MIN_RTT, NetworkConfig, UDP_IDLE_TIMEOUT},
     rawcast::{LocalProtocol, RawCastFrame},
 };
 use smoltcp::{
@@ -108,6 +108,15 @@ pub struct TcpConnection {
     /// real data movement so the socket's LRU/idle timestamp is refreshed only
     /// when the connection is genuinely active.
     last_io_total: u64,
+    /// Receiver side of the stream's end-to-end flow control: tells the server how
+    /// many download bytes it may still send, as the app actually takes them.
+    credit: CreditReceiver,
+    /// Where grants go (the bridge task) and what identifies this socket there.
+    credit_tx: mpsc::Sender<RawCastFrame>,
+    credit_dst: (u64, std::net::Ipv4Addr, u16),
+    /// Newest grant that did not fit into `credit_tx` yet. Grants are absolute
+    /// limits, so only the latest one ever needs to be kept.
+    pending_grant: Option<u32>,
 }
 
 impl TcpConnection {
@@ -120,6 +129,10 @@ impl TcpConnection {
     pub fn new(
         handle: SocketHandle,
         permit: OwnedSemaphorePermit,
+        credit_tx: mpsc::Sender<RawCastFrame>,
+        socket_id: u64,
+        dst_ip: std::net::Ipv4Addr,
+        dst_port: u16,
     ) -> (
         Self,
         mpsc::Receiver<Bytes>,
@@ -144,6 +157,10 @@ impl TcpConnection {
             last_rtt_push_ms: i64::MIN,
             last_pushed_rtt_ms: 0,
             last_io_total: 0,
+            credit: CreditReceiver::new(),
+            credit_tx,
+            credit_dst: (socket_id, dst_ip, dst_port),
+            pending_grant: None,
         };
 
         (conn, rx_from_smol, tx_to_smol, handshake_tx, is_saturated)
@@ -341,9 +358,11 @@ impl TcpConnection {
                 match socket.send_slice(&chunk) {
                     Ok(n) if n == chunk.len() => {
                         // Entire chunk accepted.
+                        self.on_download_consumed(n);
                     }
                     Ok(n) => {
                         // Partial write — keep the remainder for the next tick.
+                        self.on_download_consumed(n);
                         self.pending_chunk = Some(chunk.slice(n..));
                         break;
                     }
@@ -364,6 +383,8 @@ impl TcpConnection {
             }
         }
 
+        self.flush_pending_grant();
+
         if self.server_eof && self.pending_chunk.is_none() {
             let state = socket.state();
             if state == tcp::State::Established || state == tcp::State::CloseWait {
@@ -373,6 +394,35 @@ impl TcpConnection {
                 );
                 socket.close();
             }
+        }
+    }
+
+    /// `n` download bytes were handed to the app-facing socket. This — the app taking
+    /// the data, not its arrival from the tunnel — is what frees the sender's window.
+    fn on_download_consumed(&mut self, n: usize) {
+        let rtt_ms = GLOBAL_MIN_RTT.load(Ordering::Relaxed);
+        let rtt = std::time::Duration::from_millis(if rtt_ms == 0 { 100 } else { rtt_ms as u64 });
+        if let Some(offset) = self
+            .credit
+            .on_consumed(n, std::time::Instant::now(), rtt)
+        {
+            self.pending_grant = Some(offset);
+        }
+        self.flush_pending_grant();
+    }
+
+    /// Hands the newest grant to the bridge if the channel has room; otherwise it
+    /// stays pending and is retried on the next tick.
+    fn flush_pending_grant(&mut self) {
+        let Some(offset) = self.pending_grant else {
+            return;
+        };
+        let (socket_id, ip, port) = self.credit_dst;
+        let frame = RawCastFrame::credit(LocalProtocol::Tcp, socket_id, ip, port, offset);
+        match self.credit_tx.try_send(frame) {
+            Ok(()) => self.pending_grant = None,
+            Err(mpsc::error::TrySendError::Full(_)) => {}
+            Err(mpsc::error::TrySendError::Closed(_)) => self.pending_grant = None,
         }
     }
 
@@ -406,6 +456,17 @@ impl TcpConnection {
                 netrunner_logger::error!("❌ [TCP {}] Failed to send CONNECT to tunnel", socket_id);
                 return;
             }
+
+            // First credit grant, right behind the Connect: from here on the server limits
+            // what it pushes to what this socket actually consumes (see `net::credit`).
+            let initial_grant = RawCastFrame::credit(
+                LocalProtocol::Tcp,
+                socket_id,
+                dst_ip,
+                dst_port,
+                CreditReceiver::initial_offset(),
+            );
+            let _ = tx_tunnel.send(initial_grant).await;
 
             let _ = handshake_tx.send(());
 
