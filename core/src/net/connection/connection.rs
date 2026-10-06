@@ -518,7 +518,11 @@ impl SessionManager {
     }
 
     pub fn remove(&self, session_id: &str) {
-        if self.sessions.remove(session_id).is_some() {
+        if let Some((_, muxer)) = self.sessions.remove(session_id) {
+            // Сессию убирают, когда у неё нет ног: потоки, привязанные к ней,
+            // больше ничего не доставят. Закрываем их, иначе мосты держат сокеты
+            // к целям, пока цель сама не оборвёт соединение.
+            muxer.remove_all_streams();
             // Снимаем записи ВСЕХ ног сессии (каждая нога регистрировала свой
             // корень — см. `register_datagram_session`). Собираем ключи в
             // owned-вектор до удаления, чтобы не держать итератор одной
@@ -2795,7 +2799,13 @@ impl TunnelHandler for ServerHandler {
         let (control_tx, control_rx) = mpsc::channel::<MuxMessage>(cap);
         let (data_tx, data_rx) = mpsc::channel::<MuxMessage>(cap);
 
-        let control_tx_clone = control_tx.clone();
+        // Обработчик ноги НЕ должен держать сильную копию `control_tx`: пока она
+        // жива, канал не закрывается, даже если health-check выселил ногу из
+        // муксера, — писатель ноги (`control_rx.recv()`) ждёт вечно, движок и
+        // сокет живут, а сессия числится «без ног» и не убирается (зомби-нога).
+        // Со слабой ссылкой выселение роняет последние отправители, писатель
+        // получает `None`, движок завершается и штатная очистка ниже срабатывает.
+        let control_tx_weak = control_tx.downgrade();
         muxer.add_leg(leg_id, control_tx, data_tx);
         // Прошли все три фазы (валидный хендшейк → auth-фрейм → токен принят
         // бэкендом, если --require-auth включён) — вот теперь это реальное
@@ -2880,7 +2890,10 @@ impl TunnelHandler for ServerHandler {
 
         let res = engine.run().await;
 
-        muxer.remove_leg(leg_id, &control_tx_clone);
+        // `None`: ногу уже выселили (отправители сброшены) — убирать нечего.
+        if let Some(control_tx) = control_tx_weak.upgrade() {
+            muxer.remove_leg(leg_id, &control_tx);
+        }
 
         if muxer.active_legs_count() == 0 {
             let sm = self.session_manager.clone();
@@ -3384,11 +3397,25 @@ mod tests {
     async fn spawn_node_with_sessions(
         validator: Arc<CountingValidator>,
     ) -> (std::net::SocketAddr, Arc<SessionManager>) {
+        let (addr, sessions, _finished) = spawn_node_full(validator).await;
+        (addr, sessions)
+    }
+
+    /// Ещё и счётчик завершившихся обработчиков соединений.
+    async fn spawn_node_full(
+        validator: Arc<CountingValidator>,
+    ) -> (
+        std::net::SocketAddr,
+        Arc<SessionManager>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
         NetworkConfig::init_global(1500);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let sm = Arc::new(SessionManager::new());
         let node_sessions = sm.clone();
+        let finished = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let node_finished = finished.clone();
         tokio::spawn(async move {
             loop {
                 let (stream, _) = listener.accept().await.unwrap();
@@ -3401,12 +3428,14 @@ mod tests {
                     crate::decoy::CoverFlight::node_default().records.into(),
                     true,
                 );
+                let done = finished.clone();
                 tokio::spawn(async move {
                     let _ = handler.run().await;
+                    done.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 });
             }
         });
-        (addr, node_sessions)
+        (addr, node_sessions, node_finished)
     }
 
     async fn connect_client(addr: std::net::SocketAddr) -> Arc<Muxer> {
@@ -3428,6 +3457,60 @@ mod tests {
 
     fn calls(v: &CountingValidator) -> usize {
         v.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Выселенная health-check'ом нога не должна оставаться жить: движок и
+    /// сокет обязаны завершиться, иначе сессия висит «без ног» с живыми потоками
+    /// (на проде — SG: `Evicting` без последующей очистки, зомби минутами).
+    #[tokio::test]
+    async fn evicted_leg_ends_its_engine_instead_of_lingering() {
+        let validator = Arc::new(CountingValidator {
+            reject: false,
+            calls: Default::default(),
+        });
+        let (addr, sessions, finished) = spawn_node_full(validator).await;
+        let _client = connect_client(addr).await;
+
+        // Ждём, пока на ноде появится сессия хотя бы с одной ногой.
+        let mut muxer = None;
+        for _ in 0..100 {
+            if let Some(entry) = sessions.get_session().iter().next() {
+                if entry.value().active_legs_count() > 0 {
+                    muxer = Some(entry.value().clone());
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let muxer = muxer.expect("server session with a leg");
+        let before = finished.load(std::sync::atomic::Ordering::SeqCst);
+
+        // Ровно то, что делает health-check при таймауте PONG.
+        let leg_id = 0;
+        muxer.force_remove_leg(leg_id);
+
+        let mut ended = false;
+        for _ in 0..60 {
+            if finished.load(std::sync::atomic::Ordering::SeqCst) > before {
+                ended = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(ended, "движок выселенной ноги должен завершиться");
+    }
+
+    #[tokio::test]
+    async fn removing_a_session_closes_its_streams() {
+        let sm = SessionManager::new();
+        let muxer = sm.get_or_create("s");
+        let (tx, _rx) = mpsc::channel(4);
+        muxer.register_stream(7, tx);
+        assert_eq!(muxer.active_streams_count(), 1);
+
+        sm.remove("s");
+
+        assert_eq!(muxer.active_streams_count(), 0);
     }
 
     #[tokio::test]
