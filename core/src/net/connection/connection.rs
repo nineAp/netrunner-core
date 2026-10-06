@@ -787,7 +787,100 @@ async fn resolve_safe_decoy_addr(host: &str, port: u16) -> Option<std::net::Sock
     .await
     .ok()?
     .ok()?;
-    addrs.into_iter().find(|a| is_safe_decoy_ip(&a.ip()))
+    addrs
+        .into_iter()
+        .find(|a| is_safe_decoy_ip(&a.ip()) && !is_local_ip(&a.ip()))
+}
+
+/// `true`, если адрес назначен самому этому хосту.
+///
+/// `bind` на чужой адрес даёт `EADDRNOTAVAIL`, на собственный — успешен, поэтому
+/// отдельный перечень интерфейсов не нужен. Без этой проверки SNI вроде
+/// «имя ноды → её же публичный IP» превращал fallback в петлю: узел подключался
+/// к себе же, пересылал туда тот же невалидный ClientHello, получал его снова
+/// как «чужой» и так без конца — каждый виток держал два сокета и два буфера, и
+/// один такой hello от сканера за секунды выедал память ноды (OOM на 2 ГБ).
+fn is_local_ip(ip: &std::net::IpAddr) -> bool {
+    std::net::UdpSocket::bind(std::net::SocketAddr::new(*ip, 0)).is_ok()
+}
+
+/// Сколько fallback-мостов узел держит одновременно. Это чистая маскировка, а не
+/// рабочий трафик: потолок гарантирует, что враждебный или зациклившийся hello
+/// (например, через два узла, чей общий домен указывает на оба) не раздует память
+/// — лишние соединения просто закрываются.
+const MAX_FALLBACK_BRIDGES: usize = 512;
+
+/// Простой моста без байт в обе стороны, после которого он закрывается. Настоящий
+/// сайт-приманка тоже закрывает бездействующее соединение (keep-alive nginx/Apache
+/// — десятки секунд), так что для сканера это не заметно, а зависшие мосты
+/// перестают копиться вечно.
+const FALLBACK_BRIDGE_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const FALLBACK_BRIDGE_IDLE_CHECK: Duration = Duration::from_secs(5);
+
+static FALLBACK_BRIDGE_PERMITS: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(MAX_FALLBACK_BRIDGES);
+
+/// Двунаправленная прокачка клиент ⇄ приманка с общим счётчиком активности: мост
+/// закрывается, когда ни в одну из сторон не прошло ни байта за `idle`.
+///
+/// Тайм-аут общий, а не по направлению: долгая загрузка страницы (данные идут
+/// только от сервера, клиент молчит) — нормальный трафик и обрываться не должна.
+async fn relay_with_idle_timeout<CR, CW, SR, SW>(
+    mut client_read: CR,
+    mut client_write: CW,
+    mut server_read: SR,
+    mut server_write: SW,
+    idle: Duration,
+    check_every: Duration,
+) where
+    CR: AsyncRead + Unpin,
+    CW: AsyncWrite + Unpin,
+    SR: AsyncRead + Unpin,
+    SW: AsyncWrite + Unpin,
+{
+    async fn pump<R, W>(mut from: R, mut to: W, last_activity_ms: &AtomicU64, started: Instant)
+    where
+        R: AsyncRead + Unpin,
+        W: AsyncWrite + Unpin,
+    {
+        let mut buffer = vec![0u8; 8 * 1024];
+        loop {
+            match from.read(&mut buffer).await {
+                Ok(0) | Err(_) => return,
+                Ok(read) => {
+                    if to.write_all(&buffer[..read]).await.is_err() {
+                        return;
+                    }
+                    last_activity_ms.store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
+    let started = Instant::now();
+    let last_activity_ms = AtomicU64::new(0);
+    let idle_ms = idle.as_millis() as u64;
+
+    let transfer = async {
+        tokio::join!(
+            pump(&mut client_read, &mut server_write, &last_activity_ms, started),
+            pump(&mut server_read, &mut client_write, &last_activity_ms, started),
+        );
+    };
+    let watchdog = async {
+        loop {
+            tokio::time::sleep(check_every).await;
+            let quiet_for = (started.elapsed().as_millis() as u64)
+                .saturating_sub(last_activity_ms.load(Ordering::Relaxed));
+            if quiet_for >= idle_ms {
+                return;
+            }
+        }
+    };
+    tokio::select! {
+        _ = transfer => {}
+        _ = watchdog => debug!("Stealth fallback connection closed after idle timeout."),
+    }
 }
 
 /// Дожидается и вырезает из буфера фиктивную запись `ChangeCipherSpec`,
@@ -2179,8 +2272,8 @@ impl ServerHandler {
     /// выглядит как обычный визит на публичный сайт — сервер не выдаёт себя
     /// сканерам и активным пробам DPI.
     async fn handle_stealth_fallback(
-        mut client_inbound: TunnelReadHalf,
-        mut client_outbound: TunnelWriteHalf,
+        client_inbound: TunnelReadHalf,
+        client_outbound: TunnelWriteHalf,
         initial_data: Bytes,
         decoy_host: &str,
         requested_sni: Option<&str>,
@@ -2194,6 +2287,13 @@ impl ServerHandler {
         // `netrunner_auth_failed_total` (см. ниже в `run`) — граница между
         // "реальный VPN-трафик" и "сканеры/DPI-пробы, долбящиеся на порт".
         metrics::counter!("netrunner_scanner_fallback_total").increment(1);
+
+        // Держим разрешение на мост до конца функции (см. `MAX_FALLBACK_BRIDGES`).
+        // Нет свободного — соединение просто закрывается.
+        let Ok(_bridge_permit) = FALLBACK_BRIDGE_PERMITS.try_acquire() else {
+            metrics::counter!("netrunner_scanner_fallback_dropped_total").increment(1);
+            return;
+        };
         // В режиме SelfHosted запрошенный SNI не учитывается вовсе: узел всегда
         // отдаёт свой собственный сайт (decoy_host → локальный сайт узла).
         // Именно это отличает корректную маскировку от открытого релея —
@@ -2232,16 +2332,21 @@ impl ServerHandler {
             tokio::time::timeout(FALLBACK_CONNECT_TIMEOUT, TcpStream::connect(target_addr)).await;
 
         if let Ok(Ok(target_server)) = target_stream {
-            let (mut server_read, mut server_write) = target_server.into_split();
+            let (server_read, mut server_write) = target_server.into_split();
 
             if !initial_data.is_empty() && server_write.write_all(&initial_data).await.is_err() {
                 return;
             }
 
-            let client_to_server = tokio::io::copy(&mut client_inbound, &mut server_write);
-            let server_to_client = tokio::io::copy(&mut server_read, &mut client_outbound);
-
-            let _ = tokio::join!(client_to_server, server_to_client);
+            relay_with_idle_timeout(
+                client_inbound,
+                client_outbound,
+                server_read,
+                server_write,
+                FALLBACK_BRIDGE_IDLE_TIMEOUT,
+                FALLBACK_BRIDGE_IDLE_CHECK,
+            )
+            .await;
             debug!("Stealth fallback connection closed.");
         } else {
             warn!("Failed to connect to fallback host.");
@@ -2945,6 +3050,69 @@ mod tests {
         // (без сети), но результат всё равно должен быть отфильтрован.
         let addr = resolve_safe_decoy_addr("10.0.0.5", 443).await;
         assert_eq!(addr, None);
+    }
+
+    #[test]
+    fn is_local_ip_recognises_own_addresses_only() {
+        assert!(is_local_ip(&"127.0.0.1".parse().unwrap()));
+        // Адрес из публичного диапазона, которого на этом хосте нет.
+        assert!(!is_local_ip(&"93.184.216.34".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn fallback_bridge_closes_when_both_sides_stay_silent() {
+        let (_client_end, client_side) = tokio::io::duplex(1024);
+        let (_server_end, server_side) = tokio::io::duplex(1024);
+        let (client_read, client_write) = tokio::io::split(client_side);
+        let (server_read, server_write) = tokio::io::split(server_side);
+
+        let started = Instant::now();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            relay_with_idle_timeout(
+                client_read,
+                client_write,
+                server_read,
+                server_write,
+                Duration::from_millis(300),
+                Duration::from_millis(50),
+            ),
+        )
+        .await
+        .expect("a bridge without traffic must close on its own");
+        assert!(started.elapsed() >= Duration::from_millis(300));
+    }
+
+    #[tokio::test]
+    async fn fallback_bridge_stays_open_for_one_way_traffic_and_relays_bytes() {
+        let (mut client_end, client_side) = tokio::io::duplex(1024);
+        let (mut server_end, server_side) = tokio::io::duplex(1024);
+        let (client_read, client_write) = tokio::io::split(client_side);
+        let (server_read, server_write) = tokio::io::split(server_side);
+        let bridge = tokio::spawn(relay_with_idle_timeout(
+            client_read,
+            client_write,
+            server_read,
+            server_write,
+            Duration::from_millis(300),
+            Duration::from_millis(50),
+        ));
+
+        // Сервер отдаёт данные дольше тайм-аута простоя, клиент молчит — как при
+        // загрузке страницы: мост обязан жить и доставлять байты.
+        for round in 0..10u8 {
+            server_end.write_all(&[round]).await.unwrap();
+            let mut byte = [0u8; 1];
+            client_end.read_exact(&mut byte).await.unwrap();
+            assert_eq!(byte[0], round);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(!bridge.is_finished(), "one-way traffic must keep the bridge alive");
+
+        tokio::time::timeout(Duration::from_secs(5), bridge)
+            .await
+            .expect("the bridge must close after traffic stops")
+            .unwrap();
     }
 
     #[tokio::test]
