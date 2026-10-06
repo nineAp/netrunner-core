@@ -179,11 +179,16 @@ impl RemoteOpener {
         };
         if let Some(stream) = stream {
             let (reader, writer) = stream.into_split();
-            tokio::select! {
-                _ = token.cancelled() => {},
-                _ = run_tcp_bridge(stream_id, reader, writer, muxer.clone(), v_rx) => {},
-            }
-            if !token.is_cancelled() {
+            // `biased` + a flag: the bridge's own guard cancels the stream token on the
+            // way out, so `token.is_cancelled()` can't tell "bridge finished" from
+            // "evicted". Only an eviction (cancelled while the bridge still runs) skips
+            // the Close; a normal end must tell the peer, or its socket never sees EOF.
+            let bridge_finished = tokio::select! {
+                biased;
+                _ = run_tcp_bridge(stream_id, reader, writer, muxer.clone(), v_rx) => true,
+                _ = token.cancelled() => false,
+            };
+            if bridge_finished {
                 let _ = muxer
                     .send_control(stream_id, FrameType::Close, Bytes::new())
                     .await;
@@ -1517,6 +1522,36 @@ impl StreamHandler {
         Self { muxer, opener }
     }
 
+    /// What an incoming heartbeat frame needs in reply, if anything: `PING` → `PONG`
+    /// (or the mesh-onion readiness marker), and on the server side a plain heartbeat →
+    /// an empty one. The reply to a liveness probe must go back on the leg the probe
+    /// arrived on (see `Muxer::send_control_on_leg`), which is why this is separate
+    /// from `handle`: the leg reader knows the leg, the handler does not.
+    pub(crate) fn heartbeat_reply(&self, payload: &[u8]) -> Option<Bytes> {
+        if payload == b"PING" {
+            let response: &'static [u8] = if self
+                .opener
+                .as_ref()
+                .is_some_and(|opener| opener.mesh_onion_peer)
+            {
+                crate::net::MESH_ONION_READY
+            } else {
+                b"PONG"
+            };
+            Some(Bytes::from_static(response))
+        } else if payload == b"PONG"
+            || payload == crate::net::MESH_ROUTE_READY
+            || payload == crate::net::MESH_ONION_READY
+            || payload == crate::net::MESH_EGRESS_EXHAUSTED
+        {
+            None
+        } else if self.opener.is_some() {
+            Some(Bytes::new())
+        } else {
+            None
+        }
+    }
+
     /// Диспетчеризует один кадр по типу. Для `Data`/`UdpData` доставка идёт через
     /// `await` (backpressure ради сохранения порядка), для управляющих —
     /// в отдельных задачах, чтобы не блокировать reader ноги.
@@ -1526,25 +1561,12 @@ impl StreamHandler {
         match frame.header.frame_type {
             FrameType::Heartbeat => {
                 let payload = frame.payload.as_ref();
-                if payload == b"PING" {
-                    trace!(stream_id, "🤝 [Tunnel] PING received, replying PONG");
-                    let response: &'static [u8] = if self
-                        .opener
-                        .as_ref()
-                        .is_some_and(|opener| opener.mesh_onion_peer)
-                    {
-                        crate::net::MESH_ONION_READY
-                    } else {
-                        b"PONG"
-                    };
+                if let Some(reply) = self.heartbeat_reply(payload) {
+                    trace!(stream_id, "🤝 [Tunnel] heartbeat received, replying");
                     let muxer = self.muxer.clone();
                     tokio::spawn(async move {
                         let _ = muxer
-                            .send_control(
-                                stream_id,
-                                FrameType::Heartbeat,
-                                Bytes::from_static(response),
-                            )
+                            .send_control(stream_id, FrameType::Heartbeat, reply)
                             .await;
                     });
                 } else if payload == b"PONG"
@@ -1555,20 +1577,7 @@ impl StreamHandler {
                     trace!(stream_id, "🤝 [Tunnel] PONG received");
                     self.muxer.dispatch_to_local(stream_id, frame.payload);
                 } else {
-                    if self.opener.is_some() {
-                        trace!(
-                            stream_id,
-                            "💓 [Server] Standard Heartbeat received, sending reply"
-                        );
-                        let muxer = self.muxer.clone();
-                        tokio::spawn(async move {
-                            let _ = muxer
-                                .send_control(stream_id, FrameType::Heartbeat, Bytes::new())
-                                .await;
-                        });
-                    } else {
-                        trace!(stream_id, "💓 [Client] Standard Heartbeat reply received");
-                    }
+                    trace!(stream_id, "💓 [Client] Standard Heartbeat reply received");
                 }
             }
 
@@ -1644,7 +1653,13 @@ impl StreamHandler {
                     }
                 }
                 debug!(stream_id, "🏁 [Tunnel] Peer closed stream");
-                self.muxer.remove_stream(stream_id);
+                if stream_id == 0 {
+                    self.muxer.remove_stream(stream_id);
+                } else {
+                    // Graceful: whatever the peer sent before closing is still
+                    // delivered to the local consumer, which then sees EOF.
+                    self.muxer.finish_stream(stream_id);
+                }
             }
 
             FrameType::Credit => {

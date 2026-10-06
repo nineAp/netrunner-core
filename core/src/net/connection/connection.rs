@@ -2026,11 +2026,19 @@ impl ClientHandler {
                                     }
                                 }
 
-                                if let Some((_, (orig_local_id, _, _, _))) =
+                                if let Some((_, (orig_local_id, ip, port, proto))) =
                                     reg.remove(&global_stream_id)
                                 {
                                     l2g.remove(&orig_local_id);
                                     up_tx_map.remove(&orig_local_id);
+                                    // Still registered here means the PEER ended the stream
+                                    // (a local close removes the entry first), and everything
+                                    // it sent has already been forwarded above, in order. Tell
+                                    // the engine, otherwise the local socket never gets EOF and
+                                    // lingers until the idle timeout.
+                                    let _ = tx_to_tun
+                                        .send(RawCastFrame::close(proto, orig_local_id, ip, port))
+                                        .await;
                                     debug!(
                                         global_stream_id,
                                         "🧹 Garbage Collector: Cleaned up dead registry stream"
@@ -3455,6 +3463,58 @@ mod tests {
         .unwrap()
     }
 
+    /// Клиентская сторона вместе с RawCast-каналами движка: `(muxer, движок→туннель,
+    /// туннель→движок)`. Нужна тестам, которые сами играют роль клиентского движка.
+    async fn connect_client_raw(
+        addr: std::net::SocketAddr,
+    ) -> (
+        Arc<Muxer>,
+        mpsc::Sender<RawCastFrame>,
+        mpsc::Receiver<RawCastFrame>,
+    ) {
+        let (tx_to_engine, rx_from_tunnel) = mpsc::channel(256);
+        let (tx_to_tunnel, rx_from_engine) = mpsc::channel(256);
+        let muxer = ClientHandler::connect(
+            &addr.to_string(),
+            "example.com",
+            Some("jwt".into()),
+            None,
+            rx_from_engine,
+            tx_to_engine,
+        )
+        .await
+        .unwrap();
+        (muxer, tx_to_tunnel, rx_from_tunnel)
+    }
+
+    /// Цель, которая на каждое входящее соединение сразу пишет `total` байт кусками
+    /// по `chunk` и тут же закрывает сокет — как HTTP/1.0-сервер или `Connection: close`.
+    async fn spawn_burst_target(total: usize, chunk: usize) -> std::net::SocketAddr {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let block = vec![0xAB; chunk];
+                    let mut left = total;
+                    while left > 0 {
+                        let n = left.min(chunk);
+                        if sock.write_all(&block[..n]).await.is_err() {
+                            return;
+                        }
+                        left -= n;
+                    }
+                    // drop → FIN сразу за последним куском
+                });
+            }
+        });
+        addr
+    }
+
     fn calls(v: &CountingValidator) -> usize {
         v.calls.load(std::sync::atomic::Ordering::SeqCst)
     }
@@ -3610,5 +3670,118 @@ mod tests {
             after_shutdown,
             "после остановки сессии ноги не переподключаются"
         );
+    }
+
+    /// Закрытие потока сервером НЕ должно обгонять его данные и ДОЛЖНО дойти до
+    /// клиентского движка. Раньше `Close` ехал по приоритетному контрольному каналу
+    /// ноги и обгонял ещё не записанные `Data` того же потока (хвост ответа терялся:
+    /// `no_stream` в топологии), а на клиенте вообще не превращался в RawCast `Close`
+    /// (локальный сокет не получал EOF до 120-секундного idle-таймаута).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn server_close_neither_overtakes_data_nor_gets_lost() {
+        const STREAMS: u64 = 8;
+        const TOTAL: usize = 3 * 1024 * 1024;
+
+        let validator = Arc::new(CountingValidator {
+            reject: false,
+            calls: Default::default(),
+        });
+        let (addr, _sessions, _finished) = spawn_node_full(validator).await;
+        let target = spawn_burst_target(TOTAL, 64 * 1024).await;
+        let (muxer, to_tunnel, mut from_tunnel) = connect_client_raw(addr).await;
+
+        // Ноги поднимаются асинхронно: Connect до появления первой ноги был бы потерян.
+        for _ in 0..200 {
+            if muxer.active_legs_count() >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(muxer.active_legs_count() >= 1, "client legs never came up");
+
+        for id in 1..=STREAMS {
+            let mut connect = RawCastFrame::connect(
+                LocalProtocol::Tcp,
+                id,
+                std::net::Ipv4Addr::LOCALHOST,
+                target.port(),
+            );
+            connect.payload = Bytes::from(target.to_string());
+            to_tunnel.send(connect).await.unwrap();
+        }
+
+        let mut got = std::collections::HashMap::<u64, usize>::new();
+        let mut closed = std::collections::HashSet::<u64>::new();
+        let mut at_close = std::collections::HashMap::<u64, usize>::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        while closed.len() < STREAMS as usize {
+            let Ok(Some(frame)) = tokio::time::timeout_at(deadline, from_tunnel.recv()).await
+            else {
+                break;
+            };
+            match frame.event {
+                crate::rawcast::RawCastEvent::Data => *got.entry(frame.socket_id).or_default() += frame.payload.len(),
+                crate::rawcast::RawCastEvent::Close => {
+                    closed.insert(frame.socket_id);
+                    at_close.insert(
+                        frame.socket_id,
+                        got.get(&frame.socket_id).copied().unwrap_or(0),
+                    );
+                }
+                _ => {}
+            }
+        }
+
+        for id in 1..=STREAMS {
+            assert_eq!(
+                got.get(&id).copied().unwrap_or(0),
+                TOTAL,
+                "stream {id}: lost the tail of the response (bytes at Close: {:?})",
+                at_close.get(&id)
+            );
+            assert_eq!(
+                at_close.get(&id).copied(),
+                Some(TOTAL),
+                "stream {id}: Close arrived before all of its data"
+            );
+        }
+        assert_eq!(
+            closed.len(),
+            STREAMS as usize,
+            "every stream must end with a RawCast Close so the local socket sees EOF"
+        );
+    }
+
+    /// Ответ на heartbeat/PING обязан вернуться по ТОЙ ЖЕ ноге. Иначе RTT ноги
+    /// считается от чужого PING (на простое — секунды мусора, `GLOBAL_MIN_RTT` врёт
+    /// всем адаптивным механизмам), а мёртвую ногу «оживляют» PONG'и соседей.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn health_check_pong_returns_on_the_pinged_leg() {
+        let validator = Arc::new(CountingValidator {
+            reject: false,
+            calls: Default::default(),
+        });
+        let (addr, _sessions, _finished) = spawn_node_full(validator).await;
+        let (muxer, _to_tunnel, _from_tunnel) = connect_client_raw(addr).await;
+
+        let want = MAX_TUNNEL_LEGS as usize;
+        for _ in 0..200 {
+            if muxer.active_legs_count() >= want {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(muxer.active_legs_count(), want, "all legs must come up");
+
+        // Свежесть выставляется любым Heartbeat-кадром, и сервер сам шлёт heartbeat'ы —
+        // но не раньше первого интервала (секунды), а проверка идёт за миллисекунды.
+        muxer.perform_health_check().await;
+
+        for leg_id in 0..want as u32 {
+            assert!(
+                muxer.leg_has_pong(leg_id),
+                "leg {leg_id} never got the PONG for its own PING"
+            );
+        }
     }
 }

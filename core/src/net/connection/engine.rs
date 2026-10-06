@@ -84,6 +84,11 @@ impl FairDataQueue {
         self.queued_messages == 0
     }
 
+    /// Whether this stream still has frames waiting in the queue.
+    fn has_stream(&self, stream_id: u32) -> bool {
+        self.streams.contains_key(&stream_id)
+    }
+
     fn queued_messages(&self) -> usize {
         self.queued_messages
     }
@@ -739,6 +744,22 @@ impl TunnelEngine {
                                     // record_pong does no .await internally, so run it inline:
                                     // a spawn+Arc-clone per PONG was pure scheduler churn.
                                     muxer.record_pong(leg_id).await;
+                                    // Answer on THIS leg. Routed through the generic
+                                    // control path the reply landed on whichever leg the
+                                    // stream got bound to, so a leg's RTT was measured
+                                    // against another leg's PING (seconds of garbage on an
+                                    // idle tunnel) and a dead leg could be kept "alive" by
+                                    // its neighbours' PONGs.
+                                    if let Some(reply) = handler.heartbeat_reply(frame.payload.as_ref()) {
+                                        let muxer = muxer.clone();
+                                        let stream_id = frame.header.stream_id;
+                                        tokio::spawn(async move {
+                                            let _ = muxer
+                                                .send_control_on_leg(leg_id, stream_id, FrameType::Heartbeat, reply)
+                                                .await;
+                                        });
+                                        continue;
+                                    }
                                 }
                                 let _ = handler.handle(frame).await;
                             }
@@ -838,6 +859,30 @@ impl TunnelEngine {
 
                         msg_opt = control_rx.recv() => {
                             if let Some(msg) = msg_opt {
+                                // Control frames normally jump the data queue (a PONG must
+                                // not wait behind megabytes of bulk), but a `Close` is the
+                                // END of its stream: if it overtakes the stream's own `Data`
+                                // the peer drops the stream and every byte still queued
+                                // behind it is lost (the truncated-response / `no_stream`
+                                // bug). Everything the stream handed to the data channel
+                                // before sending Close is already in that channel, so pull
+                                // it into the fair queue and, if the stream still has data
+                                // there, queue the Close behind it (per-stream FIFO).
+                                if msg.frame_type == FrameType::Close && msg.stream_id != 0 {
+                                    while !data_closed {
+                                        match data_rx.try_recv() {
+                                            Ok(m) => fair_data.push(m),
+                                            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                                            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                                                data_closed = true;
+                                            }
+                                        }
+                                    }
+                                    if fair_data.has_stream(msg.stream_id) {
+                                        fair_data.push(msg);
+                                        continue;
+                                    }
+                                }
                                 let sid = msg.stream_id;
                                 wrote_since_hb = true;
                                 // Cheap: MuxMessage's payload is Bytes (refcounted),

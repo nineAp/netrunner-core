@@ -73,6 +73,11 @@ pub const PENDING_UDP_TTL: Duration = Duration::from_secs(2);
 pub const DATAGRAM_KEEPALIVE_MIN: Duration = Duration::from_secs(15);
 pub const DATAGRAM_KEEPALIVE_MAX: Duration = Duration::from_secs(25);
 
+/// After the peer closes a stream gracefully (`Muxer::finish_stream`), its consumer
+/// gets EOF and normally finishes by itself; this is how long a consumer that
+/// ignores EOF may linger before its tasks are cancelled.
+pub const STREAM_EOF_LINGER: Duration = Duration::from_secs(30);
+
 // ── Timeouts ─────────────────────────────────────────────────────────────────
 /// Тайм-аут TCP-хендшейка к целевому хосту (серверная сторона).
 pub const TCP_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);

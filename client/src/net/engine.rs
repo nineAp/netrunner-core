@@ -91,6 +91,9 @@ struct Backlog {
     bytes: usize,
     /// Last time the consumer accepted a frame (or the backlog was created).
     last_progress: StdInstant,
+    /// The tunnel closed this stream while frames were still queued here: deliver
+    /// them all first, then end the local socket's stream (EOF).
+    close_after_drain: bool,
 }
 
 impl Backlog {
@@ -102,6 +105,7 @@ impl Backlog {
             q,
             bytes,
             last_progress: StdInstant::now(),
+            close_after_drain: false,
         }
     }
 }
@@ -402,13 +406,22 @@ impl Engine {
                         inbound_map.remove(&sid);
                         continue;
                     }
-                    // Drop the backlog entry once fully drained (borrow ended).
+                    // Drop the backlog entry once fully drained (borrow ended). If the
+                    // tunnel closed the stream meanwhile, now is when the local socket
+                    // may see EOF: everything the server sent has been delivered.
                     if self
                         .pending_download
                         .get(&sid)
                         .is_some_and(|b| b.q.is_empty())
                     {
-                        self.pending_download.remove(&sid);
+                        if self
+                            .pending_download
+                            .remove(&sid)
+                            .is_some_and(|b| b.close_after_drain)
+                        {
+                            local_cache.remove(&sid);
+                            inbound_map.remove(&sid);
+                        }
                     }
                 }
             }
@@ -422,9 +435,7 @@ impl Engine {
             while let Ok(frame) = rx_tunnel.try_recv() {
                 work_done = true;
                 if frame.event == RawCastEvent::Close {
-                    local_cache.remove(&frame.socket_id);
-                    inbound_map.remove(&frame.socket_id);
-                    self.pending_download.remove(&frame.socket_id);
+                    self.on_download_close(frame.socket_id, &mut local_cache, &inbound_map);
                 } else if frame.event == RawCastEvent::Data {
                     self.route_download(
                         frame.socket_id,
@@ -628,9 +639,7 @@ impl Engine {
                             None => break,
                             Some(f) => {
                                 if f.event == RawCastEvent::Close {
-                                    local_cache.remove(&f.socket_id);
-                                    inbound_map.remove(&f.socket_id);
-                                    self.pending_download.remove(&f.socket_id);
+                                    self.on_download_close(f.socket_id, &mut local_cache, &inbound_map);
                                 } else if f.event == RawCastEvent::Data {
                                     self.route_download(
                                         f.socket_id,
@@ -645,6 +654,30 @@ impl Engine {
                 }
             }
         }
+    }
+
+    /// The tunnel closed this stream. Dropping the download senders is what gives the
+    /// local socket its EOF — but only after every frame already received has been
+    /// delivered, so a backlog is flushed first (`close_after_drain`) instead of being
+    /// thrown away.
+    fn on_download_close(
+        &mut self,
+        socket_id: u64,
+        local_cache: &mut std::collections::HashMap<
+            u64,
+            (mpsc::Sender<Bytes>, Arc<std::sync::atomic::AtomicBool>),
+        >,
+        inbound_map: &dashmap::DashMap<
+            u64,
+            (mpsc::Sender<Bytes>, Arc<std::sync::atomic::AtomicBool>),
+        >,
+    ) {
+        if let Some(b) = self.pending_download.get_mut(&socket_id) {
+            b.close_after_drain = true;
+            return;
+        }
+        local_cache.remove(&socket_id);
+        inbound_map.remove(&socket_id);
     }
 
     /// Deliver ONE download frame to its local socket without ever blocking

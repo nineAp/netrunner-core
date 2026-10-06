@@ -139,6 +139,10 @@ struct StreamBacklog {
     /// Метка времени (мс, `current_timestamp_ms`) последней успешной доставки
     /// этому потоку — неважно, быстрым путём или через дренер бэклога.
     last_progress_ms: AtomicU64,
+    /// Peer closed the stream after sending everything: once the backlog has been
+    /// handed to the consumer, the stream is finished gracefully (consumer sees EOF
+    /// instead of being cancelled with data still queued) — see `Muxer::finish_stream`.
+    closing: AtomicBool,
 }
 
 impl StreamBacklog {
@@ -149,6 +153,7 @@ impl StreamBacklog {
             cap_bytes,
             notify: Notify::new(),
             last_progress_ms: AtomicU64::new(diagnostics::current_timestamp_ms()),
+            closing: AtomicBool::new(false),
         }
     }
 
@@ -431,6 +436,10 @@ pub struct Muxer {
     /// Реестр потоков: id → регистрационная запись (канал, статистика, токен,
     /// бэклог). Токен мгновенно убивает связанные с потоком задачи при `remove_stream`.
     streams: Arc<DashMap<u32, StreamSlot>>,
+    /// Tokens of streams that the peer closed gracefully (`finish_stream`): the slot
+    /// is gone so the consumer sees EOF, but its owner still needs a way to cancel
+    /// the stream's tasks — `remove_stream` does that through this map.
+    closing_tokens: Arc<DashMap<u32, CancellationToken>>,
     /// Кредитные окна потоков, для которых ЭТА сторона — отправитель (см.
     /// [`CreditState`]). Отдельная карта от `streams`: та — про приём, эта —
     /// про то, сколько ещё можно отправить, не дожидаясь `Credit`-кадра.
@@ -525,6 +534,7 @@ impl Muxer {
             legs: Arc::new(DashMap::new()),
             active_legs_cache: Arc::new(ArcSwap::from_pointee(Vec::new())),
             streams: Arc::new(DashMap::new()),
+            closing_tokens: Arc::new(DashMap::new()),
             credits: Arc::new(DashMap::new()),
             stream_bindings: Arc::new(DashMap::new()),
             udp_flowlets: Arc::new(DashMap::new()),
@@ -1428,6 +1438,44 @@ impl Muxer {
         .is_ok()
     }
 
+    /// Sends a control frame on a SPECIFIC leg. Heartbeat replies use it: a PONG that
+    /// comes back on a different leg than the PING proves nothing about the pinged leg
+    /// and makes its RTT sample garbage (the time since that other leg's last ping).
+    /// Falls back to the normal routing if the leg is gone or its writer is closed.
+    pub(crate) async fn send_control_on_leg(
+        &self,
+        leg_id: u32,
+        stream_id: u32,
+        f_type: FrameType,
+        data: Bytes,
+    ) -> Result<(), AppError> {
+        let leg = self.legs.get(&leg_id).map(|l| l.value().clone());
+        if let Some(leg) = leg {
+            let size = data.len() as u64;
+            let msg = MuxMessage {
+                stream_id,
+                frame_type: f_type,
+                data: data.clone(),
+            };
+            if leg.control_tx.send(msg).await.is_ok() {
+                leg.stats.tx_bytes.fetch_add(size, Ordering::Relaxed);
+                return Ok(());
+            }
+        }
+        self.send_control(stream_id, f_type, data).await
+    }
+
+    /// Whether the leg has answered a heartbeat/PING at least once and is still fresh.
+    #[cfg(test)]
+    pub(crate) fn leg_has_pong(&self, leg_id: u32) -> bool {
+        self.legs.get(&leg_id).is_some_and(|leg| {
+            let last_pong = leg.stats.last_pong_ms.load(Ordering::Relaxed);
+            last_pong != 0
+                && process_uptime_ms().saturating_sub(last_pong)
+                    < crate::net::LEG_PONG_FRESHNESS.as_millis() as u64
+        })
+    }
+
     /// Удобная обёртка для отправки управляющего кадра заданного типа.
     pub(crate) async fn send_control(
         &self,
@@ -1469,6 +1517,8 @@ impl Muxer {
             backlog.clone(),
             stats.clone(),
             token.clone(),
+            self.streams.clone(),
+            self.closing_tokens.clone(),
         );
 
         self.streams.insert(
@@ -1500,6 +1550,8 @@ impl Muxer {
         backlog: Arc<StreamBacklog>,
         stats: Arc<StreamStats>,
         token: CancellationToken,
+        streams: Arc<DashMap<u32, StreamSlot>>,
+        closing_tokens: Arc<DashMap<u32, CancellationToken>>,
     ) {
         tokio::spawn(async move {
             loop {
@@ -1528,17 +1580,83 @@ impl Muxer {
                         .mux_dispatch_ok
                         .fetch_add(1, Ordering::Relaxed);
                 }
+
+                // The peer closed this stream and everything it sent has now been
+                // handed to the consumer: end the stream the graceful way. Dropping
+                // the registry slot (and, on return, our own `tx`) closes the
+                // consumer's channel AFTER the frames already buffered in it, so the
+                // consumer reads the whole tail and then sees EOF. Cancelling the
+                // token here instead (what `remove_stream` does) would abort it with
+                // those frames still queued — the truncated-response bug.
+                if backlog.closing.load(Ordering::Acquire)
+                    && backlog.bytes.load(Ordering::Acquire) == 0
+                {
+                    if let Some((_, slot)) =
+                        streams.remove_if(&stream_id, |_, s| Arc::ptr_eq(&s.backlog, &backlog))
+                    {
+                        let linger = slot.token.clone();
+                        closing_tokens.insert(stream_id, linger.clone());
+                        drop(slot);
+                        // A consumer that ignores EOF must not live forever; the
+                        // owner's `remove_stream` normally cancels the token first.
+                        tokio::spawn(async move {
+                            let _ = tokio::time::timeout(
+                                crate::net::STREAM_EOF_LINGER,
+                                linger.cancelled(),
+                            )
+                            .await;
+                            linger.cancel();
+                            closing_tokens.remove(&stream_id);
+                        });
+                    }
+                    return;
+                }
             }
         });
+    }
+
+    /// Drops the receiving side of a stream (registry slot, backlog drainer, tasks tied
+    /// to its token) but KEEPS its leg binding. Used when a bridge ends: the `Close`
+    /// frame that follows must go out on the SAME leg as the stream's data, otherwise
+    /// it can overtake data still queued on that leg and the peer drops the tail.
+    /// The owner finishes the cleanup with [`remove_stream`](Self::remove_stream)
+    /// after sending the `Close`.
+    pub fn release_stream_inbound(&self, stream_id: u32) {
+        // 🔥 Мгновенно убиваем "зомби-задачи", привязанные к стриму!
+        if let Some((_, slot)) = self.streams.remove(&stream_id) {
+            slot.token.cancel();
+        }
+        // Stream the peer already closed gracefully (`finish_stream`): the slot is
+        // gone, but its tasks are still cancelled through the saved token.
+        if let Some((_, token)) = self.closing_tokens.remove(&stream_id) {
+            token.cancel();
+        }
+    }
+
+    /// The peer closed `stream_id`. Unlike [`remove_stream`](Self::remove_stream) this
+    /// does NOT throw away what is still on its way to the consumer: the stream ends
+    /// once everything already received has been delivered, and the consumer then
+    /// sees its channel close (EOF) instead of being cancelled mid-delivery.
+    ///
+    /// `Close` travels behind the stream's own `Data` on the wire, so by the time
+    /// it is handled every byte the peer sent is either in the consumer's channel
+    /// or in the stream backlog — both are preserved.
+    pub fn finish_stream(&self, stream_id: u32) {
+        let Some(backlog) = self
+            .streams
+            .get(&stream_id)
+            .map(|entry| entry.value().backlog.clone())
+        else {
+            return;
+        };
+        backlog.closing.store(true, Ordering::Release);
+        backlog.notify.notify_one();
     }
 
     /// Удаляет поток, отменяя его токен (мгновенно гасит связанные задачи, включая
     /// бэклог-дренер) и снимая привязку к ноге.
     pub fn remove_stream(&self, stream_id: u32) {
-        // 🔥 Мгновенно убиваем "зомби-задачи", привязанные к стриму!
-        if let Some((_, slot)) = self.streams.remove(&stream_id) {
-            slot.token.cancel();
-        }
+        self.release_stream_inbound(stream_id);
         self.stream_bindings.remove(&stream_id);
         self.udp_flowlets.remove(&stream_id);
         // Поток закрыт — держать под ним ранний UDP-буфер незачем.

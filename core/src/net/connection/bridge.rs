@@ -42,7 +42,11 @@ struct StreamGuard {
 impl Drop for StreamGuard {
     fn drop(&mut self) {
         debug!(self.stream_id, "StreamGuard: Cleaning up resources");
-        self.muxer.remove_stream(self.stream_id);
+        // Only the receiving side goes away here. The leg binding stays so the
+        // `Close` the caller sends right after this bridge ends rides the same leg
+        // as the stream's data (see `Muxer::release_stream_inbound`); the caller
+        // calls `remove_stream` once that Close is out.
+        self.muxer.release_stream_inbound(self.stream_id);
     }
 }
 
