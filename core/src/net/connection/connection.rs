@@ -726,12 +726,78 @@ fn tune_tcp_notsent_lowat(stream: &TcpStream) {
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 fn tune_tcp_notsent_lowat(_stream: &TcpStream) {}
 
+/// Congestion controller for the tunnel legs. A leg is ONE TCP connection that
+/// carries every stream, so a loss-based controller (the Linux default, Cubic) keeps
+/// the bottleneck queue full for as long as any bulk stream is running — the latency
+/// every other app on the tunnel then feels as "lag during a speedtest". BBR holds the
+/// queue near empty. Nodes provisioned by hand got it through sysctl, newer ones
+/// (cubic + fq_codel) did not, so it is requested per socket and no longer depends on
+/// host setup. `NR_LEG_CC` overrides the name (`off` keeps the OS default).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn tune_tcp_congestion(stream: &TcpStream) {
+    let name = std::env::var("NR_LEG_CC").unwrap_or_else(|_| "bbr".to_string());
+    if name.is_empty() || name == "off" {
+        return;
+    }
+    if let Err(error) = set_tcp_congestion(stream, &name) {
+        debug!(%error, congestion = %name, "cannot set the leg congestion controller; keeping the OS default");
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn tune_tcp_congestion(_stream: &TcpStream) {}
+
+/// `setsockopt(TCP_CONGESTION)`. Needs the algorithm to be loaded (or loadable) and,
+/// unless it is in `tcp_allowed_congestion_control`, `CAP_NET_ADMIN`.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn set_tcp_congestion(stream: &TcpStream, name: &str) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let rc = unsafe {
+        libc::setsockopt(
+            stream.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            libc::TCP_CONGESTION,
+            name.as_ptr().cast(),
+            name.len() as libc::socklen_t,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// `getsockopt(TCP_CONGESTION)` — what the socket actually uses.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg_attr(not(test), allow(dead_code))]
+fn tcp_congestion(stream: &TcpStream) -> std::io::Result<String> {
+    use std::os::fd::AsRawFd;
+    let mut buf = [0u8; 16];
+    let mut len = buf.len() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            libc::TCP_CONGESTION,
+            buf.as_mut_ptr().cast(),
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let end = buf[..len as usize].iter().position(|&b| b == 0).unwrap_or(len as usize);
+    Ok(String::from_utf8_lossy(&buf[..end]).into_owned())
+}
+
 impl Connection {
     pub fn new(stream: TcpStream) -> Self {
         // Both are local scheduling controls.  Neither changes the NRXP wire
         // format or advertises a non-standard TCP option to the peer.
         let _ = stream.set_nodelay(true);
         tune_tcp_notsent_lowat(&stream);
+        tune_tcp_congestion(&stream);
         let (inbound, outbound) = stream.into_split();
         Self {
             inbound: TunnelReadHalf::Tcp(inbound),
@@ -3915,5 +3981,31 @@ mod tests {
         }
         assert_eq!(received, TOTAL, "granted stream must arrive in full");
         assert!(closed, "stream must end with Close");
+    }
+
+    /// The per-socket congestion controller must actually take effect, and a name the
+    /// kernel does not know must be harmless (the leg keeps working with the default).
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[tokio::test]
+    async fn leg_congestion_controller_can_be_chosen_per_socket() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let _server = listener.accept().await.unwrap();
+
+        // `reno` is built into every kernel (unlike bbr, which is a module that a
+        // build sandbox may not have), so it proves the plumbing.
+        set_tcp_congestion(&client, "reno").expect("reno is always available");
+        assert_eq!(tcp_congestion(&client).unwrap(), "reno");
+
+        assert!(set_tcp_congestion(&client, "no-such-algorithm").is_err());
+        assert_eq!(
+            tcp_congestion(&client).unwrap(),
+            "reno",
+            "a failed request must leave the socket as it was"
+        );
+        // And the best-effort wrapper never panics or breaks the socket.
+        tune_tcp_congestion(&client);
+        client.set_nodelay(true).unwrap();
     }
 }
