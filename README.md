@@ -68,6 +68,7 @@ systemd, Docker, мониторинг, обновление и ротация к
 | [docs/PROTOCOL.md](docs/PROTOCOL.md) | полная спецификация NRXP: хендшейк, ключи, кадры, мультиплексирование, UDP, mesh, константы |
 | [docs/SECURITY_MODEL.md](docs/SECURITY_MODEL.md) | модель угроз, гарантии, секреты, остаточные риски |
 | [docs/MESH.md](docs/MESH.md) | mesh и onion-маршрутизация: роли, защита, возможности, ограничения |
+| [docs/en/](docs/en) | английские версии: DEPLOYMENT, PROTOCOL, SECURITY_MODEL, MESH, SECURITY, ARCH |
 | [docs/SECURITY.md](docs/SECURITY.md) | популярное объяснение криптографии и сравнение с MTProto |
 | [ARCH.md](ARCH.md) | краткий обзор архитектуры |
 | [docs/MAINTENANCE.md](docs/MAINTENANCE.md) | эксплуатация, CI, известные грабли |

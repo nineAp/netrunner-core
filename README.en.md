@@ -3,7 +3,7 @@
 A multiplexed VPN tunnel in Rust that masquerades as ordinary HTTPS (a Chrome TLS 1.3 session).
 Client (Linux/OpenWrt/Android via UniFFI) + server node.
 
-🇷🇺 [Русская версия](README.md) · **Note:** the detailed documents under `docs/` are currently in Russian.
+🇷🇺 [Русская версия](README.md) · Detailed documents: `docs/en/` (English); `docs/MAINTENANCE.md`, `docs/PROTOCOL_ANALYSIS.md`, `docs/UDP_LEG_RESEARCH.md` are Russian only.
 
 **Features**
 
@@ -16,7 +16,7 @@ Client (Linux/OpenWrt/Android via UniFFI) + server node.
 - L3 VPN without TCP-in-TCP: TUN + userspace stack (`nrxp-smoltcp`), kill-switch, router mode.
 
 > ⚠️ This is not Tor and does not promise "indistinguishable from HTTPS for DPI". Read the
-> [security model](docs/SECURITY_MODEL.md), especially §7 (known limitations).
+> [security model](docs/en/SECURITY_MODEL.md), especially §7 (known limitations).
 
 ## Quick start: your own node in 5 minutes
 
@@ -52,20 +52,20 @@ sudo ./target/release/netrunner-client --config client.toml
 ```
 
 > ⚠️ The node connects to any address a client asks for (including `127.0.0.1` and private
-> networks). Read the [hardening checklist](docs/DEPLOYMENT.md#9-hardening-чеклист) before handing out keys.
+> networks). Read the [hardening checklist](docs/en/DEPLOYMENT.md#9-hardening-checklist) before handing out keys.
 
-systemd, Docker, monitoring, upgrades and key rotation: **[deployment guide](docs/DEPLOYMENT.md)**.
+systemd, Docker, monitoring, upgrades and key rotation: **[deployment guide](docs/en/DEPLOYMENT.md)**.
 
 ## Documentation
 
 | Document | Contents |
 |---|---|
-| [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) | deploying a node and a client: build, systemd/Docker, flags, firewall, monitoring, keys |
-| [docs/PROTOCOL.md](docs/PROTOCOL.md) | full NRXP specification: handshake, keys, frames, multiplexing, UDP, mesh, constants |
-| [docs/SECURITY_MODEL.md](docs/SECURITY_MODEL.md) | threat model, guarantees, secrets, residual risks |
-| [docs/MESH.md](docs/MESH.md) | mesh and onion routing: roles, protections, capabilities, limits |
-| [docs/SECURITY.md](docs/SECURITY.md) | plain-language cryptography overview, comparison with MTProto |
-| [ARCH.md](ARCH.md) | architecture overview |
+| [docs/en/DEPLOYMENT.md](docs/en/DEPLOYMENT.md) | deploying a node and a client: build, systemd/Docker, flags, firewall, monitoring, keys |
+| [docs/en/PROTOCOL.md](docs/en/PROTOCOL.md) | full NRXP specification: handshake, keys, frames, multiplexing, UDP, mesh, constants |
+| [docs/en/SECURITY_MODEL.md](docs/en/SECURITY_MODEL.md) | threat model, guarantees, secrets, residual risks |
+| [docs/en/MESH.md](docs/en/MESH.md) | mesh and onion routing: roles, protections, capabilities, limits |
+| [docs/en/SECURITY.md](docs/en/SECURITY.md) | plain-language cryptography overview, comparison with MTProto |
+| [docs/en/ARCH.md](docs/en/ARCH.md) | architecture overview |
 | [docs/MAINTENANCE.md](docs/MAINTENANCE.md) | operations, CI, known pitfalls |
 | [docs/PROTOCOL_ANALYSIS.md](docs/PROTOCOL_ANALYSIS.md) | quantitative analysis vs VLESS/Trojan/Hysteria2 (historical) |
 | [docs/UDP_LEG_RESEARCH.md](docs/UDP_LEG_RESEARCH.md) | UDP leg research |

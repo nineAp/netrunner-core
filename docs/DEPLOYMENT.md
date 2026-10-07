@@ -1,5 +1,7 @@
 # Развёртывание netrunner-proxy
 
+🇬🇧 [English version](en/DEPLOYMENT.md)
+
 Пошаговое руководство: от пустого VPS до работающего узла и клиента. Быстрый старт —
 в [README](../README.md); протокол — [PROTOCOL.md](PROTOCOL.md); угрозы и требования к
 оператору — [SECURITY_MODEL.md](SECURITY_MODEL.md).
