@@ -63,6 +63,7 @@ systemd, Docker, monitoring, upgrades and key rotation: **[deployment guide](doc
 | [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) | deploying a node and a client: build, systemd/Docker, flags, firewall, monitoring, keys |
 | [docs/PROTOCOL.md](docs/PROTOCOL.md) | full NRXP specification: handshake, keys, frames, multiplexing, UDP, mesh, constants |
 | [docs/SECURITY_MODEL.md](docs/SECURITY_MODEL.md) | threat model, guarantees, secrets, residual risks |
+| [docs/MESH.md](docs/MESH.md) | mesh and onion routing: roles, protections, capabilities, limits |
 | [docs/SECURITY.md](docs/SECURITY.md) | plain-language cryptography overview, comparison with MTProto |
 | [ARCH.md](ARCH.md) | architecture overview |
 | [docs/MAINTENANCE.md](docs/MAINTENANCE.md) | operations, CI, known pitfalls |
