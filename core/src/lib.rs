@@ -164,6 +164,10 @@ pub mod devtools;
 /// [`DecoySni`](tlseng::decoy::DecoySni), описание витрины и cover-flight.
 /// Наружу отдаётся только этот модуль tlseng — остальное (сборка отпечатка)
 /// остаётся деталью реализации ядра.
+/// Браузерные профили как данные: загрузка из JSON, проверка, подмена
+/// встроенных профилей своими.
+pub mod browser_profile;
+
 pub mod decoy {
     pub use crate::tlseng::decoy::{
         CoverFlight, Decoy, DecoyCatalog, DecoyError, DecoyMode, DecoySni, DECOY_DOMAINS_ENV,

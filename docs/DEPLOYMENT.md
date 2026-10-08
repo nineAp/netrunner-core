@@ -239,6 +239,7 @@ sni             = "www.debian.org"        # = --decoy-host узла
 node_secret     = "<PROXY_NRXP_SECRET>"
 node_public_key = "<nrxp_public_key из лога узла>"
 auth_token      = ""                      # пусто для автономного узла
+# browser_profile = "/etc/netrunner/chrome.json"   # свой профиль браузера, см. PCAP_PROFILE.md
 killswitch_enabled = true
 tunnel_mode     = "bypass_lan"            # all | bypass_lan
 ```
@@ -250,6 +251,9 @@ sudo setcap cap_net_admin,cap_net_raw,cap_dac_override=eip ./target/release/netr
 
 Все ключи также принимаются через `NETRUNNER_*` и флаги (`--help`). Пустая пара
 `node_secret`/`node_public_key` включает анонимную схему — только для тестов.
+Свой профиль браузера для маскировки (снять с настоящего браузера одной командой или написать JSON
+руками): [PCAP_PROFILE.md](PCAP_PROFILE.md) — `netrunner-client profile record --out chrome.json`, затем
+`browser_profile = "chrome.json"` либо `--browser-profile`.
 OpenWrt (`router_mode`, procd, firewall-зона): [`client/openwrt/README.md`](../client/openwrt/README.md).
 Мобильное приложение и Tauri-клиент используют тот же `client/` через UniFFI
 (`make build-android`).

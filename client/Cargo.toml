@@ -14,7 +14,7 @@ required-features = ["cli"]
 
 [features]
 default = []
-cli = ["dep:clap", "dep:serde", "dep:toml"]
+cli = ["dep:clap", "dep:serde", "dep:toml", "netrunner-core/pcap"]
 
 [dependencies]
 netrunner-core = { path = "../core", features = ["ring-aead"] }

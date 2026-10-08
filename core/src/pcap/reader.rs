@@ -69,6 +69,27 @@ impl Endian {
     }
 }
 
+/// Записывает пакеты в классический `pcap` (наносекунды, little-endian).
+/// Все пакеты обязаны иметь один `link_type` (берётся у первого).
+pub fn write_pcap(packets: &[Packet<'_>]) -> Vec<u8> {
+    let link = packets.first().map_or(1, |p| p.link_type);
+    let mut f = Vec::with_capacity(24 + packets.iter().map(|p| 16 + p.data.len()).sum::<usize>());
+    f.extend_from_slice(&0xa1b2_3c4du32.to_le_bytes());
+    f.extend_from_slice(&2u16.to_le_bytes());
+    f.extend_from_slice(&4u16.to_le_bytes());
+    f.extend_from_slice(&[0u8; 8]);
+    f.extend_from_slice(&262_144u32.to_le_bytes());
+    f.extend_from_slice(&link.to_le_bytes());
+    for p in packets {
+        f.extend_from_slice(&((p.ts_nanos / 1_000_000_000) as u32).to_le_bytes());
+        f.extend_from_slice(&((p.ts_nanos % 1_000_000_000) as u32).to_le_bytes());
+        f.extend_from_slice(&(p.data.len() as u32).to_le_bytes());
+        f.extend_from_slice(&p.orig_len.max(p.data.len() as u32).to_le_bytes());
+        f.extend_from_slice(p.data);
+    }
+    f
+}
+
 // ─────────────────────────────── classic pcap ───────────────────────────────
 
 fn read_classic(bytes: &[u8]) -> Result<Vec<Packet<'_>>, PcapError> {
@@ -270,6 +291,19 @@ mod tests {
                 assert_eq!(pk[1].data, b"defg");
             }
         }
+    }
+
+    #[test]
+    fn write_then_read_round_trip() {
+        let pk = [
+            Packet { ts_nanos: 1_500_000_007, link_type: 101, orig_len: 3, data: b"abc" },
+            Packet { ts_nanos: 2_000_000_000, link_type: 101, orig_len: 9, data: b"de" },
+        ];
+        let f = write_pcap(&pk);
+        let back = read_packets(&f).unwrap();
+        assert_eq!(back.len(), 2);
+        assert_eq!((back[0].ts_nanos, back[0].link_type, back[0].data), (1_500_000_007, 101, &b"abc"[..]));
+        assert_eq!(back[1].orig_len, 9);
     }
 
     #[test]

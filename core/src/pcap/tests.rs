@@ -358,7 +358,12 @@ fn real_chrome_148_capture() {
     );
     // Длина payload GREASE-ECH у браузера случайна, а не константа.
     assert!(p.ech_payload_lengths.len() > 1, "{:?}", p.ech_payload_lengths);
-    assert!(p.notes.iter().any(|n| n.contains("ECH")), "{:#?}", p.notes);
+    // Раньше ECH-payload был зашитой константой и попадал в notes; теперь
+    // профиль хранит наблюдавшиеся длины и сборщик берёт случайную из них.
+    assert!(p.notes.is_empty(), "{:#?}", p.notes);
+    assert_eq!(p.compress_cert_algs, vec![2]);
+    assert_eq!(p.psk_modes, vec![1]);
+    assert_eq!(p.ec_point_formats, vec![0]);
 
     // Первый flight сервера (openssl s_server, RSA-2048): EE, Certificate,
     // CertificateVerify, Finished — Finished = 4 + 32 + 17 = 53.
@@ -374,4 +379,54 @@ fn real_chrome_148_capture() {
     let again = analyze(&pcap_file(&connection(47000, &wire, &[23, 832], 1_700_000_000_000_000_000)))
         .unwrap();
     assert_eq!(ja4(&again.client_hellos[0]), j);
+}
+
+/// JSON — единственный канал между снятием профиля и движком: профиль,
+/// записанный в JSON и прочитанный обратно, ведёт себя как оригинал, а длина
+/// ECH-payload у него случайна из наблюдавшегося набора.
+#[test]
+fn captured_profile_survives_json_and_drives_the_builder() {
+    use crate::browser_profile::{self, ProfileSpec};
+    let a = analyze(REAL_CHROME_148).unwrap();
+    let p = a.build_profile(&ProfileOptions {
+        name: Some("chrome_148".into()),
+        ..Default::default()
+    })
+    .unwrap();
+    let json = p.to_json();
+    assert!(json.contains("\"server_name\"") && json.contains("\"0x11ec\""), "{json}");
+
+    // Валидация и разбор обратно.
+    let spec = ProfileSpec::from_json(&json).unwrap();
+    assert!(spec.validate().unwrap().is_empty());
+    let built = spec.into_profile().unwrap();
+    assert_eq!(built.ech_payload_lengths, p.ech_payload_lengths.as_slice());
+
+    // Собранные hello дают тот же JA4 и разные длины ECH.
+    let mut lens = std::collections::HashSet::new();
+    for i in 0..40u16 {
+        let keys = SessionKeys::new(true);
+        let wire = ClientHello::make_client_hello(built, "a.test", &keys);
+        let an = analyze(&pcap_file(&connection(48000 + i, &wire, &[41], 1_700_000_000_000_000_000)))
+            .unwrap();
+        assert_eq!(ja4(&an.client_hellos[0]), p.ja4);
+        lens.insert(an.client_hellos[0].ech.unwrap().1);
+    }
+    assert!(lens.len() > 1, "ECH payload length must vary: {lens:?}");
+    assert!(lens.iter().all(|l| p.ech_payload_lengths.contains(l)), "{lens:?}");
+
+    // Подмена встроенного пула: сессии берут профиль из JSON.
+    let report = browser_profile::load_json(&json).unwrap();
+    assert_eq!(report.names, vec!["chrome_148"]);
+    assert_eq!(browser_profile::active_count(), 1);
+    let chosen = BrowserProfile::for_session("any-session");
+    assert_eq!(chosen.ech_payload_lengths, p.ech_payload_lengths.as_slice());
+    browser_profile::clear();
+    assert_eq!(browser_profile::active_count(), 0);
+    assert!(BrowserProfile::for_session("any-session").ech_payload_lengths == [144]);
+
+    // Некорректный профиль отклоняется и не меняет состояние.
+    let bad = json.replace("\"0x001d\"", "\"0x0017\"");
+    assert!(browser_profile::load_json(&bad).is_err());
+    assert_eq!(browser_profile::active_count(), 0);
 }

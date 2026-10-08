@@ -43,21 +43,12 @@ mod grease;
 mod handshake;
 mod mlkem;
 mod profile;
+pub(crate) mod spec;
 mod tls_record;
 mod types;
 
 pub(crate) use extension::ExtensionStack;
 pub(crate) use handshake::{ClientHello, HelloHeader, ServerHello};
-pub(crate) use profile::{BrowserProfile, ServerProfile};
+pub(crate) use profile::{custom_profiles, set_custom_profiles, BrowserProfile, ServerProfile};
 pub(crate) use tls_record::{ApplicationData, TlsRecord};
 pub(crate) use types::{ContentType, HelloType};
-
-// Нужны блоку `pcap` (снятие профиля с захвата): он строит `BrowserProfile`
-// из динамических данных.
-#[cfg(feature = "pcap")]
-pub(crate) use types::{ExtensionOrder, TlsGroups, TlsSignatures, TlsVersions};
-
-#[cfg(feature = "pcap")]
-pub(crate) fn protocol_version_from(v: u16) -> Option<types::ProtocolVersion> {
-    types::ProtocolVersion::try_from(v).ok()
-}

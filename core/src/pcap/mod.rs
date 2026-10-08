@@ -43,6 +43,8 @@
 //! Чтобы поймать перемешивание расширений, нужно **минимум два** соединения
 //! браузера (откройте два разных сайта). Подробнее — `docs/PCAP_PROFILE.md`.
 
+#[cfg(target_os = "linux")]
+pub mod capture;
 mod fingerprint;
 mod net;
 mod profile;
@@ -53,7 +55,7 @@ mod tls;
 pub use fingerprint::{ja3_hash, ja3_string, ja4, md5_hex};
 pub use net::{Transport, UdpDatagram};
 pub use profile::{select_hellos, CapturedProfile, FingerprintGroup, ProfileOptions};
-pub use reader::{read_packets, Packet};
+pub use reader::{read_packets, write_pcap, Packet};
 pub use tcp::{assemble_flows, Endpoint, Flow, Stream};
 pub use tls::{
     handshake_messages, is_grease, parse_client_hello, parse_server_hello, split_records,
@@ -180,12 +182,17 @@ impl Analysis {
 /// Разбирает захват целиком.
 pub fn analyze(bytes: &[u8]) -> Result<Analysis, PcapError> {
     let packets = read_packets(bytes)?;
+    Ok(analyze_packets(&packets))
+}
+
+/// Разбор уже прочитанных пакетов (живой захват, `capture::record`).
+pub fn analyze_packets(packets: &[Packet<'_>]) -> Analysis {
     let mut a = Analysis {
         packets: packets.len(),
         ..Default::default()
     };
 
-    for pk in &packets {
+    for pk in packets {
         if let Some(Transport::Udp(u)) = net::decode(pk.link_type, pk.data) {
             // QUIC long header: старший бит и fixed bit, тип Initial = 0b00.
             if (u.dport == 443 || u.sport == 443)
@@ -198,7 +205,7 @@ pub fn analyze(bytes: &[u8]) -> Result<Analysis, PcapError> {
         }
     }
 
-    let flows = assemble_flows(&packets);
+    let flows = assemble_flows(packets);
     a.tcp_flows = flows.len();
 
     for flow in &flows {
@@ -244,7 +251,7 @@ pub fn analyze(bytes: &[u8]) -> Result<Analysis, PcapError> {
             a.quic_initials
         ));
     }
-    Ok(a)
+    a
 }
 
 fn server_flight(flow: &Flow, client_first_app_ts: Option<u64>) -> Option<ServerFlight> {

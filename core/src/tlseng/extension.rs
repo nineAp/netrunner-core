@@ -20,7 +20,7 @@ use crate::{
     nrxp::{ErrorAction, ErrorStage, TlsError},
     parser::Parser,
     tlseng::{
-        consts::{CERT_COMPRESSION_BROTLI, OCSP_STATUS_TYPE, PSK_DHE_KE_MODE, TYPE_HOST_NAME},
+        consts::{OCSP_STATUS_TYPE, TYPE_HOST_NAME},
         grease::GreaseSet,
         mlkem,
         profile::BrowserProfile,
@@ -179,9 +179,13 @@ impl ExtensionBuilder {
         self.add_extension(etype, &[]);
     }
 
-    pub fn apply_generic_extension(&mut self, etype: u16, _profile: &BrowserProfile) {
-        {
-            netrunner_logger::trace!(etype, "Applying generic or unknown extension");
+    /// Расширение без собственной сборки: если профиль хранит его тело
+    /// (`raw_extensions`) — пишем как есть; иначе пропускаем (раньше так
+    /// происходило всегда, и такой профиль незаметно терял расширение).
+    pub fn apply_generic_extension(&mut self, etype: u16, profile: &BrowserProfile) {
+        match profile.raw_extensions.iter().find(|(id, _)| *id == etype) {
+            Some((_, body)) => self.add_extension(etype, body),
+            None => netrunner_logger::trace!(etype, "Skipping extension with no builder and no raw body"),
         }
     }
 
@@ -301,22 +305,30 @@ impl ExtensionBuilder {
     /// нельзя. Константа здесь — компромисс: она правдоподобна, но при
     /// накоплении captures её стоит заменить наблюдаемой зависимостью, иначе
     /// одинаковый размер ECH во всех наших соединениях сам станет признаком.
-    pub fn ech_grease(&mut self) {
+    pub fn ech_grease(&mut self, payload_lengths: &[u16]) {
         const ENC_LEN: usize = 32;
-        const PAYLOAD_LEN: usize = 144;
+        // Длина payload случайна на каждое соединение, как у Chrome.
+        let payload_len: usize = {
+            use aead::rand_core::RngCore as _;
+            if payload_lengths.is_empty() {
+                144
+            } else {
+                payload_lengths[(OsRng.next_u32() as usize) % payload_lengths.len()] as usize
+            }
+        };
 
-        let mut data = BytesMut::with_capacity(10 + ENC_LEN + PAYLOAD_LEN);
+        let mut data = BytesMut::with_capacity(10 + ENC_LEN + payload_len);
         data.put_u8(0x00); // ECHClientHelloType::outer
         data.put_u16(0x0001); // HKDF-SHA256
         data.put_u16(0x0001); // AES-128-GCM
 
-        let mut rnd = [0u8; 1 + ENC_LEN + PAYLOAD_LEN];
+        let mut rnd = vec![0u8; 1 + ENC_LEN + payload_len];
         OsRng.fill_bytes(&mut rnd);
 
         data.put_u8(rnd[0]); // config_id
         data.put_u16(ENC_LEN as u16);
         data.put_slice(&rnd[1..1 + ENC_LEN]);
-        data.put_u16(PAYLOAD_LEN as u16);
+        data.put_u16(payload_len as u16);
         data.put_slice(&rnd[1 + ENC_LEN..]);
 
         self.add_extension(TlsExtensions::ECH, &data);
@@ -330,7 +342,7 @@ impl ExtensionBuilder {
     /// давало содержимое вида `02 68 32 00 00`, где Wireshark читает первые
     /// два байта как длину вектора (`0x0268` = 616) и ругается "too large,
     /// truncating it to 3". Реальный Chrome шлёт `00 03 02 68 32`.
-    pub fn application_settings(&mut self, protocols: &[&str]) {
+    pub fn application_settings(&mut self, codepoint: u16, protocols: &[&str]) {
         let mut list_data = BytesMut::new();
         for proto in protocols {
             let p_bytes = proto.as_bytes();
@@ -340,7 +352,7 @@ impl ExtensionBuilder {
         let mut data = BytesMut::with_capacity(2 + list_data.len());
         data.put_u16(list_data.len() as u16);
         data.put_slice(&list_data);
-        self.add_extension(TlsExtensions::ALPS, &data);
+        self.add_extension(codepoint, &data);
     }
 
     pub fn alpn(&mut self, protocols: &[&str]) {
@@ -356,10 +368,10 @@ impl ExtensionBuilder {
         self.add_extension(TlsExtensions::ALPN, &extension_data);
     }
 
-    pub fn psk_key_exchange_modes(&mut self) {
-        let mut data = BytesMut::with_capacity(2);
-        data.put_u8(1);
-        data.put_u8(PSK_DHE_KE_MODE);
+    pub fn psk_key_exchange_modes(&mut self, modes: &[u8]) {
+        let mut data = BytesMut::with_capacity(1 + modes.len());
+        data.put_u8(modes.len() as u8);
+        data.put_slice(modes);
         self.add_extension(TlsExtensions::PSK_MODES, &data);
     }
 
@@ -380,10 +392,10 @@ impl ExtensionBuilder {
         self.add_extension(TlsExtensions::STATUS_REQUEST, &data);
     }
 
-    pub fn ec_point_formats(&mut self) {
-        let mut data = BytesMut::with_capacity(2);
-        data.put_u8(1);
-        data.put_u8(0x00);
+    pub fn ec_point_formats(&mut self, formats: &[u8]) {
+        let mut data = BytesMut::with_capacity(1 + formats.len());
+        data.put_u8(formats.len() as u8);
+        data.put_slice(formats);
         self.add_extension(TlsExtensions::EC_POINT_FORMATS, &data);
     }
 
@@ -487,9 +499,9 @@ impl ExtensionBuilder {
                 TlsExtensions::ALPN => self.alpn(profile.alpn),
                 TlsExtensions::SCT => self.signed_certificate_timestamp(),
                 TlsExtensions::EMS => self.extended_main_secret(),
-                TlsExtensions::ECH => self.ech_grease(),
+                TlsExtensions::ECH => self.ech_grease(profile.ech_payload_lengths),
                 TlsExtensions::COMPRESS_CERT => {
-                    self.compress_certificate(&[CERT_COMPRESSION_BROTLI])
+                    self.compress_certificate(profile.compress_cert_algs)
                 }
                 TlsExtensions::DELEGATED_CREDENTIAL => {
                     self.delegated_credential(profile.delegated_signatures)
@@ -498,15 +510,15 @@ impl ExtensionBuilder {
                 TlsExtensions::SUPPORTED_VERSIONS => {
                     self.supported_versions(profile.versions, profile.has_grease)
                 }
-                TlsExtensions::PSK_MODES => self.psk_key_exchange_modes(),
+                TlsExtensions::PSK_MODES => self.psk_key_exchange_modes(profile.psk_modes),
                 TlsExtensions::KEY_SHARE => self.key_share(profile, pub_key),
                 TlsExtensions::ALPS => {
                     if !profile.alps_protocols.is_empty() {
-                        self.application_settings(profile.alps_protocols);
+                        self.application_settings(profile.alps_codepoint, profile.alps_protocols);
                     }
                 }
                 TlsExtensions::STATUS_REQUEST => self.status_request(),
-                TlsExtensions::EC_POINT_FORMATS => self.ec_point_formats(),
+                TlsExtensions::EC_POINT_FORMATS => self.ec_point_formats(profile.ec_point_formats),
                 TlsExtensions::RENEGOTIATION_INFO => self.renegotiation_info(),
                 TlsExtensions::PADDING => {
                     if profile.target_padding_len > 0 {

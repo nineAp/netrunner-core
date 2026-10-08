@@ -40,7 +40,29 @@ pub(crate) struct BrowserProfile {
     /// Chromium делает это с версии 110; не-Chromium стеки (Firefox, Safari)
     /// шлют фиксированный порядок, и для них флаг обязан быть `false`.
     pub shuffle_extensions: bool,
+    /// Допустимые длины payload GREASE-ECH; на каждое соединение берётся
+    /// случайная. Пустой список = исторические 144 байта. У живого Chrome
+    /// длина случайна (144/176/208/240), константа сама становится признаком.
+    pub ech_payload_lengths: &'static [u16],
+    /// Алгоритмы расширения `compress_certificate`.
+    pub compress_cert_algs: &'static [u16],
+    /// Режимы `psk_key_exchange_modes`.
+    pub psk_modes: &'static [u8],
+    /// Форматы точек `ec_point_formats`.
+    pub ec_point_formats: &'static [u8],
+    /// Кодпоинт ALPS: `0x44cd` (старый) либо `0x4469` (новый). В
+    /// `extension_order` ALPS всегда обозначается `TlsExtensions::ALPS`.
+    pub alps_codepoint: u16,
+    /// Тела расширений, у которых нет собственной сборки (id → байты):
+    /// выписываются как есть, когда id встречается в `extension_order`.
+    pub raw_extensions: &'static [(u16, &'static [u8])],
 }
+
+/// Значения новых полей, совпадающие с тем, что сборщик писал раньше.
+const DEFAULT_ECH_LENGTHS: &[u16] = &[144];
+const DEFAULT_COMPRESS_CERT: &[u16] = &[super::consts::CERT_COMPRESSION_BROTLI];
+const DEFAULT_PSK_MODES: &[u8] = &[super::consts::PSK_DHE_KE_MODE];
+const DEFAULT_EC_POINT_FORMATS: &[u8] = &[0];
 
 impl BrowserProfile {
     /// Актуальный Chrome, снятый с живого захвата (сентябрь 2026).
@@ -88,6 +110,12 @@ impl BrowserProfile {
         alps_protocols: &["h2"],
 
         target_padding_len: 0,
+        ech_payload_lengths: DEFAULT_ECH_LENGTHS,
+        compress_cert_algs: DEFAULT_COMPRESS_CERT,
+        psk_modes: DEFAULT_PSK_MODES,
+        ec_point_formats: DEFAULT_EC_POINT_FORMATS,
+        alps_codepoint: 0x44cd,
+        raw_extensions: &[],
     };
 
     /// Отпечаток Chrome 131: GREASE + ALPS, паддинг до 512, только TLS 1.3,
@@ -116,6 +144,12 @@ impl BrowserProfile {
         alps_protocols: &["h2"],
 
         target_padding_len: 512,
+        ech_payload_lengths: DEFAULT_ECH_LENGTHS,
+        compress_cert_algs: DEFAULT_COMPRESS_CERT,
+        psk_modes: DEFAULT_PSK_MODES,
+        ec_point_formats: DEFAULT_EC_POINT_FORMATS,
+        alps_codepoint: 0x44cd,
+        raw_extensions: &[],
     };
 
     /// Отпечаток Firefox 133: без GREASE и ALPS (их у Firefox не бывает), без
@@ -139,6 +173,12 @@ impl BrowserProfile {
         shuffle_extensions: false,
         alps_protocols: &[],
         target_padding_len: 0,
+        ech_payload_lengths: DEFAULT_ECH_LENGTHS,
+        compress_cert_algs: DEFAULT_COMPRESS_CERT,
+        psk_modes: DEFAULT_PSK_MODES,
+        ec_point_formats: DEFAULT_EC_POINT_FORMATS,
+        alps_codepoint: 0x44cd,
+        raw_extensions: &[],
     };
 
     /// Отпечаток Edge 130: тот же Chromium-движок, что и Chrome (GREASE + ALPS +
@@ -165,6 +205,12 @@ impl BrowserProfile {
         alps_protocols: &["h2"],
 
         target_padding_len: 512,
+        ech_payload_lengths: DEFAULT_ECH_LENGTHS,
+        compress_cert_algs: DEFAULT_COMPRESS_CERT,
+        psk_modes: DEFAULT_PSK_MODES,
+        ec_point_formats: DEFAULT_EC_POINT_FORMATS,
+        alps_codepoint: 0x44cd,
+        raw_extensions: &[],
     };
 
     /// Отпечаток Safari 17: не Chromium — без GREASE, без ALPS, TLS 1.3+1.2,
@@ -188,6 +234,12 @@ impl BrowserProfile {
         shuffle_extensions: false,
         alps_protocols: &[],
         target_padding_len: 0,
+        ech_payload_lengths: DEFAULT_ECH_LENGTHS,
+        compress_cert_algs: DEFAULT_COMPRESS_CERT,
+        psk_modes: DEFAULT_PSK_MODES,
+        ec_point_formats: DEFAULT_EC_POINT_FORMATS,
+        alps_codepoint: 0x44cd,
+        raw_extensions: &[],
     };
 
     /// Пул профилей для ротации между туннельными сессиями.
@@ -231,9 +283,36 @@ impl BrowserProfile {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         session_id.hash(&mut hasher);
-        let idx = (hasher.finish() as usize) % Self::ALL.len();
-        Self::ALL[idx]
+        let h = hasher.finish() as usize;
+        // Профили, загруженные из JSON, имеют приоритет над встроенным пулом.
+        if let Some(p) = custom_pick(h) {
+            return p;
+        }
+        Self::ALL[h % Self::ALL.len()]
     }
+}
+
+/// Профили, загруженные во время работы (см. `browser_profile::load_json`).
+static CUSTOM: std::sync::RwLock<Vec<&'static BrowserProfile>> = std::sync::RwLock::new(Vec::new());
+
+fn custom_pick(h: usize) -> Option<&'static BrowserProfile> {
+    let g = CUSTOM.read().ok()?;
+    if g.is_empty() {
+        None
+    } else {
+        Some(g[h % g.len()])
+    }
+}
+
+/// Заменяет набор пользовательских профилей. Пустой — вернуться к встроенным.
+pub(crate) fn set_custom_profiles(list: Vec<&'static BrowserProfile>) {
+    if let Ok(mut g) = CUSTOM.write() {
+        *g = list;
+    }
+}
+
+pub(crate) fn custom_profiles() -> Vec<&'static BrowserProfile> {
+    CUSTOM.read().map(|g| g.clone()).unwrap_or_default()
 }
 
 /// Серверный профиль ответа. Поля с префиксом `_` зарезервированы под будущее

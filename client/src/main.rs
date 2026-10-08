@@ -8,12 +8,13 @@
 #![allow(dead_code)]
 
 mod net;
+mod profile_cmd;
 mod tun;
 
 use std::{fs, net::SocketAddr, path::PathBuf};
 
 use anyhow::{Context, Result, bail};
-use clap::{ArgAction, Parser, ValueEnum};
+use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use net::engine::{EngineBuilder, EngineConfig};
 use netrunner_core::net::NetworkConfig;
 use netrunner_logger::{Logger, error, info};
@@ -59,6 +60,8 @@ struct FileConfig {
     lan_interfaces: Vec<String>,
     strong_privacy: Option<bool>,
     log_level: Option<String>,
+    /// JSON-профиль браузера (см. `netrunner-client profile record`).
+    browser_profile: Option<PathBuf>,
 }
 
 /// Аргументы headless-клиента. Секреты лучше хранить в root-only TOML или
@@ -67,9 +70,13 @@ struct FileConfig {
 #[command(
     author,
     version,
-    about = "Netrunner headless VPN client for Linux/OpenWrt"
+    about = "Netrunner headless VPN client for Linux/OpenWrt",
+    args_conflicts_with_subcommands = true
 )]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+
     /// TOML-конфиг (для OpenWrt: /etc/netrunner/client.toml).
     #[arg(long, env = "NETRUNNER_CONFIG", value_name = "PATH")]
     config: Option<PathBuf>,
@@ -134,6 +141,20 @@ struct Cli {
 
     #[arg(long, env = "RUST_LOG")]
     log_level: Option<String>,
+
+    /// JSON-профиль браузера для маскировки ClientHello вместо встроенного
+    /// (получить: `netrunner-client profile record --out chrome.json`).
+    #[arg(long, env = "NETRUNNER_BROWSER_PROFILE", value_name = "PATH")]
+    browser_profile: Option<PathBuf>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Браузерные профили: запись трафика браузера и сборка JSON-профиля.
+    Profile {
+        #[command(subcommand)]
+        action: profile_cmd::ProfileAction,
+    },
 }
 
 struct EffectiveConfig {
@@ -154,6 +175,7 @@ struct EffectiveConfig {
     lan_interfaces: Vec<String>,
     strong_privacy: bool,
     log_level: String,
+    browser_profile: Option<PathBuf>,
 }
 
 fn non_empty(value: Option<String>) -> Option<String> {
@@ -246,6 +268,7 @@ fn build_config(cli: Cli, file: FileConfig) -> Result<EffectiveConfig> {
         lan_interfaces,
         strong_privacy: cli.strong_privacy || file.strong_privacy.unwrap_or(false),
         log_level: non_empty(cli.log_level.or(file.log_level)).unwrap_or_else(|| "info".to_owned()),
+        browser_profile: cli.browser_profile.or(file.browser_profile),
     })
 }
 
@@ -276,7 +299,10 @@ async fn shutdown_signal() {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+    if let Some(Command::Profile { action }) = cli.command.take() {
+        return profile_cmd::run(action).await;
+    }
     let file = read_file_config(cli.config.as_ref())?;
     let config = build_config(cli, file)?;
 
@@ -294,6 +320,15 @@ async fn main() -> Result<()> {
         lan_interfaces = ?config.lan_interfaces,
         "Запускаем headless Netrunner client"
     );
+
+    if let Some(path) = &config.browser_profile {
+        let report = netrunner_core::browser_profile::load_file(path)
+            .with_context(|| format!("не удалось загрузить browser_profile {}", path.display()))?;
+        info!(profiles = ?report.names, "Загружен пользовательский профиль браузера");
+        for w in &report.warnings {
+            tracing::warn!("browser_profile: {w}");
+        }
+    }
 
     NetworkConfig::init_global(config.mtu);
     let tun_device = Tun::create(|tun_cfg| {

@@ -240,6 +240,7 @@ sni             = "www.debian.org"        # = the node's --decoy-host
 node_secret     = "<PROXY_NRXP_SECRET>"
 node_public_key = "<nrxp_public_key from the node log>"
 auth_token      = ""                      # empty for a standalone node
+# browser_profile = "/etc/netrunner/chrome.json"   # your own browser profile, see PCAP_PROFILE.md
 killswitch_enabled = true
 tunnel_mode     = "bypass_lan"            # all | bypass_lan
 ```
@@ -251,6 +252,9 @@ sudo setcap cap_net_admin,cap_net_raw,cap_dac_override=eip ./target/release/netr
 
 All keys are also accepted via `NETRUNNER_*` variables and flags (`--help`). An empty
 `node_secret`/`node_public_key` pair enables the anonymous scheme — for tests only.
+A custom browser profile for camouflage (extract it from a real browser with one command or write the
+JSON by hand): [PCAP_PROFILE.md](PCAP_PROFILE.md) — `netrunner-client profile record --out chrome.json`,
+then `browser_profile = "chrome.json"` or `--browser-profile`.
 OpenWrt (`router_mode`, procd, firewall zone): [`client/openwrt/README.md`](../../client/openwrt/README.md).
 The mobile app and the Tauri client use the same `client/` through UniFFI
 (`make build-android`).

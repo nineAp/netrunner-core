@@ -1,0 +1,99 @@
+{
+  "schema": 1,
+  "name": "chrome_148",
+  "record_layer_version": "0x0301",
+  "cipher_suites": [
+    "0x1301",
+    "0x1302",
+    "0x1303",
+    "0xc02b",
+    "0xc02f",
+    "0xc02c",
+    "0xc030",
+    "0xcca9",
+    "0xcca8",
+    "0xc013",
+    "0xc014",
+    "0x009c",
+    "0x009d",
+    "0x002f",
+    "0x0035"
+  ],
+  "groups": [
+    "0x11ec",
+    "0x001d",
+    "0x0017",
+    "0x0018"
+  ],
+  "signatures": [
+    "0x0403",
+    "0x0804",
+    "0x0401",
+    "0x0503",
+    "0x0805",
+    "0x0501",
+    "0x0806",
+    "0x0601"
+  ],
+  "delegated_signatures": [],
+  "versions": [
+    "0x0304",
+    "0x0303"
+  ],
+  "alpn": [
+    "h2",
+    "http/1.1"
+  ],
+  "alps_protocols": [
+    "h2"
+  ],
+  "extension_order": [
+    "grease_first",
+    "ech",
+    "status_request",
+    "renegotiation_info",
+    "server_name",
+    "sct",
+    "psk_key_exchange_modes",
+    "supported_versions",
+    "ec_point_formats",
+    "extended_master_secret",
+    "signature_algorithms",
+    "session_ticket",
+    "alpn",
+    "compress_certificate",
+    "supported_groups",
+    "alps",
+    "key_share",
+    "grease_last"
+  ],
+  "has_grease": true,
+  "shuffle_extensions": true,
+  "target_padding_len": 0,
+  "ech_payload_lengths": [
+    144,
+    176,
+    208,
+    240
+  ],
+  "compress_cert_algs": [
+    "0x0002"
+  ],
+  "psk_modes": [
+    1
+  ],
+  "ec_point_formats": [
+    0
+  ],
+  "raw_extensions": {},
+  "meta": {
+    "hellos_used": 6,
+    "ja3_hash": "5abee733343485fc9f9892c905c2a1c8",
+    "ja4": "t13d1516h2_8daaf6152771_d8a2da3f94cd",
+    "notes": [],
+    "other_groups": [],
+    "shuffle_evidence": "порядок расширений различается между 6 ClientHello",
+    "sni": "a.test",
+    "source": "netrunner pcap profile builder"
+  }
+}

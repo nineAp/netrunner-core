@@ -12,6 +12,7 @@ Client (Linux/OpenWrt/Android via UniFFI) + server node.
 - authenticated handshake (X25519 + node static key), forward secrecy, AEAD (AES-GCM / ChaCha20-Poly1305);
 - camouflage: Chrome 140 fingerprint (JA3/JA4, post-quantum `key_share`), server cover flight,
   irregular length padding, decoy site for scanners and active probes;
+- custom browser profile from JSON: `netrunner-client profile record` extracts it from a real browser;
 - optional: UDP leg (QUIC/WebRTC mimicry), multi-node mesh with onion routes;
 - L3 VPN without TCP-in-TCP: TUN + userspace stack (`nrxp-smoltcp`), kill-switch, router mode.
 
@@ -63,7 +64,7 @@ systemd, Docker, monitoring, upgrades and key rotation: **[deployment guide](doc
 | [docs/en/DEPLOYMENT.md](docs/en/DEPLOYMENT.md) | deploying a node and a client: build, systemd/Docker, flags, firewall, monitoring, keys |
 | [docs/en/PROTOCOL.md](docs/en/PROTOCOL.md) | full NRXP specification: handshake, keys, frames, multiplexing, UDP, mesh, constants |
 | [docs/en/SECURITY_MODEL.md](docs/en/SECURITY_MODEL.md) | threat model, guarantees, secrets, residual risks |
-| [docs/en/PCAP_PROFILE.md](docs/en/PCAP_PROFILE.md) | extracting a browser profile from a pcap capture (`--features pcap`) |
+| [docs/en/PCAP_PROFILE.md](docs/en/PCAP_PROFILE.md) | browser profiles: recording traffic from the binary, JSON format, loading (`profile record`) |
 | [docs/en/MESH.md](docs/en/MESH.md) | mesh and onion routing: roles, protections, capabilities, limits |
 | [docs/en/SECURITY.md](docs/en/SECURITY.md) | plain-language cryptography overview, comparison with MTProto |
 | [docs/en/ARCH.md](docs/en/ARCH.md) | architecture overview |

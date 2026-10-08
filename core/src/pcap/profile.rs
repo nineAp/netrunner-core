@@ -82,6 +82,13 @@ pub struct CapturedProfile {
     /// Наблюдавшиеся длины payload GREASE-ECH во всех `ClientHello` группы
     /// (по возрастанию). У Chrome длина **случайна** среди нескольких значений.
     pub ech_payload_lengths: Vec<u16>,
+    pub compress_cert_algs: Vec<u16>,
+    pub psk_modes: Vec<u8>,
+    pub ec_point_formats: Vec<u8>,
+    /// Кодпоинт ALPS из захвата (`0x44cd` либо `0x4469`).
+    pub alps_codepoint: Option<u16>,
+    /// Расширения без собственной сборки: тело из эталонного hello (id → hex).
+    pub raw_extensions: std::collections::BTreeMap<String, String>,
 
     /// Отпечатки эталонного `ClientHello`.
     pub ja3: String,
@@ -274,39 +281,30 @@ impl CapturedProfile {
         if r.compression != [0] {
             notes.push(format!("compression_methods = {:?}, сборщик пишет [0]", r.compression));
         }
-        let unknown: Vec<String> = r
-            .extensions
-            .iter()
-            .map(|e| e.id)
-            .filter(|id| !is_grease(*id) && !KNOWN_EXTENSIONS.contains(id) && *id != ext::ALPS_OLD)
-            .map(|id| format!("{id:#06x}"))
-            .collect();
-        if !unknown.is_empty() {
-            notes.push(format!(
-                "расширения без собственной сборки ({}): будут добавлены пустыми — отпечаток JA3/JA4 \
-                 совпадёт, содержимое нет",
-                unknown.join(", ")
-            ));
-        }
-        if let Some((cp, _)) = &r.alps {
-            if *cp != ext::ALPS {
+        // Расширения без собственной сборки сохраняются «сырыми»: тело берётся из
+        // эталонного hello. Если оно меняется между соединениями (cookie, ticket),
+        // повтор одного значения сам станет признаком — предупреждаем.
+        let mut raw_extensions = std::collections::BTreeMap::new();
+        for e in &r.extensions {
+            if is_grease(e.id) || KNOWN_EXTENSIONS.contains(&e.id) || e.id == ext::ALPS_OLD {
+                continue;
+            }
+            let varies = hellos.iter().any(|h| {
+                h.extensions.iter().find(|x| x.id == e.id).map(|x| &x.data) != Some(&e.data)
+            });
+            raw_extensions.insert(
+                format!("{:#06x}", e.id),
+                e.data.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+            );
+            if e.id == 0x0029 {
+                notes.push("pre_shared_key (0x0029): resumption-hello, профиль из него не годится".into());
+            } else if varies {
                 notes.push(format!(
-                    "ALPS с кодпоинтом {cp:#06x}, сборщик использует {:#06x}",
-                    ext::ALPS
+                    "расширение {:#06x} без сборки: тело меняется между соединениями, но в профиль \
+                     записано одно значение (raw_extensions)",
+                    e.id
                 ));
             }
-        }
-        if r.has_ext(ext::PSK_MODES) && r.psk_modes != [1] {
-            notes.push(format!("psk_key_exchange_modes = {:?}, сборщик пишет [1]", r.psk_modes));
-        }
-        if r.has_ext(ext::EC_POINT_FORMATS) && r.ec_point_formats != [0] {
-            notes.push(format!("ec_point_formats = {:?}, сборщик пишет [0]", r.ec_point_formats));
-        }
-        if r.has_ext(ext::COMPRESS_CERT) && r.compress_certificate != [2] {
-            notes.push(format!(
-                "compress_certificate = {:?}, сборщик пишет только brotli [2]",
-                r.compress_certificate
-            ));
         }
         if let Some(sr) = r.extensions.iter().find(|e| e.id == ext::STATUS_REQUEST) {
             if sr.data != [1, 0, 0, 0, 0] {
@@ -331,12 +329,6 @@ impl CapturedProfile {
         if let Some((enc, _)) = r.ech {
             if enc != 32 {
                 notes.push(format!("ECH: enc = {enc} Б, сборщик пишет 32 Б"));
-            }
-            if ech_lens != [144] {
-                notes.push(format!(
-                    "ECH: наблюдались длины payload {ech_lens:?} Б, сборщик пишет константу 144 — \
-                     у браузера длина случайна, константа сама становится признаком"
-                ));
             }
         } else if r.has_ext(ext::ECH) {
             notes.push("ECH не вида outer: сборщик пишет GREASE-ECH outer".into());
@@ -408,6 +400,11 @@ impl CapturedProfile {
             has_grease,
             shuffle_extensions: shuffle,
             ech_payload_lengths: ech_lens,
+            compress_cert_algs: r.compress_certificate.clone(),
+            psk_modes: r.psk_modes.clone(),
+            ec_point_formats: r.ec_point_formats.clone(),
+            alps_codepoint: r.alps.as_ref().map(|(c, _)| *c),
+            raw_extensions,
             shuffle_evidence: evidence,
             ja3: ja3_string(r),
             ja3_hash: ja3_hash(r),
@@ -419,9 +416,53 @@ impl CapturedProfile {
         })
     }
 
-    /// JSON-представление (для сохранения/сравнения профилей).
+    /// Профиль как JSON-описание [`ProfileSpec`](crate::browser_profile::ProfileSpec):
+    /// его читает движок (`browser_profile::load_file`), его можно править руками.
+    pub fn to_spec(&self) -> crate::browser_profile::ProfileSpec {
+        use crate::browser_profile::{ExtId, Hex16, ProfileSpec, SCHEMA_VERSION};
+        let h = |v: &[u16]| v.iter().map(|x| Hex16(*x)).collect::<Vec<_>>();
+        let order = self
+            .extension_order
+            .iter()
+            .map(|id| ExtId(if *id == ext::ALPS_OLD { ext::ALPS } else { *id }))
+            .collect();
+        ProfileSpec {
+            schema: SCHEMA_VERSION,
+            name: self.name.clone(),
+            record_layer_version: Hex16(self.record_layer_version),
+            cipher_suites: h(&self.cipher_suites),
+            groups: h(&self.groups),
+            signatures: h(&self.signatures),
+            delegated_signatures: h(&self.delegated_signatures),
+            versions: h(&self.versions),
+            alpn: self.alpn.clone(),
+            alps_protocols: self.alps_protocols.clone(),
+            alps_codepoint: self.alps_codepoint.filter(|c| *c != ext::ALPS).map(Hex16),
+            extension_order: order,
+            has_grease: Some(self.has_grease),
+            shuffle_extensions: self.shuffle_extensions,
+            target_padding_len: self.target_padding_len,
+            ech_payload_lengths: self.ech_payload_lengths.clone(),
+            compress_cert_algs: h(&self.compress_cert_algs),
+            psk_modes: self.psk_modes.clone(),
+            ec_point_formats: self.ec_point_formats.clone(),
+            raw_extensions: self.raw_extensions.clone(),
+            meta: Some(serde_json::json!({
+                "source": "netrunner pcap profile builder",
+                "ja4": self.ja4,
+                "ja3_hash": self.ja3_hash,
+                "sni": self.sni,
+                "hellos_used": self.hellos_used,
+                "shuffle_evidence": self.shuffle_evidence,
+                "notes": self.notes,
+                "other_groups": self.other_groups,
+            })),
+        }
+    }
+
+    /// JSON-описание профиля (см. [`to_spec`](Self::to_spec)).
     pub fn to_json(&self) -> String {
-        serde_json::to_string_pretty(self).unwrap_or_else(|_| "{}".into())
+        self.to_spec().to_json()
     }
 
     /// Готовый к вставке в `core/src/tlseng/profile.rs` ассоциированный
@@ -482,38 +523,19 @@ impl CapturedProfile {
         let _ = writeln!(s, "    shuffle_extensions: {},", self.shuffle_extensions);
         let _ = writeln!(s, "    alps_protocols: &[{}],", strs(&self.alps_protocols));
         let _ = writeln!(s, "    target_padding_len: {},", self.target_padding_len);
+        let _ = writeln!(s, "    ech_payload_lengths: &[{}],", self.ech_payload_lengths.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(", "));
+        let _ = writeln!(s, "    compress_cert_algs: &[{}],", hex(&self.compress_cert_algs));
+        let _ = writeln!(s, "    psk_modes: &{:?},", self.psk_modes);
+        let _ = writeln!(s, "    ec_point_formats: &{:?},", self.ec_point_formats);
+        let _ = writeln!(s, "    alps_codepoint: {:#06x},", self.alps_codepoint.unwrap_or(ext::ALPS));
+        let _ = writeln!(s, "    raw_extensions: &[], // тела расширений — в JSON-варианте (raw_extensions)");
         let _ = writeln!(s, "}};");
         s
     }
 
-    /// Профиль как значение, которым умеет пользоваться сборщик `ClientHello`.
-    /// Память намеренно «утекает» (`Box::leak`): профили живут весь процесс.
+    /// Профиль как значение, которым пользуется сборщик `ClientHello`.
     pub(crate) fn to_browser_profile(&self) -> Option<&'static crate::tlseng::BrowserProfile> {
-        use crate::tlseng::BrowserProfile;
-        let leak_u16 = |v: &[u16]| -> &'static [u16] { Box::leak(v.to_vec().into_boxed_slice()) };
-        let leak_strs = |v: &[String]| -> &'static [&'static str] {
-            let items: Vec<&'static str> = v
-                .iter()
-                .map(|s| &*Box::leak(s.clone().into_boxed_str()))
-                .collect();
-            Box::leak(items.into_boxed_slice())
-        };
-        let rec = crate::tlseng::protocol_version_from(self.record_layer_version)?;
-        let p = BrowserProfile {
-            groups: crate::tlseng::TlsGroups(leak_u16(&self.groups)),
-            signatures: crate::tlseng::TlsSignatures(leak_u16(&self.signatures)),
-            delegated_signatures: crate::tlseng::TlsSignatures(leak_u16(&self.delegated_signatures)),
-            versions: crate::tlseng::TlsVersions(leak_u16(&self.versions)),
-            alpn: leak_strs(&self.alpn),
-            extension_order: crate::tlseng::ExtensionOrder(leak_u16(&self.extension_order)),
-            cipher_suites: leak_u16(&self.cipher_suites),
-            record_layer_version: rec,
-            target_padding_len: self.target_padding_len,
-            alps_protocols: leak_strs(&self.alps_protocols),
-            has_grease: self.has_grease,
-            shuffle_extensions: self.shuffle_extensions,
-        };
-        Some(Box::leak(Box::new(p)))
+        self.to_spec().into_profile().ok()
     }
 }
 
