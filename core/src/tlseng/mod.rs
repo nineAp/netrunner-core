@@ -51,3 +51,13 @@ pub(crate) use handshake::{ClientHello, HelloHeader, ServerHello};
 pub(crate) use profile::{BrowserProfile, ServerProfile};
 pub(crate) use tls_record::{ApplicationData, TlsRecord};
 pub(crate) use types::{ContentType, HelloType};
+
+// Нужны блоку `pcap` (снятие профиля с захвата): он строит `BrowserProfile`
+// из динамических данных.
+#[cfg(feature = "pcap")]
+pub(crate) use types::{ExtensionOrder, TlsGroups, TlsSignatures, TlsVersions};
+
+#[cfg(feature = "pcap")]
+pub(crate) fn protocol_version_from(v: u16) -> Option<types::ProtocolVersion> {
+    types::ProtocolVersion::try_from(v).ok()
+}

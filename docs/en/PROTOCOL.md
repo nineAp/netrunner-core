@@ -241,8 +241,9 @@ encapsulation can be performed against this key. [К] `tlseng/mlkem.rs`
 length 32 (earlier, a substring search for `00 1d 00 20` could fire by chance inside the ballast —
 once per ~3.6 million handshakes). [К] `SessionKeys::extract_peer_public`
 
-> `[?]` The exact GREASE-ECH payload length (144) was calibrated from a single capture; in a real
-> Chrome it depends on the size of the inner ClientHello. The Firefox/Safari profile sizes have not
+> `[?]` The GREASE-ECH payload length (144) was calibrated from a single capture. **Extraction from
+> Chrome 148 ([PCAP_PROFILE.md](PCAP_PROFILE.md)) showed that in the browser it is random:
+> 144/176/208/240 B** — the constant 144 in the builder is a distinguishing sign (needs fixing). The Firefox/Safari profile sizes have not
 > been checked against a live capture.
 
 ### 3.4 `ServerHello`

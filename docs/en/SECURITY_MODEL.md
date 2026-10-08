@@ -254,6 +254,7 @@ Hence a separate layer. State by known detector:
 | 9 | Record lengths congruent modulo a step | statistical | ✅ closed; the *set* of a connection's boundaries remains visible |
 | 10 | **No real certificate / `Certificate` is just a record of the right size** | active (driving TLS to completion) | ⚠ **open**: the node will not present a chain |
 | 11 | **A probe with `nrxp_secret`, or a replay of a foreign ClientHello** | active | ⚠ **open** (A3) |
+| 12 | **Constant ECH payload length (144 B)** — in Chrome 148 it is random (144/176/208/240) | passive, statistical | ⚠ **open** (found by pcap analysis, [PCAP_PROFILE.md](PCAP_PROFILE.md)) |
 
 What is **not** verified by a live capture `[?]`: the GREASE-ECH length (144), cover-flight sizes
 relative to a real decoy site, Firefox/Safari fingerprints, the QUIC and RTP profiles, the ALPS

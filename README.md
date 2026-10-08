@@ -67,6 +67,7 @@ systemd, Docker, мониторинг, обновление и ротация к
 | [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) | развёртывание узла и клиента: сборка, systemd/Docker, флаги, файрвол, мониторинг, ключи |
 | [docs/PROTOCOL.md](docs/PROTOCOL.md) | полная спецификация NRXP: хендшейк, ключи, кадры, мультиплексирование, UDP, mesh, константы |
 | [docs/SECURITY_MODEL.md](docs/SECURITY_MODEL.md) | модель угроз, гарантии, секреты, остаточные риски |
+| [docs/PCAP_PROFILE.md](docs/PCAP_PROFILE.md) | снятие браузерного профиля с pcap-захвата (`--features pcap`) |
 | [docs/MESH.md](docs/MESH.md) | mesh и onion-маршрутизация: роли, защита, возможности, ограничения |
 | [docs/en/](docs/en) | английские версии: DEPLOYMENT, PROTOCOL, SECURITY_MODEL, MESH, SECURITY, ARCH |
 | [docs/SECURITY.md](docs/SECURITY.md) | популярное объяснение криптографии и сравнение с MTProto |

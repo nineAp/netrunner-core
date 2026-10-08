@@ -63,6 +63,7 @@ systemd, Docker, monitoring, upgrades and key rotation: **[deployment guide](doc
 | [docs/en/DEPLOYMENT.md](docs/en/DEPLOYMENT.md) | deploying a node and a client: build, systemd/Docker, flags, firewall, monitoring, keys |
 | [docs/en/PROTOCOL.md](docs/en/PROTOCOL.md) | full NRXP specification: handshake, keys, frames, multiplexing, UDP, mesh, constants |
 | [docs/en/SECURITY_MODEL.md](docs/en/SECURITY_MODEL.md) | threat model, guarantees, secrets, residual risks |
+| [docs/en/PCAP_PROFILE.md](docs/en/PCAP_PROFILE.md) | extracting a browser profile from a pcap capture (`--features pcap`) |
 | [docs/en/MESH.md](docs/en/MESH.md) | mesh and onion routing: roles, protections, capabilities, limits |
 | [docs/en/SECURITY.md](docs/en/SECURITY.md) | plain-language cryptography overview, comparison with MTProto |
 | [docs/en/ARCH.md](docs/en/ARCH.md) | architecture overview |

@@ -100,9 +100,16 @@ web-time = "1.1"
 dev-dump = []
 mesh-quic = ["dep:quinn", "dep:rustls", "dep:rcgen", "ring-aead"]
 ring-aead = ["dep:ring"]
+# Разбор pcap/pcapng и снятие браузерного профиля (core/src/pcap). Без внешних
+# зависимостей; в обычные и wasm-сборки не попадает.
+pcap = []
 
 # Пример собирается ТОЛЬКО с `--features dev-dump`, иначе `cargo build --examples`
 # не тянет его в обычных сборках.
 [[example]]
 name = "quic_initial_dump"
 required-features = ["dev-dump"]
+
+[[example]]
+name = "pcap_profile"
+required-features = ["pcap"]

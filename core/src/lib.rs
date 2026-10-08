@@ -145,6 +145,9 @@ pub mod edge;
 pub mod net;
 pub mod nrxp;
 pub mod parser;
+/// Разбор захватов трафика (pcap/pcapng) и снятие браузерного профиля.
+#[cfg(feature = "pcap")]
+pub mod pcap;
 mod quiceng;
 pub mod rawcast;
 mod rawdgram;
