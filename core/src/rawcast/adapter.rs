@@ -95,6 +95,9 @@ impl RawCastAdapter {
             FrameType::Data | FrameType::UdpData => RawCastEvent::Data,
             FrameType::Close => RawCastEvent::Close,
             FrameType::Heartbeat => return Err("Heartbeat should be handled by muxer".into()),
+            FrameType::PeerGossip => {
+                return Err("PeerGossip is handled by the mesh directory, not the bridge".into())
+            }
             FrameType::Diag => {
                 return Err("Diag frame is handled by diagnostics, not the bridge".into())
             }

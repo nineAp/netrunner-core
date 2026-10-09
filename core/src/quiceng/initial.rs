@@ -335,7 +335,11 @@ fn plan_scrambled(
         .filter(|(_, _, _, c)| !c.is_empty())
         .map(|(datagram, pn_len, _, chunks)| {
             let mut frames: Vec<PlanFrame> = chunks.iter().map(|(o, l)| PlanFrame::Crypto(*o, *l)).collect();
-            for _ in 0..rng.random_range(0..=6usize) {
+            // PING по одному байту, но только пока пакет не вышел за размер датаграммы
+            // (иначе датаграмма окажется длиннее снятой с браузера).
+            let crypto_used: usize = chunks.iter().map(|(o, l)| crypto_frame_len(*o, *l)).sum();
+            let room = datagram.saturating_sub(packet_overhead(dcid, scid, pn_len) + crypto_used);
+            for _ in 0..rng.random_range(0..=6usize).min(room) {
                 frames.push(PlanFrame::Ping);
             }
             for i in (1..frames.len()).rev() {

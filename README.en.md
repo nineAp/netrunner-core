@@ -66,6 +66,7 @@ systemd, Docker, monitoring, upgrades and key rotation: **[deployment guide](doc
 | [docs/en/PROTOCOL.md](docs/en/PROTOCOL.md) | full NRXP specification: handshake, keys, frames, multiplexing, UDP, mesh, constants |
 | [docs/en/SECURITY_MODEL.md](docs/en/SECURITY_MODEL.md) | threat model, guarantees, secrets, residual risks |
 | [docs/en/PCAP_PROFILE.md](docs/en/PCAP_PROFILE.md) | browser profiles: recording traffic from the binary, JSON format, loading (`profile record`) |
+| [docs/en/DECENTRALIZATION.md](docs/en/DECENTRALIZATION.md) | decentralization: panel-less nodes (swarm, signed descriptors, record exchange), roles, schemes, roadmap |
 | [docs/en/MESH.md](docs/en/MESH.md) | mesh and onion routing: roles, protections, capabilities, limits |
 | [docs/en/SECURITY.md](docs/en/SECURITY.md) | plain-language cryptography overview, comparison with MTProto |
 | [docs/en/ARCH.md](docs/en/ARCH.md) | architecture overview |

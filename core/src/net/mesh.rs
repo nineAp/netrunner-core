@@ -122,6 +122,9 @@ pub struct NodeMesh {
     egress_rotation: Mutex<EgressRotation>,
     peer_sessions: Mutex<HashMap<PeerSessionKey, Arc<PeerSessionSlot>>>,
     mixer: OnceCell<mpsc::Sender<MixPacket>>,
+    /// Каталог без панели (этап A децентрализации): если задан, узел обменивается
+    /// записями с соседями. См. [`gossip_round`](Self::gossip_round).
+    directory: std::sync::OnceLock<Arc<crate::net::directory::Directory>>,
     cover_tasks: Mutex<HashMap<String, Arc<CoverState>>>,
 }
 
@@ -158,6 +161,7 @@ impl NodeMesh {
             egress_rotation: Mutex::new(EgressRotation::default()),
             peer_sessions: Mutex::new(HashMap::new()),
             mixer: OnceCell::new(),
+            directory: std::sync::OnceLock::new(),
             cover_tasks: Mutex::new(HashMap::new()),
         }
     }
@@ -178,6 +182,58 @@ impl NodeMesh {
 
     pub(crate) fn onion_auth_token(&self) -> String {
         format!("mesh4:{}:{}", self.local_node_id, self.local_node_secret)
+    }
+
+    /// Подключает каталог. Вызывается один раз при старте; повторный вызов игнорируется.
+    pub fn set_directory(&self, directory: Arc<crate::net::directory::Directory>) {
+        let _ = self.directory.set(directory);
+    }
+
+    pub fn directory(&self) -> Option<Arc<crate::net::directory::Directory>> {
+        self.directory.get().cloned()
+    }
+
+    /// Один раунд обмена: до `fanout` случайных соседей, поддерживающих gossip.
+    /// Возвращает `(обменов удалось, записей узнано)`. Старым узлам (без признака
+    /// `GOSSIP` в записи) кадр не шлют: неизвестный тип рвёт им ногу.
+    pub async fn gossip_round(&self, fanout: usize) -> (usize, usize) {
+        let Some(directory) = self.directory() else {
+            return (0, 0);
+        };
+        let now = crate::net::directory::unix_now();
+        let mut peers = directory.gossip_peers(now);
+        peers.retain(|p| !p.node_id.eq_ignore_ascii_case(&self.local_node_id));
+        // Fisher–Yates: случайные соседи без повторов.
+        for i in (1..peers.len()).rev() {
+            let j = rand::rng().random_range(0..=i);
+            peers.swap(i, j);
+        }
+        let (mut ok, mut learned) = (0usize, 0usize);
+        for peer in peers.into_iter().take(fanout.max(1)) {
+            let token = self.onion_auth_token();
+            let outcome = async {
+                let session = self.peer_session(&peer, &token, None).await?;
+                session.gossip_exchange(&directory, now).await
+            }
+            .await;
+            match outcome {
+                Ok(stats) => {
+                    ok += 1;
+                    learned += stats.learned();
+                    metrics::counter!("netrunner_directory_exchanges_total").increment(1);
+                    metrics::counter!("netrunner_directory_records_learned_total")
+                        .increment(stats.learned() as u64);
+                    metrics::counter!("netrunner_directory_records_rejected_total")
+                        .increment(stats.rejected as u64);
+                }
+                Err(error) => {
+                    metrics::counter!("netrunner_directory_exchange_failures_total").increment(1);
+                    tracing_debug_gossip_failure(&peer, &error.internal_msg);
+                }
+            }
+        }
+        metrics::gauge!("netrunner_directory_records").set(directory.len() as f64);
+        (ok, learned)
     }
 
     pub fn set_onion_identity(&self, identity: crate::crypto::LocalIdentity) {
@@ -2194,4 +2250,8 @@ mod tests {
         assert!(mesh.route_via_peer(&next, "peer-a").is_none());
         assert!(mesh.route_via_peer(&next, "ingress").is_none());
     }
+}
+
+fn tracing_debug_gossip_failure(peer: &MeshPeer, error: &str) {
+    netrunner_logger::debug!(peer = %peer.node_id, error = %error, "directory gossip exchange failed");
 }

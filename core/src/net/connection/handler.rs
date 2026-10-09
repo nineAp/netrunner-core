@@ -1609,6 +1609,49 @@ impl StreamHandler {
         }
     }
 
+    /// Обмен записями каталога. Ответ на наш запрос будит ожидающего; входящий
+    /// запрос обслуживается только от аутентифицированного mesh-пира и только если
+    /// на этом узле есть каталог. Всё остальное молча отбрасывается: лишний кадр
+    /// не должен ни ронять ногу, ни давать повод для ответа постороннему.
+    async fn handle_peer_gossip(&self, stream_id: u32, payload: Bytes) {
+        use crate::net::directory::{Handled, Message};
+        let Ok(message) = Message::decode(&payload) else {
+            metrics::counter!("netrunner_directory_bad_messages_total").increment(1);
+            return;
+        };
+        if !message.is_request() && !matches!(message, Message::Push(_)) {
+            // Reply на наш запрос.
+            self.muxer.dispatch_to_local(stream_id, payload);
+            return;
+        }
+        let Some(directory) = self
+            .opener
+            .as_ref()
+            .filter(|opener| opener.mesh_peer)
+            .and_then(|opener| opener.mesh.as_ref())
+            .and_then(|mesh| mesh.directory())
+        else {
+            return;
+        };
+        match directory.handle_incoming(&payload, crate::net::directory::unix_now()) {
+            Ok(Handled::Reply(reply)) => {
+                let _ = self
+                    .muxer
+                    .send_control(stream_id, FrameType::PeerGossip, Bytes::from(reply))
+                    .await;
+            }
+            Ok(Handled::Absorbed(stats)) => {
+                metrics::counter!("netrunner_directory_records_learned_total")
+                    .increment(stats.learned() as u64);
+                metrics::counter!("netrunner_directory_records_rejected_total")
+                    .increment(stats.rejected as u64);
+            }
+            Err(_) => {
+                metrics::counter!("netrunner_directory_bad_messages_total").increment(1);
+            }
+        }
+    }
+
     /// Диспетчеризует один кадр по типу. Для `Data`/`UdpData` доставка идёт через
     /// `await` (backpressure ради сохранения порядка), для управляющих —
     /// в отдельных задачах, чтобы не блокировать reader ноги.
@@ -1662,6 +1705,7 @@ impl StreamHandler {
                 self.handle_mesh_onion_request(stream_id, frame.payload, true)
                     .await
             }
+            FrameType::PeerGossip => self.handle_peer_gossip(stream_id, frame.payload).await,
 
             FrameType::Data => {
                 // Non-blocking: in-order delivery is guaranteed by the stream's

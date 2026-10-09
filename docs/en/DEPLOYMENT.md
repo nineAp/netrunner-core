@@ -332,6 +332,9 @@ periodic task is stuck) — for docker/systemd healthchecks.
 * **Mesh** (`--mesh-enabled`): additionally `PROXY_NODE_ID`, NRXP credentials,
   `/internal/mesh/{peers,validate}`, open `udp/8443` (or `--mesh-quic-port`) between nodes.
   `--mesh-max-hops` 1…8 is a hard upper bound on route length. Details — [MESH.md](MESH.md).
+* **Mesh without a panel** (swarm, `--swarm-key`): nodes find each other by signed descriptors; no backend or
+  `PROXY_NODE_ID` needed; `--advertise`, `--directory-seed`, `--directory-file`. Launch and limits —
+  [DECENTRALIZATION.md](DECENTRALIZATION.md#55-a-node-without-the-panel).
 * **MASQUE** (HTTP/3 relay for iOS, **experimental**, `udp/8444`):
   [`masque-edge/README.md`](../../masque-edge/README.md), config template
   `server/masque-edge.env.example`; needs a publicly trusted certificate.

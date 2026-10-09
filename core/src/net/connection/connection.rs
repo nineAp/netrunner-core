@@ -145,6 +145,63 @@ impl MeshPeerSession {
         .await
     }
 
+    /// Один обмен записями каталога с этим пиром: `Digest` → `Reply` → `Push`.
+    /// Возвращает, сколько записей узнали мы. Ничего не знает о маршрутах и
+    /// пользовательских потоках — это отдельный короткий поток в той же сессии.
+    pub(crate) async fn gossip_exchange(
+        &self,
+        directory: &crate::net::directory::Directory,
+        now: u64,
+    ) -> Result<crate::net::directory::Stats, AppError> {
+        if !self.is_usable() {
+            return Err(AppError::new(
+                ERR_INFRA_TIMEOUT,
+                "Mesh peer unavailable",
+                "The pooled mesh peer session has no active transport",
+            ));
+        }
+        let stream_id = self.muxer.next_stream_id();
+        let cap = NetworkConfig::global().channel_capacity;
+        let (stream_tx, mut stream_rx) = mpsc::channel::<Bytes>(cap.min(8));
+        self.muxer.register_stream_with_backlog_cap(
+            stream_id,
+            stream_tx,
+            crate::net::SERVER_STREAM_BACKLOG_MAX_BYTES,
+        );
+        let result = async {
+            self.muxer
+                .send_control(
+                    stream_id,
+                    FrameType::PeerGossip,
+                    Bytes::from(directory.begin_exchange(now)),
+                )
+                .await?;
+            let reply = tokio::time::timeout(Duration::from_secs(8), stream_rx.recv())
+                .await
+                .ok()
+                .flatten()
+                .ok_or_else(|| {
+                    AppError::new(
+                        ERR_INFRA_TIMEOUT,
+                        "Gossip timeout",
+                        "The peer did not answer the directory digest",
+                    )
+                })?;
+            let (stats, push) = directory.complete_exchange(&reply, now).map_err(|e| {
+                AppError::new(ERR_INFRA_TIMEOUT, "Gossip rejected", e.to_string())
+            })?;
+            if let Some(push) = push {
+                self.muxer
+                    .send_control(stream_id, FrameType::PeerGossip, Bytes::from(push))
+                    .await?;
+            }
+            Ok(stats)
+        }
+        .await;
+        self.muxer.remove_stream(stream_id);
+        result
+    }
+
     pub(crate) async fn open_onion_stream(
         &self,
         capsule: &[u8],

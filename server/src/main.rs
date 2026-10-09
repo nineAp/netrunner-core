@@ -126,6 +126,40 @@ struct Args {
     #[arg(long, env = "NETRUNNER_SHAPE_PROFILE")]
     shape_profile: Option<String>,
 
+    /// Ключ роя (hex, 32 байта): узел работает **без панели** — соседей находит из
+    /// подписанных самоописаний (обмен с другими узлами), а входной секрет каждого
+    /// узла выводится из ключа роя. Нужны `PROXY_NRXP_PRIVATE_KEY` и `--advertise`;
+    /// `PROXY_NRXP_SECRET`, `PROXY_NODE_ID` и бэкенд не требуются. Сгенерировать
+    /// ключ: `openssl rand -hex 32`, один на всю сеть. См. docs/DECENTRALIZATION.md.
+    #[arg(long, env = "PROXY_SWARM_KEY", hide_env_values = true)]
+    swarm_key: Option<String>,
+
+    /// Публичный адрес этого узла `host:port` (NRXP, TCP) — попадает в его
+    /// самоописание. Обязателен с `--swarm-key`.
+    #[arg(long, env = "NETRUNNER_ADVERTISE")]
+    advertise: Option<String>,
+
+    /// Самоописания соседей для начального знакомства: hex-строка либо путь к
+    /// файлу (по записи в строке). Получить: `--print-descriptor` на соседе.
+    #[arg(long, env = "NETRUNNER_DIRECTORY_SEED", value_delimiter = ',')]
+    directory_seed: Vec<String>,
+
+    /// Файл, в котором узел хранит каталог между перезапусками.
+    #[arg(long, env = "NETRUNNER_DIRECTORY_FILE")]
+    directory_file: Option<std::path::PathBuf>,
+
+    /// Раз в сколько секунд обмениваться записями с соседями (с разбросом ±30 %).
+    #[arg(long, default_value_t = 15)]
+    directory_gossip_interval: u64,
+
+    /// Принимать записи с частными адресами (LAN, стенды). В боевой сети не нужен.
+    #[arg(long)]
+    directory_allow_private: bool,
+
+    /// Напечатать самоописание этого узла (для `--directory-seed` соседей) и выйти.
+    #[arg(long)]
+    print_descriptor: bool,
+
     /// Требовать валидный Bearer-токен (выданный `netrunner-backend`) от
     /// каждого клиента и отчитываться о расходе трафика для динамических
     /// лимитов. Выключено по умолчанию — включается по инстансу, не меняя
@@ -191,7 +225,26 @@ fn main() {
         );
     }
 
-    let auth_required_by_node = args.require_auth || args.mesh_enabled;
+    // Рой без панели: каталог узла строится из подписанных самоописаний.
+    let swarm_directory: Option<Arc<netrunner_core::net::directory::Directory>> = args
+        .swarm_key
+        .as_deref()
+        .map(|key| build_directory(&args, key));
+    if args.print_descriptor {
+        let dir = swarm_directory
+            .as_ref()
+            .expect("--print-descriptor требует --swarm-key (и --advertise)");
+        let own = dir.own(netrunner_core::net::directory::unix_now());
+        println!("node_id        {}", dir.node_id_hex());
+        println!("static_public  {}", hex::encode(own.static_pub));
+        // Для клиентов этого узла (`node_secret` / `node_public_key` в client.toml).
+        println!("nrxp_secret    {}", dir.swarm().node_secret(&dir.node_id()));
+        println!("descriptor     {}", hex::encode(own.encode()));
+        return;
+    }
+    let swarm_mode = swarm_directory.is_some();
+    // В режиме роя панель нужна только для учётных записей пользователей.
+    let auth_required_by_node = args.require_auth || (args.mesh_enabled && !swarm_mode);
     let backend_url = if auth_required_by_node {
         Some(
             args.backend_url
@@ -209,7 +262,7 @@ fn main() {
     } else {
         None
     };
-    let auth: Option<Arc<dyn AuthValidator>> = if auth_required_by_node {
+    let panel: Option<Arc<dyn AuthValidator>> = if auth_required_by_node {
         let backend_url = backend_url.expect("backend URL checked above");
         let internal_secret = internal_secret.as_ref().expect("secret checked above");
         Some(Arc::new(BackendClient::new(
@@ -219,8 +272,26 @@ fn main() {
     } else {
         None
     };
+    // Каталог и допуск пиров — из роя; учётные записи — из панели, если она есть.
+    let auth: Option<Arc<dyn AuthValidator>> = match &swarm_directory {
+        Some(dir) => Some(Arc::new(netrunner_core::net::directory::DirectoryValidator::new(
+            dir.clone(),
+            panel,
+        ))),
+        None => panel,
+    };
 
-    let mesh = if args.mesh_enabled {
+    let mesh = if let Some(dir) = &swarm_directory {
+        let node_secret = dir.swarm().node_secret(&dir.node_id());
+        let mesh = Arc::new(netrunner_core::net::NodeMesh::with_max_hops_and_quic_port(
+            dir.node_id_hex(),
+            node_secret,
+            args.mesh_max_hops,
+            args.mesh_quic_port,
+        ));
+        mesh.set_directory(dir.clone());
+        Some(mesh)
+    } else if args.mesh_enabled {
         let node_id = std::env::var("PROXY_NODE_ID")
             .expect("--mesh-enabled requires PROXY_NODE_ID from netrunner-backend");
         let node_secret = internal_secret
@@ -255,10 +326,30 @@ fn main() {
     // (например, `.env` уехал не тот). Расхождение видно сравнением
     // `netrunner_nrxp_*` с ноды и `node_nrxp_*` с бэкенда.
     let mut nrxp_strict_flag = false;
-    let identity = match (
-        std::env::var("PROXY_NRXP_SECRET").ok(),
-        std::env::var("PROXY_NRXP_PRIVATE_KEY").ok(),
-    ) {
+    // В рое входной секрет не настраивается, а выводится из ключа роя и личности
+    // узла — так же, как его считают соседи.
+    let nrxp_env = match &swarm_directory {
+        Some(dir) => {
+            let derived = dir.swarm().node_secret(&dir.node_id());
+            if let Ok(explicit) = std::env::var("PROXY_NRXP_SECRET") {
+                if !explicit.trim().eq_ignore_ascii_case(&derived) {
+                    panic!(
+                        "PROXY_NRXP_SECRET не совпадает с секретом, выведенным из --swarm-key: \
+                         соседи не смогут подключиться. Уберите переменную — в рое он выводится сам"
+                    );
+                }
+            }
+            (
+                Some(derived),
+                Some(hex::encode(dir.identity().static_private)),
+            )
+        }
+        None => (
+            std::env::var("PROXY_NRXP_SECRET").ok(),
+            std::env::var("PROXY_NRXP_PRIVATE_KEY").ok(),
+        ),
+    };
+    let identity = match nrxp_env {
         (Some(secret), Some(private_key)) => {
             // Пока false, нода принимает и клиентов старой анонимной схемы —
             // это нужно ровно на время раскатки, пока бэкенд не раздал ключи
@@ -297,7 +388,7 @@ fn main() {
         ),
     };
 
-    if args.mesh_enabled && identity.is_none() {
+    if (args.mesh_enabled || swarm_mode) && identity.is_none() {
         panic!("--mesh-enabled requires PROXY_NRXP_SECRET and PROXY_NRXP_PRIVATE_KEY");
     }
     if let (Some(mesh), Some(Identity::Local(local))) = (mesh.as_ref(), identity.as_ref()) {
@@ -449,14 +540,15 @@ fn main() {
         fallback_host,
         auth,
         args.require_auth,
-        args.mesh_enabled,
+        args.mesh_enabled || swarm_mode,
         mesh,
         args.mesh_quic_port,
         args.health_port,
         identity,
         cover_flight,
         honor_requested_sni,
-    );
+    )
+    .with_directory(args.directory_file.clone(), args.directory_gossip_interval);
 
     let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
 
@@ -487,6 +579,78 @@ fn main() {
             error!(error = ?e, "Задача сервера завершилась с паникой при остановке");
         }
     });
+}
+
+/// Собирает каталог роя из флагов: личность из `PROXY_NRXP_PRIVATE_KEY`, адрес из
+/// `--advertise`, начальные записи из `--directory-seed` и файла каталога.
+fn build_directory(args: &Args, swarm_key: &str) -> Arc<netrunner_core::net::directory::Directory> {
+    use netrunner_core::net::directory::{
+        unix_now, Directory, DirectoryConfig, Endpoint, EndpointKind, StoreConfig, SwarmIdentity,
+        SwarmKey,
+    };
+    let swarm = SwarmKey::from_hex(swarm_key).unwrap_or_else(|e| panic!("--swarm-key: {e}"));
+    let private = std::env::var("PROXY_NRXP_PRIVATE_KEY")
+        .expect("--swarm-key требует PROXY_NRXP_PRIVATE_KEY (статический ключ узла, hex)");
+    let identity = SwarmIdentity::from_private_hex(&private)
+        .unwrap_or_else(|e| panic!("PROXY_NRXP_PRIVATE_KEY: {e}"));
+    let advertise = args
+        .advertise
+        .as_deref()
+        .expect("--swarm-key требует --advertise host:port (публичный адрес узла)");
+    let (host, port) = advertise
+        .rsplit_once(':')
+        .and_then(|(h, p)| Some((h.trim_matches(|c| c == '[' || c == ']'), p.parse::<u16>().ok()?)))
+        .unwrap_or_else(|| panic!("--advertise: ожидается host:port, получено {advertise:?}"));
+    let now = unix_now();
+    let directory = Directory::new(
+        identity,
+        swarm,
+        DirectoryConfig {
+            store: StoreConfig {
+                allow_private: args.directory_allow_private,
+                ..Default::default()
+            },
+            advertise: vec![Endpoint {
+                kind: EndpointKind::Tcp,
+                host: host.to_string(),
+                port,
+            }],
+            decoy_sni: args.decoy_host.clone(),
+            ..Default::default()
+        },
+        now,
+    );
+    // Своя запись обязана быть валидной сразу: иначе соседи её отвергнут.
+    if let Err(e) = directory.own(now).verify(now, args.directory_allow_private) {
+        panic!(
+            "самоописание узла не проходит проверку ({e}); для частных адресов нужен \
+             --directory-allow-private"
+        );
+    }
+    if let Some(path) = &args.directory_file {
+        if let Ok(bytes) = std::fs::read(path) {
+            let n = directory.import(&bytes, now);
+            netrunner_logger::info!(path = %path.display(), records = n, "directory loaded");
+        }
+    }
+    for seed in &args.directory_seed {
+        let text = std::fs::read_to_string(seed).unwrap_or_else(|_| seed.clone());
+        for line in text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
+            let bytes = hex::decode(line).unwrap_or_else(|e| panic!("--directory-seed: {e}"));
+            if let netrunner_core::net::directory::Insert::Rejected(why) =
+                directory.insert_bytes(&bytes, now)
+            {
+                netrunner_logger::warn!(?why, "seed descriptor rejected")
+            }
+        }
+    }
+    netrunner_logger::info!(
+        node_id = %directory.node_id_hex(),
+        advertise = %advertise,
+        records = directory.len(),
+        "swarm directory ready"
+    );
+    Arc::new(directory)
 }
 
 #[cfg(test)]

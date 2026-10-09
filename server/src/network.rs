@@ -106,9 +106,23 @@ pub struct Network {
     /// (`Relay`) или всегда отдавать свой сайт (`SelfHosted`). См.
     /// `netrunner_core::decoy::DecoyMode`.
     honor_requested_sni: bool,
+    /// Файл каталога (рой без панели) и период обмена записями с соседями, секунды.
+    directory_file: Option<std::path::PathBuf>,
+    gossip_interval_secs: u64,
 }
 
 impl Network {
+    /// Настройки каталога роя: куда сохранять записи и как часто обмениваться.
+    pub fn with_directory(
+        mut self,
+        file: Option<std::path::PathBuf>,
+        gossip_interval_secs: u64,
+    ) -> Self {
+        self.directory_file = file;
+        self.gossip_interval_secs = gossip_interval_secs.max(1);
+        self
+    }
+
     pub fn new(
         host: String,
         port: u16,
@@ -136,6 +150,8 @@ impl Network {
             identity,
             cover_flight,
             honor_requested_sni,
+            directory_file: None,
+            gossip_interval_secs: 15,
         }
     }
 
@@ -187,6 +203,44 @@ impl Network {
                     tokio::time::sleep(Duration::from_secs(20)).await;
                 }
             });
+        }
+
+        // Рой без панели: обмен записями с соседями, сборка мусора и сохранение
+        // каталога на диск. Список пиров для маршрутизации берётся выше из
+        // `DirectoryValidator::list_mesh_peers`, то есть тоже из каталога.
+        if let Some(mesh) = self.mesh.clone() {
+            if let Some(directory) = mesh.directory() {
+                let file = self.directory_file.clone();
+                let interval = self.gossip_interval_secs;
+                tokio::spawn(async move {
+                    let mut last_saved = 0usize;
+                    loop {
+                        let (ok, learned) = mesh.gossip_round(2).await;
+                        let now = netrunner_core::net::directory::unix_now();
+                        let expired = directory.gc(now);
+                        if ok > 0 || learned > 0 || expired > 0 {
+                            info!(exchanges = ok, learned, expired, records = directory.len(), "directory gossip round");
+                        }
+                        if let Some(path) = &file {
+                            // Пишем при изменении набора записей; временный файл +
+                            // переименование, чтобы обрыв не оставил половинку.
+                            if learned > 0 || expired > 0 || directory.len() != last_saved {
+                                let tmp = path.with_extension("tmp");
+                                if std::fs::write(&tmp, directory.export(now))
+                                    .and_then(|()| std::fs::rename(&tmp, path))
+                                    .is_ok()
+                                {
+                                    last_saved = directory.len();
+                                } else {
+                                    warn!(path = %path.display(), "failed to save the directory");
+                                }
+                            }
+                        }
+                        let jitter = rand::random::<f64>() * 0.6 + 0.7;
+                        tokio::time::sleep(Duration::from_secs_f64(interval as f64 * jitter)).await;
+                    }
+                });
+            }
         }
 
         // Диагностика — только ограниченный in-memory store, без файлов на

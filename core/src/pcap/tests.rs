@@ -858,10 +858,10 @@ fn scrambled_initial_layout_is_always_decodable() {
     let runtime = q.spec.build_runtime().unwrap();
     let ep = |port| Endpoint { ip: std::net::IpAddr::from([10, 0, 0, 1]), port };
     let mut npackets = std::collections::HashSet::new();
-    for i in 0..300u32 {
+    for i in 0..3000u32 {
         let flight = crate::quiceng::build_client_initial_flight(runtime, 1, "fuzz.example", &[i as u8; 8]);
         assert!(!flight.is_empty() && flight.len() <= 4, "{}", flight.len());
-        assert!(flight.iter().all(|d| d.len() >= 1200 && d.len() <= 1500), "{:?}", flight.iter().map(|d| d.len()).collect::<Vec<_>>());
+        assert!(flight.iter().all(|d| d.len() == 1250), "размер датаграммы = снятому с браузера: {:?}", flight.iter().map(|d| d.len()).collect::<Vec<_>>());
         npackets.insert(flight.len());
         let mut qc = QuicCollector::default();
         for d in &flight {

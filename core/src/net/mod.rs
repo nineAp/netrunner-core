@@ -38,6 +38,7 @@
 mod auth;
 mod config;
 mod credit;
+pub mod directory;
 #[cfg(not(target_arch = "wasm32"))]
 mod mesh;
 #[cfg(not(target_arch = "wasm32"))]

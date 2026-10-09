@@ -66,6 +66,11 @@ pub(crate) enum FrameType {
     MeshOnionConnect = 0x0b,
     /// UDP variant of `MeshOnionConnect`.
     MeshOnionUdpConnect = 0x0c,
+    /// Обмен самоописаниями узлов между mesh-пирами (`net::directory::gossip`).
+    /// Payload — одно сообщение обмена (`Digest`/`Reply`/`Push`). Узлу, который
+    /// не заявил `features::GOSSIP` в своей записи, этот кадр не шлют: для него
+    /// неизвестный тип рвёт ногу.
+    PeerGossip = 0x0d,
 }
 
 /// Разобранный заголовок кадра (25 байт). Поля идут в том же порядке, что и в wire.
@@ -235,6 +240,7 @@ impl Parser for FrameHeader {
             0x0a => FrameType::SecureUdpConnect,
             0x0b => FrameType::MeshOnionConnect,
             0x0c => FrameType::MeshOnionUdpConnect,
+            0x0d => FrameType::PeerGossip,
             unknown => {
                 // After successful AEAD decryption an unknown frame type means a
                 // protocol version mismatch or data corruption that the cipher
@@ -332,6 +338,7 @@ mod tests {
             (FrameType::SecureUdpConnect, 0x0a),
             (FrameType::MeshOnionConnect, 0x0b),
             (FrameType::MeshOnionUdpConnect, 0x0c),
+            (FrameType::PeerGossip, 0x0d),
         ] {
             let wire =
                 Frame::new(7, frame_type, Bytes::from_static(b"payload")).into_bytes(&AUTH_KEY, 0);

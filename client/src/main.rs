@@ -8,6 +8,7 @@
 #![allow(dead_code)]
 
 mod net;
+mod nodes;
 mod profile_cmd;
 mod tun;
 
@@ -61,6 +62,9 @@ struct FileConfig {
     strong_privacy: Option<bool>,
     tunnel_legs: Option<u32>,
     log_level: Option<String>,
+    /// Запасные узлы: `[[nodes]]` с `address`, `node_secret`, `node_public_key`, `sni`.
+    /// При старте клиент подключается к первому достижимому (основной — первым).
+    nodes: Vec<nodes::NodeEntry>,
     /// JSON-профиль браузера (см. `netrunner-client profile record`).
     browser_profile: Option<PathBuf>,
 }
@@ -184,6 +188,8 @@ struct EffectiveConfig {
     tunnel_legs: u32,
     log_level: String,
     browser_profile: Option<PathBuf>,
+    /// Запасные узлы из `[[nodes]]` (проверены при чтении конфига).
+    fallback_nodes: Vec<nodes::NodeCandidate>,
 }
 
 fn non_empty(value: Option<String>) -> Option<String> {
@@ -254,6 +260,15 @@ fn build_config(cli: Cli, file: FileConfig) -> Result<EffectiveConfig> {
         file.killswitch_enabled.unwrap_or(true)
     };
 
+    let default_sni = non_empty(cli.sni.clone().or(file.sni.clone()))
+        .unwrap_or_else(|| netrunner_core::net::DEFAULT_DECOY_HOST.to_owned());
+    let fallback_nodes = file
+        .nodes
+        .iter()
+        .cloned()
+        .map(|n| n.into_candidate(&default_sni))
+        .collect::<Result<Vec<_>>>()?;
+
     Ok(EffectiveConfig {
         remote_address,
         proxy_address,
@@ -280,7 +295,48 @@ fn build_config(cli: Cli, file: FileConfig) -> Result<EffectiveConfig> {
         ),
         log_level: non_empty(cli.log_level.or(file.log_level)).unwrap_or_else(|| "info".to_owned()),
         browser_profile: cli.browser_profile.or(file.browser_profile),
+        fallback_nodes,
     })
+}
+
+/// Выбирает рабочий узел из основного и запасных: прошлый рабочий — первым, затем по
+/// порядку конфига; берётся первый достижимый. Если живых нет, остаётся основной
+/// (ноги будут переподключаться, как и раньше).
+async fn select_node(config: &mut EffectiveConfig) {
+    if config.fallback_nodes.is_empty() {
+        return;
+    }
+    let primary = nodes::NodeCandidate {
+        address: config.remote_address.clone(),
+        proxy: config.proxy_address,
+        sni: config.sni.clone(),
+        node_secret: config.node_secret.clone(),
+        node_public_key: config.node_public_key.clone(),
+    };
+    let mut all = vec![primary.clone()];
+    all.extend(config.fallback_nodes.iter().cloned());
+    let ordered = nodes::order_candidates(all, nodes::read_last_good(&config.cache_dir).as_deref());
+    match nodes::pick(&ordered, std::time::Duration::from_secs(3)).await {
+        Some(i) => {
+            let chosen = ordered[i].clone();
+            if chosen != primary {
+                info!(
+                    node = %chosen.address,
+                    "Основной узел недоступен или не предпочтителен — подключаемся к запасному"
+                );
+            }
+            nodes::write_last_good(&config.cache_dir, &chosen.address);
+            config.remote_address = chosen.address;
+            config.proxy_address = chosen.proxy;
+            config.sni = chosen.sni;
+            config.node_secret = chosen.node_secret;
+            config.node_public_key = chosen.node_public_key;
+        }
+        None => tracing::warn!(
+            "Ни один из {} узлов не ответил по TCP — остаёмся на основном, ноги будут переподключаться",
+            ordered.len()
+        ),
+    }
 }
 
 async fn shutdown_signal() {
@@ -347,6 +403,9 @@ async fn main() -> Result<()> {
             tracing::warn!("browser_profile: {w}");
         }
     }
+
+    let mut config = config;
+    select_node(&mut config).await;
 
     NetworkConfig::init_global(config.mtu);
     let tun_device = Tun::create(|tun_cfg| {
@@ -435,6 +494,37 @@ mod tests {
         assert_eq!(config.mtu, 1380);
         assert!(!config.killswitch_enabled);
         assert_eq!(config.lan_interfaces, ["br-lan"]);
+    }
+
+    #[test]
+    fn backup_nodes_are_read_from_toml_and_validated() {
+        let file: FileConfig = toml::from_str(
+            r#"
+            remote_address = "198.51.100.10:443"
+            tunnel_legs = 6
+
+            [[nodes]]
+            address = "198.51.100.11:443"
+            node_secret = "aa"
+            node_public_key = "bb"
+
+            [[nodes]]
+            address = "198.51.100.12:8443"
+            sni = "cdn.example"
+            "#,
+        )
+        .unwrap();
+        let cli = Cli::try_parse_from(["netrunner-client"]).unwrap();
+        let config = build_config(cli, file).unwrap();
+        assert_eq!(config.tunnel_legs, 6);
+        assert_eq!(config.fallback_nodes.len(), 2);
+        assert_eq!(config.fallback_nodes[0].node_secret.as_deref(), Some("aa"));
+        assert_eq!(config.fallback_nodes[1].sni, "cdn.example");
+
+        let bad: FileConfig = toml::from_str("[[nodes]]\naddress = \"host.example:443\"\n").unwrap();
+        let cli = Cli::try_parse_from(["netrunner-client", "--remote-address", "198.51.100.10:443"]).unwrap();
+        assert!(build_config(cli, bad).is_err());
+        assert!(toml::from_str::<FileConfig>("[[nodes]]\naddress = \"1.2.3.4:5\"\nbogus = 1\n").is_err());
     }
 
     #[test]

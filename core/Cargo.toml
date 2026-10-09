@@ -21,6 +21,8 @@ chacha20 = "0.9"
 aes-gcm = "0.10"
 aes = "0.8"
 x25519-dalek = { version = "2.0", features = ["static_secrets"] }
+# Подписи самоописаний узлов (net::directory): личность узла = ключи, а не запись в панели.
+ed25519-dalek = { version = "2.1", default-features = false, features = ["std"] }
 aead = { version = "0.5.2", features = ["bytes"] }
 hkdf = "0.12"
 hmac = "0.12"

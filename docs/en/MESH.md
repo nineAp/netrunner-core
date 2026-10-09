@@ -330,6 +330,10 @@ ceiling `N`; the price is latency and load.
 
 ## 14. Decentralization: what exists and how to get there
 
+> **Update.** Stage A of the proposal below is **implemented**: signed descriptors, their exchange between
+> nodes (the `PeerGossip` frame), the panel-less swarm mode `--swarm-key` — see [DECENTRALIZATION.md](DECENTRALIZATION.md).
+> The rest of this section is still a design.
+
 **What is confirmed.** A network of nodes with no single entry point has worked on the
 netrunner-vpn.com project: nodes build routes through each other themselves, any node can be an
 ingress, a relay or an egress, and the exit is not tied to the entry. In this repository such a mode

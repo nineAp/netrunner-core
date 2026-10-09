@@ -331,6 +331,9 @@ scrape_configs:
 * **Mesh** (`--mesh-enabled`): дополнительно `PROXY_NODE_ID`, NRXP-учётные данные,
   `/internal/mesh/{peers,validate}`, открыть `udp/8443` (или `--mesh-quic-port`) между узлами.
   `--mesh-max-hops` 1…8 — жёсткий верхний предел маршрута.
+* **Mesh без панели** (рой, `--swarm-key`): узлы находят друг друга по подписанным самоописаниям, бэкенд и
+  `PROXY_NODE_ID` не нужны; `--advertise`, `--directory-seed`, `--directory-file`. Запуск и ограничения —
+  [DECENTRALIZATION.md](DECENTRALIZATION.md#55-узел-без-панели).
 * **MASQUE** (HTTP/3-релей для iOS, **экспериментальный**, `udp/8444`):
   [`masque-edge/README.md`](../masque-edge/README.md), шаблон конфигурации
   `server/masque-edge.env.example`; нужен публично доверенный сертификат.
