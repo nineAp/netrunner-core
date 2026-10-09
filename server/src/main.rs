@@ -109,6 +109,23 @@ struct Args {
     #[arg(long)]
     decoy_sni: Option<String>,
 
+    /// Длины TLS-записей первого flight'а узла (`EncryptedExtensions`,
+    /// `Certificate`, `CertificateVerify`, `Finished`): список через запятую
+    /// (`27,4342,537,69`) либо путь к JSON-файлу, который пишет
+    /// `netrunner-client profile record --flight-out`. Снимите их с настоящего
+    /// ответа своего домена — тогда cover-flight совпадает с тем, что отдаёт
+    /// сайт узла, а не со «средней» цепочкой. Не задан — типовая цепочка.
+    #[arg(long, env = "NETRUNNER_COVER_FLIGHT")]
+    cover_flight: Option<String>,
+
+    /// JSON-профиль браузера с блоком `shape` (его пишет
+    /// `netrunner-client profile record`): длины TLS-записей узла
+    /// (направление сервер → клиент) выравниваются по наблюдавшимся у браузера.
+    /// Остальное содержимое файла узлом не используется. Не задан —
+    /// синтетическое распределение длин.
+    #[arg(long, env = "NETRUNNER_SHAPE_PROFILE")]
+    shape_profile: Option<String>,
+
     /// Требовать валидный Bearer-токен (выданный `netrunner-backend`) от
     /// каждого клиента и отчитываться о расходе трафика для динамических
     /// лимитов. Выключено по умолчанию — включается по инстансу, не меняя
@@ -393,13 +410,38 @@ fn main() {
         }
     };
 
+    // Форма трафика: узел отправляет направление `down`.
+    netrunner_core::nrxp::shape::set_server_role(true);
+    if let Some(path) = &args.shape_profile {
+        match netrunner_core::browser_profile::load_shape_file(path) {
+            Ok((up, down)) => info!("shape-profile: {path}: клиент→сервер {up}, сервер→клиент {down} значений"),
+            Err(e) => panic!("--shape-profile: {e}"),
+        }
+    }
+
     // Cover-flight — один на весь узел, детерминированный (см. ServerHandler).
-    // Пока считается из типовой цепочки; правильный следующий шаг — измерить
-    // настоящую цепочку своего домена (см. CoverFlight::node_default).
-    let cover_flight: std::sync::Arc<[usize]> = netrunner_core::decoy::CoverFlight::node_default()
-        .as_records()
-        .to_vec()
-        .into();
+    // Измеренный (--cover-flight) либо типовая цепочка Let's Encrypt.
+    let cover_flight: std::sync::Arc<[usize]> = match args.cover_flight.as_deref() {
+        Some(spec) => {
+            let text = if std::path::Path::new(spec).is_file() {
+                std::fs::read_to_string(spec)
+                    .unwrap_or_else(|e| panic!("--cover-flight: не удалось прочитать {spec}: {e}"))
+            } else {
+                spec.to_owned()
+            };
+            let (flight, warnings) = netrunner_core::decoy::CoverFlight::parse(&text)
+                .unwrap_or_else(|e| panic!("--cover-flight: {e}"));
+            for w in warnings {
+                netrunner_logger::warn!("cover-flight: {w}");
+            }
+            info!("cover-flight: измеренный, записи {:?}", flight.as_records());
+            flight.as_records().to_vec().into()
+        }
+        None => netrunner_core::decoy::CoverFlight::node_default()
+            .as_records()
+            .to_vec()
+            .into(),
+    };
 
     let net = Network::new(
         args.host.clone(),

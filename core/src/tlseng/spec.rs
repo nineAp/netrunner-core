@@ -219,9 +219,37 @@ pub struct ProfileSpec {
     /// Тела расширений без собственной сборки: `"0x0029": "hex…"`.
     #[serde(default)]
     pub raw_extensions: BTreeMap<String, String>,
+    /// QUIC-часть профиля: `ClientHello`, транспортные параметры и раскладка
+    /// Initial-пакетов UDP-ноги. У пула профилей QUIC-блоки собираются отдельно
+    /// (сессия берёт любой из них), не обязательно из того же профиля, что и TCP.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quic: Option<Box<crate::quiceng::QuicSpec>>,
+    /// Форма трафика: длины записей, снятые с браузера (см. `nrxp::shape`).
+    /// Если у нескольких профилей файла есть `shape`, значения объединяются.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shape: Option<ShapeSpec>,
     /// Произвольные сведения (источник, JA3/JA4, замечания) — движком не читаются.
     #[serde(default)]
     pub meta: Option<serde_json::Value>,
+}
+
+/// Распределение длин TLS-записей `ApplicationData` после рукопожатия.
+/// Значения — квантили наблюдений (сортированные), до 256 на направление.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShapeSpec {
+    /// Клиент → сервер.
+    #[serde(default)]
+    pub up: Vec<u16>,
+    /// Сервер → клиент.
+    #[serde(default)]
+    pub down: Vec<u16>,
+}
+
+impl ShapeSpec {
+    pub fn lengths(&self) -> crate::nrxp::shape::ShapeLengths {
+        crate::nrxp::shape::ShapeLengths { up: self.up.clone(), down: self.down.clone() }
+    }
 }
 
 fn default_schema() -> u32 {
@@ -267,6 +295,13 @@ impl ProfileSpec {
         serde_json::to_string_pretty(self).unwrap_or_else(|_| "{}".into())
     }
 
+    /// Пул профилей одним файлом (массив): сессии выбирают из него по хешу.
+    pub fn pool_to_json(specs: &[ProfileSpec]) -> String {
+        let mut s = serde_json::to_string_pretty(specs).unwrap_or_else(|_| "[]".into());
+        s.push('\n');
+        s
+    }
+
     /// Нормализованный порядок расширений: оба кодпоинта ALPS → `ALPS`.
     fn normalized_order(&self) -> Vec<u16> {
         self.extension_order
@@ -309,6 +344,12 @@ impl ProfileSpec {
     /// Проверяет, что профиль работает с нашим протоколом. `Err` — причины
     /// отказа; `Ok` — список предупреждений (профиль применим, но не идеален).
     pub fn validate(&self) -> Result<Vec<String>, ProfileError> {
+        self.validate_with_dynamic(&[])
+    }
+
+    /// То же, но расширения из `dynamic` считаются заполняемыми движком на
+    /// соединение (как `quic_transport_parameters`), а не «без сборщика».
+    pub(crate) fn validate_with_dynamic(&self, dynamic: &[u16]) -> Result<Vec<String>, ProfileError> {
         let mut err: Vec<String> = Vec::new();
         let mut warn: Vec<String> = Vec::new();
         let order = self.normalized_order();
@@ -316,6 +357,19 @@ impl ProfileSpec {
         let ids = |v: &[Hex16]| v.iter().map(|h| h.0).collect::<Vec<u16>>();
         let grease = |v: u16| (v & 0x0f0f) == 0x0a0a && (v & 0xff) == (v >> 8);
 
+        if let Some(q) = &self.quic {
+            match q.validate() {
+                Ok(w) => warn.extend(w),
+                Err(ProfileError::Invalid(v)) => err.extend(v),
+                Err(e) => err.push(e.to_string()),
+            }
+        }
+        if let Some(sh) = &self.shape {
+            match crate::nrxp::shape::validate(&sh.lengths()) {
+                Ok(w) => warn.extend(w),
+                Err(e) => err.push(e),
+            }
+        }
         if self.schema != SCHEMA_VERSION {
             err.push(format!("schema {} is not supported (expected {SCHEMA_VERSION})", self.schema));
         }
@@ -439,7 +493,7 @@ impl ProfileSpec {
                     }
                 }
                 for id in &order {
-                    if !is_slot(*id) && !NATIVE.contains(id) && !raw.iter().any(|(r, _)| r == id) {
+                    if !is_slot(*id) && !NATIVE.contains(id) && !dynamic.contains(id) && !raw.iter().any(|(r, _)| r == id) {
                         warn.push(format!(
                             "extension {id:#06x} has no builder and no raw body: it will be omitted \
                              (JA3/JA4 will differ)"
@@ -458,7 +512,11 @@ impl ProfileSpec {
     /// Проверяет и строит рабочий профиль. Память намеренно не освобождается:
     /// профиль живёт весь процесс (как и встроенные `const`).
     pub(crate) fn into_profile(&self) -> Result<&'static BrowserProfile, ProfileError> {
-        self.validate()?;
+        self.into_profile_with_dynamic(&[])
+    }
+
+    pub(crate) fn into_profile_with_dynamic(&self, dynamic: &[u16]) -> Result<&'static BrowserProfile, ProfileError> {
+        self.validate_with_dynamic(dynamic)?;
         let leak_u16 = |v: Vec<u16>| -> &'static [u16] { Box::leak(v.into_boxed_slice()) };
         let leak_u8 = |v: Vec<u8>| -> &'static [u8] { Box::leak(v.into_boxed_slice()) };
         let leak_strs = |v: &[String]| -> &'static [&'static str] {

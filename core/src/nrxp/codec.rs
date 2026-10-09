@@ -131,6 +131,58 @@ const GAP_CAP: std::ops::RangeInclusive<usize> = 256..=640;
 
 impl PadShaper {
     fn new() -> Self {
+        match super::shape::outbound_samples() {
+            Some(observed) => Self::from_observed(&observed),
+            None => Self::synthetic(),
+        }
+    }
+
+    /// Границы из длин записей, наблюдавшихся у браузера (см. [`super::shape`]).
+    ///
+    /// Из распределения берётся случайный набор длин (по частоте: частые длины
+    /// попадают чаще), свой у каждого соединения. Промежутки шире `GAP_CAP`
+    /// достраиваются промежуточными границами — как и в синтетической ветке,
+    /// набивка на запись остаётся ограниченной и КПД канала не страдает; от
+    /// наблюдений зависит лишь то, **где** стоят границы.
+    fn from_observed(observed: &[u16]) -> Self {
+        let mut rng = rand::rng();
+        let floor = rng.random_range(FLOOR_RANGE);
+        let want = rng.random_range(24..=48usize);
+
+        let mut picked: Vec<usize> = (0..want)
+            .map(|_| observed[rng.random_range(0..observed.len())] as usize)
+            .map(|l| l.clamp(floor, MAX_RECORD_LEN))
+            .collect();
+        picked.push(floor);
+        picked.sort_unstable();
+        picked.dedup();
+
+        let mut boundaries = Vec::with_capacity(picked.len() * 2);
+        let mut prev = *picked.first().unwrap_or(&floor);
+        boundaries.push(prev);
+        for &next in picked.iter().skip(1).chain(std::iter::once(&MAX_RECORD_LEN)) {
+            // Достраиваем разрыв шире потолка промежуточными границами.
+            let mut cur = prev;
+            loop {
+                let cap = rng.random_range(GAP_CAP);
+                if next - cur <= cap {
+                    break;
+                }
+                let step = rng.random_range(MIN_GAP.max(cap / 2)..=cap);
+                cur += step;
+                boundaries.push(cur);
+            }
+            if next > cur {
+                boundaries.push(next);
+            }
+            prev = next;
+        }
+        boundaries.dedup();
+        debug_assert_eq!(boundaries.last(), Some(&MAX_RECORD_LEN));
+        Self { boundaries }
+    }
+
+    fn synthetic() -> Self {
         let mut rng = rand::rng();
         let floor = rng.random_range(FLOOR_RANGE);
 
@@ -648,6 +700,56 @@ mod tests {
         }
 
         assert_eq!(got, sent, "кадры должны прийти все и в исходном порядке");
+    }
+
+    /// Границы из наблюдений: монотонны, кончаются потолком TLS, промежутки
+    /// ограничены (КПД канала), а наблюдавшиеся длины действительно становятся
+    /// границами — форма следует браузеру, а не синтетике.
+    #[test]
+    fn observed_lengths_become_boundaries_without_hurting_efficiency() {
+        let observed: Vec<u16> = vec![
+            66, 66, 66, 90, 120, 120, 300, 300, 517, 517, 517, 1400, 1448, 2048, 4096, 8200, 16401,
+        ];
+        let mut hit = std::collections::HashSet::new();
+        for _ in 0..200 {
+            let s = PadShaper::from_observed(&observed);
+            let b = &s.boundaries;
+            assert!(b.windows(2).all(|w| w[0] < w[1]), "строго возрастают: {b:?}");
+            assert_eq!(*b.last().unwrap(), MAX_RECORD_LEN);
+            assert!(
+                b.windows(2).all(|w| w[1] - w[0] <= *GAP_CAP.end()),
+                "промежуток шире потолка: {b:?}"
+            );
+            assert!(b[0] >= *FLOOR_RANGE.start() && b[0] <= *FLOOR_RANGE.end().max(&517));
+            for &o in &observed {
+                if b.contains(&(o as usize)) {
+                    hit.insert(o);
+                }
+            }
+            // набивка не больше потолка промежутка
+            for len in [100usize, 700, 3000, 9000, 16000] {
+                let t = s.target_record_len(len - AEAD_TAG_LEN);
+                assert!(t >= len && t - len <= *GAP_CAP.end(), "{len} -> {t}");
+            }
+        }
+        // за 200 соединений в границы попадают разные наблюдавшиеся длины
+        assert!(hit.len() >= 8, "{hit:?}");
+    }
+
+    #[test]
+    fn shape_is_used_for_the_right_direction_only() {
+        use super::super::shape::{self, ShapeLengths};
+        let _guard = shape::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // направление клиента — `up`; на узле — `down`; мало образцов — синтетика
+        let up: Vec<u16> = (0..20).map(|i| 700 + i * 3).collect();
+        shape::set_shape(Some(ShapeLengths { up: up.clone(), down: vec![100; 3] }));
+        shape::set_server_role(false);
+        assert_eq!(shape::outbound_samples().as_deref(), Some(up.as_slice()));
+        shape::set_server_role(true);
+        assert!(shape::outbound_samples().is_none(), "down меньше MIN_SAMPLES");
+        shape::set_server_role(false);
+        shape::set_shape(None);
+        assert!(shape::outbound_samples().is_none());
     }
 
     #[test]

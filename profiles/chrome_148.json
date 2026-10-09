@@ -49,22 +49,22 @@
   ],
   "extension_order": [
     "grease_first",
-    "ech",
-    "status_request",
-    "renegotiation_info",
-    "server_name",
-    "sct",
-    "psk_key_exchange_modes",
-    "supported_versions",
-    "ec_point_formats",
-    "extended_master_secret",
-    "signature_algorithms",
-    "session_ticket",
-    "alpn",
     "compress_certificate",
-    "supported_groups",
-    "alps",
     "key_share",
+    "psk_key_exchange_modes",
+    "sct",
+    "ec_point_formats",
+    "supported_versions",
+    "ech",
+    "session_ticket",
+    "renegotiation_info",
+    "alps",
+    "supported_groups",
+    "server_name",
+    "alpn",
+    "signature_algorithms",
+    "status_request",
+    "extended_master_secret",
     "grease_last"
   ],
   "has_grease": true,
@@ -86,14 +86,163 @@
     0
   ],
   "raw_extensions": {},
+  "quic": {
+    "hello": {
+      "schema": 1,
+      "name": "chrome_148_quic",
+      "record_layer_version": "0x0303",
+      "cipher_suites": [
+        "0x1301",
+        "0x1302",
+        "0x1303"
+      ],
+      "groups": [
+        "0x11ec",
+        "0x001d",
+        "0x0017",
+        "0x0018"
+      ],
+      "signatures": [
+        "0x0403",
+        "0x0804",
+        "0x0401",
+        "0x0503",
+        "0x0805",
+        "0x0501",
+        "0x0806",
+        "0x0601",
+        "0x0201"
+      ],
+      "delegated_signatures": [],
+      "versions": [
+        "0x0304"
+      ],
+      "alpn": [
+        "h3"
+      ],
+      "alps_protocols": [
+        "h3"
+      ],
+      "extension_order": [
+        "ech",
+        "alpn",
+        "compress_certificate",
+        "signature_algorithms",
+        "alps",
+        "psk_key_exchange_modes",
+        "key_share",
+        "0x0039",
+        "server_name",
+        "supported_groups",
+        "supported_versions"
+      ],
+      "has_grease": false,
+      "shuffle_extensions": true,
+      "target_padding_len": 0,
+      "ech_payload_lengths": [
+        144,
+        176,
+        240
+      ],
+      "compress_cert_algs": [
+        "0x0002"
+      ],
+      "psk_modes": [
+        1
+      ],
+      "ec_point_formats": [],
+      "raw_extensions": {},
+      "meta": {
+        "hellos_used": 6,
+        "ja4": "q13d0311h3_55b375c5d22e_653d80c3fe9d"
+      }
+    },
+    "scid_len": 0,
+    "pn_len": 1,
+    "first_pn": 1,
+    "scramble_frames": true,
+    "shuffle_transport_params": true,
+    "initial_packets": [
+      {
+        "crypto": 889,
+        "datagram": 1250
+      },
+      {
+        "crypto": 893,
+        "datagram": 1250,
+        "pn_len": 2
+      }
+    ],
+    "transport_params": [
+      {
+        "id": "0x0008",
+        "value": "4064",
+        "kind": "fixed"
+      },
+      {
+        "id": "0x0006",
+        "value": "80600000",
+        "kind": "fixed"
+      },
+      {
+        "id": "0x0011",
+        "value": "000000011a7afaca00000001",
+        "kind": "version_information"
+      },
+      {
+        "id": "0x000f",
+        "value": "",
+        "kind": "scid"
+      },
+      {
+        "id": "0x0005",
+        "value": "80600000",
+        "kind": "fixed"
+      },
+      {
+        "id": "0x204106b18921143e",
+        "value": "b987e5ca27abf20a928e06d1",
+        "kind": "grease"
+      },
+      {
+        "id": "0x0020",
+        "value": "80010000",
+        "kind": "fixed"
+      },
+      {
+        "id": "0x0009",
+        "value": "4067",
+        "kind": "fixed"
+      },
+      {
+        "id": "0x0004",
+        "value": "80f00000",
+        "kind": "fixed"
+      },
+      {
+        "id": "0x0007",
+        "value": "80600000",
+        "kind": "fixed"
+      },
+      {
+        "id": "0x0001",
+        "value": "80007530",
+        "kind": "fixed"
+      },
+      {
+        "id": "0x0003",
+        "value": "45c0",
+        "kind": "fixed"
+      }
+    ]
+  },
   "meta": {
-    "hellos_used": 6,
-    "ja3_hash": "5abee733343485fc9f9892c905c2a1c8",
+    "hellos_used": 12,
+    "ja3_hash": "3f8e8f5cd7ebd11d5c8e85318f8c774e",
     "ja4": "t13d1516h2_8daaf6152771_d8a2da3f94cd",
     "notes": [],
     "other_groups": [],
-    "shuffle_evidence": "порядок расширений различается между 6 ClientHello",
-    "sni": "a.test",
-    "source": "netrunner pcap profile builder"
+    "shuffle_evidence": "порядок расширений различается между 12 ClientHello",
+    "source": "netrunner-client profile record (Google Chrome 148, Linux; loopback TLS + forced QUIC)"
   }
 }

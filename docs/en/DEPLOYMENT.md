@@ -117,6 +117,8 @@ panics at startup.
 | `--decoy-host` | `www.debian.org` | decoy site for "not ours" connections (`relay` mode) |
 | `--decoy-mode` | `relay` | `relay` \| `self-hosted` (see §6) |
 | `--decoy-preset`, `--decoy-sni`, `--decoy-local-site` | — / — / `127.0.0.1:8443` | `self-hosted` only |
+| `--cover-flight` | typical chain | record lengths of the node's first reply: a list `27,4342,537,69` or a JSON file from `profile record --flight-out` (`NETRUNNER_COVER_FLIGHT`), see [PCAP_PROFILE.md](PCAP_PROFILE.md) |
+| `--shape-profile` | synthetic | browser-profile JSON with a `shape` block: the node's record lengths follow the browser's (`NETRUNNER_SHAPE_PROFILE`) |
 | `--require-auth` | off | require a token, validate it at `--backend-url` |
 | `--backend-url` | — | control-plane URL (required with `--require-auth`/`--mesh-enabled`) |
 | `--mesh-enabled`, `--mesh-max-hops`, `--mesh-quic-port` | off, `2`, `8443` | mesh (§11) |

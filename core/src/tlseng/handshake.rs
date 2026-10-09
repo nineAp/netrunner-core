@@ -212,6 +212,46 @@ impl ClientHello {
 /// поиском» проходит по полям переменной длины (session_id → ciphers →
 /// compression → extensions), не сдвигая курсор, и убеждается, что пришёл весь
 /// блок; `parse` затем извлекает поля по-настоящему.
+impl ClientHello {
+    /// `ClientHello` для QUIC Initial: handshake-сообщение **без** TLS-записи,
+    /// с **пустым** `legacy_session_id` (RFC 9001 §8.4) и телом
+    /// `quic_transport_parameters`, которое передаёт вызывающий. Остальное
+    /// строится тем же сборщиком и тем же профилем, что и TCP-нога, —
+    /// отпечаток определяется данными профиля, а не отдельной «подделкой».
+    ///
+    /// `key_share` x25519 — случайные 32 байта: Initial декоративный, ключей
+    /// из него никто не выводит (см. `quiceng::initial`).
+    pub fn make_quic_hello(profile: &BrowserProfile, host: &str, transport_params: Vec<u8>) -> Bytes {
+        let mut random = [0u8; 32];
+        OsRng.fill_bytes(&mut random);
+        let mut pub_key = [0u8; 32];
+        OsRng.fill_bytes(&mut pub_key);
+
+        let grease = GreaseSet::random();
+        let mut cipher_suites = Vec::with_capacity(profile.cipher_suites.len() + 1);
+        if profile.has_grease {
+            cipher_suites.push(grease.cipher);
+        }
+        cipher_suites.extend_from_slice(profile.cipher_suites);
+
+        // 4 (заголовок handshake) + 2 + 32 + 1 (пустой session_id) + шифры + 2 + 2
+        let overhead = 4 + 2 + 32 + 1 + 2 + cipher_suites.len() * 2 + 2 + 2;
+        let mut ext_builder = ExtensionBuilder::with_grease(grease)
+            .with_dynamic_raw(crate::tlseng::consts::EXT_QUIC_TRANSPORT_PARAMETERS, transport_params);
+        ext_builder.apply_profile(profile, host, &pub_key, overhead);
+        let extensions = ext_builder.build();
+
+        let hello = ClientHello {
+            _version: ProtocolVersion::Tls12,
+            random,
+            session_id: Bytes::new(),
+            cipher_suites,
+            extensions,
+        };
+        hello.serialize()
+    }
+}
+
 impl Parser for ClientHello {
     type Error = TlsError;
 

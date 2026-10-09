@@ -170,7 +170,7 @@ pub mod browser_profile;
 
 pub mod decoy {
     pub use crate::tlseng::decoy::{
-        CoverFlight, Decoy, DecoyCatalog, DecoyError, DecoyMode, DecoySni, DECOY_DOMAINS_ENV,
+        CoverFlight, CoverFlightError, Decoy, DecoyCatalog, DecoyError, DecoyMode, DecoySni, DECOY_DOMAINS_ENV,
     };
 }
 mod utils;

@@ -49,6 +49,8 @@ pub struct ProfileOptions {
     pub client_ip: Option<std::net::IpAddr>,
     /// Брать группу с этим JA4 (по умолчанию — самую многочисленную).
     pub ja4: Option<String>,
+    /// То же для QUIC-отпечатка (JA4 с `q`).
+    pub quic_ja4: Option<String>,
 }
 
 /// Группа однотипных `ClientHello` (одинаковый JA4).
@@ -89,6 +91,15 @@ pub struct CapturedProfile {
     pub alps_codepoint: Option<u16>,
     /// Расширения без собственной сборки: тело из эталонного hello (id → hex).
     pub raw_extensions: std::collections::BTreeMap<String, String>,
+
+    /// QUIC-блок (если в захвате был клиентский Initial); ставится сборкой профиля.
+    pub quic: Option<crate::quiceng::QuicSpec>,
+    /// Форма трафика: квантили длин TLS-записей после рукопожатия (клиент →
+    /// сервер и обратно) по всем соединениям группы. Пусто — не наблюдалось.
+    pub shape_up: Vec<u16>,
+    pub shape_down: Vec<u16>,
+    /// Сколько записей легло в `shape_*` до сжатия (up, down).
+    pub shape_records: (usize, usize),
 
     /// Отпечатки эталонного `ClientHello`.
     pub ja3: String,
@@ -272,7 +283,14 @@ impl CapturedProfile {
         if r.legacy_version != 0x0303 {
             notes.push(format!("legacy_version = {:#06x}, сборщик пишет 0x0303", r.legacy_version));
         }
-        if r.session_id_len != 32 {
+        if r.quic {
+            if r.session_id_len != 0 {
+                notes.push(format!(
+                    "session_id в QUIC длиной {} Б, должен быть пуст (RFC 9001 §8.4)",
+                    r.session_id_len
+                ));
+            }
+        } else if r.session_id_len != 32 {
             notes.push(format!(
                 "session_id длиной {} Б, сборщик всегда использует 32 Б (в нём несёт служебные поля)",
                 r.session_id_len
@@ -287,6 +305,10 @@ impl CapturedProfile {
         let mut raw_extensions = std::collections::BTreeMap::new();
         for e in &r.extensions {
             if is_grease(e.id) || KNOWN_EXTENSIONS.contains(&e.id) || e.id == ext::ALPS_OLD {
+                continue;
+            }
+            // Транспортные параметры QUIC движок заполняет сам на каждое соединение.
+            if r.quic && e.id == super::quic::EXT_QUIC_TP {
                 continue;
             }
             let varies = hellos.iter().any(|h| {
@@ -405,6 +427,10 @@ impl CapturedProfile {
             ec_point_formats: r.ec_point_formats.clone(),
             alps_codepoint: r.alps.as_ref().map(|(c, _)| *c),
             raw_extensions,
+            quic: None,
+            shape_up: Vec::new(),
+            shape_down: Vec::new(),
+            shape_records: (0, 0),
             shuffle_evidence: evidence,
             ja3: ja3_string(r),
             ja3_hash: ja3_hash(r),
@@ -447,15 +473,23 @@ impl CapturedProfile {
             psk_modes: self.psk_modes.clone(),
             ec_point_formats: self.ec_point_formats.clone(),
             raw_extensions: self.raw_extensions.clone(),
+            quic: self.quic.clone().map(Box::new),
+            shape: (!self.shape_up.is_empty() || !self.shape_down.is_empty()).then(|| {
+                crate::tlseng::spec::ShapeSpec { up: self.shape_up.clone(), down: self.shape_down.clone() }
+            }),
             meta: Some(serde_json::json!({
                 "source": "netrunner pcap profile builder",
                 "ja4": self.ja4,
                 "ja3_hash": self.ja3_hash,
-                "sni": self.sni,
                 "hellos_used": self.hellos_used,
                 "shuffle_evidence": self.shuffle_evidence,
                 "notes": self.notes,
-                "other_groups": self.other_groups,
+                // Только отпечаток и счётчик: имена сайтов из захвата в файл не попадают —
+                // профиль выкладывают и пересылают, а SNI — это история посещений.
+                "other_groups": self.other_groups
+                    .iter()
+                    .map(|g| serde_json::json!({ "ja4": g.ja4, "hellos": g.hellos }))
+                    .collect::<Vec<_>>(),
             })),
         }
     }
@@ -491,9 +525,6 @@ impl CapturedProfile {
         let _ = writeln!(s, "// Сгенерировано pcap-сборщиком профиля netrunner-core.");
         let _ = writeln!(s, "// JA4:  {}", self.ja4);
         let _ = writeln!(s, "// JA3:  {}", self.ja3_hash);
-        if let Some(sni) = &self.sni {
-            let _ = writeln!(s, "// SNI захвата: {sni}");
-        }
         let _ = writeln!(
             s,
             "// ClientHello в профиле: {}; перемешивание расширений: {} ({})",

@@ -116,6 +116,8 @@ curl -s http://127.0.0.1:9091/            # {"status":"ok","active_connections":
 | `--decoy-host` | `www.debian.org` | сайт-приманка для «не наших» (режим `relay`) |
 | `--decoy-mode` | `relay` | `relay` \| `self-hosted` (см. §6) |
 | `--decoy-preset`, `--decoy-sni`, `--decoy-local-site` | — / — / `127.0.0.1:8443` | только `self-hosted` |
+| `--cover-flight` | типовая цепочка | длины записей первого ответа узла: список `27,4342,537,69` или JSON-файл от `profile record --flight-out` (`NETRUNNER_COVER_FLIGHT`), см. [PCAP_PROFILE.md](PCAP_PROFILE.md) |
+| `--shape-profile` | синтетика | JSON-профиль браузера с блоком `shape`: длины записей узла выравниваются по браузерным (`NETRUNNER_SHAPE_PROFILE`) |
 | `--require-auth` | выкл | требовать токен, валидировать у `--backend-url` |
 | `--backend-url` | — | URL control-plane (обязателен с `--require-auth`/`--mesh-enabled`) |
 | `--mesh-enabled`, `--mesh-max-hops`, `--mesh-quic-port` | выкл, `2`, `8443` | mesh (§11) |

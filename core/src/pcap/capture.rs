@@ -29,8 +29,10 @@ pub struct CaptureConfig {
     pub ports: Vec<u16>,
     /// Остановиться через столько времени.
     pub max_duration: Option<Duration>,
-    /// Остановиться, когда набрано столько `ClientHello` одного (самого
-    /// частого) отпечатка.
+    /// Остановиться, когда набрано столько TCP-`ClientHello` одного (самого
+    /// частого) отпечатка. Если в записи уже пошёл QUIC, ждём ещё
+    /// [`QUIC_STOP_AFTER`] его соединений одного отпечатка, но не дольше
+    /// [`QUIC_GRACE`].
     pub stop_after_hellos: Option<usize>,
     /// Сколько байт полезной нагрузки хранить на направление соединения.
     pub bytes_per_flow: usize,
@@ -62,8 +64,13 @@ pub struct Progress {
     pub packets_kept: u64,
     pub tcp_flows: usize,
     pub client_hellos: usize,
+    /// Из них клиентских QUIC Initial с собранным `ClientHello`.
+    pub quic_hellos: usize,
     /// Число `ClientHello` у самого частого отпечатка.
     pub best_group_hellos: usize,
+    /// То же отдельно для TCP и для QUIC.
+    pub best_tcp_hellos: usize,
+    pub best_quic_hellos: usize,
     /// Различных отпечатков (JA4) пока видно.
     pub groups: usize,
 }
@@ -155,12 +162,42 @@ struct Filter {
     ports: Vec<u16>,
     per_flow: usize,
     flows: HashMap<(std::net::IpAddr, u16, std::net::IpAddr, u16), FlowCount>,
+    /// Сколько клиентских QUIC Initial-датаграмм уже взято по каждой 4-ке.
+    udp: HashMap<(std::net::IpAddr, u16, std::net::IpAddr, u16), u8>,
 }
+
+/// Сколько QUIC-соединений одного отпечатка ждать после набора TCP-порога.
+pub const QUIC_STOP_AFTER: usize = 4;
+/// Сколько дольше ждать QUIC после набора TCP-порога.
+pub const QUIC_GRACE: Duration = Duration::from_secs(15);
+
+/// Сколько датаграмм QUIC Initial хранить на соединение: хватает на `ClientHello`,
+/// разбитый на несколько пакетов, и повторную отправку.
+const QUIC_DATAGRAMS_PER_FLOW: u8 = 6;
 
 impl Filter {
     fn keep(&mut self, link: u32, data: &[u8]) -> bool {
-        let Some(Transport::Tcp(s)) = decode(link, data) else {
-            return false;
+        let s = match decode(link, data) {
+            Some(Transport::Tcp(s)) => s,
+            Some(Transport::Udp(u)) => {
+                // Клиентский QUIC Initial: к порту из списка, длинный заголовок типа
+                // Initial. Длину не ограничиваем 1200: у Chrome ClientHello идёт
+                // несколькими пакетами, и не каждая датаграмма добита до минимума.
+                if !self.ports.contains(&u.dport)
+                    || u.payload.len() < 100
+                    || u.payload[0] & 0xc0 != 0xc0
+                    || u.payload[0] & 0x30 != 0
+                {
+                    return false;
+                }
+                let n = self.udp.entry((u.src, u.sport, u.dst, u.dport)).or_default();
+                if *n >= QUIC_DATAGRAMS_PER_FLOW {
+                    return false;
+                }
+                *n += 1;
+                return true;
+            }
+            None => return false,
         };
         if !(self.ports.contains(&s.sport) || self.ports.contains(&s.dport)) {
             return false;
@@ -209,12 +246,14 @@ pub fn record(
         ports: cfg.ports.clone(),
         per_flow: cfg.bytes_per_flow,
         flows: HashMap::new(),
+        udp: HashMap::new(),
     };
     let mut rec = Recording {
         frames: Vec::new(),
         progress: Progress::default(),
     };
     let mut kept_bytes = 0usize;
+    let mut reached: Option<Instant> = None;
     let mut seen = 0u64;
 
     let result = loop {
@@ -243,8 +282,15 @@ pub fn record(
             last_progress = Instant::now();
             let p = progress_of(&rec, seen, started.elapsed());
             on_progress(&p);
-            if cfg.stop_after_hellos.is_some_and(|n| p.best_group_hellos >= n) {
-                break Ok(());
+            if let Some(n) = cfg.stop_after_hellos {
+                if p.best_tcp_hellos >= n || (p.best_tcp_hellos == 0 && p.best_group_hellos >= n) {
+                    let since = *reached.get_or_insert_with(Instant::now);
+                    // QUIC уже пошёл — даём набрать его порог; иначе останавливаемся сразу.
+                    let quic_seen = p.quic_hellos > 0;
+                    if !quic_seen || p.best_quic_hellos >= QUIC_STOP_AFTER || since.elapsed() >= QUIC_GRACE {
+                        break Ok(());
+                    }
+                }
             }
         }
     };
@@ -258,18 +304,26 @@ pub fn record(
 
 fn progress_of(rec: &Recording, seen: u64, elapsed: Duration) -> Progress {
     let a = rec.analyze();
-    let mut counts: HashMap<String, usize> = HashMap::new();
+    let mut tcp: HashMap<String, usize> = HashMap::new();
+    let mut quic: HashMap<String, usize> = HashMap::new();
     for h in &a.client_hellos {
-        *counts.entry(super::ja4(h)).or_default() += 1;
+        *tcp.entry(super::ja4(h)).or_default() += 1;
     }
+    for h in a.quic_flows.iter().filter_map(|f| f.hello.as_ref()) {
+        *quic.entry(super::ja4(h)).or_default() += 1;
+    }
+    let best = |m: &HashMap<String, usize>| m.values().copied().max().unwrap_or(0);
     Progress {
         elapsed,
         packets_seen: seen,
         packets_kept: rec.frames.len() as u64,
         tcp_flows: a.tcp_flows,
         client_hellos: a.client_hellos.len(),
-        best_group_hellos: counts.values().copied().max().unwrap_or(0),
-        groups: counts.len(),
+        quic_hellos: quic.values().sum(),
+        best_group_hellos: best(&tcp).max(best(&quic)),
+        best_tcp_hellos: best(&tcp),
+        best_quic_hellos: best(&quic),
+        groups: tcp.len() + quic.len(),
     }
 }
 
@@ -373,6 +427,7 @@ mod tests {
             ports: vec![443],
             per_flow: 100,
             flows: HashMap::new(),
+            udp: HashMap::new(),
         };
         let c = [10, 0, 0, 1];
         let s = [10, 0, 0, 2];

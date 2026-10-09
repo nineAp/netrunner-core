@@ -270,6 +270,16 @@ pub(crate) mod build {
         ipv4(src, dst, 6, &tcp)
     }
 
+    pub fn udp_v4(src: [u8; 4], dst: [u8; 4], sport: u16, dport: u16, payload: &[u8]) -> Vec<u8> {
+        let mut udp = Vec::new();
+        udp.extend_from_slice(&sport.to_be_bytes());
+        udp.extend_from_slice(&dport.to_be_bytes());
+        udp.extend_from_slice(&((8 + payload.len()) as u16).to_be_bytes());
+        udp.extend_from_slice(&[0, 0]);
+        udp.extend_from_slice(payload);
+        ipv4(src, dst, 17, &udp)
+    }
+
     pub fn ipv4(src: [u8; 4], dst: [u8; 4], proto: u8, l4: &[u8]) -> Vec<u8> {
         let mut ip = vec![0x45, 0];
         ip.extend_from_slice(&((20 + l4.len()) as u16).to_be_bytes());

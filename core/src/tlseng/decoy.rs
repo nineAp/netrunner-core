@@ -252,7 +252,7 @@ impl DecoyCatalog {
         {
             return Err(DecoyError::BadSyntax);
         }
-        if !self.domains.iter().any(|d| *d == host) {
+        if !self.domains.contains(&host) {
             return Err(DecoyError::NotOwned {
                 available: self.domains.len(),
             });
@@ -271,6 +271,29 @@ pub struct Decoy {
     /// Резолвятся в файлы `blocks/<имя>.html` при сборке витрины.
     pub elements: Vec<String>,
 }
+
+/// Почему cover-flight отвергнут.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CoverFlightError {
+    /// Число записей вне 1..=12.
+    Count(usize),
+    /// Длина записи нулевая либо больше предела TLS.
+    Length(usize),
+    /// Не разобралось (мусор, неверный JSON).
+    Syntax(String),
+}
+
+impl fmt::Display for CoverFlightError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Count(n) => write!(f, "записей в flight: {n}, у настоящего сервера 1–12"),
+            Self::Length(l) => write!(f, "длина записи {l} вне 1..={}", CoverFlight::MAX_RECORD),
+            Self::Syntax(e) => write!(f, "cover-flight не разобран: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for CoverFlightError {}
 
 /// Длины TLS-записей, которыми узел отвечает сразу после `ServerHello`.
 ///
@@ -330,6 +353,81 @@ impl CoverFlight {
     /// Длины записей как срез — для передачи в движок cover-flight.
     pub fn as_records(&self) -> &[usize] {
         &self.records
+    }
+
+    /// Наименьшая длина записи, которую умеет выдать cover-кадр: заголовок
+    /// кадра (25) + AEAD-тег (16). Запись короче поднимется до этого значения.
+    pub const MIN_RECORD: usize = 41;
+    /// Верхний предел записи TLS 1.3 (16384 + 256).
+    pub const MAX_RECORD: usize = 16 * 1024 + 256;
+
+    /// Flight из измеренных длин записей (см. `profile record --flight-out`).
+    /// Проверяет правдоподобие: у настоящего сервера 1–12 записей, каждая не
+    /// длиннее предела TLS. Записи короче [`MIN_RECORD`](Self::MIN_RECORD)
+    /// допустимы, но возвращаются в предупреждении: cover-кадр не может быть
+    /// короче своего заголовка и будет поднят до минимума.
+    pub fn from_records(records: Vec<usize>) -> Result<(Self, Vec<String>), CoverFlightError> {
+        if records.is_empty() || records.len() > 12 {
+            return Err(CoverFlightError::Count(records.len()));
+        }
+        if let Some(&bad) = records.iter().find(|&&r| r == 0 || r > Self::MAX_RECORD) {
+            return Err(CoverFlightError::Length(bad));
+        }
+        let mut warnings = Vec::new();
+        for (i, &r) in records.iter().enumerate() {
+            if r < Self::MIN_RECORD {
+                warnings.push(format!(
+                    "запись {} длиной {r} Б короче минимального cover-кадра ({} Б) и будет поднята до него",
+                    i + 1,
+                    Self::MIN_RECORD
+                ));
+            }
+        }
+        Ok((Self { records }, warnings))
+    }
+
+    /// Разбор из строки: список через запятую (`27,4342,537,69`) либо JSON
+    /// (`{"records":[...]}`, как пишет `profile record --flight-out`).
+    pub fn parse(text: &str) -> Result<(Self, Vec<String>), CoverFlightError> {
+        let t = text.trim();
+        let records: Vec<usize> = if t.starts_with('{') || t.starts_with('[') {
+            #[derive(serde::Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct File {
+                #[serde(default)]
+                schema: Option<u32>,
+                records: Vec<usize>,
+                #[serde(default)]
+                meta: Option<serde_json::Value>,
+            }
+            let f: File = if t.starts_with('[') {
+                File { schema: None, records: serde_json::from_str(t).map_err(|e| CoverFlightError::Syntax(e.to_string()))?, meta: None }
+            } else {
+                serde_json::from_str(t).map_err(|e| CoverFlightError::Syntax(e.to_string()))?
+            };
+            let _ = f.meta;
+            if f.schema.is_some_and(|v| v != 1) {
+                return Err(CoverFlightError::Syntax(format!("неизвестная версия формата {:?}", f.schema)));
+            }
+            f.records
+        } else {
+            t.split(|c: char| c == ',' || c.is_whitespace())
+                .filter(|x| !x.is_empty())
+                .map(|x| x.parse::<usize>().map_err(|_| CoverFlightError::Syntax(format!("не число: {x:?}"))))
+                .collect::<Result<_, _>>()?
+        };
+        Self::from_records(records)
+    }
+
+    /// JSON для файла, который читает узел (`--cover-flight FILE`).
+    pub fn to_json(&self) -> String {
+        let mut s = serde_json::to_string_pretty(&serde_json::json!({
+            "schema": 1,
+            "records": self.records,
+        }))
+        .unwrap_or_default();
+        s.push('\n');
+        s
     }
 
     pub fn from_chain(cert_der_lens: &[usize], signature_len: usize, hash_len: usize) -> Self {
@@ -466,6 +564,22 @@ mod tests {
         assert!(cert > 2000, "Certificate — килобайты, получено {cert}");
         assert!(cv < cert && cv > fin, "CertificateVerify между ними: {cv}");
         assert!(fin < 64, "Finished — десятки байт, получено {fin}");
+    }
+
+    #[test]
+    fn cover_flight_parses_lists_and_json_and_rejects_nonsense() {
+        let (f, w) = CoverFlight::parse("27, 4342,537 69").unwrap();
+        assert_eq!(f.records, vec![27, 4342, 537, 69]);
+        assert_eq!(w.len(), 1, "27 Б короче минимального кадра: {w:?}");
+        let (j, _) = CoverFlight::parse(&f.to_json()).unwrap();
+        assert_eq!(j, f);
+        assert_eq!(CoverFlight::parse("[50,60]").unwrap().0.records, vec![50, 60]);
+        assert!(CoverFlight::parse("").is_err());
+        assert!(CoverFlight::parse("1,2,3,4,5,6,7,8,9,10,11,12,13").is_err());
+        assert!(CoverFlight::parse("100,99999").is_err());
+        assert!(CoverFlight::parse("100,abc").is_err());
+        assert!(CoverFlight::parse("{\"records\":[100],\"typo\":1}").is_err());
+        assert!(CoverFlight::parse("{\"schema\":2,\"records\":[100]}").is_err());
     }
 
     #[test]

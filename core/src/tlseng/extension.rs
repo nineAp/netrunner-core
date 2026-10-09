@@ -152,9 +152,19 @@ pub(crate) struct ExtensionBuilder {
     /// потому что одно и то же значение обязано попасть и в `supported_groups`,
     /// и в `key_share` — см. [`GreaseSet`].
     grease: GreaseSet,
+    /// Тела расширений, известные только в момент сборки (например
+    /// `quic_transport_parameters` с нашим SCID): имеют приоритет над
+    /// `raw_extensions` профиля.
+    dynamic_raw: Vec<(u16, Vec<u8>)>,
 }
 
 impl ExtensionBuilder {
+    /// Задаёт тело расширения, вычисляемое на соединение.
+    pub fn with_dynamic_raw(mut self, etype: u16, body: Vec<u8>) -> Self {
+        self.dynamic_raw.push((etype, body));
+        self
+    }
+
     pub fn new() -> Self {
         Self::with_grease(GreaseSet::random())
     }
@@ -163,6 +173,7 @@ impl ExtensionBuilder {
         Self {
             payload: BytesMut::with_capacity(2048),
             grease,
+            dynamic_raw: Vec::new(),
         }
     }
 
@@ -183,6 +194,11 @@ impl ExtensionBuilder {
     /// (`raw_extensions`) — пишем как есть; иначе пропускаем (раньше так
     /// происходило всегда, и такой профиль незаметно терял расширение).
     pub fn apply_generic_extension(&mut self, etype: u16, profile: &BrowserProfile) {
+        if let Some(i) = self.dynamic_raw.iter().position(|(id, _)| *id == etype) {
+            let (_, body) = self.dynamic_raw.swap_remove(i);
+            self.add_extension(etype, &body);
+            return;
+        }
         match profile.raw_extensions.iter().find(|(id, _)| *id == etype) {
             Some((_, body)) => self.add_extension(etype, body),
             None => netrunner_logger::trace!(etype, "Skipping extension with no builder and no raw body"),

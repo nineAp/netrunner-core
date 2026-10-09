@@ -84,8 +84,9 @@ pub fn ja4(ch: &ClientHelloInfo) -> String {
         _ => "00".to_string(),
     };
 
+    let transport = if ch.quic { 'q' } else { 't' };
     let a = format!(
-        "t{ver}{sni}{:02}{:02}{alpn}",
+        "{transport}{ver}{sni}{:02}{:02}{alpn}",
         ciphers.len().min(99),
         exts.len().min(99)
     );

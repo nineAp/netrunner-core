@@ -13,7 +13,8 @@ Chrome). Клиент (Linux/OpenWrt/Android через UniFFI) + серверн
   AEAD (AES-GCM / ChaCha20-Poly1305);
 - маскировка: отпечаток Chrome 140 (JA3/JA4, постквантовый `key_share`), cover-flight сервера,
   нерегулярная набивка длин, сайт-приманка для сканеров и активных проб;
-- свой профиль браузера из JSON: `netrunner-client profile record` снимает его с настоящего браузера;
+- свой профиль браузера из JSON: `netrunner-client profile record` снимает с настоящего браузера TLS-отпечаток,
+  QUIC Initial и форму трафика, проверяет, что движок их воспроизводит, и пишет один файл;
 - опционально: UDP-нога (QUIC/WebRTC-мимикрия), mesh из нескольких узлов с onion-маршрутами;
 - L3-VPN без TCP-in-TCP: TUN + userspace-стек (`nrxp-smoltcp`), kill-switch, режим роутера.
 

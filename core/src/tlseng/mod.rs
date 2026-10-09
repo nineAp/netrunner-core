@@ -47,6 +47,7 @@ pub(crate) mod spec;
 mod tls_record;
 mod types;
 
+pub(crate) use consts::EXT_QUIC_TRANSPORT_PARAMETERS as EXT_QUIC_TP;
 pub(crate) use extension::ExtensionStack;
 pub(crate) use handshake::{ClientHello, HelloHeader, ServerHello};
 pub(crate) use profile::{custom_profiles, set_custom_profiles, BrowserProfile, ServerProfile};

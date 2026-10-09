@@ -325,6 +325,13 @@ async fn main() -> Result<()> {
         let report = netrunner_core::browser_profile::load_file(path)
             .with_context(|| format!("не удалось загрузить browser_profile {}", path.display()))?;
         info!(profiles = ?report.names, "Загружен пользовательский профиль браузера");
+        if report.shape_samples != (0, 0) {
+            info!(
+                up = report.shape_samples.0,
+                down = report.shape_samples.1,
+                "Форма трафика из профиля: длины TLS-записей выравниваются по браузерным"
+            );
+        }
         for w in &report.warnings {
             tracing::warn!("browser_profile: {w}");
         }

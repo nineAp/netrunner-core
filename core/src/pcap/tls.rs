@@ -225,6 +225,8 @@ pub struct ClientHelloInfo {
     pub ech: Option<(u16, u16)>,
     /// Длина тела расширения `padding`, если оно есть.
     pub padding_ext_len: Option<usize>,
+    /// `ClientHello` из QUIC Initial (JA4 начинается с `q`, а не `t`).
+    pub quic: bool,
 }
 
 impl ClientHelloInfo {
@@ -321,6 +323,7 @@ pub fn parse_client_hello(
         status_request: false,
         ech: None,
         padding_ext_len: None,
+        quic: false,
     };
 
     for x in &extensions {

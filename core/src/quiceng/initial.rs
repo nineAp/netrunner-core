@@ -181,9 +181,21 @@ fn seal_initial_packet(
     payload: &[u8],
     keys: &InitialKeys,
 ) -> Bytes {
-    const PN_LEN: usize = 4;
+    seal_initial_packet_n(version, dcid, scid, payload, keys, 0, 4)
+}
+
+/// То же с номером пакета `pn` и его длиной `pn_len` (1..=4).
+fn seal_initial_packet_n(
+    version: u32,
+    dcid: &[u8],
+    scid: &[u8],
+    payload: &[u8],
+    keys: &InitialKeys,
+    pn: u32,
+    pn_len: usize,
+) -> Bytes {
     let mut out = BytesMut::new();
-    let pn_len_bits = ((PN_LEN - 1) & 0x03) as u8;
+    let pn_len_bits = ((pn_len - 1) & 0x03) as u8;
     // bit7=1 (long) | bit6=1 (fixed) | type=00 (Initial) | reserved=00 | pn_len
     out.put_u8(0xC0 | pn_len_bits);
     out.put_u32(version);
@@ -192,25 +204,225 @@ fn seal_initial_packet(
     out.put_u8(scid.len() as u8);
     out.put_slice(scid);
     put_varint(&mut out, 0); // Token Length = 0 (мы никогда не несём retry token)
-    put_varint(&mut out, (PN_LEN + payload.len() + 16) as u64); // PN + payload + AEAD tag
+    put_varint(&mut out, (pn_len + payload.len() + 16) as u64); // PN + payload + AEAD tag
 
     let pn_offset = out.len();
-    out.put_slice(&0u32.to_be_bytes()); // packet number = 0
+    out.put_slice(&pn.to_be_bytes()[4 - pn_len..]); // packet number (до HP)
 
     let mut sealed = BytesMut::from(payload);
     sealed.reserve(16);
-    let nonce = build_initial_nonce(&keys.aead_iv, 0);
+    let nonce = build_initial_nonce(&keys.aead_iv, pn as u64);
     Aes128Gcm::new(GenericArray::from_slice(&keys.aead_key))
         .encrypt_in_place(
             GenericArray::from_slice(&nonce),
-            &out[..pn_offset + PN_LEN],
+            &out[..pn_offset + pn_len],
             &mut sealed,
         )
         .expect("fixed-size in-place AES-128-GCM seal cannot fail");
     out.put_slice(&sealed);
 
-    apply_initial_hp(&mut out, pn_offset, PN_LEN, &keys.hp_key);
+    apply_initial_hp(&mut out, pn_offset, pn_len, &keys.hp_key);
     out.freeze()
+}
+
+/// Кадр, из которого собирается нагрузка Initial-пакета.
+#[derive(Debug, Clone, Copy)]
+enum PlanFrame {
+    /// CRYPTO: `(смещение в потоке, длина)`.
+    Crypto(usize, usize),
+    Ping,
+    Padding(usize),
+}
+
+/// Что войдёт в один Initial-пакет.
+struct PlannedPacket {
+    datagram: usize,
+    pn_len: usize,
+    frames: Vec<PlanFrame>,
+}
+
+/// Служебные байты пакета без нагрузки: заголовок, номер, тег.
+fn packet_overhead(dcid: usize, scid: usize, pn_len: usize) -> usize {
+    1 + 4 + 1 + dcid + 1 + scid + 1 + 2 + pn_len + 16
+}
+
+/// Размер CRYPTO-кадра на проводе.
+fn crypto_frame_len(offset: usize, len: usize) -> usize {
+    1 + varint_size(offset as u64) + varint_size(len as u64) + len
+}
+
+/// Кадры по порядку: один CRYPTO на пакет, остальное — PADDING (как у большинства стеков).
+fn plan_sequential(p: &super::QuicHelloProfile, hello_len: usize, dcid: usize, scid: usize) -> Vec<PlannedPacket> {
+    let mut out = Vec::new();
+    let mut offset = 0usize;
+    let mut i = 0usize;
+    while offset < hello_len && i <= 16 {
+        let (want, datagram, pn_len) = p.packets[i.min(p.packets.len() - 1)];
+        let last_shape = i + 1 >= p.packets.len();
+        let capacity = datagram.saturating_sub(packet_overhead(dcid, scid, pn_len) + 1 + varint_size(offset as u64) + 2).max(1);
+        let remaining = hello_len - offset;
+        // Последняя описанная раскладка забирает остаток (длина ClientHello
+        // немного гуляет от соединения к соединению), но в пределах датаграммы.
+        let take = if last_shape { remaining.min(capacity) } else { remaining.min(want).min(capacity) };
+        let used = crypto_frame_len(offset, take);
+        let pad = datagram.saturating_sub(packet_overhead(dcid, scid, pn_len) + used);
+        let mut frames = vec![PlanFrame::Crypto(offset, take)];
+        if pad > 0 {
+            frames.push(PlanFrame::Padding(pad));
+        }
+        out.push(PlannedPacket { datagram, pn_len, frames });
+        offset += take;
+        i += 1;
+    }
+    out
+}
+
+/// «Взбитая» раскладка, как у Chrome: `ClientHello` режется на CRYPTO-кадры
+/// случайной длины (много мелких, несколько крупных), кадры раскладываются по
+/// пакетам непоследовательно, между ними PING и PADDING случайными кусками.
+fn plan_scrambled(
+    p: &super::QuicHelloProfile,
+    hello_len: usize,
+    dcid: usize,
+    scid: usize,
+    rng: &mut impl rand::Rng,
+) -> Vec<PlannedPacket> {
+    use rand::RngExt;
+    // 1. Нарезка потока на куски.
+    let mut chunks: Vec<(usize, usize)> = Vec::new();
+    let mut off = 0usize;
+    while off < hello_len {
+        let size = if rng.random_range(0..100) < 75 {
+            rng.random_range(1..=90usize)
+        } else {
+            rng.random_range(100..=600usize)
+        }
+        .min(hello_len - off);
+        chunks.push((off, size));
+        off += size;
+    }
+    // 2. Случайный порядок раздачи.
+    for i in (1..chunks.len()).rev() {
+        chunks.swap(i, rng.random_range(0..=i));
+    }
+    // 3. Раздача по пакетам: до цели `crypto` очередного пакета, остаток — последнему
+    //    (и новым пакетам, если не помещается в датаграмму).
+    let n_shapes = p.packets.len();
+    type Chunks = Vec<(usize, usize)>;
+    let mut packets: Vec<(usize, usize, usize, Chunks)> = Vec::new(); // datagram, pn_len, crypto_sum, chunks
+    let mut idx = 0usize;
+    let shape = |i: usize| p.packets[i.min(n_shapes - 1)];
+    let (_, d0, l0) = shape(0);
+    packets.push((d0, l0, 0, Vec::new()));
+    for ch in chunks {
+        let (want, datagram, pn_len) = shape(idx);
+        let cur = packets.last().expect("есть пакет");
+        let used: usize = cur.3.iter().map(|(o, l)| crypto_frame_len(*o, *l)).sum();
+        let fits = used + crypto_frame_len(ch.0, ch.1) + packet_overhead(dcid, scid, pn_len) <= datagram;
+        let reached = idx + 1 < n_shapes && cur.2 >= want;
+        if (reached || !fits) && idx < 16 && !cur.3.is_empty() {
+            idx += 1;
+            let (_, d, l) = shape(idx);
+            packets.push((d, l, 0, Vec::new()));
+        }
+        let cur = packets.last_mut().expect("есть пакет");
+        cur.2 += ch.1;
+        cur.3.push(ch);
+    }
+    // 4. Кадры внутри пакета: порядок, PING, PADDING кусками.
+    packets
+        .into_iter()
+        .filter(|(_, _, _, c)| !c.is_empty())
+        .map(|(datagram, pn_len, _, chunks)| {
+            let mut frames: Vec<PlanFrame> = chunks.iter().map(|(o, l)| PlanFrame::Crypto(*o, *l)).collect();
+            for _ in 0..rng.random_range(0..=6usize) {
+                frames.push(PlanFrame::Ping);
+            }
+            for i in (1..frames.len()).rev() {
+                frames.swap(i, rng.random_range(0..=i));
+            }
+            let used: usize = frames
+                .iter()
+                .map(|f| match f {
+                    PlanFrame::Crypto(o, l) => crypto_frame_len(*o, *l),
+                    PlanFrame::Ping => 1,
+                    PlanFrame::Padding(n) => *n,
+                })
+                .sum();
+            let mut pad = datagram.saturating_sub(packet_overhead(dcid, scid, pn_len) + used);
+            let runs = if pad == 0 { 0 } else { rng.random_range(1..=8usize.min(pad)) };
+            for r in 0..runs {
+                let size = if r + 1 == runs { pad } else { rng.random_range(1..=(pad - (runs - r - 1)).max(1)) };
+                pad -= size;
+                let at = rng.random_range(0..=frames.len());
+                frames.insert(at, PlanFrame::Padding(size));
+            }
+            PlannedPacket { datagram, pn_len, frames }
+        })
+        .collect()
+}
+
+/// Клиентский Initial по **данным профиля** (`quic` в JSON): `ClientHello`
+/// профиля, транспортные параметры, SCID заданной длины и раскладка по
+/// пакетам и датаграммам, снятая с браузера — например, два Initial'а по 1250
+/// байт, когда постквантовый `ClientHello` не умещается в один; у Chrome кадры
+/// внутри пакетов «взбиты» (см. `QuicSpec::scramble_frames`).
+///
+/// Возвращает датаграммы по порядку отправки. `dcid` — адрес нашей ноги (его
+/// длина и значение — часть протокола с узлом, а не отпечатка).
+pub(crate) fn build_client_initial_flight(
+    profile: &super::QuicHelloProfile,
+    version: u32,
+    decoy_sni: &str,
+    dcid: &[u8],
+) -> Vec<Bytes> {
+    let mut rng = rand::rng();
+    let mut scid = vec![0u8; profile.scid_len];
+    rng.fill_bytes(&mut scid);
+
+    let hello = crate::tlseng::ClientHello::make_quic_hello(
+        profile.hello,
+        decoy_sni,
+        profile.transport_params(&scid),
+    );
+    let keys = derive_initial_keys(dcid, true);
+    let plan = if profile.scramble {
+        plan_scrambled(profile, hello.len(), dcid.len(), scid.len(), &mut rng)
+    } else {
+        plan_sequential(profile, hello.len(), dcid.len(), scid.len())
+    };
+
+    plan.into_iter()
+        .enumerate()
+        .map(|(i, pp)| {
+            let mut payload = BytesMut::new();
+            for f in &pp.frames {
+                match *f {
+                    PlanFrame::Crypto(offset, len) => {
+                        payload.put_u8(0x06);
+                        put_varint(&mut payload, offset as u64);
+                        put_varint(&mut payload, len as u64);
+                        payload.put_slice(&hello[offset..offset + len]);
+                    }
+                    PlanFrame::Ping => payload.put_u8(0x01),
+                    PlanFrame::Padding(n) => payload.put_bytes(0, n),
+                }
+            }
+            let pn = profile.first_pn + i as u32;
+            // Номер обязан помещаться в выбранную длину.
+            let need = (1..=4usize).find(|n| (pn as u64) < 1u64 << (8 * *n as u32)).unwrap_or(4);
+            seal_initial_packet_n(version, dcid, &scid, &payload, &keys, pn, pp.pn_len.max(need))
+        })
+        .collect()
+}
+
+fn varint_size(v: u64) -> usize {
+    match v {
+        0..=0x3f => 1,
+        0x40..=0x3fff => 2,
+        0x4000..=0x3fff_ffff => 4,
+        _ => 8,
+    }
 }
 
 /// Декоративный ответ сервера на клиентский Initial (bug #12): пара пакетов —

@@ -19,3 +19,6 @@ pub(crate) const CERT_COMPRESSION_BROTLI: u16 = 0x0002;
 
 /// Тип запроса OCSP (`status_request`) — `ocsp`.
 pub(crate) const OCSP_STATUS_TYPE: u8 = 0x01;
+
+/// Тип расширения `quic_transport_parameters` (RFC 9001 §8.2).
+pub(crate) const EXT_QUIC_TRANSPORT_PARAMETERS: u16 = 0x0039;

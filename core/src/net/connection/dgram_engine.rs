@@ -423,7 +423,7 @@ fn build_decorative_initial(
     kind: &DgramEngineKind,
     datagram_root: impl Into<DatagramRoot>,
     decoy_sni: &str,
-) -> Option<Bytes> {
+) -> Vec<Bytes> {
     let datagram_root = datagram_root.into();
     match kind {
         DgramEngineKind::Quic => {
@@ -432,16 +432,26 @@ fn build_decorative_initial(
             // сервер ищет в своих демультиплексирующих картах.
             let leg_token = DatagramKeyMaterial::derive_from_root(datagram_root, true).leg_token();
             let dcid = dgram_leg::quic_dcid_client(&leg_token);
-            // SCID нулевой длины — как у Chrome QUIC (см. bug #11); тогда и
-            // `initial_source_connection_id` в transport params пуст.
-            Some(quiceng::build_client_initial(
-                &quiceng::QuicProfile::CHROME,
-                decoy_sni,
-                &dcid,
-                &[],
-            ))
+            // Профиль браузера из JSON (`quic`): ClientHello, транспортные
+            // параметры и раскладка Initial'ов — как у снятого браузера. Выбор
+            // стабилен на сессию (по leg_token). Без пользовательского профиля —
+            // встроенный Initial: SCID нулевой длины, как у Chrome (bug #11).
+            match quiceng::pick_custom(leg_token.as_ref()) {
+                Some(profile) => quiceng::build_client_initial_flight(
+                    profile,
+                    quiceng::QuicProfile::CHROME.version,
+                    decoy_sni,
+                    &dcid,
+                ),
+                None => vec![quiceng::build_client_initial(
+                    &quiceng::QuicProfile::CHROME,
+                    decoy_sni,
+                    &dcid,
+                    &[],
+                )],
+            }
         }
-        DgramEngineKind::WebRtc => None,
+        DgramEngineKind::WebRtc => Vec::new(),
     }
 }
 
@@ -494,11 +504,11 @@ async fn try_establish(
     mut tx: DgramTx,
     mut rx: DgramRx,
     socket: &UdpSocket,
-    decorative_first: Option<Bytes>,
+    decorative_first: Vec<Bytes>,
 ) -> Option<(DgramTx, DgramRx)> {
     use tokio::time::{Duration, Instant};
 
-    if let Some(decorative) = decorative_first {
+    for decorative in decorative_first {
         let _ = socket.send(&decorative).await;
     }
 
@@ -630,7 +640,7 @@ pub(crate) async fn attempt_client_datagram_leg(
             "Datagram leg: both mimicry engines failed, trying raw UDP"
         );
         let (raw_tx, raw_rx) = build_raw_pair(datagram_root, true);
-        established = try_establish(raw_tx, raw_rx, &socket, None).await;
+        established = try_establish(raw_tx, raw_rx, &socket, Vec::new()).await;
     }
 
     let Some((tx, rx)) = established else {
@@ -1136,7 +1146,7 @@ mod tests {
                 let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
                 socket.connect(listen_addr).await.unwrap();
                 let (tx, rx) = build_mimicry_pair(&kind, datagram_root, true);
-                let Some((tx, rx)) = try_establish(tx, rx, &socket, None).await else {
+                let Some((tx, rx)) = try_establish(tx, rx, &socket, Vec::new()).await else {
                     panic!("{kind:?} failed to establish over real loopback sockets");
                 };
 
@@ -1477,7 +1487,7 @@ mod tests {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         socket.connect(listen_addr).await.unwrap();
         let (raw_tx, raw_rx) = build_raw_pair(datagram_root, true);
-        let established = try_establish(raw_tx, raw_rx, &socket, None).await;
+        let established = try_establish(raw_tx, raw_rx, &socket, Vec::new()).await;
         assert!(
             established.is_some(),
             "raw leg must round-trip through the real listener despite the misleading first byte"
@@ -1528,7 +1538,7 @@ mod tests {
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         client.connect(listen_addr).await.unwrap();
         let (raw_tx, raw_rx) = build_raw_pair(datagram_root, true);
-        let established = try_establish(raw_tx, raw_rx, &client, None).await;
+        let established = try_establish(raw_tx, raw_rx, &client, Vec::new()).await;
         assert!(
             established.is_some(),
             "a single dropped PING must not fail establishment — later retries must get through (bug #7)"

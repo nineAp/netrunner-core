@@ -53,6 +53,7 @@ mod codec;
 mod datagram;
 mod errors;
 mod frame;
+pub mod shape;
 
 #[cfg(all(test, feature = "ring-aead"))]
 pub(crate) use bridge::HandshakeMessage;

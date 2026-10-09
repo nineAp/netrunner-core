@@ -12,7 +12,8 @@ Client (Linux/OpenWrt/Android via UniFFI) + server node.
 - authenticated handshake (X25519 + node static key), forward secrecy, AEAD (AES-GCM / ChaCha20-Poly1305);
 - camouflage: Chrome 140 fingerprint (JA3/JA4, post-quantum `key_share`), server cover flight,
   irregular length padding, decoy site for scanners and active probes;
-- custom browser profile from JSON: `netrunner-client profile record` extracts it from a real browser;
+- custom browser profile from JSON: `netrunner-client profile record` extracts the TLS fingerprint, the QUIC
+  Initial and the traffic shape from a real browser, checks that the engine reproduces them, and writes one file;
 - optional: UDP leg (QUIC/WebRTC mimicry), multi-node mesh with onion routes;
 - L3 VPN without TCP-in-TCP: TUN + userspace stack (`nrxp-smoltcp`), kill-switch, router mode.
 

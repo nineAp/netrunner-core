@@ -40,10 +40,13 @@ mod header;
 mod initial;
 #[cfg(not(target_arch = "wasm32"))]
 mod real;
+mod spec;
 
 pub(crate) use fingerprint::QuicProfile;
+pub use spec::{Hex64, PacketSpec, QuicSpec, TpKind, TpSpec};
+pub(crate) use spec::{custom_count, pick_custom, set_custom, QuicHelloProfile};
 pub(crate) use header::{QuicRx, QuicTx};
-pub(crate) use initial::{build_client_initial, build_server_initial_flight};
+pub(crate) use initial::{build_client_initial, build_client_initial_flight, build_server_initial_flight};
 // Никто пока не вызывает — `QuicMode::Real` не подключён к жизненному циклу
 // ноги (см. докстринг модуля `real`, там же — что именно для этого нужно).
 // Экспорт оставлен как обозначенная точка расширения, а не удалён вместе с
