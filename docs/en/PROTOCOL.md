@@ -67,7 +67,7 @@ Transports:
 
 | Transport | What it is | Described in |
 |---|---|---|
-| **TCP leg** | primary; `MAX_TUNNEL_LEGS = 4` parallel TCP connections per session | §3–§6 |
+| **TCP leg** | primary; 1 to `MAX_TUNNEL_LEGS = 10` parallel TCP connections per session (default 4, chosen by the client) | §3–§6 |
 | **UDP leg** | optional; one per session; QUIC/WebRTC mimicry or bare UDP | §7 |
 | **Mesh (QUIC)** | node ⇄ node, real QUIC, with the same NRXP on top | §8 |
 | **WSS / MASQUE** | external relays in front of a node | §10 |
@@ -298,7 +298,7 @@ payload (UTF-8):
 
 * `session_id` — 32 hex characters (`{:016x}{:016x}` of two random u64), one for the client's whole
   session (shared by all legs);
-* `leg_id` — a number `0..MAX_TUNNEL_LEGS-1`;
+* `leg_id` — a number `0..MAX_TUNNEL_LEGS-1` (0…9);
 * `auth_token` — a Bearer token (the user's JWT) or an empty string; for mesh peers — a `mesh…:`
   claim (see §8.1). Parsing is `splitn(3, ':')`, the token may contain `:`.
 
@@ -566,7 +566,7 @@ leg from scratch). The read buffer is capped at `TUNNEL_MAX_BUFFER_SIZE = 1 MiB`
 ### 6.1 Session and legs
 
 A session = the client's `session_id` (§3.7). A **leg** is one TCP connection carrying the records of
-many streams. A session has up to `MAX_TUNNEL_LEGS = 4` legs; the server joins the legs of one
+many streams. A session has up to `MAX_TUNNEL_LEGS = 10` legs (the client chooses the number: `--tunnel-legs`, an app setting; default `DEFAULT_TUNNEL_LEGS = 4`; nodes older than this release accept at most 4 and do not register the extra legs); the server joins the legs of one
 `session_id` into one `Muxer`. Legs start staggered by `LEG_STAGGER_DELAY (1 s) × id × U(0.6; 1.4)`
 (an even step would be a metronome). Client legs keep `TCP_NODELAY`; on Linux/Android both sides set
 `TCP_NOTSENT_LOWAT = 2 × 16360` and request `TCP_CONGESTION = bbr` from the kernel (`NR_LEG_CC=off`
@@ -956,7 +956,7 @@ detail and an assessment — [SECURITY_MODEL.md](SECURITY_MODEL.md) §6):
 | `MAX_RECORD_PLAINTEXT` / `MAX_FRAME_PAYLOAD` | 16385 / 16360 | `nrxp/frame.rs` |
 | max record `length` field | 16401 | `nrxp/codec.rs` |
 | `AUTH_TIME_STEP` / `AUTH_WINDOW_SIZE` | 60 s / 2 (±2 min, 5 candidates) | `net/constants.rs` |
-| `MAX_TUNNEL_LEGS` | 4 | `net/constants.rs` |
+| `MAX_TUNNEL_LEGS` / `DEFAULT_TUNNEL_LEGS` | 10 / 4 | `net/constants.rs` |
 | `TLS_HELLO_TIMEOUT` / `SECURE_HANDSHAKE_TIMEOUT` | 10 s / 20 s | `net/constants.rs` |
 | `HEALTH_CHECK_INTERVAL` (heartbeat base) | 3 s (±30 %, ×1…8) | `net/constants.rs` |
 | `LEG_PONG_FRESHNESS` / `HEALTH_CHECK_TIMEOUT` | 45 s / 20 s | `net/constants.rs` |

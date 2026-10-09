@@ -59,6 +59,7 @@ struct FileConfig {
     router_mode: Option<bool>,
     lan_interfaces: Vec<String>,
     strong_privacy: Option<bool>,
+    tunnel_legs: Option<u32>,
     log_level: Option<String>,
     /// JSON-профиль браузера (см. `netrunner-client profile record`).
     browser_profile: Option<PathBuf>,
@@ -139,6 +140,12 @@ struct Cli {
     #[arg(long, env = "NETRUNNER_STRONG_PRIVACY", action = ArgAction::SetTrue)]
     strong_privacy: bool,
 
+    /// Сколько параллельных TCP-ног поднять: 1–10, по умолчанию 4. Больше ног —
+    /// выше пиковая скорость на каналах с потерями и устойчивость к обрыву ноги,
+    /// но больше соединений к узлу. Узлы старше этого релиза принимают не больше 4.
+    #[arg(long, env = "NETRUNNER_TUNNEL_LEGS", value_parser = clap::value_parser!(u32).range(1..=10))]
+    tunnel_legs: Option<u32>,
+
     #[arg(long, env = "RUST_LOG")]
     log_level: Option<String>,
 
@@ -174,6 +181,7 @@ struct EffectiveConfig {
     router_mode: bool,
     lan_interfaces: Vec<String>,
     strong_privacy: bool,
+    tunnel_legs: u32,
     log_level: String,
     browser_profile: Option<PathBuf>,
 }
@@ -267,6 +275,9 @@ fn build_config(cli: Cli, file: FileConfig) -> Result<EffectiveConfig> {
         router_mode,
         lan_interfaces,
         strong_privacy: cli.strong_privacy || file.strong_privacy.unwrap_or(false),
+        tunnel_legs: netrunner_core::net::clamp_tunnel_legs(
+            cli.tunnel_legs.or(file.tunnel_legs).unwrap_or(0),
+        ),
         log_level: non_empty(cli.log_level.or(file.log_level)).unwrap_or_else(|| "info".to_owned()),
         browser_profile: cli.browser_profile.or(file.browser_profile),
     })
@@ -359,7 +370,8 @@ async fn main() -> Result<()> {
         .with_node_credentials(config.node_secret, config.node_public_key)
         .with_tunnel_mode(config.tunnel_mode.into(), config.routed_cidrs)
         .with_router_mode(config.router_mode, config.lan_interfaces)
-        .with_strong_privacy(config.strong_privacy);
+        .with_strong_privacy(config.strong_privacy)
+        .with_tunnel_legs(config.tunnel_legs);
 
     let build_result = EngineBuilder::new(engine_config)
         .with_tun(tun_device)

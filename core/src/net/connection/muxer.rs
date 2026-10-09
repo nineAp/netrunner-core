@@ -423,6 +423,10 @@ pub fn adaptive_batch_chunk(base: usize) -> usize {
 pub struct Muxer {
     /// Источник истины по ногам (id → нога). Шардированная карта, lock-free.
     legs: Arc<DashMap<u32, MuxLeg>>,
+    /// Наибольшее число ног, одновременно бывших в сессии. Узел не знает, сколько
+    /// ног хотел клиент (это выбор пользователя), поэтому «деградацию» меряет
+    /// относительно собственного пика, а не относительно константы.
+    peak_legs: Arc<std::sync::atomic::AtomicUsize>,
     // 🔥 ОПТИМИЗАЦИЯ: полностью lock-free кэш горячего пути.
     // ArcSwap: чтение (load_full) — атомарный bump Arc без блокировок; запись
     // (store) реже и тоже неблокирующая. Заменил RwLock<Arc<Vec>> — у которого
@@ -528,6 +532,7 @@ impl Muxer {
     pub fn new(is_client: bool, session_id: String) -> Self {
         let muxer = Self {
             legs: Arc::new(DashMap::new()),
+            peak_legs: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             active_legs_cache: Arc::new(ArcSwap::from_pointee(Vec::new())),
             streams: Arc::new(DashMap::new()),
             closing_tokens: Arc::new(DashMap::new()),
@@ -770,6 +775,8 @@ impl Muxer {
                 max_datagram_payload: 0,
             },
         );
+        self.peak_legs
+            .fetch_max(self.legs.len(), std::sync::atomic::Ordering::Relaxed);
         self.update_legs_cache(); // Обновляем Lock-Free кэш
         info!(
             leg_id,
@@ -950,6 +957,11 @@ impl Muxer {
     }
 
     /// Число активных ног.
+    /// Пик числа одновременных ног за жизнь сессии (см. поле `peak_legs`).
+    pub fn peak_legs_count(&self) -> usize {
+        self.peak_legs.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub fn active_legs_count(&self) -> usize {
         self.legs.len()
     }

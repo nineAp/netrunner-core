@@ -292,6 +292,11 @@ pub struct SessionParams {
     pub cipher_preference: Option<String>,
     /// "server" | "direct" | "two-hop" | "x-hop-3".."x-hop-8". Unknown values use node policy.
     pub mesh_route_preference: Option<String>,
+    /// Сколько параллельных TCP-ног поднять (`1..=10`, по умолчанию 4). Больше ног —
+    /// выше пиковая скорость на каналах с потерями и устойчивость к обрыву одной
+    /// ноги, но больше соединений к узлу. Вне диапазона значение приводится к
+    /// ближайшей границе, `None`/`0` — по умолчанию.
+    pub tunnel_legs: Option<u32>,
 }
 
 /// Фабрика VPN-сессий — главная точка входа FFI.
@@ -354,6 +359,7 @@ impl SessionManager {
             routed_cidrs,
             cipher_preference,
             mesh_route_preference,
+            tunnel_legs,
         } = params;
         let data_cipher_preference = cipher_preference
             .as_deref()
@@ -406,7 +412,8 @@ impl SessionManager {
             .with_tunnel_mode(parse_tunnel_mode(tunnel_mode.as_deref()), routed_cidrs)
             .with_strong_privacy(strong_privacy)
             .with_data_cipher_preference(data_cipher_preference)
-            .with_mesh_route_preference(mesh_route_preference);
+            .with_mesh_route_preference(mesh_route_preference)
+            .with_tunnel_legs(tunnel_legs.unwrap_or(0));
 
         #[cfg(any(target_os = "android", target_os = "ios"))]
         {

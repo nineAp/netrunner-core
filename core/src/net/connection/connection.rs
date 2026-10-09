@@ -38,7 +38,7 @@ use crate::{
             muxer::{MuxMessage, Muxer},
         },
         NetworkConfig, DNS_LOOKUP_TIMEOUT, FALLBACK_CONNECT_TIMEOUT, HTTPS_PORT,
-        LEG_RECONNECT_DELAY, LEG_STAGGER_DELAY, MAX_TUNNEL_LEGS, NETWORK_WATCHER_INTERVAL,
+        LEG_RECONNECT_DELAY, LEG_STAGGER_DELAY, NETWORK_WATCHER_INTERVAL,
         SECURE_HANDSHAKE_TIMEOUT, SESSION_CLEANUP_DELAY, STREAM_PAUSE_BUDGET, STREAM_PAUSE_RETRY,
         TLS_HELLO_TIMEOUT, TOPOLOGY_PRINT_INTERVAL,
     },
@@ -1744,7 +1744,7 @@ impl ClientHandler {
     /// Точка входа клиента: поднимает весь туннель и возвращает его [`Muxer`].
     ///
     /// Запускает три группы фоновых задач:
-    /// 1. **Ноги** — [`MAX_TUNNEL_LEGS`] задач, каждая в вечном цикле
+    /// 1. **Ноги** — `tunnel_legs` задач (по умолчанию [`DEFAULT_TUNNEL_LEGS`](crate::net::DEFAULT_TUNNEL_LEGS)), каждая в вечном цикле
     ///    establish→disconnect→reconnect (со сдвигом старта [`LEG_STAGGER_DELAY`]).
     /// 2. **Сторож сети** — следит за сменой локального IP и при переключении
     ///    сети сбрасывает все ноги (быстрый реконнект вместо зависших сокетов).
@@ -1829,10 +1829,14 @@ impl ClientHandler {
             strong_privacy,
             data_cipher_preference,
             crate::net::MeshRoutePreference::ServerDefault,
+            crate::net::DEFAULT_TUNNEL_LEGS,
         )
         .await
     }
 
+    /// Самый полный вариант входа клиента. `tunnel_legs` — сколько параллельных
+    /// TCP-ног поднять; приводится к `1..=MAX_TUNNEL_LEGS`
+    /// ([`clamp_tunnel_legs`](crate::net::clamp_tunnel_legs)).
     pub async fn connect_with_privacy_and_preferences(
         remote_proxy_addr: &str,
         decoy_sni: impl Into<Arc<str>>,
@@ -1843,7 +1847,9 @@ impl ClientHandler {
         strong_privacy: bool,
         data_cipher_preference: DataCipherPreference,
         mesh_route_preference: crate::net::MeshRoutePreference,
+        tunnel_legs: u32,
     ) -> Result<Arc<Muxer>, AppError> {
+        let tunnel_legs = crate::net::clamp_tunnel_legs(tunnel_legs);
         let decoy_sni: Arc<str> = decoy_sni.into();
         let auth_token: Arc<str> = auth_token.unwrap_or_default().into();
         let session_id = SessionManager::generate_id();
@@ -1892,7 +1898,7 @@ impl ClientHandler {
             }
         });
 
-        for id in 0..MAX_TUNNEL_LEGS {
+        for id in 0..tunnel_legs {
             let addr = remote_proxy_addr.to_string();
             let m = muxer.clone();
             let sid = session_id.clone();
@@ -3076,6 +3082,7 @@ mod tests {
     }
 
     use super::*;
+    use crate::net::{DEFAULT_TUNNEL_LEGS, MAX_TUNNEL_LEGS};
 
     // ---------- is_plausible_hostname ----------
 
@@ -3587,6 +3594,53 @@ mod tests {
         (muxer, tx_to_tunnel, rx_from_tunnel)
     }
 
+    /// Число ног выбирает клиент: запрошенные 7 поднимаются все (узел принимает до
+    /// `MAX_TUNNEL_LEGS`), а запрос сверх предела приводится к 10, не к 4.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn client_chooses_the_number_of_legs_up_to_the_limit() {
+        for (asked, want) in [(1u32, 1usize), (7, 7), (50, MAX_TUNNEL_LEGS as usize)] {
+            let validator = Arc::new(CountingValidator {
+                reject: false,
+                calls: Default::default(),
+            });
+            let (addr, sessions, _finished) = spawn_node_full(validator).await;
+            let (tx_to_engine, _rx_from_tunnel) = mpsc::channel(256);
+            let (_tx_to_tunnel, rx_from_engine) = mpsc::channel(256);
+            let muxer = ClientHandler::connect_with_privacy_and_preferences(
+                &addr.to_string(),
+                "example.com",
+                Some("jwt".into()),
+                None,
+                rx_from_engine,
+                tx_to_engine,
+                false,
+                DataCipherPreference::Auto,
+                crate::net::MeshRoutePreference::ServerDefault,
+                asked,
+            )
+            .await
+            .unwrap();
+            for _ in 0..300 {
+                if muxer.active_legs_count() >= want {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            assert_eq!(muxer.active_legs_count(), want, "asked {asked}");
+            // и узел видит ровно столько же ног у этой сессии
+            let node_muxer = sessions.get_session().iter().next().map(|e| e.value().clone());
+            let node_muxer = node_muxer.expect("узел знает сессию");
+            for _ in 0..100 {
+                if node_muxer.active_legs_count() >= want {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            assert_eq!(node_muxer.active_legs_count(), want, "node side, asked {asked}");
+            assert_eq!(node_muxer.peak_legs_count(), want);
+        }
+    }
+
     /// Цель, которая на каждое входящее соединение сразу пишет `total` байт кусками
     /// по `chunk` и тут же закрывает сокет — как HTTP/1.0-сервер или `Connection: close`.
     async fn spawn_burst_target(total: usize, chunk: usize) -> std::net::SocketAddr {
@@ -3864,7 +3918,7 @@ mod tests {
         let (addr, _sessions, _finished) = spawn_node_full(validator).await;
         let (muxer, _to_tunnel, _from_tunnel) = connect_client_raw(addr).await;
 
-        let want = MAX_TUNNEL_LEGS as usize;
+        let want = DEFAULT_TUNNEL_LEGS as usize;
         for _ in 0..200 {
             if muxer.active_legs_count() >= want {
                 break;

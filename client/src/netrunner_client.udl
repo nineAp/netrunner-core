@@ -43,6 +43,8 @@ dictionary SessionParams {
     // "server" | "direct" | "two-hop" | "x-hop-3".."x-hop-8".
     // null/unknown keeps the ingress node's current policy.
     string? mesh_route_preference;
+    // Число параллельных TCP-ног: 1..10, null/0 — по умолчанию (4).
+    u32? tunnel_legs;
 };
 
 interface SessionManager {

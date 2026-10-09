@@ -1009,6 +1009,8 @@ pub struct EngineConfig {
     /// Client route preference; the ingress node's `--mesh-max-hops` remains
     /// the hard limit.
     pub mesh_route_preference: MeshRoutePreference,
+    /// Сколько параллельных TCP-ног поднять; всегда в `1..=MAX_TUNNEL_LEGS`.
+    pub tunnel_legs: u32,
 }
 
 impl EngineConfig {
@@ -1035,7 +1037,14 @@ impl EngineConfig {
             strong_privacy: false,
             data_cipher_preference: DataCipherPreference::Auto,
             mesh_route_preference: MeshRoutePreference::ServerDefault,
+            tunnel_legs: netrunner_core::net::DEFAULT_TUNNEL_LEGS,
         }
+    }
+
+    /// Число параллельных TCP-ног туннеля. Приводится к `1..=10`; `0` — по умолчанию.
+    pub fn with_tunnel_legs(mut self, legs: u32) -> Self {
+        self.tunnel_legs = netrunner_core::net::clamp_tunnel_legs(legs);
+        self
     }
 
     pub fn with_decoy_sni(mut self, decoy_sni: impl Into<String>) -> Self {
@@ -1158,6 +1167,7 @@ impl std::fmt::Debug for EngineConfig {
             )
             .field("strong_privacy", &self.strong_privacy)
             .field("mesh_route_preference", &self.mesh_route_preference)
+            .field("tunnel_legs", &self.tunnel_legs)
             .finish()
     }
 }
@@ -1180,6 +1190,18 @@ mod engine_config_tests {
         assert!(!debug.contains("node-secret-value"));
         assert!(!debug.contains("node-public-value"));
         assert!(debug.contains("[redacted]"));
+    }
+
+    #[test]
+    fn tunnel_legs_default_to_four_and_are_clamped_to_one_through_ten() {
+        use netrunner_core::net::{DEFAULT_TUNNEL_LEGS, MAX_TUNNEL_LEGS};
+        let config = EngineConfig::new("198.51.100.10:443");
+        assert_eq!(config.tunnel_legs, DEFAULT_TUNNEL_LEGS);
+        assert_eq!(DEFAULT_TUNNEL_LEGS, 4);
+        assert_eq!(MAX_TUNNEL_LEGS, 10);
+        for (asked, want) in [(0, 4), (1, 1), (6, 6), (10, 10), (11, 10), (u32::MAX, 10)] {
+            assert_eq!(config.clone().with_tunnel_legs(asked).tunnel_legs, want, "asked {asked}");
+        }
     }
 
     #[test]
@@ -1295,6 +1317,7 @@ impl EngineBuilder {
             self.config.strong_privacy,
             self.config.data_cipher_preference,
             self.config.mesh_route_preference,
+            self.config.tunnel_legs,
         )
         .await
         .map_err(|e| format!("Failed to establish secure tunnel: {}", e))?;

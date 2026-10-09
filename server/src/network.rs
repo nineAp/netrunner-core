@@ -8,7 +8,7 @@
 
 use netrunner_core::net::{
     run_datagram_listener, AuthValidator, Connection, Muxer, NetworkConfig, NodeHealthReport,
-    NodeMesh, ServerHandler, SessionManager, TunnelHandler, MAX_TUNNEL_LEGS,
+    NodeMesh, ServerHandler, SessionManager, TunnelHandler,
     TOPOLOGY_PRINT_INTERVAL,
 };
 use netrunner_core::Identity;
@@ -218,15 +218,18 @@ impl Network {
                 // enough to alert on "legs died and did not come back"
                 // without reading logs by hand. `netrunner_sessions_leg_degraded`
                 // is the actionable one: a session sitting below
-                // MAX_TUNNEL_LEGS is one `TunnelEngine::run` failure away from
+                // the session's own peak leg count (the client chooses how many
+                // legs to open) is one `TunnelEngine::run` failure away from
                 // the requeue path (see `TunnelEngine::requeue_pending`)
                 // having fewer and fewer legs to fail over onto.
                 let total_active_legs: usize =
                     active_muxers.iter().map(|m| m.active_legs_count()).sum();
-                let expected_legs = active_muxers.len() * MAX_TUNNEL_LEGS as usize;
+                // Узел не знает, сколько ног хотел клиент, — «ожидаемое» число
+                // считается по пику самой сессии, а не по константе.
+                let expected_legs: usize = active_muxers.iter().map(|m| m.peak_legs_count()).sum();
                 let degraded_sessions = active_muxers
                     .iter()
-                    .filter(|m| m.active_legs_count() < MAX_TUNNEL_LEGS as usize)
+                    .filter(|m| m.active_legs_count() < m.peak_legs_count())
                     .count();
                 metrics::gauge!("netrunner_legs_active").set(total_active_legs as f64);
                 metrics::gauge!("netrunner_legs_expected").set(expected_legs as f64);

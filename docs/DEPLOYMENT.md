@@ -242,6 +242,7 @@ node_secret     = "<PROXY_NRXP_SECRET>"
 node_public_key = "<nrxp_public_key из лога узла>"
 auth_token      = ""                      # пусто для автономного узла
 # browser_profile = "/etc/netrunner/chrome.json"   # свой профиль браузера, см. PCAP_PROFILE.md
+# tunnel_legs   = 4                       # параллельные TCP-ноги, 1–10 (--tunnel-legs); узлы старше этого релиза принимают ≤ 4
 killswitch_enabled = true
 tunnel_mode     = "bypass_lan"            # all | bypass_lan
 ```

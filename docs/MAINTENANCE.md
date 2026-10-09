@@ -91,7 +91,7 @@ cargo run --release -p netrunner-loadtest -- --concurrency 50 --duration-secs 30
 Поднимает настоящий скомпилированный `netrunner-server` отдельным процессом
 и гоняет через него реальный `ClientHandler::connect`, снимая RSS/CPU из
 `/proc` — см. doc-комментарий в `tools/loadtest/src/main.rs`. Держите в уме:
-один "пользователь" = `MAX_TUNNEL_LEGS` (сейчас 4) реальных TCP-соединений.
+один "пользователь" = `DEFAULT_TUNNEL_LEGS` (сейчас 4; клиент может выбрать до `MAX_TUNNEL_LEGS = 10`) реальных TCP-соединений.
 
 ### Релизный цикл / деплой сервера
 
