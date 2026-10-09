@@ -259,7 +259,7 @@ JSON (`browser_profile`) доступно всегда, в том числе в 
 ## Проверка
 
 ```bash
-cargo test -p netrunner-core --features pcap --lib      # 330 тестов
+cargo test -p netrunner-core --features pcap --lib      # 339 тестов
 ```
 
 Один из них (`garbage_client_hello_triggers_fallback_without_hanging`) ждёт ответа DNS и в окружении

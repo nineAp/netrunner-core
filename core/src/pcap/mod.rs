@@ -340,11 +340,14 @@ pub fn analyze_packets(packets: &[Packet<'_>]) -> Analysis {
     let mut qc = quic::QuicCollector::default();
     for pk in packets {
         if let Some(Transport::Udp(u)) = net::decode(pk.link_type, pk.data) {
-            // Клиентский QUIC Initial: к порту 443, длинный заголовок типа Initial.
-            if u.dport == 443
-                && u.payload.len() >= 100
-                && u.payload[0] & 0xc0 == 0xc0
-                && u.payload[0] & 0x30 == 0
+            // Клиентский QUIC Initial: длинный заголовок типа Initial, версия 1, любой
+            // порт (запись идёт и на нестандартные `--port`). Ответы серверов (с порта
+            // 443) расшифровываются другими ключами и молча пропускаются.
+            let p = u.payload;
+            if p.len() >= 100
+                && p[0] & 0xc0 == 0xc0
+                && p[0] & 0x30 == 0
+                && p[1..5] == quic::QUIC_V1.to_be_bytes()
             {
                 a.quic_initials += 1;
                 qc.push(
@@ -362,7 +365,9 @@ pub fn analyze_packets(packets: &[Packet<'_>]) -> Analysis {
             "QUIC версии {v:#010x} не поддерживается (разбирается только версия 1)"
         ));
     }
-    if undecryptable > 0 {
+    // Ответы серверов тоже Initial'ы, но другими ключами: их провал — норма, и о нём
+    // стоит говорить, только если не нашлось ни одного клиентского.
+    if undecryptable > 0 && quic_flows.is_empty() {
         a.warnings.push(format!("{undecryptable} QUIC Initial не расшифровались (повреждены или не QUIC)"));
     }
     a.quic_flows = quic_flows;

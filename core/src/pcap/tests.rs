@@ -900,3 +900,26 @@ fn shipped_chrome_profile_has_a_working_quic_block() {
         assert_eq!(crate::pcap::ja4(h), "q13d0311h3_55b375c5d22e_653d80c3fe9d");
     }
 }
+
+/// Запись на нестандартный порт (`--port 8443`): QUIC Initial разбирается так же,
+/// как на 443 (раньше анализ смотрел только на порт 443 и не видел их).
+#[test]
+fn quic_initial_is_recognised_on_a_non_standard_port() {
+    let runtime = chrome_quic_spec().build_runtime().unwrap();
+    let mut frames = Vec::new();
+    for i in 0..3u16 {
+        let flight = crate::quiceng::build_client_initial_flight(runtime, 1, "p.example", &[i as u8; 8]);
+        for (k, d) in flight.iter().enumerate() {
+            frames.push((
+                1_700_000_000_000_000_000 + i as u64 * 1_000_000_000 + k as u64 * 1000,
+                ethernet(&udp_v4(C, S, 51000 + i, 29201, d)),
+            ));
+        }
+    }
+    // ответ сервера (с «своего» порта) расшифровывается другими ключами и не мешает
+    frames.push((1_700_000_009_000_000_000, ethernet(&udp_v4(S, C, 29201, 51000, &[0xc0; 1200]))));
+    let a = analyze(&pcap_file(&frames)).unwrap();
+    assert_eq!(a.quic_flows.len(), 3);
+    assert!(a.quic_flows.iter().all(|f| f.hello.is_some()));
+    assert!(a.warnings.is_empty(), "{:?}", a.warnings);
+}

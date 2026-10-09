@@ -260,7 +260,7 @@ feature; reading JSON (`browser_profile`) is always available, including in mobi
 ## Verification
 
 ```bash
-cargo test -p netrunner-core --features pcap --lib      # 330 tests
+cargo test -p netrunner-core --features pcap --lib      # 339 tests
 ```
 
 One of them (`garbage_client_hello_triggers_fallback_without_hanging`) waits for a DNS answer and times
