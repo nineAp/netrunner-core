@@ -1093,20 +1093,45 @@ impl Muxer {
     }
 
     /// Запоминает момент отправки PING по ноге (для замера RTT по PONG).
+    ///
+    /// Если на ноге уже есть неотвеченный PING, оставляем самый ранний: ответы
+    /// приходят по порядку, и первый PONG относится именно к нему. Перезапись
+    /// более новым PING'ом занижала бы замер. Потерянный PING не должен
+    /// навсегда завышать следующие замеры, поэтому запись старше
+    /// [`HEALTH_CHECK_TIMEOUT`](crate::net::HEALTH_CHECK_TIMEOUT) заменяется.
     pub fn record_ping_sent(&self, leg_id: u32) {
-        self.pending_pings.insert(leg_id, Instant::now());
+        use dashmap::mapref::entry::Entry;
+        match self.pending_pings.entry(leg_id) {
+            Entry::Vacant(slot) => {
+                slot.insert(Instant::now());
+            }
+            Entry::Occupied(mut slot) => {
+                if slot.get().elapsed() > crate::net::HEALTH_CHECK_TIMEOUT {
+                    slot.insert(Instant::now());
+                }
+            }
+        }
     }
 
-    /// Обрабатывает PONG: считает RTT и обновляет сглаженную оценку (EWMA, α=0.25),
-    /// затем пересчитывает глобальный минимум [`GLOBAL_MIN_RTT`] по всем ногам.
-    pub async fn record_pong(&self, leg_id: u32) {
-        // Отмечаем свежесть ноги ДО разбора RTT: PONG мог прийти на heartbeat
-        // writer'а, для которого `pending_pings` не заполняется, и такой ответ
-        // всё равно доказывает, что нога жива (см. `perform_health_check`).
+    /// Обрабатывает Heartbeat-кадр, пришедший по ноге.
+    ///
+    /// Любой Heartbeat доказывает, что нога жива, и обновляет свежесть
+    /// (см. `perform_health_check`). RTT же считается только по настоящему
+    /// ответу на наш PING (`is_reply`): встречный heartbeat пира идёт по его
+    /// собственному таймеру и не связан с нашим PING'ом. Раньше он засчитывался
+    /// как PONG, и «RTT» равнялся времени до следующего heartbeat'а клиента
+    /// (секунды при реальных 60-130 мс). RTT обновляет сглаженную оценку
+    /// (EWMA, α=0.25), затем пересчитывается глобальный минимум
+    /// [`GLOBAL_MIN_RTT`] по всем ногам.
+    pub async fn record_pong(&self, leg_id: u32, is_reply: bool) {
         if let Some(leg) = self.legs.get(&leg_id) {
             leg.stats
                 .last_pong_ms
                 .store(process_uptime_ms().max(1), Ordering::Relaxed);
+        }
+
+        if !is_reply {
+            return;
         }
 
         if let Some((_, start_time)) = self.pending_pings.remove(&leg_id) {
@@ -1835,6 +1860,11 @@ impl Muxer {
             .retain(|_, p| now.saturating_sub(p.since_ms) < ttl_ms);
     }
 
+    /// Whether a local consumer is registered for `stream_id`.
+    pub(crate) fn has_stream(&self, stream_id: u32) -> bool {
+        self.streams.contains_key(&stream_id)
+    }
+
     pub fn dispatch_to_local(&self, stream_id: u32, data: Bytes) {
         let size = data.len() as u64;
 
@@ -2254,6 +2284,59 @@ mod scheduling_tests {
         }
         muxer.update_legs_cache();
         muxer
+    }
+
+    fn muxer_with_one_leg() -> Muxer {
+        let muxer = Muxer::new(true, "rtt-test".into());
+        let (control_tx, _control_rx) = tokio::sync::mpsc::channel(8);
+        let (data_tx, _data_rx) = tokio::sync::mpsc::channel(8);
+        muxer.add_leg(0, control_tx, data_tx);
+        muxer
+    }
+
+    fn leg_rtt(muxer: &Muxer) -> u32 {
+        muxer.legs.get(&0).unwrap().stats.rtt_ms.load(Ordering::Relaxed)
+    }
+
+    /// The peer's own keepalive proves the leg is alive but is not an answer to
+    /// our PING: counting it made the "RTT" the gap between two unrelated timers
+    /// (seconds on a leg whose real round trip is ~100 ms).
+    #[tokio::test]
+    async fn peer_heartbeat_refreshes_the_leg_but_does_not_time_our_ping() {
+        let muxer = muxer_with_one_leg();
+        let before = leg_rtt(&muxer);
+
+        muxer.record_ping_sent(0);
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        muxer.record_pong(0, false).await;
+
+        assert!(muxer.leg_has_pong(0), "any heartbeat must refresh liveness");
+        assert_eq!(leg_rtt(&muxer), before, "a peer keepalive must not set the RTT");
+        assert!(
+            muxer.pending_pings.contains_key(&0),
+            "the PING is still waiting for its real answer"
+        );
+
+        muxer.record_pong(0, true).await;
+        let measured = leg_rtt(&muxer);
+        // A fresh leg starts at 0 ms, so the first sample is smoothed: (3*0 + 120) / 4.
+        assert!(
+            measured > before && measured <= 120,
+            "the real PONG is timed from the PING (got {measured} ms, was {before} ms)"
+        );
+        assert!(muxer.pending_pings.get(&0).is_none());
+    }
+
+    /// Two PINGs in flight (keepalive + health probe): the first PONG answers the
+    /// earlier one, so the older timestamp must survive the second send.
+    #[tokio::test]
+    async fn an_outstanding_ping_keeps_its_original_timestamp() {
+        let muxer = muxer_with_one_leg();
+        muxer.record_ping_sent(0);
+        let first = *muxer.pending_pings.get(&0).unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        muxer.record_ping_sent(0);
+        assert_eq!(*muxer.pending_pings.get(&0).unwrap(), first);
     }
 
     /// bug #4: ранний `UdpData`, пришедший ДО регистрации потока, обязан быть

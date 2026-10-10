@@ -743,7 +743,8 @@ impl TunnelEngine {
                                 if frame.header.frame_type == FrameType::Heartbeat {
                                     // record_pong does no .await internally, so run it inline:
                                     // a spawn+Arc-clone per PONG was pure scheduler churn.
-                                    muxer.record_pong(leg_id).await;
+                                    let is_reply = StreamHandler::is_ping_reply(frame.payload.as_ref());
+                                    muxer.record_pong(leg_id, is_reply).await;
                                     // Answer on THIS leg. Routed through the generic
                                     // control path the reply landed on whichever leg the
                                     // stream got bound to, so a leg's RTT was measured
@@ -758,6 +759,16 @@ impl TunnelEngine {
                                                 .send_control_on_leg(leg_id, stream_id, FrameType::Heartbeat, reply)
                                                 .await;
                                         });
+                                        continue;
+                                    }
+                                    // A PONG to our own keepalive PING (stream 0) usually has
+                                    // no local stream to wake; the RTT and freshness were
+                                    // recorded above, so skip the dispatch (and its "no
+                                    // stream" count). Keep it when something is registered
+                                    // on stream 0: a mesh peer session waits there for the
+                                    // PONG that confirms the handshake. Probe PONGs on their
+                                    // own stream still go to the handler.
+                                    if is_reply && frame.header.stream_id == 0 && !muxer.has_stream(0) {
                                         continue;
                                     }
                                 }
@@ -824,8 +835,12 @@ impl TunnelEngine {
                             hb_deadline = tokio::time::Instant::now()
                                 + Self::next_heartbeat_delay(hb_idle_streak);
 
+                            // A non-empty PING so the peer answers with a PONG we can
+                            // time. An empty heartbeat gets no reply from a client,
+                            // and counting the peer's own heartbeat as the answer
+                            // made the measured RTT the gap between two timers.
                             muxer_pong.record_ping_sent(leg_id);
-                            let msg = MuxMessage { stream_id: 0, frame_type: FrameType::Heartbeat, data: Bytes::new() };
+                            let msg = MuxMessage { stream_id: 0, frame_type: FrameType::Heartbeat, data: Bytes::from_static(b"PING") };
                             if let Err(e) = Self::handle_outbound(&mut outbound, &mut tx_codec, msg, leg_id, &muxer_pong).await.map(|n| snd_tuner.on_bytes(n)) {
                                 crate::net::diagnostics::send_diag_event(
                                     crate::net::diagnostics::DiagnosticsEvent::TunnelWriteStuck {

@@ -4155,6 +4155,55 @@ mod tests {
         );
     }
 
+    /// End-to-end sanity check: the node times its keepalive PING against the
+    /// client's PONG, so a loopback leg reads milliseconds. Not a regression
+    /// detector by itself (the old keepalive-gap measurement can land under 500 ms
+    /// by chance on loopback); the deterministic checks are the
+    /// `peer_heartbeat_refreshes_the_leg_but_does_not_time_our_ping` tests in
+    /// `muxer.rs`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn node_side_leg_rtt_is_the_round_trip_not_the_keepalive_gap() {
+        let validator = Arc::new(CountingValidator {
+            reject: false,
+            calls: Default::default(),
+        });
+        let (addr, sessions, _finished) = spawn_node_full(validator).await;
+        let (client, _to_tunnel, _from_tunnel) = connect_client_raw(addr).await;
+
+        let want = DEFAULT_TUNNEL_LEGS as usize;
+        for _ in 0..200 {
+            if client.active_legs_count() >= want {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(client.active_legs_count(), want, "all legs must come up");
+
+        // The first keepalive fires 2.1-3.9 s after the leg comes up.
+        let server = sessions
+            .get_session()
+            .iter()
+            .next()
+            .map(|e| e.value().clone())
+            .expect("the node has the session");
+        let mut measured = Vec::new();
+        for _ in 0..120 {
+            measured = (0..want as u32)
+                .filter_map(|leg| server.leg_rtt_ms(leg))
+                .filter(|rtt| *rtt > 0)
+                .collect();
+            if !measured.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(!measured.is_empty(), "the node never timed a PING");
+        assert!(
+            measured.iter().all(|rtt| *rtt < 500),
+            "loopback round trip must not read as seconds: {measured:?} ms"
+        );
+    }
+
     /// Ответ на heartbeat/PING обязан вернуться по ТОЙ ЖЕ ноге. Иначе RTT ноги
     /// считается от чужого PING (на простое — секунды мусора, `GLOBAL_MIN_RTT` врёт
     /// всем адаптивным механизмам), а мёртвую ногу «оживляют» PONG'и соседей.

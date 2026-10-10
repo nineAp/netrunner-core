@@ -1710,6 +1710,13 @@ impl StreamHandler {
         Self { muxer, opener }
     }
 
+    /// Whether a heartbeat payload is the answer to a `PING` of ours (and so can
+    /// be timed), as opposed to the peer's own keepalive. A mesh-onion peer
+    /// answers `PING` with `MESH_ONION_READY` instead of `PONG`.
+    pub(crate) fn is_ping_reply(payload: &[u8]) -> bool {
+        payload == b"PONG" || payload == crate::net::MESH_ONION_READY
+    }
+
     /// What an incoming heartbeat frame needs in reply, if anything: `PING` → `PONG`
     /// (or the mesh-onion readiness marker), and on the server side a plain heartbeat →
     /// an empty one. The reply to a liveness probe must go back on the leg the probe
@@ -2020,6 +2027,16 @@ mod tests {
     fn client_handler() -> (StreamHandler, Arc<Muxer>) {
         let muxer = Arc::new(Muxer::new(true, "test-session".into()));
         (StreamHandler::new(muxer.clone(), None), muxer)
+    }
+
+    /// Only an answer to our PING may be timed; the peer's own (empty) keepalive
+    /// and its stream signals must not be.
+    #[test]
+    fn only_pong_style_payloads_count_as_a_ping_reply() {
+        assert!(StreamHandler::is_ping_reply(b"PONG"));
+        assert!(StreamHandler::is_ping_reply(crate::net::MESH_ONION_READY));
+        assert!(!StreamHandler::is_ping_reply(b""));
+        assert!(!StreamHandler::is_ping_reply(b"PING"));
     }
 
     /// Регрессия на сам баг: сервер шлёт "auth_rejected: ..." Close-кадром на
