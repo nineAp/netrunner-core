@@ -21,9 +21,13 @@ mod dgram_engine;
 mod engine;
 mod handler;
 mod muxer;
+mod reverse_egress;
 
 pub use buftune::BUF_CAP;
 pub(crate) use connection::{mesh_process_uptime_ms, MeshPeerSession};
 pub use connection::{ClientHandler, Connection, ServerHandler, SessionManager, TunnelHandler};
 pub use dgram_engine::run_datagram_listener;
 pub use muxer::{Muxer, GLOBAL_MIN_RTT};
+pub use reverse_egress::{
+    EgressPolicy, ExitChoice, ExitMode, ExitPolicy, ReverseEgressRegistry, EGRESS_TOKEN_PREFIX,
+};

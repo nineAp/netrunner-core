@@ -1349,9 +1349,23 @@ impl Muxer {
             // Heartbeat (PONG): dropping it via try_send causes the health-check
             // probe to time out after HEALTH_CHECK_TIMEOUT and evict a live leg.
             // Credit too: a dropped grant would leave the sender blocked until the next one.
+            // Connect too (all variants): a dropped Connect is never retried and carries no
+            // ack, so the local socket would hang forever — which a browser opening dozens
+            // of connections at once hit constantly (the 16-slot control queue of a leg
+            // overflowed and the surplus Connects vanished with only a rate-limited WARN).
+            // The caller of a Connect is a per-stream task, so awaiting here stalls only
+            // that one stream, never the shared loop.
             let is_critical = matches!(
                 message.frame_type,
-                FrameType::Close | FrameType::Heartbeat | FrameType::Credit
+                FrameType::Close
+                    | FrameType::Heartbeat
+                    | FrameType::Credit
+                    | FrameType::Connect
+                    | FrameType::UdpConnect
+                    | FrameType::SecureConnect
+                    | FrameType::SecureUdpConnect
+                    | FrameType::MeshOnionConnect
+                    | FrameType::MeshOnionUdpConnect
             );
 
             if is_critical {

@@ -68,8 +68,9 @@ pub use credit::{
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use connection::{
-    run_datagram_listener, ClientHandler, Connection, Muxer, ServerHandler, SessionManager,
-    TunnelHandler, BUF_CAP, GLOBAL_MIN_RTT,
+    run_datagram_listener, ClientHandler, Connection, EgressPolicy, ExitChoice, ExitMode, ExitPolicy,
+    Muxer, ReverseEgressRegistry, ServerHandler, SessionManager, TunnelHandler, BUF_CAP,
+    EGRESS_TOKEN_PREFIX, GLOBAL_MIN_RTT,
 };
 pub use constants::*;
 #[cfg(not(target_arch = "wasm32"))]

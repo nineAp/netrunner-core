@@ -50,6 +50,10 @@ pub struct RemoteOpener {
     pub mesh_peer: bool,
     /// The authenticated peer used the mesh4 onion-capable handshake.
     pub mesh_onion_peer: bool,
+    /// Ingress side: reverse-egress sessions that may carry this client's flows.
+    pub reverse_egress: Option<Arc<super::ReverseEgressRegistry>>,
+    /// Egress side of a reverse-egress session: what targets may be dialed.
+    pub(crate) egress_policy: Option<Arc<super::reverse_egress::EgressRuntime>>,
 }
 
 impl RemoteOpener {
@@ -90,6 +94,28 @@ impl RemoteOpener {
             self.reject_stream(stream_id, token).await;
             return;
         }
+        if let Some(registry) = self.reverse_egress.as_ref() {
+            use super::reverse_egress::Pick;
+            match registry.pick_for(self.muxer.quota_user_id().as_deref()) {
+                Pick::Local => {}
+                Pick::Via(session) => {
+                    tokio::spawn(Self::open_via_reverse_egress(
+                        self.muxer.clone(),
+                        session,
+                        stream_id,
+                        target,
+                        v_rx,
+                        token,
+                    ));
+                    return;
+                }
+                // A remote exit is required but unavailable: fail closed, never exit from here.
+                Pick::Refuse => {
+                    self.reject_stream(stream_id, token).await;
+                    return;
+                }
+            }
+        }
         if !self.mesh_peer && self.mesh_route.is_none() {
             if let Some(mesh) = self.mesh.clone() {
                 if mesh.is_direct_output() {
@@ -116,6 +142,23 @@ impl RemoteOpener {
         token: CancellationToken,
         strong_privacy: bool,
     ) {
+        // Reverse egress carries TCP only. Never let UDP exit locally while the owner
+        // asked for (or currently has) a remote exit.
+        if self.egress_policy.is_some() {
+            self.reject_stream(stream_id, token).await;
+            return;
+        }
+        if let Some(registry) = self.reverse_egress.as_ref() {
+            use super::reverse_egress::Pick;
+            let remote_exit = !matches!(
+                registry.pick_for(self.muxer.quota_user_id().as_deref()),
+                Pick::Local
+            );
+            if remote_exit {
+                self.reject_stream(stream_id, token).await;
+                return;
+            }
+        }
         if !self.mesh_peer
             && self
                 .mesh_route
@@ -310,6 +353,7 @@ impl RemoteOpener {
         let mesh_peer = self.mesh_peer;
         let self_mesh_onion_peer = self.mesh_onion_peer;
         let mesh2_peer = mesh_route.is_some();
+        let egress_policy = self.egress_policy.clone();
         tokio::spawn(async move {
             if let (Some(mesh), Some(route)) = (mesh, mesh_route) {
                 Self::open_via_mesh(
@@ -318,6 +362,22 @@ impl RemoteOpener {
                 .await;
                 return;
             }
+
+            // Reverse-egress dialer: honour the flow limit (the slot is held until the flow ends).
+            let _slot = match &egress_policy {
+                Some(runtime) => match runtime.try_acquire() {
+                    Some(slot) => Some(slot),
+                    None => {
+                        warn!(stream_id, "⚠️ [Egress] flow limit reached, refusing");
+                        let _ = muxer
+                            .send_control(stream_id, FrameType::Close, Bytes::new())
+                            .await;
+                        muxer.remove_stream(stream_id);
+                        return;
+                    }
+                },
+                None => None,
+            };
 
             // Приватность: НЕ логируем `target` (хост, к которому идёт пользователь)
             // — это ровно та информация о его активности, которую прокси не должен
@@ -330,7 +390,12 @@ impl RemoteOpener {
                     debug!(stream_id, "🔪 Target connection cancelled by Eviction");
                     return;
                 }
-                connect_res = tokio::time::timeout(Duration::from_secs(7), TcpStream::connect(&target)) => {
+                connect_res = tokio::time::timeout(Duration::from_secs(7), async {
+                    match &egress_policy {
+                        Some(runtime) => runtime.policy.connect(&target).await,
+                        None => TcpStream::connect(&target).await,
+                    }
+                }) => {
                     match connect_res {
                         Ok(Ok(stream)) => {
                             if mesh_peer {
@@ -718,7 +783,7 @@ impl RemoteOpener {
         route: MeshRoute,
         ingress_stream_id: u32,
         target: String,
-        mut ingress_rx: mpsc::Receiver<Bytes>,
+        ingress_rx: mpsc::Receiver<Bytes>,
         token: CancellationToken,
         is_udp: bool,
         upstream_peer: bool,
@@ -788,7 +853,7 @@ impl RemoteOpener {
             route = retry_route;
         }
 
-        let Some((peer_session, peer_stream_id, mut peer_rx)) = connected else {
+        let Some((peer_session, peer_stream_id, peer_rx)) = connected else {
             if !token.is_cancelled() {
                 let _ = ingress_muxer
                     .send_control(ingress_stream_id, FrameType::Close, Bytes::new())
@@ -797,6 +862,74 @@ impl RemoteOpener {
             ingress_muxer.remove_stream(ingress_stream_id);
             return;
         };
+        metrics::histogram!("netrunner_mesh_route_setup_seconds")
+            .record(route_setup_started.elapsed().as_secs_f64());
+        Self::bridge_via_peer(
+            ingress_muxer,
+            peer_session,
+            peer_stream_id,
+            peer_rx,
+            ingress_stream_id,
+            ingress_rx,
+            token,
+            is_udp,
+            upstream_peer,
+        )
+        .await;
+    }
+
+    /// Opens `target` through a connected reverse-egress session and bridges the client's
+    /// flow to it. The egress confirms the connect before the client is let through.
+    async fn open_via_reverse_egress(
+        ingress_muxer: Arc<Muxer>,
+        session: Arc<super::MeshPeerSession>,
+        ingress_stream_id: u32,
+        target: String,
+        ingress_rx: mpsc::Receiver<Bytes>,
+        token: CancellationToken,
+    ) {
+        match session.open_stream(&target, false, Some(&token)).await {
+            Ok((peer_stream_id, peer_rx)) => {
+                metrics::counter!("netrunner_reverse_egress_streams_total").increment(1);
+                Self::bridge_via_peer(
+                    ingress_muxer,
+                    session,
+                    peer_stream_id,
+                    peer_rx,
+                    ingress_stream_id,
+                    ingress_rx,
+                    token,
+                    false,
+                    false,
+                )
+                .await;
+            }
+            Err(_) => {
+                metrics::counter!("netrunner_reverse_egress_connect_failures_total").increment(1);
+                if !token.is_cancelled() {
+                    let _ = ingress_muxer
+                        .send_control(ingress_stream_id, FrameType::Close, Bytes::new())
+                        .await;
+                }
+                ingress_muxer.remove_stream(ingress_stream_id);
+            }
+        }
+    }
+
+    /// Shuttles one flow between the client-facing stream and a stream on a peer session
+    /// (mesh hop or reverse egress), with credit relay and cleanup on both sides.
+    #[allow(clippy::too_many_arguments)]
+    async fn bridge_via_peer(
+        ingress_muxer: Arc<Muxer>,
+        peer_session: Arc<super::MeshPeerSession>,
+        peer_stream_id: u32,
+        mut peer_rx: mpsc::Receiver<Bytes>,
+        ingress_stream_id: u32,
+        mut ingress_rx: mpsc::Receiver<Bytes>,
+        token: CancellationToken,
+        is_udp: bool,
+        upstream_peer: bool,
+    ) {
         let peer_muxer = peer_session.muxer.clone();
         if token.is_cancelled() {
             let _ = peer_muxer
@@ -806,8 +939,6 @@ impl RemoteOpener {
             ingress_muxer.remove_stream(ingress_stream_id);
             return;
         }
-        metrics::histogram!("netrunner_mesh_route_setup_seconds")
-            .record(route_setup_started.elapsed().as_secs_f64());
         if let Some(rtt_ms) = peer_muxer.leg_rtt_ms(0).filter(|rtt| *rtt > 0) {
             metrics::histogram!("netrunner_mesh_peer_rtt_ms").record(f64::from(rtt_ms));
         }

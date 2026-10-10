@@ -105,6 +105,9 @@ pub(crate) struct MeshPeerSession {
     engine_task: tokio::task::AbortHandle,
     ready_payload: &'static [u8],
     last_used_ms: AtomicU64,
+    /// `false` for a reverse-egress view of an accepted session: the session belongs to the
+    /// `SessionManager`/leg engines, so dropping this handle must not shut it down.
+    owns_muxer: bool,
     #[cfg(feature = "mesh-quic")]
     _quic_endpoint: Option<quinn::Endpoint>,
     #[cfg(feature = "mesh-quic")]
@@ -112,6 +115,22 @@ pub(crate) struct MeshPeerSession {
 }
 
 impl MeshPeerSession {
+    /// A handle for opening streams towards a reverse-egress dialer over the session this
+    /// node accepted. The dialer's `RemoteOpener` confirms connects with a plain `PONG`.
+    pub(crate) fn for_reverse_egress(muxer: Arc<Muxer>) -> Self {
+        Self {
+            muxer,
+            engine_task: tokio::spawn(std::future::pending::<()>()).abort_handle(),
+            ready_payload: b"PONG",
+            last_used_ms: AtomicU64::new(mesh_process_uptime_ms()),
+            owns_muxer: false,
+            #[cfg(feature = "mesh-quic")]
+            _quic_endpoint: None,
+            #[cfg(feature = "mesh-quic")]
+            quic_connection: None,
+        }
+    }
+
     pub(crate) fn is_usable(&self) -> bool {
         !self.muxer.is_fatal() && self.muxer.active_legs_count() > 0
     }
@@ -350,6 +369,10 @@ impl MeshPeerSession {
 
 impl Drop for MeshPeerSession {
     fn drop(&mut self) {
+        if !self.owns_muxer {
+            self.engine_task.abort();
+            return;
+        }
         self.muxer.remove_all_streams();
         self.muxer.shutdown();
         self.engine_task.abort();
@@ -1463,6 +1486,7 @@ impl ClientHandler {
                 engine_task: engine_task.abort_handle(),
                 ready_payload,
                 last_used_ms: AtomicU64::new(mesh_process_uptime_ms()),
+                owns_muxer: true,
                 #[cfg(feature = "mesh-quic")]
                 _quic_endpoint: quic_endpoint,
                 #[cfg(feature = "mesh-quic")]
@@ -1664,6 +1688,7 @@ impl ClientHandler {
         identity: &Option<Identity>,
         data_cipher_preference: DataCipherPreference,
         mesh_route_preference: crate::net::MeshRoutePreference,
+        egress: &Option<Arc<super::reverse_egress::EgressRuntime>>,
     ) -> Result<(), AppError> {
         let leg_name = format!("TCP-Leg-{}", leg_id);
 
@@ -1730,7 +1755,9 @@ impl ClientHandler {
         // ECDH), но UDP-нога, если уже поднята, живёт независимо от него.
         let claim_material =
             crate::crypto::DatagramKeyMaterial::derive_from_root(datagram_root, true);
-        if muxer.try_claim_datagram_leg_token(claim_material.leg_token()) {
+        // A reverse-egress dialer is TCP-only: its handler would have to serve targets on a
+        // datagram leg too, and the ingress opens its streams over the TCP legs.
+        if egress.is_none() && muxer.try_claim_datagram_leg_token(claim_material.leg_token()) {
             let muxer = muxer.clone();
             // Тот же IP И тот же порт, на который уже легла TCP-нога — не
             // второй DNS-lookup, и естественно совпадает с тем, как настоящий
@@ -1760,7 +1787,19 @@ impl ClientHandler {
 
         muxer.add_leg(leg_id, control_tx, data_tx);
 
-        let handler = Arc::new(StreamHandler::new(muxer.clone(), None));
+        // Reverse-egress dialer: this side opens targets for the ingress.
+        let opener = egress.as_ref().map(|policy| {
+            Arc::new(RemoteOpener {
+                muxer: muxer.clone(),
+                mesh: None,
+                mesh_route: None,
+                mesh_peer: true,
+                mesh_onion_peer: false,
+                reverse_egress: None,
+                egress_policy: Some(policy.clone()),
+            })
+        });
+        let handler = Arc::new(StreamHandler::new(muxer.clone(), opener));
         let engine = TunnelEngine {
             leg_id,
             inbound: Some(inbound),
@@ -1899,12 +1938,88 @@ impl ClientHandler {
         decoy_sni: impl Into<Arc<str>>,
         auth_token: Option<String>,
         identity: Option<Identity>,
+        rx_from_engine: mpsc::Receiver<RawCastFrame>,
+        tx_to_engine: mpsc::Sender<RawCastFrame>,
+        strong_privacy: bool,
+        data_cipher_preference: DataCipherPreference,
+        mesh_route_preference: crate::net::MeshRoutePreference,
+        tunnel_legs: u32,
+    ) -> Result<Arc<Muxer>, AppError> {
+        Self::connect_inner(
+            remote_proxy_addr,
+            decoy_sni,
+            auth_token,
+            identity,
+            rx_from_engine,
+            tx_to_engine,
+            strong_privacy,
+            data_cipher_preference,
+            mesh_route_preference,
+            tunnel_legs,
+            None,
+        )
+        .await
+    }
+
+    /// Dials an ingress as a **reverse egress**: this node (typically behind NAT) becomes the
+    /// exit for flows the ingress routes to it. Only TCP is served, and only targets that
+    /// `policy` allows. `auth_token` is the ingress's usual client token; `label` names this
+    /// egress in the ingress's registry (no `:`).
+    pub async fn connect_egress(
+        remote_proxy_addr: &str,
+        decoy_sni: impl Into<Arc<str>>,
+        auth_token: Option<String>,
+        label: &str,
+        identity: Option<Identity>,
+        policy: crate::net::EgressPolicy,
+    ) -> Result<Arc<Muxer>, AppError> {
+        let label = label.replace(':', "_");
+        let token = format!(
+            "{}{label}:{}",
+            crate::net::EGRESS_TOKEN_PREFIX,
+            auth_token.unwrap_or_default()
+        );
+        // This role has no local engine: the RawCast channels stay open, silent, for as long
+        // as the session lives.
+        let (keep_tx, rx_from_engine) = mpsc::channel::<RawCastFrame>(1);
+        let (tx_to_engine, keep_rx) = mpsc::channel::<RawCastFrame>(1);
+        let muxer = Self::connect_inner(
+            remote_proxy_addr,
+            decoy_sni,
+            Some(token),
+            identity,
+            rx_from_engine,
+            tx_to_engine,
+            false,
+            DataCipherPreference::Auto,
+            crate::net::MeshRoutePreference::ServerDefault,
+            crate::net::DEFAULT_TUNNEL_LEGS,
+            Some(super::reverse_egress::EgressRuntime::new(policy)),
+        )
+        .await?;
+        let weak = Arc::downgrade(&muxer);
+        tokio::spawn(async move {
+            let _keep = (keep_tx, keep_rx);
+            while weak.upgrade().is_some() {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        });
+        Ok(muxer)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn connect_inner(
+        remote_proxy_addr: &str,
+        decoy_sni: impl Into<Arc<str>>,
+        auth_token: Option<String>,
+        identity: Option<Identity>,
         mut rx_from_engine: mpsc::Receiver<RawCastFrame>,
         tx_to_engine: mpsc::Sender<RawCastFrame>,
         strong_privacy: bool,
         data_cipher_preference: DataCipherPreference,
         mesh_route_preference: crate::net::MeshRoutePreference,
         tunnel_legs: u32,
+        egress: Option<Arc<super::reverse_egress::EgressRuntime>>,
     ) -> Result<Arc<Muxer>, AppError> {
         let tunnel_legs = crate::net::clamp_tunnel_legs(tunnel_legs);
         let decoy_sni: Arc<str> = decoy_sni.into();
@@ -1962,6 +2077,7 @@ impl ClientHandler {
             let decoy_sni = decoy_sni.clone();
             let auth_token = auth_token.clone();
             let identity = identity.clone();
+            let egress = egress.clone();
             let data_cipher_preference = data_cipher_preference;
             let mesh_route_preference = mesh_route_preference;
             tokio::spawn(async move {
@@ -1992,6 +2108,7 @@ impl ClientHandler {
                         &identity,
                         data_cipher_preference,
                         mesh_route_preference,
+                        &egress,
                     )
                     .await
                     {
@@ -2391,6 +2508,9 @@ pub struct ServerHandler {
     /// игнорируется, поэтому открытого релея не возникает. Управляется
     /// [`crate::decoy::DecoyMode::honor_requested_sni`].
     pub(crate) honor_requested_sni: bool,
+    /// Reverse egress: when set, dialers presenting an `egress:` token are accepted as exits
+    /// and flows of ordinary clients may be routed through them (see [`ExitMode`]).
+    pub(crate) reverse_egress: Option<Arc<crate::net::ReverseEgressRegistry>>,
     #[cfg(feature = "mesh-quic")]
     mesh_quic_connection: Option<quinn::Connection>,
 }
@@ -2417,9 +2537,16 @@ impl ServerHandler {
             identity,
             cover_flight,
             honor_requested_sni,
+            reverse_egress: None,
             #[cfg(feature = "mesh-quic")]
             mesh_quic_connection: None,
         }
+    }
+
+    /// Enables reverse egress on this ingress.
+    pub fn with_reverse_egress(mut self, registry: Arc<crate::net::ReverseEgressRegistry>) -> Self {
+        self.reverse_egress = Some(registry);
+        self
     }
 
     /// Installs node routing policy while preserving the legacy constructor
@@ -2849,6 +2976,15 @@ impl TunnelHandler for ServerHandler {
             || auth_token.starts_with("mesh2:")
             || auth_token.starts_with("mesh3:")
             || auth_token.starts_with("mesh4:");
+        // `egress:<label>:<token>`: a reverse-egress dialer. The inner token is validated like
+        // any client token; without a registry the ingress does not offer this role at all.
+        let egress_claim: Option<(String, String)> = auth_token
+            .strip_prefix(crate::net::EGRESS_TOKEN_PREFIX)
+            .map(|rest| {
+                let (label, token) = rest.split_once(':').unwrap_or((rest, ""));
+                (label.to_owned(), token.to_owned())
+            });
+        let is_egress = egress_claim.is_some() && !is_mesh_peer;
         #[cfg(feature = "mesh-quic")]
         if mesh_quic_connection.is_some() && !is_mesh_peer {
             metrics::counter!("netrunner_mesh_quic_non_mesh_rejected_total").increment(1);
@@ -2867,7 +3003,33 @@ impl TunnelHandler for ServerHandler {
         #[cfg(not(feature = "mesh-quic"))]
         self.session_manager
             .register_datagram_session(&muxer, leg_id, datagram_root);
-        let auth_result = if is_mesh_peer {
+        let auth_result = if is_egress {
+            let inner_token = egress_claim.as_ref().map_or("", |(_, t)| t.as_str());
+            if self.reverse_egress.is_none() {
+                Err(AppError::new(
+                    ERR_AUTH_FAILED,
+                    "Доступ запрещен",
+                    "Reverse egress is not enabled on this ingress",
+                ))
+            } else if require_auth {
+                match &auth {
+                    Some(validator) => validator.validate_egress(inner_token).await.map(Some),
+                    None => Err(AppError::new(
+                        ERR_AUTH_FAILED,
+                        "Доступ запрещен",
+                        "User authentication service is unavailable",
+                    )),
+                }
+            } else {
+                // Without user auth anybody could register as an exit and receive other clients'
+                // traffic: the egress role always needs a validator.
+                Err(AppError::new(
+                    ERR_AUTH_FAILED,
+                    "Доступ запрещен",
+                    "Reverse egress requires authentication",
+                ))
+            }
+        } else if is_mesh_peer {
             match &parsed_mesh_auth {
                 Err(reason) => Err(AppError::new(
                     ERR_AUTH_FAILED,
@@ -3016,8 +3178,28 @@ impl TunnelHandler for ServerHandler {
             mesh_route,
             mesh_peer: is_mesh_peer,
             mesh_onion_peer,
+            reverse_egress: if is_mesh_peer {
+                None
+            } else {
+                self.reverse_egress.clone()
+            },
+            egress_policy: None,
         });
-        let handler = Arc::new(StreamHandler::new(muxer.clone(), Some(opener)));
+        // A reverse-egress dialer never opens flows towards this ingress: no opener, so any
+        // `Connect` it sends is rejected. The ingress opens streams towards it instead.
+        let handler = Arc::new(StreamHandler::new(
+            muxer.clone(),
+            if is_egress { None } else { Some(opener) },
+        ));
+        if let (true, Some(registry), Some((label, _))) =
+            (is_egress, self.reverse_egress.as_ref(), egress_claim.as_ref())
+        {
+            registry.register(
+                &session_id,
+                label,
+                Arc::new(MeshPeerSession::for_reverse_egress(muxer.clone())),
+            );
+        }
 
         #[cfg(feature = "mesh-quic")]
         if is_mesh_peer {
@@ -3070,9 +3252,13 @@ impl TunnelHandler for ServerHandler {
             let sm = self.session_manager.clone();
             let sid = log_session_id;
             let m = muxer.clone();
+            let egress_registry = is_egress.then(|| self.reverse_egress.clone()).flatten();
             tokio::spawn(async move {
                 tokio::time::sleep(SESSION_CLEANUP_DELAY).await;
                 if m.active_legs_count() == 0 {
+                    if let Some(registry) = egress_registry {
+                        registry.unregister(&sid);
+                    }
                     sm.remove(&sid);
                 }
             });
@@ -3506,6 +3692,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl crate::net::AuthValidator for CountingValidator {
+        async fn validate_egress(&self, token: &str) -> Result<crate::net::UserQuota, AppError> {
+            if token == "no-egress-role" {
+                return Err(AppError::new(ERR_AUTH_FAILED, "Доступ запрещен", "no role"));
+            }
+            self.validate(token).await
+        }
         async fn validate(&self, _token: &str) -> Result<crate::net::UserQuota, AppError> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if self.reject {
@@ -3516,7 +3708,7 @@ mod tests {
                 ));
             }
             Ok(crate::net::UserQuota {
-                user_id: "user".into(),
+                user_id: _token.into(),
                 limit_bytes: None,
                 used_bytes: 0,
             })
@@ -4118,5 +4310,416 @@ mod tests {
         // And the best-effort wrapper never panics or breaks the socket.
         tune_tcp_congestion(&client);
         client.set_nodelay(true).unwrap();
+    }
+
+    // ---------- reverse egress ----------
+
+    /// Ingress node with a reverse-egress registry.
+    async fn spawn_ingress_with_registry(
+        registry: Arc<crate::net::ReverseEgressRegistry>,
+    ) -> std::net::SocketAddr {
+        NetworkConfig::init_global(1500);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let sm = Arc::new(SessionManager::new());
+        let validator = Arc::new(CountingValidator {
+            reject: false,
+            calls: Default::default(),
+        });
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let handler = ServerHandler::new(
+                    Connection::new(stream),
+                    sm.clone(),
+                    Arc::from("example.com"),
+                    Some(validator.clone() as Arc<dyn crate::net::AuthValidator>),
+                    None,
+                    crate::decoy::CoverFlight::node_default().records.into(),
+                    true,
+                )
+                .with_reverse_egress(registry.clone());
+                tokio::spawn(async move {
+                    let _ = handler.run().await;
+                });
+            }
+        });
+        addr
+    }
+
+    async fn wait_for_legs(muxer: &Arc<Muxer>) {
+        for _ in 0..200 {
+            if muxer.active_legs_count() >= 1 {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("legs never came up");
+    }
+
+    /// Returns (bytes received, closed) for one RawCast stream towards `target`.
+    async fn fetch_via_client(
+        to_tunnel: &mpsc::Sender<RawCastFrame>,
+        from_tunnel: &mut mpsc::Receiver<RawCastFrame>,
+        target: std::net::SocketAddr,
+    ) -> (usize, bool) {
+        let mut connect = RawCastFrame::connect(
+            LocalProtocol::Tcp,
+            1,
+            std::net::Ipv4Addr::LOCALHOST,
+            target.port(),
+        );
+        connect.payload = Bytes::from(target.to_string());
+        to_tunnel.send(connect).await.unwrap();
+        let (mut got, mut closed) = (0usize, false);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !closed {
+            let Ok(Some(frame)) = tokio::time::timeout_at(deadline, from_tunnel.recv()).await
+            else {
+                break;
+            };
+            match frame.event {
+                crate::rawcast::RawCastEvent::Data => got += frame.payload.len(),
+                crate::rawcast::RawCastEvent::Close => closed = true,
+                _ => {}
+            }
+        }
+        (got, closed)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reverse_egress_carries_client_flows_through_the_dialer() {
+        use crate::net::{EgressPolicy, ExitMode, ReverseEgressRegistry};
+        const TOTAL: usize = 3 * 1024 * 1024;
+        let registry = ReverseEgressRegistry::new(ExitMode::Require);
+        let addr = spawn_ingress_with_registry(registry.clone()).await;
+        let target = spawn_burst_target(TOTAL, 64 * 1024).await;
+
+        // The "home" node dials the ingress; the target is on loopback, so it opts in.
+        let egress = ClientHandler::connect_egress(
+            &addr.to_string(),
+            "example.com",
+            Some("jwt".into()),
+            "home",
+            None,
+            EgressPolicy {
+                allow_private: true,
+
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        wait_for_legs(&egress).await;
+        for _ in 0..100 {
+            if !registry.live().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(registry.live(), vec!["home".to_string()]);
+
+        let (client, to_tunnel, mut from_tunnel) = connect_client_raw(addr).await;
+        wait_for_legs(&client).await;
+        let (got, closed) = fetch_via_client(&to_tunnel, &mut from_tunnel, target).await;
+        assert_eq!(got, TOTAL, "all bytes must arrive through the reverse egress");
+        assert!(closed);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn require_mode_fails_closed_without_an_egress() {
+        use crate::net::{ExitMode, ReverseEgressRegistry};
+        let registry = ReverseEgressRegistry::new(ExitMode::Require);
+        let addr = spawn_ingress_with_registry(registry).await;
+        let target = spawn_burst_target(1024, 1024).await; // reachable locally on purpose
+
+        let (client, to_tunnel, mut from_tunnel) = connect_client_raw(addr).await;
+        wait_for_legs(&client).await;
+        let (got, closed) = fetch_via_client(&to_tunnel, &mut from_tunnel, target).await;
+        assert_eq!(got, 0, "no data may leave through the ingress itself");
+        assert!(closed, "the flow must be refused, not left hanging");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn prefer_mode_falls_back_to_local_without_an_egress() {
+        use crate::net::{ExitMode, ReverseEgressRegistry};
+        let registry = ReverseEgressRegistry::new(ExitMode::Prefer);
+        let addr = spawn_ingress_with_registry(registry).await;
+        let target = spawn_burst_target(4096, 1024).await;
+
+        let (client, to_tunnel, mut from_tunnel) = connect_client_raw(addr).await;
+        wait_for_legs(&client).await;
+        let (got, _) = fetch_via_client(&to_tunnel, &mut from_tunnel, target).await;
+        assert_eq!(got, 4096);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn default_policy_keeps_the_egress_lan_out_of_reach() {
+        use crate::net::{EgressPolicy, ExitMode, ReverseEgressRegistry};
+        let registry = ReverseEgressRegistry::new(ExitMode::Require);
+        let addr = spawn_ingress_with_registry(registry.clone()).await;
+        let target = spawn_burst_target(1024, 1024).await; // loopback = the egress's own LAN
+
+        let egress = ClientHandler::connect_egress(
+            &addr.to_string(),
+            "example.com",
+            Some("jwt".into()),
+            "home",
+            None,
+            EgressPolicy::default(),
+        )
+        .await
+        .unwrap();
+        wait_for_legs(&egress).await;
+        for _ in 0..100 {
+            if !registry.live().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        let (client, to_tunnel, mut from_tunnel) = connect_client_raw(addr).await;
+        wait_for_legs(&client).await;
+        let (got, closed) = fetch_via_client(&to_tunnel, &mut from_tunnel, target).await;
+        assert_eq!(got, 0, "a loopback target must be refused by the egress policy");
+        assert!(closed);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_dialing_egress_cannot_open_flows_towards_the_ingress() {
+        use crate::net::{EgressPolicy, ExitMode, ReverseEgressRegistry};
+        let registry = ReverseEgressRegistry::new(ExitMode::Local);
+        let addr = spawn_ingress_with_registry(registry.clone()).await;
+        let target = spawn_burst_target(1024, 1024).await;
+
+        // Hand-built egress session so the test can inject frames: reuse connect_egress and
+        // send a Connect from the egress muxer — the ingress must reject it (no opener).
+        let egress = ClientHandler::connect_egress(
+            &addr.to_string(),
+            "example.com",
+            Some("jwt".into()),
+            "home",
+            None,
+            EgressPolicy {
+                allow_private: true,
+
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        wait_for_legs(&egress).await;
+        let stream_id = egress.next_stream_id();
+        let (tx, mut rx) = mpsc::channel::<Bytes>(8);
+        egress.register_stream(stream_id, tx);
+        egress
+            .send_control(stream_id, FrameType::Connect, Bytes::from(target.to_string()))
+            .await
+            .unwrap();
+        // Rejected → Close arrives as an empty/ended stream, never data.
+        let got = tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv()).await;
+        assert!(
+            !matches!(got, Ok(Some(ref b)) if !b.is_empty()),
+            "ingress must not serve flows requested by a dialing egress"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_token_without_the_egress_role_is_not_registered() {
+        use crate::net::{EgressPolicy, ExitMode, ReverseEgressRegistry};
+        let registry = ReverseEgressRegistry::new(ExitMode::Require);
+        let addr = spawn_ingress_with_registry(registry.clone()).await;
+        let egress = ClientHandler::connect_egress(
+            &addr.to_string(),
+            "example.com",
+            Some("no-egress-role".into()),
+            "intruder",
+            None,
+            EgressPolicy::default(),
+        )
+        .await
+        .unwrap();
+        for _ in 0..40 {
+            if egress.is_fatal() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(egress.is_fatal(), "the ingress must reject the token");
+        assert!(registry.live().is_empty());
+    }
+
+    // ---------- reverse egress: per-client exit and flow limit ----------
+
+    struct TestPolicy(Vec<(&'static str, crate::net::ExitChoice)>);
+
+    impl crate::net::ExitPolicy for TestPolicy {
+        fn choice_for(&self, user_id: Option<&str>) -> crate::net::ExitChoice {
+            self.0
+                .iter()
+                .find(|(user, _)| Some(*user) == user_id)
+                .map_or(crate::net::ExitChoice::Default, |(_, c)| c.clone())
+        }
+    }
+
+    async fn connect_client_raw_as(
+        addr: std::net::SocketAddr,
+        token: &str,
+    ) -> (
+        Arc<Muxer>,
+        mpsc::Sender<RawCastFrame>,
+        mpsc::Receiver<RawCastFrame>,
+    ) {
+        let (tx_to_engine, rx_from_tunnel) = mpsc::channel(256);
+        let (tx_to_tunnel, rx_from_engine) = mpsc::channel(256);
+        let muxer = ClientHandler::connect(
+            &addr.to_string(),
+            "example.com",
+            Some(token.into()),
+            None,
+            rx_from_engine,
+            tx_to_engine,
+        )
+        .await
+        .unwrap();
+        (muxer, tx_to_tunnel, rx_from_tunnel)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn exit_policy_sends_a_client_local_while_others_are_refused() {
+        use crate::net::{ExitChoice, ExitMode, ReverseEgressRegistry};
+        let registry = ReverseEgressRegistry::new(ExitMode::Require);
+        registry.set_policy(Some(Arc::new(TestPolicy(vec![(
+            "local-user",
+            ExitChoice::Local,
+        )]))));
+        let addr = spawn_ingress_with_registry(registry).await;
+        let target = spawn_burst_target(4096, 1024).await;
+
+        let (a, to_a, mut from_a) = connect_client_raw_as(addr, "local-user").await;
+        wait_for_legs(&a).await;
+        let (got, _) = fetch_via_client(&to_a, &mut from_a, target).await;
+        assert_eq!(got, 4096, "a Local client exits from the ingress even in Require mode");
+
+        let (b, to_b, mut from_b) = connect_client_raw_as(addr, "someone-else").await;
+        wait_for_legs(&b).await;
+        let (got, closed) = fetch_via_client(&to_b, &mut from_b, target).await;
+        assert_eq!(got, 0, "everybody else still fails closed without an egress");
+        assert!(closed);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn exit_policy_can_pin_a_client_to_a_labeled_egress() {
+        use crate::net::{EgressPolicy, ExitChoice, ExitMode, ReverseEgressRegistry};
+        let registry = ReverseEgressRegistry::new(ExitMode::Local);
+        registry.set_policy(Some(Arc::new(TestPolicy(vec![
+            ("pinned", ExitChoice::Egress("home".into())),
+            ("ghost", ExitChoice::Egress("nowhere".into())),
+        ]))));
+        let addr = spawn_ingress_with_registry(registry.clone()).await;
+        let target = spawn_burst_target(4096, 1024).await;
+        let egress = ClientHandler::connect_egress(
+            &addr.to_string(),
+            "example.com",
+            Some("egress-token".into()),
+            "home",
+            None,
+            EgressPolicy {
+                allow_private: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        wait_for_legs(&egress).await;
+        for _ in 0..100 {
+            if !registry.live().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        let (p, to_p, mut from_p) = connect_client_raw_as(addr, "pinned").await;
+        wait_for_legs(&p).await;
+        let (got, _) = fetch_via_client(&to_p, &mut from_p, target).await;
+        assert_eq!(got, 4096, "a client pinned to a live label exits through it");
+
+        let (g, to_g, mut from_g) = connect_client_raw_as(addr, "ghost").await;
+        wait_for_legs(&g).await;
+        let (got, closed) = fetch_via_client(&to_g, &mut from_g, target).await;
+        assert_eq!(got, 0, "a client pinned to a missing label is refused, not sent elsewhere");
+        assert!(closed);
+
+        // A client without a pin follows the mode (Local here) and exits from the ingress.
+        let (d, to_d, mut from_d) = connect_client_raw_as(addr, "default-user").await;
+        wait_for_legs(&d).await;
+        let (got, _) = fetch_via_client(&to_d, &mut from_d, target).await;
+        assert_eq!(got, 4096);
+    }
+
+    /// A target that accepts connections and keeps them open without sending anything.
+    async fn spawn_hold_target() -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock);
+            }
+        });
+        addr
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn egress_flow_limit_refuses_the_extra_flow_and_keeps_the_first() {
+        use crate::net::{EgressPolicy, ExitMode, ReverseEgressRegistry};
+        let registry = ReverseEgressRegistry::new(ExitMode::Require);
+        let addr = spawn_ingress_with_registry(registry.clone()).await;
+        let target = spawn_hold_target().await;
+        let egress = ClientHandler::connect_egress(
+            &addr.to_string(),
+            "example.com",
+            Some("jwt".into()),
+            "home",
+            None,
+            EgressPolicy {
+                allow_private: true,
+                max_streams: Some(1),
+            },
+        )
+        .await
+        .unwrap();
+        wait_for_legs(&egress).await;
+        for _ in 0..100 {
+            if !registry.live().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let (client, to_tunnel, mut from_tunnel) = connect_client_raw(addr).await;
+        wait_for_legs(&client).await;
+
+        for id in 1..=2u64 {
+            let mut connect = RawCastFrame::connect(
+                LocalProtocol::Tcp,
+                id,
+                std::net::Ipv4Addr::LOCALHOST,
+                target.port(),
+            );
+            connect.payload = Bytes::from(target.to_string());
+            to_tunnel.send(connect).await.unwrap();
+        }
+        let mut closed = std::collections::HashSet::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(4);
+        while let Ok(Some(frame)) = tokio::time::timeout_at(deadline, from_tunnel.recv()).await {
+            if matches!(frame.event, crate::rawcast::RawCastEvent::Close) {
+                closed.insert(frame.socket_id);
+            }
+        }
+        assert_eq!(
+            closed.len(),
+            1,
+            "exactly one of the two flows must be refused by the limit, closed: {closed:?}"
+        );
     }
 }

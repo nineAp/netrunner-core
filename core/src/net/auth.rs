@@ -351,6 +351,16 @@ pub struct NodeHealthReport {
 pub trait AuthValidator: Send + Sync {
     /// Проверяет Bearer-токен клиента (JWT, выданный бэкендом при логине).
     async fn validate(&self, token: &str) -> Result<UserQuota, AppError>;
+    /// Проверяет токен узла, который хочет быть reverse-egress (выходом для клиентов этого ingress).
+    /// По умолчанию — отказ: роль выдаётся явно, обычный клиентский токен её не даёт
+    /// (иначе любой клиент мог бы перехватывать чужой трафик, назначив себя выходом).
+    async fn validate_egress(&self, _token: &str) -> Result<UserQuota, AppError> {
+        Err(AppError::new(
+            netrunner_logger::ERR_AUTH_FAILED,
+            "Доступ запрещен",
+            "This validator does not grant the reverse-egress role",
+        ))
+    }
     /// Отчитывается о переданных байтах и синхронно узнаёт, не превышен ли лимит.
     async fn report_usage(&self, user_id: &str, delta_bytes: u64) -> Result<UsageReport, AppError>;
     /// Отчитывается о нескольких пользователях одним идемпотентным пакетом.
